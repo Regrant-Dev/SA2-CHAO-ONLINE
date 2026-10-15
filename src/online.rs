@@ -97,11 +97,19 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         }
         "client" | "join" => {
             let host = get("host");
-            let addr = host
+            // The port is optional: without one, the default port.
+            let full = if host.contains(':') {
+                host.to_string()
+            } else {
+                format!("{host}:{DEFAULT_PORT}")
+            };
+            let addr = full
                 .to_socket_addrs()
                 .ok()
                 .and_then(|mut a| a.next())
-                .ok_or_else(|| format!("bad host address '{host}' (use ip:port)"))?;
+                .ok_or_else(|| {
+                    format!("bad host address '{host}' (use a name or IP, :port optional)")
+                })?;
             Mode::Client { host: addr }
         }
         other => return Err(format!("unknown mode '{other}'")),
@@ -946,6 +954,22 @@ mod tests {
             Mode::Client {
                 host: "10.0.0.5:27015".parse().unwrap()
             }
+        );
+    }
+
+    #[test]
+    fn host_port_is_optional() {
+        let c = parse_config("mode=join\nhost=10.0.0.5").unwrap();
+        assert_eq!(
+            c.mode,
+            Mode::Client {
+                host: format!("10.0.0.5:{DEFAULT_PORT}").parse().unwrap()
+            }
+        );
+        // Names are looked up (localhost resolves everywhere).
+        let c = parse_config("mode=join\nhost=localhost:4000").unwrap();
+        assert!(
+            matches!(c.mode, Mode::Client { host } if host.port() == 4000 && host.ip().is_loopback())
         );
     }
 

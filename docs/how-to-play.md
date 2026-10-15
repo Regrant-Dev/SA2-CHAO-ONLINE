@@ -26,8 +26,8 @@ Press **F9** in game. Pause first when typing: the game also reads letter keys a
 | Start now | Only while held at a start: start it for everyone there (same as F8) |
 | Multiplayer | Off / Host / Join |
 | Your name | Shown above you to others (up to 10 characters) |
-| Host address | When joining: the host's address, e.g. `100.101.102.103:43902` |
-| Port | When hosting: the UDP port to listen on (default 43902) |
+| Host address | Shown in Join mode: the host's or server's name or IP, e.g. `100.101.102.103` or `myserver.example.com:43902` (the port is optional; default 43902) |
+| Port | Shown in Host mode: the UDP port your game listens on (default 43902) |
 | Name tags | Names above other players |
 | Room | Create a room, join someone's, or leave (Left/Right to choose, Enter to do it) |
 | Live karate vs | In a room, at Karate: who your next fight is live against (first free player, or pick one) |

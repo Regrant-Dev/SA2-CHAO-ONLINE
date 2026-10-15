@@ -56,21 +56,21 @@ enum Row {
 }
 
 /// Rows shown right now: "Start now" first while held at a start, then the connection and
-/// play settings, then actions, and connecting/stopping at the bottom.
-fn rows() -> Vec<Row> {
+/// play settings, then actions, and connecting/stopping at the bottom. `mode` (index into
+/// `MODES`) picks the address row: Host address only when joining, Port only when hosting.
+fn rows(mode: usize) -> Vec<Row> {
     let mut rows = Vec::new();
     if together::is_holding() || race::is_holding() || crate::karate_live::is_holding() {
         rows.push(Row::StartNow);
     }
     // Connection, then the room (live play together) ...
-    rows.extend([
-        Row::Mode,
-        Row::Name,
-        Row::Host,
-        Row::Port,
-        Row::NameTags,
-        Row::Room,
-    ]);
+    rows.extend([Row::Mode, Row::Name]);
+    match MODES[mode.min(MODES.len() - 1)] {
+        "Host" => rows.push(Row::Port),
+        "Join" => rows.push(Row::Host),
+        _ => {}
+    }
+    rows.extend([Row::NameTags, Row::Room]);
     if room::summary().is_some() {
         rows.push(Row::RoomInfo);
     }
@@ -289,7 +289,7 @@ pub fn on_frame() {
         m.open = false;
         return;
     }
-    let rows = rows();
+    let rows = rows(m.settings.mode);
     m.row = m.row.min(rows.len() - 1);
     if m.pressed(VK_UP) {
         m.row = (m.row + rows.len() - 1) % rows.len();
