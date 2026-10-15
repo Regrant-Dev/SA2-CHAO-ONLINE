@@ -123,6 +123,8 @@ pub struct Pose {
     pub frame: f32,
     /// `game::POSE_*` bits.
     pub flags: u8,
+    /// `CharObj2Base::Upgrades` (mech upgrade parts).
+    pub upgrades: u32,
 }
 
 /// Spin ball centres (newest last) and their texture (0/1).
@@ -185,6 +187,7 @@ pub fn blend(a: &Pose, b: &Pose, t: f32) -> Pose {
         anim,
         frame,
         flags: b.flags,
+        upgrades: b.upgrades,
     }
 }
 
@@ -245,22 +248,9 @@ pub fn on_frame() {
                 p.failed.push(character);
                 continue;
             }
-            // The model/motion tables are shared by index. If this character's indices are
-            // already taken here (e.g. by a mech), the loader leaves them and our draws would
-            // mix up models and motions, which crashes; don't draw this character then.
-            // SAFETY: lists just returned by the game's loaders.
-            if let Err(clash) = unsafe { check_tables(models, motions) } {
-                log!("puppets: can't show character {character} here ({clash})");
-                // SAFETY: release what we loaded; the releases only clear entries that point
-                // at these lists.
-                unsafe {
-                    free_motions(motions);
-                    free_models(models);
-                    free_texlist(texlist);
-                }
-                p.failed.push(character);
-                continue;
-            }
+            // The game's model/motion tables are shared by index, and another character here
+            // (e.g. a mech) may already hold this one's slots: puppets therefore always draw
+            // from the lists this load returned, never from the shared tables.
             log!("puppets: loaded character {character} for other players");
             p.loaded.push(Loaded {
                 character,
@@ -293,39 +283,39 @@ pub fn on_frame() {
     log!("puppets: object created at {object:#x}");
 }
 
-/// Checks that every entry of a loaded model list (`{i32 index, NJS_OBJECT*}`, ends at index -1)
-/// and motion list (`{u16 index, u16 count, NJS_MOTION*}`, ends at index 0xFFFF) is what the
-/// shared tables now hold at that index.
-unsafe fn check_tables(models: usize, motions: usize) -> Result<(), String> {
+/// The model (`{i32 index, NJS_OBJECT*}`, ends at index -1) with this index in a loaded list.
+unsafe fn list_model(models: usize, index: usize) -> usize {
     unsafe {
         for i in 0..MODEL_COUNT {
             let entry = models + i * TABLE_STRIDE;
-            let index = read::<i32>(entry);
-            if index < 0 {
+            let at = read::<i32>(entry);
+            if at < 0 {
                 break;
             }
-            let index = index as usize;
-            if index >= MODEL_COUNT
-                || read::<usize>(MODEL_TABLE + index * TABLE_STRIDE) != read::<usize>(entry + 4)
-            {
-                return Err(format!("model slot {index} is taken"));
-            }
-        }
-        for i in 0..MOTION_COUNT {
-            let entry = motions + i * TABLE_STRIDE;
-            let index = read::<u16>(entry);
-            if index == 0xFFFF {
-                break;
-            }
-            let index = usize::from(index);
-            if index >= MOTION_COUNT
-                || read::<usize>(MOTION_TABLE + index * TABLE_STRIDE) != read::<usize>(entry + 4)
-            {
-                return Err(format!("motion slot {index} is taken"));
+            if at as usize == index {
+                return read::<usize>(entry + 4);
             }
         }
     }
-    Ok(())
+    0
+}
+
+/// The motion (`{u16 index, u16 count, NJS_MOTION*}`, ends at index 0xFFFF) with this index in
+/// a loaded list.
+unsafe fn list_motion(motions: usize, index: usize) -> usize {
+    unsafe {
+        for i in 0..MOTION_COUNT {
+            let entry = motions + i * TABLE_STRIDE;
+            let at = read::<u16>(entry);
+            if at == 0xFFFF {
+                break;
+            }
+            if usize::from(at) == index {
+                return read::<usize>(entry + 4);
+            }
+        }
+    }
+    0
 }
 
 /// Creates an object in the display list whose `display` callback runs during the display
@@ -401,6 +391,7 @@ extern "C" fn display(_object: usize) {
                     // SAFETY: the local player's CharObj2 (checked non-null above).
                     anim_info: unsafe { read::<usize>(co2 as usize + game::CO2_ANIM_INFO) },
                     texlist: unsafe { read::<usize>(co2 as usize + slot) },
+                    lists: None,
                 })
             } else {
                 p.loaded
@@ -410,10 +401,17 @@ extern "C" fn display(_object: usize) {
                         character_files(l.character).map(|f| Source {
                             anim_info: f.anim_info,
                             texlist: l.texlist,
+                            lists: Some((l.models, l.motions)),
                         })
                     })
             };
             let result = match source {
+                // Mechs and walkers like ours: the game's own walker display draws them, with
+                // their upgrade parts (re/characters.md "Walker extra parts").
+                // SAFETY: display callback on the game thread; same character as ours.
+                Some(source) if pose.character == me.character && is_walker(pose.character) => unsafe {
+                    draw_walker(&source, &pose, co2 as usize)
+                },
                 // SAFETY: display callback runs on the game thread inside the display pass.
                 Some(source) => unsafe { draw(&source, &pose) },
                 None if character_files(pose.character).is_some() => {
@@ -497,7 +495,17 @@ unsafe fn spin_ball(p: &mut Puppets, name: &str, pose: &Pose) {
         _ => (SONIC_BALL_MODEL, SONIC_EFFECT_TEXLIST),
     };
     unsafe {
-        let model = read::<usize>(MODEL_TABLE + model_slot * TABLE_STRIDE);
+        // From Sonic's / Shadow's own list when we loaded them for puppets (the shared slot
+        // may belong to another character here), else the shared table.
+        let family = if matches!(pose.character, 1 | 9) {
+            1
+        } else {
+            0
+        };
+        let model = match p.loaded.iter().find(|l| l.character == family) {
+            Some(l) => list_model(l.models, model_slot),
+            None => read::<usize>(MODEL_TABLE + model_slot * TABLE_STRIDE),
+        };
         let textures = read::<usize>(texlist);
         let loaded = textures != 0 && read::<usize>(textures + 8) != 0;
         if !loaded && !p.effects_requested {
@@ -547,9 +555,133 @@ unsafe fn spin_ball(p: &mut Puppets, name: &str, pose: &Pose) {
 struct Source {
     anim_info: usize,
     texlist: usize,
+    /// (model list, motion list) of a character we loaded; `None` = the local player's own
+    /// character, whose models and motions are in the shared tables.
+    lists: Option<(usize, usize)>,
 }
 
-unsafe fn draw(source: &Source, pose: &Pose) -> Result<(), &'static str> {
+impl Source {
+    unsafe fn model(&self, index: usize) -> usize {
+        unsafe {
+            match self.lists {
+                Some((models, _)) => list_model(models, index),
+                None => read::<usize>(MODEL_TABLE + index * TABLE_STRIDE),
+            }
+        }
+    }
+
+    unsafe fn motion(&self, index: usize) -> usize {
+        unsafe {
+            match self.lists {
+                Some((_, motions)) => list_motion(motions, index),
+                None => read::<usize>(MOTION_TABLE + index * TABLE_STRIDE),
+            }
+        }
+    }
+}
+
+// ---- Mechs and walkers (re/characters.md "Walker extra parts") ----
+//
+// The walker display 0x7444F0 (cdecl, ObjectMaster*) draws the body and then the upgrade parts
+// from bone matrices its per-bone callback records into the CharObj2. Puppets of the same
+// walker as ours get a private copy of our CharObj2 (so every pointer in it is valid for this
+// character) with their pose and upgrades written in, and a private EntityData1, and the game
+// draws them itself. The globals the display and its callback write are saved and restored, so
+// our own walker is untouched.
+
+/// Walker CharObj2 size (the walker loader allocates 0x458 bytes, 0x740CD9).
+const WALKER_CO2_SIZE: usize = 0x458;
+/// EntityData1: action byte, status (+6 bit 1 = blinking, skipped), angles, position, scale.
+const ENTITY_SIZE: usize = 0x40;
+const ENTITY_ACTION: usize = 0x00;
+const ENTITY_STATUS: usize = 0x06;
+const ENTITY_ROTATION: usize = 0x08;
+const ENTITY_POSITION: usize = 0x14;
+const OBJ_DATA1: usize = 0x34;
+const OBJ_DATA2: usize = 0x40;
+/// CharObj2 animation block: mode (2 = blending), requested and current animation, frame.
+const CO2_MOTION_MODE: usize = 0x174;
+const CO2_NEXT_ANIM: usize = 0x176;
+/// Globals the walker display and its bone callback write: (address, length).
+const WALKER_GLOBALS: [(usize, usize); 5] = [
+    (0x01A5_1D00, 0x400), // bone matrices and the drawn CharObj2 (0x1A51D2C..0x1A520F0)
+    (0x01A5_57FC, 0x50),  // matrix stack top, bone callback, draw flags (0x1A557FC..0x1A5584C)
+    (0x01DE_4660, 0x08),  // per-player light index
+    (0x01DE_B6A0, 0x10),  // render flags it saves
+    (0x025E_FFCC, 0x14),  // fog switch and colour
+];
+
+#[repr(C, align(16))]
+struct WalkerCopy {
+    co2: [u8; WALKER_CO2_SIZE + 8],
+    entity: [u8; ENTITY_SIZE],
+    object: [u8; 0x50],
+}
+
+static mut WALKER: WalkerCopy = WalkerCopy {
+    co2: [0; WALKER_CO2_SIZE + 8],
+    entity: [0; ENTITY_SIZE],
+    object: [0; 0x50],
+};
+
+fn is_walker(character: u8) -> bool {
+    matches!(character, 6 | 7 | 10 | 11)
+}
+
+/// Draws `pose` with the game's walker display, from a copy of our own walker's CharObj2.
+///
+/// # Safety
+/// Display pass on the game thread; `co2` is our CharObj2 and our character is `pose`'s.
+unsafe fn draw_walker(source: &Source, pose: &Pose, co2: usize) -> Result<(), &'static str> {
+    unsafe {
+        let (_, _, frame) = resolve(source, pose)?;
+        let entity = game::local_entity() as usize;
+        if entity == 0 {
+            return Err("no local player");
+        }
+        let walker = &mut *std::ptr::addr_of_mut!(WALKER);
+        ptr::copy_nonoverlapping(co2 as *const u8, walker.co2.as_mut_ptr(), WALKER_CO2_SIZE);
+        ptr::copy_nonoverlapping(entity as *const u8, walker.entity.as_mut_ptr(), ENTITY_SIZE);
+        let c = walker.co2.as_mut_ptr() as usize;
+        write(c + game::CO2_UPGRADES, pose.upgrades);
+        write(c + CO2_MOTION_MODE, 0u16);
+        write(c + CO2_NEXT_ANIM, pose.anim);
+        write(c + game::CO2_ANIM, pose.anim);
+        write(c + game::CO2_FRAME, frame);
+        let e = walker.entity.as_mut_ptr() as usize;
+        write(e + ENTITY_ACTION, 0u8);
+        write(e + ENTITY_STATUS, read::<u8>(e + ENTITY_STATUS) & !2);
+        write(e + ENTITY_ROTATION, pose.rotation);
+        write(e + ENTITY_POSITION, pose.position);
+        walker.object = [0; 0x50];
+        let object = walker.object.as_mut_ptr() as usize;
+        write(object + OBJ_DATA1, e);
+        write(object + OBJ_DATA2, c);
+
+        let saved: Vec<Vec<u8>> = WALKER_GLOBALS
+            .iter()
+            .map(|&(at, len)| std::slice::from_raw_parts(at as *const u8, len).to_vec())
+            .collect();
+        let render = read::<usize>(RENDER_STATE);
+        let old_texlist = if render != 0 {
+            read::<usize>(render + RENDER_TEXLIST)
+        } else {
+            0
+        };
+        walker_display(object);
+        for (&(at, len), bytes) in WALKER_GLOBALS.iter().zip(&saved) {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, len);
+        }
+        if render != 0 {
+            write(render + RENDER_TEXLIST, old_texlist);
+        }
+        refresh_fog();
+    }
+    Ok(())
+}
+
+/// A pose's model, motion and the frame to show (checked against the animation tables).
+unsafe fn resolve(source: &Source, pose: &Pose) -> Result<(usize, usize, f32), &'static str> {
     let blending = pose.flags & game::POSE_BLENDING != 0;
     unsafe {
         let anim = pose.anim as usize;
@@ -568,8 +700,8 @@ unsafe fn draw(source: &Source, pose: &Pose) -> Result<(), &'static str> {
         if model_index >= MODEL_COUNT || motion_index >= MOTION_COUNT {
             return Err("model/motion index out of range");
         }
-        let model = read::<usize>(MODEL_TABLE + model_index * TABLE_STRIDE);
-        let motion = read::<usize>(MOTION_TABLE + motion_index * TABLE_STRIDE);
+        let model = source.model(model_index);
+        let motion = source.motion(motion_index);
         if model == 0 {
             return Err("model not loaded");
         }
@@ -585,6 +717,13 @@ unsafe fn draw(source: &Source, pose: &Pose) -> Result<(), &'static str> {
         } else {
             0.0
         };
+        Ok((model, motion, frame))
+    }
+}
+
+unsafe fn draw(source: &Source, pose: &Pose) -> Result<(), &'static str> {
+    unsafe {
+        let (model, motion, frame) = resolve(source, pose)?;
 
         let top = read::<usize>(MATRIX_TOP);
         let limit = read::<usize>(MATRIX_LIMIT);
@@ -801,6 +940,13 @@ mod ffi {
         unsafe { std::mem::transmute::<usize, extern "C" fn()>(REFRESH_FOG)() }
     }
 
+    const WALKER_DISPLAY: usize = 0x0074_44F0;
+
+    /// The walker display 0x7444F0 (cdecl, ObjectMaster*).
+    pub unsafe fn walker_display(object: usize) {
+        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(WALKER_DISPLAY)(object) }
+    }
+
     /// `LoadSonEffTex` 0x755DA0: Sonic's effect textures (no arguments; safe to call twice).
     pub unsafe fn load_sonic_effects() {
         unsafe { std::mem::transmute::<usize, extern "C" fn()>(LOAD_SONIC_EFFECTS)() }
@@ -953,6 +1099,7 @@ mod ffi {
     pub unsafe fn draw_motion(_: usize, _: usize, _: f32) {}
     pub unsafe fn scale(_: f32) {}
     pub unsafe fn draw_object(_: usize) {}
+    pub unsafe fn walker_display(_: usize) {}
     pub unsafe fn refresh_fog() {}
     pub unsafe fn load_sonic_effects() {}
     pub unsafe fn calc_point(_: usize, p: [f32; 3]) -> [f32; 3] {
@@ -978,7 +1125,7 @@ mod ffi {
 use ffi::{
     calc_point, draw_motion, draw_object, free_models, free_motions, free_texlist, load_models,
     load_motions, load_object, load_sonic_effects, load_texlist, project_screen, refresh_fog,
-    rotate, scale, translate,
+    rotate, scale, translate, walker_display,
 };
 
 #[cfg(test)]
@@ -993,6 +1140,7 @@ mod tests {
             anim,
             frame,
             flags: 0,
+            upgrades: 0,
         }
     }
 

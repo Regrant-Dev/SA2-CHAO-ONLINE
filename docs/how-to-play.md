@@ -98,9 +98,10 @@ or fighting copy is saved anywhere, and your own Chao never leave your save.
 same garden (F9 > Garden visits: Garden Chao, My Chao or Off).
 
 **Chao Race.** While connected, friends' Chao take the other lanes of your Chao Races (F9 >
-Friends' Chao in races) (each
-friend's My Chao first, then another of their Chao while lanes are left; the rest are CPU).
-Labels show "You" and the owner of each friend's Chao. In a **room**, everyone goes to the
+Friends' Chao in races): each friend's My Chao first (or the Chao
+they picked to race with, while they're at a race too), then another of their Chao while lanes
+are left; the rest are CPU. Labels show "You" and the owner of each friend's Chao. Outside a
+room each game runs its own race with those Chao, so results can differ between screens. In a **room**, everyone goes to the
 race entrance, chooses their Chao and opens the course list; whoever confirms a race takes the
 others along, the start waits until someone starts it (see below), and each friend's lane follows their real Chao
 live, so their cheering, boosts and finish happen as they really did.

@@ -514,6 +514,7 @@ mod tests {
             frame: 0.0,
             flags: 0,
             room: (0xFF, 0),
+            upgrades: 0,
         })
     }
 

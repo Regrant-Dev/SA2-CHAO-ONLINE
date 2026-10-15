@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -139,6 +139,8 @@ pub struct PlayerState {
     pub flags: u8,
     /// The room the player is in: (creator's id, kind), or (0xFF, 0) for none (room.rs).
     pub room: (u8, u8),
+    /// `CharObj2Base::Upgrades` (mechs draw their upgrade parts from it).
+    pub upgrades: u32,
 }
 
 mod tag {
@@ -288,7 +290,8 @@ impl Body {
                     .f32(s.frame)
                     .u8(s.flags)
                     .u8(s.room.0)
-                    .u8(s.room.1);
+                    .u8(s.room.1)
+                    .u32(s.upgrades);
             }
             Self::Chao { index, data } => {
                 w.u8(tag::CHAO).u8(*index).bytes(&data.bytes);
@@ -349,6 +352,7 @@ impl Body {
                 frame: r.f32(MAX_FRAME)?,
                 flags: r.u8()?,
                 room: (r.u8()?, r.u8()?),
+                upgrades: r.u32()?,
             }),
             tag::CHAO => {
                 let index = r.u8()?;
@@ -469,6 +473,7 @@ mod tests {
                     frame: 37.5,
                     flags: 1,
                     room: (0, 2),
+                    upgrades: 0x40_0000,
                 }),
             },
             Message::Game {
@@ -553,6 +558,7 @@ mod tests {
                 frame: 0.0,
                 flags: 0,
                 room: (0xFF, 0),
+                upgrades: 0,
             }),
         }
         .encode();

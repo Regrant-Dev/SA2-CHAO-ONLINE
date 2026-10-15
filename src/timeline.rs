@@ -82,6 +82,7 @@ mod tests {
             anim: 0,
             frame: 0.0,
             flags: 0,
+            upgrades: 0,
         }
     }
 

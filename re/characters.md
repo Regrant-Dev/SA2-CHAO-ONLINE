@@ -136,6 +136,24 @@ Found by scanning loaders for `MOV ECX,tex; CALL 0x44C510; MOV [reg+slot],EAX; M
 | Eggman on foot 3 | 0x360 | draw at 0x73E901, same as Tails → not drawn yet |
 | Mechs 6/7 (EWALK/TWALK) | 0x448 (+ WALKTEX 0x444) | several models → not drawn yet |
 | Chao walkers 10/11 | 0x444 | not drawn yet |
+
+### Walker extra parts (2026-10-15, from a code dump: `--features dumpexe` + tools/rebuild_exe.py)
+Walker display (around 0x7445A1) stores the drawing CharObj2 at 0x1A51F0C, copies the view
+matrix to 0x1A51F70 and sets the per-bone callback 0x1A55834 = **0x744020** before drawing the
+body. The callback compares each bone's NJS_OBJECT with model-table entries 247, 248, 249, 251
+(0x1DE9DEC..0x1DE9E0C) and **writes** those bones' world positions into the CharObj2
+(+0x200, +0x218, +0x230, +0x260, +0x29C, +0x2B4, +0x2CC, +0x2FC) and saved matrices
+(0x1A52090, 0x1A520C0): gameplay data (aim, effects), so puppets must not run it with the
+local player's CharObj2. After the body (0x7448C3..) the display draws the extra parts from
+those matrices: models 258/259/260 (0x1DE9E34/3C/44) with textures from CharObj2+0x424/+0x42C/
++0x434 (WALKTEX), gated by upgrade bits (e.g. `[co2+0x24] & 0x400000`). **Puppets (2026-10-15):** a
+puppet of the same walker as ours is drawn by calling 0x7444F0 itself with a private copy of our
+CharObj2 (0x458 bytes, the loader's allocation at 0x740CD9) carrying the puppet's animation,
+frame and upgrades (sent in `PlayerState.upgrades`), and a private EntityData1 (action 0, its
+angles and position). The globals the display and callback write (0x1A51D00..0x1A52100,
+0x1A557FC..0x1A5584C, 0x1DE4660..0x1DE4668, 0x1DEB6A0..0x1DEB6B0, fog 0x25EFFCC..0x25EFFE0)
+are saved and restored around the call. A walker different from ours still draws its body only
+(our CharObj2 would carry the wrong models/textures).
 Knuckles' display (0x72F449) uses the same motion double lookup as Sonic, model from the
 shared table, and `co2+0x19C` as the motion when `co2+0x174 == 2`.
 Puppets still reuse the *local* player's loaded assets, so only same-character players show.

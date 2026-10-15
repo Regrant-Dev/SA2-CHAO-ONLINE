@@ -141,6 +141,7 @@ fn to_pose(s: &PlayerState) -> puppet::Pose {
         anim: s.anim,
         frame: s.frame,
         flags: s.flags,
+        upgrades: s.upgrades,
     }
 }
 
@@ -162,6 +163,9 @@ struct Online {
     last_flags: u8,
     /// "My Chao" as last sent to the others (live karate uses it on both sides).
     my_chao: Option<ChaoData>,
+    /// The Chao we picked for a Chao Race, sent in place of My Chao while racing so friends'
+    /// games show it in our lane.
+    race_chao: Option<ChaoData>,
     /// Client mode: where to rejoin, and when (set after a disconnect).
     rejoin: Option<(SocketAddr, Identity, Option<Instant>)>,
 }
@@ -222,6 +226,7 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
         resend_chao: false,
         last_flags: 0,
         my_chao: None,
+        race_chao: None,
         rejoin,
     }))
 }
@@ -613,6 +618,24 @@ pub fn on_frame() {
             online.session.send(body, true, now);
         }
     }
+    // At a Chao Race: friends' games show the Chao we picked for it in our lane, not My Chao.
+    if online.session.my_id().is_some() {
+        let racing = game::race_chao();
+        if racing.is_some() && racing != online.race_chao {
+            if let Some(chao) = racing.clone() {
+                log!("online: racing with {}", chao.summary());
+                let body = Body::Chao {
+                    index: MY_CHAO_INDEX,
+                    data: Box::new(chao),
+                };
+                online.session.send(body, true, now);
+            }
+            online.race_chao = racing;
+        } else if racing.is_none() && online.race_chao.take().is_some() {
+            // Left the race: back to My Chao.
+            RESEND_MY_CHAO.store(true, Ordering::Relaxed);
+        }
+    }
     {
         let peers: Vec<(u8, together::Peer)> = online
             .remote
@@ -731,6 +754,7 @@ pub fn on_frame() {
                 | crate::race::flags()
                 | crate::karate_live::flags(),
             room: room::wire(),
+            upgrades: me.map_or(0, |m| m.upgrades),
         };
         // In a room race, our racing Chao goes out instead of our (absent) character.
         let mut state = state;

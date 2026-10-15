@@ -41,6 +41,8 @@ const ENTITY_ROTATION_Y: usize = 0x0C;
 
 /// CharObj2 offsets, confirmed in the draw and setup code (re/characters.md).
 pub const CO2_CHAR_ID: usize = 0x03;
+/// `CharObj2Base::Upgrades` (bit flags of the character's upgrades).
+pub const CO2_UPGRADES: usize = 0x24;
 pub const CO2_ANIM: usize = 0x178;
 pub const CO2_FRAME: usize = 0x184;
 pub const CO2_ANIM_INFO: usize = 0x198;
@@ -355,6 +357,28 @@ pub fn read_chao_slot(index: usize) -> Option<ChaoData> {
     ChaoData::from_bytes(bytes)
 }
 
+/// The Chao we picked for a Chao Race, while at the race entrance or in the race (lane 0's
+/// record, set by the entrance's Chao select; re/chao-race-sync.md).
+pub fn race_chao() -> Option<ChaoData> {
+    const LANE0_RECORD: usize = 0x01A5_CC00;
+    const AREA_RACE: i32 = 4;
+    const AREA_ENTRANCE: i32 = 5;
+    if current_level() != LEVEL_CHAO_WORLD
+        || !matches!(current_chao_area(), AREA_RACE | AREA_ENTRANCE)
+    {
+        return None;
+    }
+    // SAFETY: static pointer; when set it points at a full Chao record in the game's memory.
+    unsafe {
+        let record = (LANE0_RECORD as *const usize).read_volatile();
+        if record == 0 {
+            return None;
+        }
+        ChaoData::from_bytes(std::slice::from_raw_parts(record as *const u8, CHAO_SIZE))
+    }
+    .filter(|c| c.validate().is_ok())
+}
+
 /// Player 1's position and facing, if the player object exists.
 pub fn player_position() -> Option<(Vector, i32)> {
     // SAFETY: MainCharObj1 is a static pointer array; entries are null when no player exists.
@@ -379,6 +403,14 @@ pub struct LocalPlayer {
     pub frame: f32,
     /// `POSE_*` bits.
     pub flags: u8,
+    /// `CharObj2Base::Upgrades`.
+    pub upgrades: u32,
+}
+
+/// Player 1's EntityData1 (position, angles, action), or null when no player exists.
+pub fn local_entity() -> *const u8 {
+    // SAFETY: static pointer array in the game's data section.
+    unsafe { (MAIN_CHAR_OBJ1 as *const *const u8).read_volatile() }
 }
 
 /// Player 1's CharObj2, or null when no player exists.
@@ -416,6 +448,7 @@ pub fn local_player() -> Option<LocalPlayer> {
             anim: (co2.add(CO2_ANIM) as *const i16).read_unaligned(),
             frame: (co2.add(CO2_FRAME) as *const f32).read_unaligned(),
             flags: if ball { POSE_BALL } else { 0 } | if blending { POSE_BLENDING } else { 0 },
+            upgrades: (co2.add(CO2_UPGRADES) as *const u32).read_unaligned(),
         })
     }
 }

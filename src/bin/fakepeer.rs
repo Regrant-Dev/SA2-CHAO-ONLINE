@@ -357,6 +357,7 @@ fn main() {
                     (Some(kind), Some(me)) => (me, kind),
                     _ => (0xFF, 0),
                 },
+                upgrades: 0,
             };
             session.send(Body::PlayerState(state), false, now);
         }

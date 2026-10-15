@@ -70,6 +70,8 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
         log!("mod path: {path}");
         log!("mod loader helper version: {}", helpers.version);
         log!("F9 opens the menu (multiplayer, start together, Chao tools)");
+        #[cfg(feature = "dumpexe")]
+        dump_text(&path);
     });
     hud::init(helpers);
     game::install_freeze();
@@ -143,4 +145,19 @@ pub extern "C" fn OnFrame() {
 #[unsafe(no_mangle)]
 pub extern "C" fn OnExit() {
     guarded("OnExit", online::shutdown);
+}
+
+/// Dev only (`--features dumpexe`): the game's code section as it is in memory, after Steam's
+/// wrapper decrypted it (0x401000, raw size 0x46F600), for reverse engineering.
+#[cfg(feature = "dumpexe")]
+fn dump_text(path: &str) {
+    const TEXT: usize = 0x0040_1000;
+    const TEXT_SIZE: usize = 0x0046_F600;
+    // SAFETY: the exe's code section is mapped and readable for the whole run.
+    let bytes = unsafe { std::slice::from_raw_parts(TEXT as *const u8, TEXT_SIZE) };
+    let out = format!("{path}/sonic2app.text.bin");
+    match std::fs::write(&out, bytes) {
+        Ok(()) => log!("dumpexe: wrote {out}"),
+        Err(e) => log!("dumpexe: {out}: {e}"),
+    }
 }

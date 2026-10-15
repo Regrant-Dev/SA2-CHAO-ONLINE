@@ -15,6 +15,9 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Builds the fake second player used for testing (src/bin/fakepeer.rs); off by default.
 fakepeer = []
+# Dev only: at start, saves the game's decrypted code section to `sonic2app.text.bin` in the
+# mod folder, for reverse engineering (tools/rebuild_exe.py turns it back into an exe).
+dumpexe = []
 
 [[bin]]
 name = "fakepeer"

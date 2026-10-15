@@ -32,7 +32,6 @@ Karate needs the game's Battle DLC, like in the normal game.
 | [docs/setup.md](docs/setup.md) | Building on Windows and Linux, tests, tools |
 | [docs/testing.md](docs/testing.md) | The fake second player and an in-game checklist |
 | [docs/protocol.md](docs/protocol.md) | Network messages |
-| [docs/known-issues.md](docs/known-issues.md) | Known issues |
 | [docs/game-version.md](docs/game-version.md) | The game build all addresses are for |
 | [re/](re/addresses.md) | Reverse-engineering notes: addresses, hooks, game systems |
 
