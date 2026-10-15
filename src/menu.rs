@@ -576,7 +576,7 @@ mod tests {
         let s = Settings {
             mode: 2,
             name: "Regrant".into(),
-            host: "100.64.0.2:27015".into(),
+            host: "100.101.102.103:27015".into(),
             port: "27015".into(),
             name_tags: false,
             chao_race: false,

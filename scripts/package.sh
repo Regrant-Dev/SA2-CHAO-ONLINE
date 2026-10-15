@@ -6,12 +6,15 @@ cd "$(dirname "$0")/.."
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 out=dist/sa2-chao-online
-rm -rf "$out" dist/sa2-chao-online.zip
+rm -rf "$out" dist/sa2-chao-online.zip dist/sa2co-server.exe
 mkdir -p "$out/chao/import" "$out/chao/export"
 
 cargo build --release
 cp target/i686-pc-windows-gnu/release/sa2_chao_online.dll "$out/sa2-chao-online.dll"
 i686-w64-mingw32-strip "$out/sa2-chao-online.dll"
+# The dedicated server for Windows, a separate download (not part of the mod folder).
+cp target/i686-pc-windows-gnu/release/sa2co-server.exe dist/sa2co-server.exe
+i686-w64-mingw32-strip dist/sa2co-server.exe
 sed "s/^Version=.*/Version=$version/" mod/mod.ini > "$out/mod.ini"
 cp mod/configschema.xml "$out/"
 cp docs/how-to-play.md "$out/how-to-play.md"

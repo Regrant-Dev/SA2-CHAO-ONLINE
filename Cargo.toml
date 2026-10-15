@@ -19,6 +19,11 @@ fakepeer = []
 # mod folder, for reverse engineering (tools/rebuild_exe.py turns it back into an exe).
 dumpexe = []
 
+# Dedicated server: relays a lobby without anyone's game hosting it (also as a Docker image).
+[[bin]]
+name = "sa2co-server"
+path = "src/bin/server.rs"
+
 [[bin]]
 name = "fakepeer"
 path = "src/bin/fakepeer.rs"

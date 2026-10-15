@@ -50,6 +50,11 @@ cargo clippy --release                            # the DLL
 cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer
 ```
 
+- `src/bin/server.rs`: the dedicated server `sa2co-server` (a host that isn't a player).
+  `cargo run --release --target x86_64-unknown-linux-gnu --bin sa2co-server -- 43902`, or the
+  image: `docker build -t sa2-chao-online-server .` (a static musl binary on `scratch`, under
+  1 MB). CI publishes it as `ghcr.io/regrant-dev/sa2-chao-online-server:latest` on every push
+  to `main`.
 - `src/bin/fakepeer.rs`: a fake second player for testing on one PC, built only with
   `--features fakepeer` (see [testing.md](testing.md)).
 - `tools/mdmp.py <dump>`: summarise a game crash dump (`CrashDump/` in the game folder).

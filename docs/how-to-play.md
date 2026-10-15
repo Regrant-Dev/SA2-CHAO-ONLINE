@@ -26,7 +26,7 @@ Press **F9** in game. Pause first when typing: the game also reads letter keys a
 | Start now | Only while held at a start: start it for everyone there (same as F8) |
 | Multiplayer | Off / Host / Join |
 | Your name | Shown above you to others (up to 10 characters) |
-| Host address | When joining: the host's address, e.g. `100.64.0.2:43902` |
+| Host address | When joining: the host's address, e.g. `100.101.102.103:43902` |
 | Port | When hosting: the UDP port to listen on (default 43902) |
 | Name tags | Names above other players |
 | Room | Create a room, join someone's, or leave (Left/Right to choose, Enter to do it) |
@@ -73,6 +73,24 @@ to be reachable on the port (UDP 43902 by default):
   address, e.g. `100.x.y.z:43902`.
 - **Port forwarding:** the host forwards **UDP** port 43902 on their router to their PC and
   gives friends their public IP, e.g. `203.0.113.5:43902`.
+
+### Dedicated server (optional)
+
+A dedicated server keeps a lobby up without anyone's game hosting it, so nobody has to be the
+host and the lobby stays when players come and go. It isn't a player (up to 8 players can join
+it) and only passes messages between players; everything else works the same. Everyone joins
+it with F9 > Multiplayer: **Join** and its address, e.g. `100.101.102.103:43902`. It needs the
+same mod version as the players, which it prints when it starts.
+
+- **Docker:** `docker run -d --restart unless-stopped -p 43902:43902/udp --name sa2-chao-online-server ghcr.io/regrant-dev/sa2-chao-online-server:latest`
+- **A NAS or any Docker UI:** add a container with repository
+  `ghcr.io/regrant-dev/sa2-chao-online-server:latest`, network `bridge`, and port
+  **43902/UDP** mapped to 43902. Nothing else to set.
+- **Windows:** download `sa2co-server.exe` from the release and run it (`sa2co-server.exe 43902`
+  for another port). Allow it through the firewall when Windows asks.
+
+The server's computer is the one that needs to be reachable (Tailscale or a UDP port forward).
+Update it together with the mod: an older server turns newer players away.
 
 ## Free roam and rooms
 

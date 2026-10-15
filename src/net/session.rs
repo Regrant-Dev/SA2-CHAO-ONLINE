@@ -3,6 +3,9 @@
 //! The host is player 0 and assigns ids 1..=7 to clients. Clients only talk to
 //! the host; the host forwards `Game` messages to everyone else, overwriting
 //! `from` with the sender's real id so nobody can speak for another player.
+//!
+//! A dedicated host (`Host::dedicated`, the `sa2co-server` program) only relays: it isn't a
+//! player, isn't in the player list, and gives clients ids 0..=7.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -99,6 +102,8 @@ struct Remote {
 pub struct Host {
     ep: Endpoint,
     me: Identity,
+    /// Not a player itself: only relays (the dedicated server).
+    dedicated: bool,
     clients: BTreeMap<u8, Remote>,
     by_addr: HashMap<SocketAddr, u8>,
     last_heartbeat: Instant,
@@ -109,9 +114,18 @@ impl Host {
         Self {
             ep,
             me,
+            dedicated: false,
             clients: BTreeMap::new(),
             by_addr: HashMap::new(),
             last_heartbeat: now,
+        }
+    }
+
+    /// A host that isn't a player: it only relays, and all 8 ids go to clients.
+    pub fn dedicated(ep: Endpoint, me: Identity, now: Instant) -> Self {
+        Self {
+            dedicated: true,
+            ..Self::new(ep, me, now)
         }
     }
 
@@ -119,10 +133,24 @@ impl Host {
         self.ep.local_addr()
     }
 
-    fn players(&self) -> Vec<(u8, String)> {
-        let mut out = vec![(0, self.me.name.clone())];
+    /// Everyone in the lobby: (id, name). A dedicated host isn't in it.
+    pub fn players(&self) -> Vec<(u8, String)> {
+        let mut out = Vec::new();
+        if !self.dedicated {
+            out.push((0, self.me.name.clone()));
+        }
         out.extend(self.clients.iter().map(|(id, r)| (*id, r.name.clone())));
         out
+    }
+
+    /// Polls the network: handles joins, relays game messages, drops silent clients.
+    pub fn poll_events(&mut self, now: Instant) -> Vec<Event> {
+        self.poll(now)
+    }
+
+    /// Tells every client we're going away.
+    pub fn shutdown(&mut self, now: Instant) {
+        self.broadcast(&Message::Bye, false, None, now);
     }
 
     fn broadcast(&mut self, msg: &Message, reliable: bool, except: Option<u8>, now: Instant) {
@@ -263,7 +291,8 @@ impl Host {
         if game_build != self.me.game_build {
             return self.reject(addr, "different game version");
         }
-        let Some(id) = (1..MAX_PLAYERS as u8).find(|id| !self.clients.contains_key(id)) else {
+        let first = if self.dedicated { 0 } else { 1 };
+        let Some(id) = (first..MAX_PLAYERS as u8).find(|id| !self.clients.contains_key(id)) else {
             return self.reject(addr, "lobby full");
         };
 
@@ -469,6 +498,16 @@ mod tests {
             }
         }
 
+        /// A lobby on a dedicated host (not a player).
+        fn dedicated() -> Self {
+            let now = Instant::now();
+            let host = Host::dedicated(Endpoint::bind(local()).unwrap(), identity("server"), now);
+            Self {
+                host: Session::Host(host),
+                ..Self::new()
+            }
+        }
+
         fn host_addr(&self) -> SocketAddr {
             match &self.host {
                 Session::Host(h) => h.local_addr(),
@@ -537,6 +576,47 @@ mod tests {
         let mut ids: Vec<u8> = lobby.clients.iter().map(|c| c.my_id().unwrap()).collect();
         ids.sort();
         assert_eq!(ids, (1..8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn dedicated_host_relays_for_eight_players_and_is_not_one() {
+        let mut lobby = Lobby::dedicated();
+        for i in 0..9 {
+            lobby.join(&identity(&format!("p{i}")));
+        }
+        lobby.run(500);
+        // Eight players get ids 0..=7; the ninth finds the lobby full.
+        let mut ids: Vec<u8> = lobby.clients.iter().filter_map(|c| c.my_id()).collect();
+        ids.sort();
+        assert_eq!(ids, (0..8).collect::<Vec<u8>>());
+        assert_eq!(lobby.host.players().len(), 8);
+        // Nobody sees the server as a player.
+        for c in lobby.clients.iter().filter(|c| c.my_id().is_some()) {
+            assert_eq!(c.players().len(), 8);
+            assert!(!c.players().iter().any(|(_, n)| n == "server"));
+        }
+        // Game messages still reach everyone else, from the real sender.
+        let sender = lobby
+            .clients
+            .iter()
+            .position(|c| c.my_id().is_some())
+            .unwrap();
+        let from = lobby.clients[sender].my_id().unwrap();
+        let now = lobby.now;
+        lobby.clients[sender].send(state(13), true, now);
+        lobby.run(300);
+        let got = lobby
+            .client_events
+            .iter()
+            .enumerate()
+            .filter(|(i, ev)| {
+                *i != sender
+                    && ev
+                        .iter()
+                        .any(|e| matches!(e, Event::Game { from: f, .. } if *f == from))
+            })
+            .count();
+        assert_eq!(got, 7);
     }
 
     #[test]

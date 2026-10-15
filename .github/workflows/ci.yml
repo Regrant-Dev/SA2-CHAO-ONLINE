@@ -1,5 +1,6 @@
 # Builds the mod and runs the tests on every push and pull request. Every push to main then
-# replaces the one GitHub release ("latest") with the new zip: no version tags, no old releases.
+# replaces the one GitHub release ("latest") with the new zip: no version tags, no old releases,
+# and publishes the dedicated server image as ghcr.io/regrant-dev/sa2-chao-online-server:latest.
 name: CI
 
 on:
@@ -36,7 +37,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sa2-chao-online
-          path: dist/sa2-chao-online.zip
+          path: |
+            dist/sa2-chao-online.zip
+            dist/sa2co-server.exe
 
   release:
     needs: build
@@ -61,9 +64,32 @@ jobs:
           for ref in $(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" --jq '.[].ref'); do
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/${ref#refs/}"
           done
-          gh release create latest sa2-chao-online.zip \
+          gh release create latest sa2-chao-online.zip sa2co-server.exe \
             --target "$GITHUB_SHA" --latest \
             --title "SA2 Chao Online $version" \
             --notes "Download **sa2-chao-online.zip** below, extract it into the game's \`mods\` folder and enable **SA2 Chao Online** in SA Mod Manager. The same zip works on Windows and on Linux (Proton). See \`how-to-play.md\` inside the zip.
 
+          **Dedicated server** (optional, keeps a lobby up without anyone's game hosting it): \`sa2co-server.exe\` below for Windows, or the Docker image \`ghcr.io/regrant-dev/sa2-chao-online-server:latest\`.
+
           Mod version $version, built from ${GITHUB_SHA::7}. Everyone playing together needs the same mod version."
+
+  server-image:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/regrant-dev/sa2-chao-online-server:latest

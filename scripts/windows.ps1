@@ -63,13 +63,14 @@ if ($Install) {
 if ($Package) {
     $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
     $out = "dist\sa2-chao-online"
-    Remove-Item -Recurse -Force $out, "dist\sa2-chao-online.zip" -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $out, "dist\sa2-chao-online.zip", "dist\sa2co-server.exe" -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force "$out\chao\import", "$out\chao\export" | Out-Null
     Copy-Item $Dll "$out\sa2-chao-online.dll"
     (Get-Content mod\mod.ini) -replace '^Version=.*', "Version=$version" | Set-Content "$out\mod.ini"
     Copy-Item mod\configschema.xml $out
     Copy-Item docs\how-to-play.md $out
     Copy-Item LICENSE "$out\LICENSE.txt"
+    Copy-Item "target\$Target\release\sa2co-server.exe" "dist\sa2co-server.exe"
     New-Item -ItemType File -Force "$out\chao\import\.keep", "$out\chao\export\.keep" | Out-Null
     Compress-Archive -Path $out -DestinationPath "dist\sa2-chao-online.zip"
     Write-Host "Packaged dist\sa2-chao-online.zip (version $version)"

@@ -20,7 +20,8 @@ Packet header (14 bytes): `magic "SA2O" u32 | version u8 = 1 | kind u8 | epoch u
 
 ## Session (`session.rs`)
 
-Star: the host is player 0 and assigns 1..=7. Clients talk only to the host; the host relays
+Star: the host is player 0 and assigns 1..=7 (a dedicated host, `sa2co-server`, isn't a
+player: it's left out of `Welcome` and assigns 0..=7). Clients talk only to the host; the host relays
 `Game` messages to everyone else and **overwrites `from`** with the sender's real id.
 
 - Join: the client sends `Hello` (reliable). The host checks protocol version, mod version and

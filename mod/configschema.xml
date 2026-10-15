@@ -9,7 +9,7 @@
         <HelpText>Shown above your character and in join messages (up to 10 characters).</HelpText>
       </Property>
       <Property name="Host" display="Host address (when joining)" type="string" defaultvalue="127.0.0.1:43902" alwaysinclude="true">
-        <HelpText>The host's IP and port, e.g. 100.64.0.2:43902 (Tailscale) or a public IP whose router forwards the port.</HelpText>
+        <HelpText>The host's IP and port, e.g. 100.101.102.103:43902 (Tailscale) or a public IP whose router forwards the port.</HelpText>
       </Property>
       <Property name="Port" display="Port (when hosting)" type="int" defaultvalue="43902" minvalue="1024" maxvalue="65535" alwaysinclude="true">
         <HelpText>UDP port to listen on. Other players must be able to reach it (port forwarding or Tailscale).</HelpText>

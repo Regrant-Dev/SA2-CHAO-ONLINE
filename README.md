@@ -14,6 +14,8 @@ Online multiplayer for **Sonic Adventure 2** (Steam PC), up to 8 players, as an
   written to your save.
 
 Everything is in one in-game menu: **F9**. Multiplayer is off until you turn it on.
+An optional **dedicated server** (Docker image or Windows exe) keeps a lobby up
+without anyone's game hosting it.
 
 ## Players
 
@@ -39,7 +41,7 @@ Karate needs the game's Battle DLC, like in the normal game.
 src/          the mod (Rust): lib.rs entry points, menu/hud UI, online + net/ networking,
               puppet/timeline (other players), together/room (synced starts, rooms),
               race/karate/karate_live/visitors (Chao), game/patch (game memory and hooks)
-src/bin/      fakepeer, a fake second player for testing (cargo --features fakepeer)
+src/bin/      sa2co-server (dedicated server) and fakepeer (a fake second player for testing)
 mod/          mod.ini and the SA Mod Manager settings page (configschema.xml)
 scripts/      build/install/package (install.sh + package.sh on Linux, windows.ps1 on Windows)
 tools/        small analysis scripts (crash dumps, character assets)
