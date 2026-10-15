@@ -55,6 +55,9 @@ cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --feature
 - `tools/mdmp.py <dump>`: summarise a game crash dump (`CrashDump/` in the game folder).
 - `tools/charassets.py`, `tools/texslots.py <unpacked exe>`: find character asset files and
   texture-list slots (used for `re/characters.md`).
+- `cargo build --release --features dumpexe` + `tools/rebuild_exe.py`: an analysable copy of
+  the game exe for reverse engineering (see [game-version.md](game-version.md)). Never ship or
+  share a `dumpexe` build or its output.
 
 Reverse-engineering notes are in `re/`; addresses are for the Steam build in
 [game-version.md](game-version.md).

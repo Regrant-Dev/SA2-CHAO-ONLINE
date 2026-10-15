@@ -38,6 +38,26 @@ Press **F9** in game. Pause first when typing: the game also reads letter keys a
 | Export my Chao / Bring visitor Chao | Chao files (see Chao) |
 | Save & Start / Apply / Stop | Connect with these settings, reconnect, or disconnect |
 
+**The settings file.** F9 and SA Mod Manager's Configure page both save to
+`mods/sa2-chao-online/config.ini` in the game folder. It doesn't exist until you change a
+setting; without it everything is at its default, so multiplayer starts **Off**. It remembers
+your last choice, so if you joined a friend last time you start in Join next time. You can also
+edit it by hand while the game is closed:
+
+```ini
+[Multiplayer]
+Mode=Off              ; Off, Host or Join (default Off)
+Name=Player           ; shown above you, up to 10 characters (default Player)
+Host=127.0.0.1:43902  ; when joining: the host's address and port
+Port=43902            ; when hosting: the UDP port to listen on (default 43902)
+NameTags=On           ; On/Off: names above other players (default On)
+ChaoRace=On           ; On/Off: friends' Chao in your Chao Races (default On)
+MyChao=-1             ; save slot of your Chao for races and karate, -1 = first hatched (default)
+VisitWith=Garden      ; Garden, MyChao or Off: which Chao visit friends' gardens (default Garden)
+```
+
+Delete the file to go back to all defaults.
+
 **Live or copy?** Everything you do *in a room* is live: your friends' real Chao, the same race
 and the same fight on every screen. "Practice karate" and races outside a room use **copies** of
 your friends' Chao that your own game plays, so they don't need your friends to be there, but
@@ -134,5 +154,14 @@ you until the 2P game ends.
 - **Lost connection:** you keep playing; the others disappear after a few seconds and you
   rejoin automatically when the connection is back.
 - **Can't connect:** check the address and port, and that the host's port is reachable
-  (Tailscale or port forwarding). Host and joiners need the same mod version.
+  (Tailscale or port forwarding). On Windows, allow the game through the firewall when
+  Windows asks (or add an inbound rule for UDP port 43902 on the host).
+- **"rejected: ..." top-left:** the host turned you away. `mod 0.1.0, host has 0.2.0` or
+  `protocol 14, host has 15` means you have different versions of the mod: everyone should
+  download the latest release. `different game version` means one of you doesn't have the
+  current Steam version of the game. `lobby full` means 8 players are already in.
+- **"can't listen on port ..." when hosting:** something else already uses that port (often
+  a second copy of the game). Close it or pick another Port in F9; joiners then use that port.
+- **Stuck in Join or Host every launch:** the mod remembers your last choice (see the settings
+  file above). Set Multiplayer to Off in F9, or delete `config.ini`.
 - **Log file:** `mods/sa2-chao-online/sa2-chao-online.log`; include it when reporting a problem.

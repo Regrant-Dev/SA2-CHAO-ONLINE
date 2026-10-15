@@ -13,8 +13,16 @@ Mod loader: X-Hax/sa2-mod-loader, `ModLoaderVer` 16 (helper functions up to `Dis
 
 ## Static analysis
 
-The exe on disk is wrapped with SteamStub (variant 2.1), so its code is encrypted. For reverse
-engineering, unwrap a **local copy** with Steamless (`--keepbind`); the section layout and
-addresses are unchanged (image base 0x400000; the unwrapped copy we used has SHA-256
-`c95c01434f1e8be2ef9472ff2cffb605354aeea1c95e36d5cfa1aa3b7a5c0386`). Keep it in `re/bin/`
-(git-ignored) and never share it. The game itself keeps running the original exe.
+The exe on disk is wrapped with SteamStub (variant 2.1), so its code is encrypted. The
+section layout and addresses are the same once decrypted (image base 0x400000). Two ways to
+get an analysable **local copy** (keep it in `re/bin/`, which is git-ignored, and never share it):
+
+- **Code dump (no extra tools):** build the mod with `cargo build --release --features dumpexe`,
+  install that DLL, start the game once (it writes `sonic2app.text.bin` to the mod folder),
+  then `tools/rebuild_exe.py <game>/sonic2app.exe <mod folder>/sonic2app.text.bin
+  re/bin/sonic2app.dumped.exe`. Reinstall the normal build and delete the dump afterwards.
+  The dump includes the Mod Loader's code patches, which doesn't matter for analysis.
+- **Steamless** (`--keepbind`): the unwrapped copy used for the early notes has SHA-256
+  `c95c01434f1e8be2ef9472ff2cffb605354aeea1c95e36d5cfa1aa3b7a5c0386`.
+
+The game itself keeps running the original exe.
