@@ -1,0 +1,69 @@
+# Builds the mod and runs the tests on every push and pull request. Every push to main then
+# replaces the one GitHub release ("latest") with the new zip: no version tags, no old releases.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup target add i686-pc-windows-gnu x86_64-unknown-linux-gnu
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: |
+          cargo clippy --release -- -D warnings
+          cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer -- -D warnings
+      - name: Test
+        run: cargo test --target x86_64-unknown-linux-gnu
+      - name: Package
+        run: scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sa2-chao-online
+          path: dist/sa2-chao-online.zip
+
+  release:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sa2-chao-online
+      - name: Replace the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Remove every release and tag, then publish the one release at this commit.
+          for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
+            gh release delete "$tag" --yes --cleanup-tag
+          done
+          for ref in $(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" --jq '.[].ref'); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/${ref#refs/}"
+          done
+          gh release create latest sa2-chao-online.zip \
+            --target "$GITHUB_SHA" --latest \
+            --title "SA2 Chao Online $version" \
+            --notes "Download **sa2-chao-online.zip** below, extract it into the game's \`mods\` folder and enable **SA2 Chao Online** in SA Mod Manager. The same zip works on Windows and on Linux (Proton). See \`how-to-play.md\` inside the zip.
+
+          Mod version $version, built from ${GITHUB_SHA::7}. Everyone playing together needs the same mod version."

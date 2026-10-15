@@ -1,0 +1,1027 @@
+//! Puppets: draw-only copies of other players' characters.
+//!
+//! One game object (list 1, like the player) whose display callback draws every puppet with
+//! the same calls Sonic's own display uses (re/characters.md): push matrix, translate,
+//! rotate Z/X/Y, `DrawMotion(model, frame)` with the motion in ECX, pop. A puppet of your own
+//! character uses your loaded model/textures; other characters are loaded once per stage with
+//! the game's own loaders and released when the stage ends. Name tags are drawn here too.
+
+use std::collections::BTreeSet;
+use std::ptr;
+use std::sync::Mutex;
+
+use crate::game;
+use crate::log;
+
+const ROTATE_X: usize = 0x0042_74E0;
+const ROTATE_Y: usize = 0x0042_75B0;
+const ROTATE_Z: usize = 0x0042_7680;
+
+/// Matrix stack: current pointer, upper limit pointer, base pointer; 0x30-byte entries.
+const MATRIX_TOP: usize = 0x01A5_57FC;
+const MATRIX_LIMIT: usize = 0x0267_0588;
+const MATRIX_BASE: usize = 0x0267_053C;
+const MATRIX_SIZE: usize = 0x30;
+
+/// `{index, NJS_OBJECT*}` x 532 at 0x1DE9620; we index the pointer field.
+const MODEL_TABLE: usize = 0x01DE_9624;
+const MODEL_COUNT: usize = 532;
+use game::{MOTION_COUNT, MOTION_TABLE};
+const TABLE_STRIDE: usize = 8;
+/// `AnimationInfo` entries: +0 AnimNum, +2 ModelNum.
+const ANIM_INFO_SIZE: usize = 0x10;
+/// Where each character keeps its texture list in CharObj2 (found by scanning the loaders and
+/// confirming their display code; re/characters.md). `None` = not drawable yet: Tails and
+/// Eggman on foot draw their models differently; mechs/walkers use several models.
+fn texlist_slot(character: u8) -> Option<usize> {
+    match character {
+        // Sonic, Shadow, Amy, Metal Sonic (Sonic's display 0x720090).
+        0 | 1 | 8 | 9 => Some(0x394),
+        // Knuckles, Rouge, Tikal, Chaos (Knuckles' display 0x72EF20).
+        4 | 5 | 12 | 13 => Some(0x3F0),
+        // Tails and Eggman on foot (their loaders 0x74CFF7 / 0x73C312).
+        2 => Some(0x3B0),
+        3 => Some(0x360),
+        // Mechs / walkers: the body's texlist (walker display 0x7445FF); +0x444 is the shared
+        // WALKTEX for extra parts, which puppets don't draw.
+        6 | 7 | 10 | 11 => Some(0x448),
+        _ => None,
+    }
+}
+/// A character's asset files (the game's own filename strings) and animation table, from its
+/// loader (tools/charassets.py; re/characters.md).
+struct CharacterFiles {
+    texture: usize,
+    models: usize,
+    motions: usize,
+    anim_info: usize,
+}
+
+fn character_files(character: u8) -> Option<CharacterFiles> {
+    let (texture, models, motions, anim_info) = match character {
+        0 => (0x0090_095C, 0x0090_0968, 0x0090_0994, 0x00A1_7C18), // Sonic
+        1 => (0x0090_09C4, 0x0090_09D0, 0x0090_09FC, 0x00A1_88C8), // Shadow
+        8 => (0x0090_09A4, 0x0090_09AC, 0x0090_09B8, 0x00A1_9858), // Amy
+        9 => (0x0090_0A0C, 0x0090_0A1C, 0x0090_0A30, 0x00A1_A7E8), // Metal Sonic
+        4 => (0x0090_0B10, 0x0090_0B1C, 0x0090_0B8C, 0x00A1_3320), // Knuckles
+        5 => (0x0090_0B9C, 0x0090_0BA8, 0x0090_0C18, 0x00A1_50F0), // Rouge
+        12 => (0x0090_0C28, 0x0090_0C34, 0x0090_0C44, 0x00A1_40B0), // Tikal
+        13 => (0x0090_0C54, 0x0090_0C60, 0x0090_0C7C, 0x00A1_5E80), // Chaos
+        2 => (0x0090_0F30, 0x0090_0F3C, 0x0090_0F4C, 0x00A0_D608), // Tails (on foot)
+        3 => (0x0090_0D78, 0x0090_0D80, 0x0090_0D8C, 0x00A1_2750), // Eggman (on foot)
+        // Walker loader 0x740D4A..0x741420.
+        6 => (0x0090_0E18, 0x0090_0E24, 0x0090_0E50, 0x00A0_EAA0), // Tails' mech
+        7 => (0x0090_0DC8, 0x0090_0DD4, 0x0090_0E08, 0x00A0_E1F0), // Eggman's mech
+        10 => (0x0090_0E60, 0x0090_0E6C, 0x0090_0E7C, 0x00A0_F680), // Chao Walker
+        11 => (0x0090_0E8C, 0x0090_0E98, 0x0090_0EA8, 0x00A1_02E0), // Dark Chao Walker
+        _ => return None,
+    };
+    Some(CharacterFiles {
+        texture,
+        models,
+        motions,
+        anim_info,
+    })
+}
+
+/// Another character's assets we loaded for its puppets; released at the end of the stage.
+struct Loaded {
+    character: u8,
+    texlist: usize,
+    models: usize,
+    motions: usize,
+}
+
+/// Remote players further apart than this between two updates snap instead of sliding.
+const SNAP_DISTANCE: f32 = 200.0;
+/// Upper bound for animation indices we accept (from the network or the local player).
+const MAX_ANIM: usize = 256;
+
+/// Render state pointer; +0x20 is the texture list used for chunk models.
+const RENDER_STATE: usize = 0x0267_0544;
+const RENDER_TEXLIST: usize = 0x20;
+/// Per-bone draw hook the player's display sets while drawing; we draw without one.
+const BONE_CALLBACK: usize = 0x01A5_5834;
+/// Render flags the player's display saves/changes/restores around its draw (0x720100):
+/// clears 0x200 in FLAGS_A (likely visibility culling — puppets blinked without this) and sets
+/// 0x2400 in FLAGS_B; STATE_C is saved and restored.
+const RENDER_FLAGS_A: usize = 0x025F_02D4;
+const RENDER_FLAGS_B: usize = 0x025F_02D8;
+const RENDER_STATE_C: usize = 0x025F_0268;
+
+const OBJ_DISPLAY: usize = 0x14;
+const OBJ_DELETE: usize = 0x18;
+const PUPPET_LIST: u32 = 1;
+const PUPPET_NAME: &[u8] = b"SA2ChaoOnlinePuppets\0";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pose {
+    pub character: u8,
+    pub position: [f32; 3],
+    pub rotation: [i32; 3],
+    pub anim: u16,
+    pub frame: f32,
+    /// `game::POSE_*` bits.
+    pub flags: u8,
+}
+
+/// Spin ball centres (newest last) and their texture (0/1).
+type Trail = Vec<([f32; 3], usize)>;
+
+struct Puppets {
+    /// The game object, or 0. Cleared by our delete callback when the game frees it.
+    object: usize,
+    /// Remote players' poses and names.
+    remotes: Vec<(Pose, String)>,
+    /// Other characters' assets loaded this stage (and characters that failed to load).
+    loaded: Vec<Loaded>,
+    failed: Vec<u8>,
+    /// (character, anim, reason) skips already logged.
+    skipped: BTreeSet<(u8, u16, &'static str)>,
+    /// Recent spin ball centres per player (newest last) and their texture (0/1).
+    trails: Vec<(String, Trail)>,
+    /// We asked the game to load Sonic's effect textures this stage.
+    effects_requested: bool,
+}
+
+static PUPPETS: Mutex<Puppets> = Mutex::new(Puppets {
+    object: 0,
+    remotes: Vec::new(),
+    skipped: BTreeSet::new(),
+    loaded: Vec::new(),
+    failed: Vec::new(),
+    trails: Vec::new(),
+    effects_requested: false,
+});
+
+/// Blends two consecutive network poses (`t` = 0 → `a`, 1 → `b`).
+pub fn blend(a: &Pose, b: &Pose, t: f32) -> Pose {
+    let distance = a
+        .position
+        .iter()
+        .zip(b.position)
+        .map(|(p, q)| (q - p) * (q - p))
+        .sum::<f32>()
+        .sqrt();
+    // NaN distance (bad data) also snaps.
+    if a.character != b.character || distance.is_nan() || distance > SNAP_DISTANCE {
+        return *b;
+    }
+    let lerp = |p: f32, q: f32| p + (q - p) * t;
+    // Angles wrap at 0x10000: turn the short way round.
+    let angle = |p: i32, q: i32| {
+        let delta = (q.wrapping_sub(p) as i16) as f32;
+        p.wrapping_add((delta * t).round() as i32)
+    };
+    let (anim, frame) = if a.anim == b.anim && a.flags == b.flags && b.frame >= a.frame {
+        (b.anim, lerp(a.frame, b.frame))
+    } else {
+        (b.anim, b.frame)
+    };
+    Pose {
+        character: b.character,
+        position: [0, 1, 2].map(|i| lerp(a.position[i], b.position[i])),
+        rotation: [0, 1, 2].map(|i| angle(a.rotation[i], b.rotation[i])),
+        anim,
+        frame,
+        flags: b.flags,
+    }
+}
+
+/// Poses and names of the remote players to draw this frame (already filtered to our stage).
+static NAME_TAGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Shows or hides the names above other players (F9 menu).
+pub fn set_name_tags(on: bool) {
+    NAME_TAGS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_remotes(remotes: Vec<(Pose, String)>) {
+    PUPPETS.lock().unwrap_or_else(|e| e.into_inner()).remotes = remotes;
+}
+
+/// Call every frame: creates the puppet object once a player exists in a stage.
+pub fn on_frame() {
+    let mut p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
+    // Load other characters that remote players use here (once per stage; a short hitch).
+    if p.object != 0
+        && let Some(me) = game::local_player()
+    {
+        let wanted: Vec<u8> = p.remotes.iter().map(|(pose, _)| pose.character).collect();
+        for character in wanted {
+            if character == me.character
+                || p.loaded.iter().any(|l| l.character == character)
+                || p.failed.contains(&character)
+            {
+                continue;
+            }
+            let Some(files) = character_files(character) else {
+                continue;
+            };
+            // SAFETY: game thread; the game's own loaders with its own filename strings.
+            let (texlist, models, motions) = unsafe {
+                (
+                    load_texlist(files.texture),
+                    load_models(files.models),
+                    load_motions(files.motions),
+                )
+            };
+            if texlist == 0 || models == 0 || motions == 0 {
+                log!(
+                    "puppets: couldn't load character {character} ({texlist:#x} {models:#x} {motions:#x})"
+                );
+                // SAFETY: release whatever did load.
+                unsafe {
+                    if motions != 0 {
+                        free_motions(motions);
+                    }
+                    if models != 0 {
+                        free_models(models);
+                    }
+                    if texlist != 0 {
+                        free_texlist(texlist);
+                    }
+                }
+                p.failed.push(character);
+                continue;
+            }
+            // The model/motion tables are shared by index. If this character's indices are
+            // already taken here (e.g. by a mech), the loader leaves them and our draws would
+            // mix up models and motions, which crashes; don't draw this character then.
+            // SAFETY: lists just returned by the game's loaders.
+            if let Err(clash) = unsafe { check_tables(models, motions) } {
+                log!("puppets: can't show character {character} here ({clash})");
+                // SAFETY: release what we loaded; the releases only clear entries that point
+                // at these lists.
+                unsafe {
+                    free_motions(motions);
+                    free_models(models);
+                    free_texlist(texlist);
+                }
+                p.failed.push(character);
+                continue;
+            }
+            log!("puppets: loaded character {character} for other players");
+            p.loaded.push(Loaded {
+                character,
+                texlist,
+                models,
+                motions,
+            });
+        }
+    }
+    // One object per stage, drawing all puppets.
+    if p.object != 0 {
+        return;
+    }
+    if game::current_level() == 0 || game::local_char_obj2().is_null() {
+        return;
+    }
+    // SAFETY: game thread (OnFrame); LoadObject's register convention is handled in load_object.
+    let object = unsafe { load_object(PUPPET_LIST, PUPPET_NAME.as_ptr(), 0) };
+    if object == 0 {
+        log!("puppets: LoadObject failed");
+        return;
+    }
+    // SAFETY: `object` is the 0x50-byte ObjectMaster LoadObject just returned; data pointers
+    // (+0x34..+0x40) stay null because FreeObject frees whatever is stored there.
+    unsafe {
+        ((object + OBJ_DISPLAY) as *mut usize).write(display as *const () as usize);
+        ((object + OBJ_DELETE) as *mut usize).write(delete as *const () as usize);
+    }
+    p.object = object;
+    log!("puppets: object created at {object:#x}");
+}
+
+/// Checks that every entry of a loaded model list (`{i32 index, NJS_OBJECT*}`, ends at index -1)
+/// and motion list (`{u16 index, u16 count, NJS_MOTION*}`, ends at index 0xFFFF) is what the
+/// shared tables now hold at that index.
+unsafe fn check_tables(models: usize, motions: usize) -> Result<(), String> {
+    unsafe {
+        for i in 0..MODEL_COUNT {
+            let entry = models + i * TABLE_STRIDE;
+            let index = read::<i32>(entry);
+            if index < 0 {
+                break;
+            }
+            let index = index as usize;
+            if index >= MODEL_COUNT
+                || read::<usize>(MODEL_TABLE + index * TABLE_STRIDE) != read::<usize>(entry + 4)
+            {
+                return Err(format!("model slot {index} is taken"));
+            }
+        }
+        for i in 0..MOTION_COUNT {
+            let entry = motions + i * TABLE_STRIDE;
+            let index = read::<u16>(entry);
+            if index == 0xFFFF {
+                break;
+            }
+            let index = usize::from(index);
+            if index >= MOTION_COUNT
+                || read::<usize>(MOTION_TABLE + index * TABLE_STRIDE) != read::<usize>(entry + 4)
+            {
+                return Err(format!("motion slot {index} is taken"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates an object in the display list whose `display` callback runs during the display
+/// pass every frame and whose `delete` runs when the game frees it (end of the area).
+pub(crate) fn create_display_object(
+    name: &'static [u8],
+    display: extern "C" fn(usize),
+    delete: extern "C" fn(usize),
+) -> usize {
+    debug_assert!(name.ends_with(b"\0"));
+    // SAFETY: game thread (OnFrame); LoadObject's register convention is handled in load_object.
+    let object = unsafe { load_object(PUPPET_LIST, name.as_ptr(), 0) };
+    if object != 0 {
+        // SAFETY: the ObjectMaster LoadObject just returned; data pointers stay null.
+        unsafe {
+            ((object + OBJ_DISPLAY) as *mut usize).write(display as usize);
+            ((object + OBJ_DELETE) as *mut usize).write(delete as usize);
+        }
+    }
+    object
+}
+
+extern "C" fn delete(_object: usize) {
+    let _ = std::panic::catch_unwind(|| {
+        let mut p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
+        p.object = 0;
+        // The stage is being torn down, like the characters' own assets in their delete
+        // callbacks (e.g. Sonic's 0x71E300): release what we loaded for other characters.
+        for l in p.loaded.drain(..) {
+            // SAFETY: lists/texlist returned by the game's loaders and not released yet; the
+            // releases only clear table entries that still point at these lists.
+            unsafe {
+                free_motions(l.motions);
+                free_models(l.models);
+                free_texlist(l.texlist);
+            }
+            log!("puppets: released character {} assets", l.character);
+        }
+        p.failed.clear();
+        p.trails.clear();
+        p.effects_requested = false;
+        log!("puppets: object deleted by the game");
+    });
+}
+
+extern "C" fn display(_object: usize) {
+    let _ = std::panic::catch_unwind(|| {
+        let mut p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
+        let co2 = game::local_char_obj2();
+        let Some(me) = game::local_player() else {
+            return;
+        };
+        if co2.is_null() {
+            return;
+        }
+        let poses: Vec<(Pose, Option<String>)> = p
+            .remotes
+            .iter()
+            .map(|(pose, name)| (*pose, Some(name.clone())))
+            .collect();
+        // SAFETY: display callback on the game thread; the matrix stack top is the camera view.
+        let tags = if NAME_TAGS.load(std::sync::atomic::Ordering::Relaxed) {
+            unsafe { TagProjector::new(me.position) }
+        } else {
+            None
+        };
+        for (pose, name) in poses {
+            if let (Some(tags), Some(name)) = (&tags, &name) {
+                tags.draw(pose.position, name);
+            }
+            let source = if pose.character == me.character {
+                texlist_slot(pose.character).map(|slot| Source {
+                    // SAFETY: the local player's CharObj2 (checked non-null above).
+                    anim_info: unsafe { read::<usize>(co2 as usize + game::CO2_ANIM_INFO) },
+                    texlist: unsafe { read::<usize>(co2 as usize + slot) },
+                })
+            } else {
+                p.loaded
+                    .iter()
+                    .find(|l| l.character == pose.character)
+                    .and_then(|l| {
+                        character_files(l.character).map(|f| Source {
+                            anim_info: f.anim_info,
+                            texlist: l.texlist,
+                        })
+                    })
+            };
+            let result = match source {
+                // SAFETY: display callback runs on the game thread inside the display pass.
+                Some(source) => unsafe { draw(&source, &pose) },
+                None if character_files(pose.character).is_some() => {
+                    Err("character assets not loaded")
+                }
+                None => Err("character not drawable yet"),
+            };
+            if let Some(name) = &name {
+                // SAFETY: display callback on the game thread.
+                unsafe { spin_ball(&mut p, name, &pose) };
+            }
+            // Log each distinct reason a pose wasn't drawn, once.
+            if let Err(reason) = result
+                && p.skipped.insert((pose.character, pose.anim, reason))
+            {
+                log!(
+                    "puppets: not drawing character {} anim {} (flags {:#x}): {reason}",
+                    pose.character,
+                    pose.anim,
+                    pose.flags
+                );
+            }
+        }
+    });
+}
+
+// ---- Spin ball (Sonic's "JumpAura", re/spin-ball.md) ----
+//
+// While Sonic jumps, his main spawns a small effect every frame: the ball model drawn at the
+// body centre with a one-texture list (s_ball_a or s_ball_b at random), scale 1.2, shrinking
+// by 0.3 a frame and gone after 3 frames. So three balls are always visible: the trail.
+
+/// Height of the ball centre above the player's position (`co2+0x140`, 5.4 for Sonic's family).
+const BALL_HEIGHT: f32 = 5.4;
+const BALL_SCALES: [f32; 3] = [1.2, 0.9, 0.6];
+/// Sonic's / Shadow's ball model slots (model table index 19 / 84) and effect texlists.
+const SONIC_BALL_MODEL: usize = 19;
+const SONIC_EFFECT_TEXLIST: usize = 0x00A0_8B94;
+const SHADOW_BALL_MODEL: usize = 84;
+const SHADOW_EFFECT_TEXLIST: usize = 0x00A0_8D94;
+/// `NJS_TEXNAME` size (filename, attr, texaddr).
+const TEXNAME_SIZE: usize = 12;
+/// Fog on/off byte the effect's display clears while it draws (then 0x42A870 applies it).
+const FOG_ENABLED: usize = 0x025E_FFCC;
+
+/// One-entry texture list handed to the renderer for the ball.
+static mut BALL_TEXLIST: [usize; 2] = [0, 1];
+
+/// Updates `name`'s ball trail and draws it (after the puppet itself).
+unsafe fn spin_ball(p: &mut Puppets, name: &str, pose: &Pose) {
+    let index = match p.trails.iter().position(|(n, _)| n == name) {
+        Some(i) => i,
+        None => {
+            p.trails.push((name.to_string(), Vec::new()));
+            p.trails.len() - 1
+        }
+    };
+    let trail = &mut p.trails[index].1;
+    if pose.flags & game::POSE_BALL == 0 {
+        trail.clear();
+        return;
+    }
+    // Ball centre: position + RotZ(rot.z) * RotX(rot.x) * (0, h, 0).
+    let angle = |bams: i32| bams as f32 * std::f32::consts::TAU / 65536.0;
+    let (rx, rz) = (angle(pose.rotation[0]), angle(pose.rotation[2]));
+    let (y, z) = (BALL_HEIGHT * rx.cos(), BALL_HEIGHT * rx.sin());
+    let centre = [
+        pose.position[0] - y * rz.sin(),
+        pose.position[1] + y * rz.cos(),
+        pose.position[2] + z,
+    ];
+    let texture = (trail.len() + centre[0].to_bits() as usize) & 1;
+    trail.push((centre, texture));
+    if trail.len() > BALL_SCALES.len() {
+        trail.remove(0);
+    }
+    let trail = trail.clone();
+
+    let (model_slot, texlist) = match pose.character {
+        1 | 9 => (SHADOW_BALL_MODEL, SHADOW_EFFECT_TEXLIST),
+        _ => (SONIC_BALL_MODEL, SONIC_EFFECT_TEXLIST),
+    };
+    unsafe {
+        let model = read::<usize>(MODEL_TABLE + model_slot * TABLE_STRIDE);
+        let textures = read::<usize>(texlist);
+        let loaded = textures != 0 && read::<usize>(textures + 8) != 0;
+        if !loaded && !p.effects_requested {
+            // Not playing as Sonic: load his effect textures once (freed with the stage).
+            p.effects_requested = true;
+            load_sonic_effects();
+            return;
+        }
+        if model == 0 || !loaded {
+            return;
+        }
+        let top = read::<usize>(MATRIX_TOP);
+        let limit = read::<usize>(MATRIX_LIMIT);
+        let base_ptr = read::<usize>(MATRIX_BASE);
+        let render = read::<usize>(RENDER_STATE);
+        if render == 0 || top == 0 || top < base_ptr || top + MATRIX_SIZE > limit {
+            return;
+        }
+        let old_texlist = read::<usize>(render + RENDER_TEXLIST);
+        let old_fog = read::<u8>(FOG_ENABLED);
+        write(FOG_ENABLED, 0u8);
+        refresh_fog();
+        // Newest ball is the biggest.
+        for (age, (centre, texture)) in trail.iter().rev().enumerate() {
+            let list = std::ptr::addr_of_mut!(BALL_TEXLIST);
+            (*list)[0] = textures + texture * TEXNAME_SIZE;
+            write(render + RENDER_TEXLIST, list as usize);
+            let next = top + MATRIX_SIZE;
+            ptr::copy_nonoverlapping(top as *const u8, next as *mut u8, MATRIX_SIZE);
+            write(MATRIX_TOP, next);
+            translate(next, *centre);
+            scale(BALL_SCALES[age]);
+            draw_object(model);
+            write(MATRIX_TOP, top);
+        }
+        write(render + RENDER_TEXLIST, old_texlist);
+        write(FOG_ENABLED, old_fog);
+        refresh_fog();
+    }
+}
+
+/// Draws one pose with the local player's model data. Skips anything out of range.
+///
+/// # Safety
+/// Game thread, inside the display pass; `co2` is the local player's CharObj2.
+/// Where a puppet's animation table and textures come from.
+struct Source {
+    anim_info: usize,
+    texlist: usize,
+}
+
+unsafe fn draw(source: &Source, pose: &Pose) -> Result<(), &'static str> {
+    let blending = pose.flags & game::POSE_BLENDING != 0;
+    unsafe {
+        let anim = pose.anim as usize;
+        let anim_info = source.anim_info;
+        if anim >= MAX_ANIM || anim_info == 0 {
+            return Err("animation index out of range");
+        }
+        let entry = anim_info + anim * ANIM_INFO_SIZE;
+        let base = read::<i16>(entry);
+        let model_index = read::<i16>(entry + 2);
+        if base < 0 || base as usize >= MAX_ANIM || model_index < 0 {
+            return Err("bad animation entry");
+        }
+        let motion_index = read::<i16>(anim_info + base as usize * ANIM_INFO_SIZE);
+        let (model_index, motion_index) = (model_index as usize, motion_index as usize);
+        if model_index >= MODEL_COUNT || motion_index >= MOTION_COUNT {
+            return Err("model/motion index out of range");
+        }
+        let model = read::<usize>(MODEL_TABLE + model_index * TABLE_STRIDE);
+        let motion = read::<usize>(MOTION_TABLE + motion_index * TABLE_STRIDE);
+        if model == 0 {
+            return Err("model not loaded");
+        }
+        if motion == 0 {
+            return Err("motion not loaded");
+        }
+        let frames = read::<u32>(motion + 4);
+        // While blending, `frame` is the blend progress: show the start of the target animation.
+        let frame = if blending {
+            0.0
+        } else if frames > 0 && pose.frame.is_finite() {
+            pose.frame.rem_euclid(frames as f32)
+        } else {
+            0.0
+        };
+
+        let top = read::<usize>(MATRIX_TOP);
+        let limit = read::<usize>(MATRIX_LIMIT);
+        let base_ptr = read::<usize>(MATRIX_BASE);
+        let next = top + MATRIX_SIZE;
+        if top == 0 || top < base_ptr || next > limit {
+            return Err("matrix stack full");
+        }
+        ptr::copy_nonoverlapping(top as *const u8, next as *mut u8, MATRIX_SIZE);
+        write(MATRIX_TOP, next);
+
+        let render = read::<usize>(RENDER_STATE);
+        let old_texlist = if render != 0 {
+            let old = read::<usize>(render + RENDER_TEXLIST);
+            write(render + RENDER_TEXLIST, source.texlist);
+            old
+        } else {
+            0
+        };
+        let old_bone = read::<usize>(BONE_CALLBACK);
+        write(BONE_CALLBACK, 0usize);
+        let old_flags_a = read::<u32>(RENDER_FLAGS_A);
+        let old_state_c = read::<u32>(RENDER_STATE_C);
+        write(RENDER_FLAGS_A, old_flags_a & !0x200);
+        write(RENDER_FLAGS_B, read::<u32>(RENDER_FLAGS_B) | 0x2400);
+
+        translate(next, pose.position);
+        let [rx, ry, rz] = pose.rotation;
+        if rz != 0 {
+            rotate(ROTATE_Z, next, rz);
+        }
+        if rx != 0 {
+            rotate(ROTATE_X, next, rx);
+        }
+        let ry = 0x8000i32.wrapping_sub(ry);
+        if ry != 0 {
+            rotate(ROTATE_Y, next, ry);
+        }
+        draw_motion(motion, model, frame);
+
+        write(RENDER_FLAGS_B, read::<u32>(RENDER_FLAGS_B) & !0x2400);
+        write(RENDER_FLAGS_A, old_flags_a);
+        write(RENDER_STATE_C, old_state_c);
+        write(BONE_CALLBACK, old_bone);
+        if render != 0 {
+            write(render + RENDER_TEXLIST, old_texlist);
+        }
+        write(MATRIX_TOP, top);
+    }
+    Ok(())
+}
+
+/// Height above a character's position (its middle, not its feet) for the name tag, in world
+/// units: just above the head (22 was far too high in game).
+const TAG_HEIGHT: f32 = 10.0;
+/// Hide tags beyond this distance (world units).
+const TAG_RANGE: f32 = 1500.0;
+/// Camera depth up to which tags are drawn at full size (about the usual follow distance).
+const TAG_FULL_SIZE_DEPTH: f32 = 60.0;
+
+/// Projects world points with the game's own projection (0x77FB00, the one
+/// `EnemyCheckFrameIn` uses), so it follows whatever camera is drawing — including Chao
+/// World's separate camera system. Results are in the game's 640x480 space.
+pub(crate) struct TagProjector {
+    /// View matrix (top of the matrix stack during the display pass).
+    view: usize,
+    /// +1 or -1: view-space z sign of points in front of the camera, from the local player.
+    front: f32,
+    me: [f32; 3],
+}
+
+/// The game's virtual screen used by its projection.
+const VIRTUAL_WIDTH: f32 = 640.0;
+const VIRTUAL_HEIGHT: f32 = 480.0;
+
+impl TagProjector {
+    /// # Safety
+    /// Display pass on the game thread (the matrix stack top is the camera view).
+    pub(crate) unsafe fn new(me: game::Vector) -> Option<Self> {
+        // SAFETY: static global.
+        let view = unsafe { read::<usize>(MATRIX_TOP) };
+        if view == 0 {
+            return None;
+        }
+        let me = [me.x, me.y + TAG_HEIGHT * 0.5, me.z];
+        // SAFETY: valid matrix; our stack buffers.
+        let z = unsafe { calc_point(view, me) }[2];
+        Some(Self {
+            view,
+            front: if z > 0.0 { 1.0 } else { -1.0 },
+            me,
+        })
+    }
+
+    fn draw(&self, feet: [f32; 3], name: &str) {
+        self.draw_at(feet, TAG_HEIGHT, name);
+    }
+
+    /// Draws `name` centred `height` units above world point `feet`.
+    pub(crate) fn draw_at(&self, feet: [f32; 3], height: f32, name: &str) {
+        let head = [feet[0], feet[1] + height, feet[2]];
+        let distance = (0..3)
+            .map(|i| (head[i] - self.me[i]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        if distance > TAG_RANGE {
+            return;
+        }
+        // SAFETY: as in `new`; the view matrix is unchanged during this display call.
+        let (z, screen) = unsafe { (calc_point(self.view, head)[2], project_screen(head)) };
+        if z * self.front <= 1.0 {
+            return; // behind the camera
+        }
+        // Smaller with distance from the camera: full size up close, down to half far away.
+        let depth = (z * self.front).max(1.0);
+        let shrink = (TAG_FULL_SIZE_DEPTH / depth).clamp(0.5, 1.0);
+        let [x, y] = screen;
+        if !(0.0..=VIRTUAL_WIDTH).contains(&x) || !(0.0..=VIRTUAL_HEIGHT).contains(&y) {
+            return;
+        }
+        // The 640x480 HUD space is the largest 4:3 area that fits the screen, centred.
+        let (sx, sy) = crate::hud::from_virtual(x, y);
+        crate::hud::name_tag(sx, sy, shrink, name);
+    }
+}
+
+unsafe fn read<T: Copy>(address: usize) -> T {
+    unsafe { (address as *const T).read_unaligned() }
+}
+
+unsafe fn write<T>(address: usize, value: T) {
+    unsafe { (address as *mut T).write_unaligned(value) }
+}
+
+/// Calls into the game with its register conventions. Only meaningful in the 32-bit game.
+#[cfg(target_arch = "x86")]
+mod ffi {
+    use std::arch::asm;
+
+    const LOAD_OBJECT: usize = 0x0046_F680;
+    const DRAW_MOTION: usize = 0x0078_0870;
+    const TRANSLATE: usize = 0x0042_7470;
+    const CALC_POINT: usize = 0x0042_6CC0;
+    const PROJECT_SCREEN: usize = 0x0077_FB00;
+    const LOAD_TEXLIST: usize = 0x0044_C510;
+    const LOAD_MODELS: usize = 0x0045_9590;
+    const LOAD_MOTIONS: usize = 0x0045_9740;
+    const FREE_MODELS: usize = 0x0045_96D0;
+    const FREE_MOTIONS: usize = 0x0045_9890;
+    const RELEASE_TEXLIST: usize = 0x0077_F9F0;
+    const ALLOCATOR: usize = 0x01D1_9CAC;
+
+    /// `LoadObject`: ESI = list, EDI = main (0 = no-op), name on the stack (caller pops).
+    pub unsafe fn load_object(list: u32, name: *const u8, main: usize) -> usize {
+        let object: usize;
+        unsafe {
+            asm!(
+                "push esi",
+                "push edi",
+                "mov esi, ecx",
+                "mov edi, edx",
+                "push eax",
+                "mov eax, {func}",
+                "call eax",
+                "add esp, 4",
+                "pop edi",
+                "pop esi",
+                func = const LOAD_OBJECT,
+                inout("eax") name => object,
+                inout("ecx") list => _,
+                inout("edx") main => _,
+                clobber_abi("C"),
+            );
+        }
+        object
+    }
+
+    /// Translate the matrix at `matrix` (EAX) by x, y, z (stack, caller pops).
+    pub unsafe fn translate(matrix: usize, position: [f32; 3]) {
+        let args = position.map(f32::to_bits);
+        unsafe {
+            asm!(
+                "push dword ptr [{args} + 8]",
+                "push dword ptr [{args} + 4]",
+                "push dword ptr [{args}]",
+                "mov ecx, {func}",
+                "call ecx",
+                "add esp, 12",
+                args = in(reg) args.as_ptr(),
+                func = const TRANSLATE,
+                inout("eax") matrix => _,
+                clobber_abi("C"),
+            );
+        }
+    }
+
+    const SCALE: usize = 0x0042_7750;
+    const DRAW_OBJECT: usize = 0x0042_E730;
+    const REFRESH_FOG: usize = 0x0042_A870;
+    const LOAD_SONIC_EFFECTS: usize = 0x0075_5DA0;
+
+    /// `njScale(x, y, z)` 0x427750 on the current matrix (cdecl).
+    pub unsafe fn scale(s: f32) {
+        unsafe { std::mem::transmute::<usize, extern "C" fn(f32, f32, f32)>(SCALE)(s, s, s) }
+    }
+
+    /// Draws a model with the current matrix and texture list, 0x42E730 (cdecl).
+    pub unsafe fn draw_object(model: usize) {
+        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(DRAW_OBJECT)(model) }
+    }
+
+    /// Applies the fog setting (byte 0x25EFFCC), 0x42A870 (no arguments).
+    pub unsafe fn refresh_fog() {
+        unsafe { std::mem::transmute::<usize, extern "C" fn()>(REFRESH_FOG)() }
+    }
+
+    /// `LoadSonEffTex` 0x755DA0: Sonic's effect textures (no arguments; safe to call twice).
+    pub unsafe fn load_sonic_effects() {
+        unsafe { std::mem::transmute::<usize, extern "C" fn()>(LOAD_SONIC_EFFECTS)() }
+    }
+
+    /// Rotate the matrix at `matrix` (EBX) by `angle` (stack, caller pops).
+    pub unsafe fn rotate(func: usize, matrix: usize, angle: i32) {
+        unsafe {
+            asm!(
+                "push ebx",
+                "push ecx",
+                "mov ebx, edx",
+                "call eax",
+                "add esp, 4",
+                "pop ebx",
+                inout("eax") func => _,
+                inout("ecx") angle => _,
+                inout("edx") matrix => _,
+                clobber_abi("C"),
+            );
+        }
+    }
+
+    /// `njCalcPoint` 0x426CC0: EAX = matrix, ECX = input point, EDX = output point,
+    /// stack = additive flag (caller pops), as Knuckles' display calls it (0x72EF84).
+    pub unsafe fn calc_point(matrix: usize, point: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        unsafe {
+            asm!(
+                "push 0",
+                "call {func}",
+                "add esp, 4",
+                func = in(reg) CALC_POINT,
+                inout("eax") matrix => _,
+                inout("ecx") point.as_ptr() => _,
+                inout("edx") out.as_mut_ptr() => _,
+                clobber_abi("C"),
+            );
+        }
+        out
+    }
+
+    /// World point -> game screen (640x480) with the current view, 0x77FB00:
+    /// ESI = input point, EBX = output [x, y] (as EnemyCheckFrameIn 0x479FA0 calls it).
+    pub unsafe fn project_screen(point: [f32; 3]) -> [f32; 2] {
+        let mut out = [0.0f32; 2];
+        unsafe {
+            asm!(
+                "push ebx",
+                "push esi",
+                "mov esi, ecx",
+                "mov ebx, edx",
+                "call eax",
+                "pop esi",
+                "pop ebx",
+                inout("eax") PROJECT_SCREEN => _,
+                inout("ecx") point.as_ptr() => _,
+                inout("edx") out.as_mut_ptr() => _,
+                clobber_abi("C"),
+            );
+        }
+        out
+    }
+
+    /// Texture list loader 0x44C510: ECX = name (without extension); returns the texlist.
+    pub unsafe fn load_texlist(name: usize) -> usize {
+        let out: usize;
+        unsafe {
+            asm!("call eax", inout("eax") LOAD_TEXLIST => out, inout("ecx") name => _, clobber_abi("C"));
+        }
+        out
+    }
+
+    /// Model list loader 0x459590: EAX = file name; fills empty model-table slots.
+    pub unsafe fn load_models(name: usize) -> usize {
+        let out: usize;
+        unsafe {
+            asm!("mov edx, {f}", "call edx", f = const LOAD_MODELS, inout("eax") name => out, clobber_abi("C"));
+        }
+        out
+    }
+
+    /// Motion list loader 0x459740: EAX = file name; fills empty motion-table slots.
+    pub unsafe fn load_motions(name: usize) -> usize {
+        let out: usize;
+        unsafe {
+            asm!("mov edx, {f}", "call edx", f = const LOAD_MOTIONS, inout("eax") name => out, clobber_abi("C"));
+        }
+        out
+    }
+
+    /// Model list release 0x4596D0: ESI = list (clears only table slots it filled, frees it).
+    pub unsafe fn free_models(list: usize) {
+        unsafe {
+            asm!("push esi", "mov esi, ecx", "call eax", "pop esi",
+                inout("eax") FREE_MODELS => _, inout("ecx") list => _, clobber_abi("C"));
+        }
+    }
+
+    /// Motion list release 0x459890: ESI = list (clears only its own table slots, frees it).
+    pub unsafe fn free_motions(list: usize) {
+        unsafe {
+            asm!("push esi", "mov esi, ecx", "call eax", "pop esi",
+                inout("eax") FREE_MOTIONS => _, inout("ecx") list => _, clobber_abi("C"));
+        }
+    }
+
+    /// Texlist release as Sonic's delete callback does it (0x71E33A): 0x77F9F0(texlist), then
+    /// free the block through the game allocator (`(*0x1D19CAC)[1]`) with its 0x89ABCDEF tag.
+    pub unsafe fn free_texlist(texlist: usize) {
+        unsafe {
+            let release: extern "C" fn(usize) = std::mem::transmute(RELEASE_TEXLIST);
+            release(texlist);
+            let block = texlist - 4;
+            (block as *mut u32).write(0x89AB_CDEF);
+            let allocator = (ALLOCATOR as *const usize).read();
+            let free: extern "C" fn(usize, *const u8, i32) =
+                std::mem::transmute(((allocator + 4) as *const usize).read());
+            free(block, c"sa2-chao-online".as_ptr().cast(), 0);
+        }
+    }
+
+    /// `DrawMotion`: ECX = NJS_MOTION*, cdecl(NJS_OBJECT* model, float frame).
+    pub unsafe fn draw_motion(motion: usize, model: usize, frame: f32) {
+        unsafe {
+            asm!(
+                "push edx",
+                "push eax",
+                "mov eax, {func}",
+                "call eax",
+                "add esp, 8",
+                func = const DRAW_MOTION,
+                inout("eax") model => _,
+                inout("ecx") motion => _,
+                inout("edx") frame.to_bits() => _,
+                clobber_abi("C"),
+            );
+        }
+    }
+}
+
+/// Host builds (tests, fakepeer) never run the display callback.
+#[cfg(not(target_arch = "x86"))]
+mod ffi {
+    pub unsafe fn load_object(_: u32, _: *const u8, _: usize) -> usize {
+        0
+    }
+    pub unsafe fn translate(_: usize, _: [f32; 3]) {}
+    pub unsafe fn rotate(_: usize, _: usize, _: i32) {}
+    pub unsafe fn draw_motion(_: usize, _: usize, _: f32) {}
+    pub unsafe fn scale(_: f32) {}
+    pub unsafe fn draw_object(_: usize) {}
+    pub unsafe fn refresh_fog() {}
+    pub unsafe fn load_sonic_effects() {}
+    pub unsafe fn calc_point(_: usize, p: [f32; 3]) -> [f32; 3] {
+        p
+    }
+    pub unsafe fn project_screen(_: [f32; 3]) -> [f32; 2] {
+        [0.0; 2]
+    }
+    pub unsafe fn load_texlist(_: usize) -> usize {
+        0
+    }
+    pub unsafe fn load_models(_: usize) -> usize {
+        0
+    }
+    pub unsafe fn load_motions(_: usize) -> usize {
+        0
+    }
+    pub unsafe fn free_models(_: usize) {}
+    pub unsafe fn free_motions(_: usize) {}
+    pub unsafe fn free_texlist(_: usize) {}
+}
+
+use ffi::{
+    calc_point, draw_motion, draw_object, free_models, free_motions, free_texlist, load_models,
+    load_motions, load_object, load_sonic_effects, load_texlist, project_screen, refresh_fog,
+    rotate, scale, translate,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pose(x: f32, rot_y: i32, anim: u16, frame: f32) -> Pose {
+        Pose {
+            character: 0,
+            position: [x, 0.0, 0.0],
+            rotation: [0, rot_y, 0],
+            anim,
+            frame,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn blends_position_angle_and_frame() {
+        let mid = blend(
+            &pose(0.0, 0x1000, 3, 10.0),
+            &pose(10.0, 0x2000, 3, 20.0),
+            0.5,
+        );
+        assert_eq!(mid.position[0], 5.0);
+        assert_eq!(mid.rotation[1], 0x1800);
+        assert_eq!(mid.frame, 15.0);
+    }
+
+    #[test]
+    fn turns_the_short_way_round() {
+        // 0xFF00 -> 0x0100 (+0x200 through zero), not -0xFE00.
+        let mid = blend(&pose(0.0, 0xFF00, 0, 0.0), &pose(0.0, 0x0100, 0, 0.0), 0.5);
+        assert_eq!(mid.rotation[1] & 0xFFFF, 0);
+    }
+
+    #[test]
+    fn snaps_on_teleport_and_new_animation() {
+        let far = blend(&pose(0.0, 0, 0, 0.0), &pose(5000.0, 0, 0, 0.0), 0.5);
+        assert_eq!(far.position[0], 5000.0);
+        let changed = blend(&pose(0.0, 0, 1, 30.0), &pose(0.0, 0, 2, 4.0), 0.5);
+        assert_eq!((changed.anim, changed.frame), (2, 4.0));
+        let looped = blend(&pose(0.0, 0, 1, 58.0), &pose(0.0, 0, 1, 2.0), 0.5);
+        assert_eq!(looped.frame, 2.0);
+    }
+}

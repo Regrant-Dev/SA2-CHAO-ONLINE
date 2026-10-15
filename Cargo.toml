@@ -1,0 +1,26 @@
+[package]
+name = "sa2-chao-online"
+version = "0.1.0"
+edition = "2024"
+authors = ["Regrant-Dev"]
+description = "Online multiplayer for Sonic Adventure 2 (SA2 Mod Loader mod)"
+license = "MIT"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "sa2_chao_online"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Builds the fake second player used for testing (src/bin/fakepeer.rs); off by default.
+fakepeer = []
+
+[[bin]]
+name = "fakepeer"
+path = "src/bin/fakepeer.rs"
+required-features = ["fakepeer"]
+
+[profile.release]
+opt-level = 2
+debug = "line-tables-only"

@@ -1,0 +1,17 @@
+# Build output
+target/
+dist/
+
+# Third-party sources and tools checked out locally (SA2 Mod Loader headers, dump parsers)
+third_party/
+
+# Game binaries, dumps and other copyrighted/extracted files: never commit
+re/bin/
+
+# Logs
+*.log
+
+# Personal tooling (each developer has their own setup)
+.mcp.json
+.claude/
+docs/re-tools.md
