@@ -60,6 +60,8 @@ pub struct Config {
     pub my_chao: i32,
     /// Garden visits mode (index into `VISIT_MODES`).
     pub visits: usize,
+    /// Mode of rooms we create.
+    pub room_mode: crate::room::Mode,
 }
 
 /// Parses `key = value` lines; `;` and `#` start comments.
@@ -124,6 +126,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         name_tags,
         my_chao: get("mychao").trim().parse().unwrap_or(-1),
         visits: parse_visits(get("visitwith")),
+        room_mode: crate::room::Mode::parse(get("roommode")),
         chao_race: !matches!(
             get("chaorace").to_ascii_lowercase().as_str(),
             "off" | "0" | "false" | "no"
@@ -201,6 +204,7 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
     crate::race::set_enabled(config.chao_race);
     set_my_chao(config.my_chao);
     set_visits(config.visits);
+    crate::room::set_mode(config.room_mode);
     let me = Identity {
         name: config.name.clone(),
         mod_version: env!("CARGO_PKG_VERSION").into(),
@@ -525,6 +529,64 @@ fn pump(online: &mut Online, now: Instant) {
                 from,
                 body: Body::KarateCheer { count },
             } => crate::karate_live::received_cheer(from, count),
+            Event::Game {
+                from,
+                body: Body::GardenChao(list),
+            } => crate::garden::received(from, list),
+            Event::Game {
+                from,
+                body: Body::GardenItems { area, items },
+            } => crate::items::received(from, area, items),
+            Event::Game {
+                body: Body::ItemOwner { id, owner },
+                ..
+            } => crate::items::received_owner(id, owner),
+            // Claims are for the host's referee (net/referee.rs), which doesn't pass them on.
+            Event::Game {
+                body: Body::ItemClaim { .. },
+                ..
+            } => {}
+            Event::Game {
+                body:
+                    Body::ChaoChanges {
+                        owner,
+                        index,
+                        changes,
+                    },
+                ..
+            } => {
+                if Some(owner) == online.session.my_id() {
+                    crate::garden::received_changes(index, changes);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::ChaoHeld {
+                        owner,
+                        index,
+                        offset,
+                    },
+            } => {
+                if Some(owner) == online.session.my_id() {
+                    crate::garden::received_held(from, index, offset);
+                }
+            }
+            Event::Game {
+                body:
+                    Body::StageKills {
+                        level,
+                        mission,
+                        objects,
+                    },
+                ..
+            } => {
+                // From a room player, or the referee's list for this stage (sent with a
+                // stand-in sender, see net/session.rs `deliver`).
+                if room::in_room() {
+                    crate::coop::received(level, mission, objects);
+                }
+            }
         }
     }
 }
@@ -548,6 +610,7 @@ pub fn on_frame() {
             room: r
                 .latest
                 .and_then(|s| room::RoomId::from_wire(s.room.0, s.room.1)),
+            kind: r.latest.map_or(0, |s| s.room.1),
         })
         .collect();
     room::update(online.session.my_id(), others);
@@ -589,6 +652,24 @@ pub fn on_frame() {
     // Shared garden: send our Chao when we enter a garden (or someone joins), and show the
     // Chao of players in the same garden as visitors.
     let garden = if game::in_garden() { area } else { -1 };
+    if garden > 0 {
+        // Where the others in this garden are drawn, for Chao they're holding.
+        let holders = online
+            .remote
+            .iter()
+            .filter(|(_, r)| {
+                r.latest
+                    .is_some_and(|s| s.level == level && i32::from(s.chao_area) == garden)
+            })
+            .filter_map(|(&id, r)| {
+                r.timeline.sample(clock).map(|p| {
+                    let [x, y, z] = p.position;
+                    (id, (game::Vector { x, y, z }, p.rotation[1]))
+                })
+            })
+            .collect();
+        crate::garden::set_holders(holders);
+    }
     if garden != online.garden {
         online.garden = garden;
         online.resend_chao = true;
@@ -597,11 +678,17 @@ pub fn on_frame() {
         online.resend_chao = false;
         let mine = match VISITS.load(Ordering::Relaxed) {
             VISITS_OFF => Vec::new(),
-            VISITS_MY_CHAO => my_chosen_chao().into_iter().collect(),
+            VISITS_MY_CHAO => my_chosen_slot().into_iter().collect(),
             _ => carried_chao(garden),
         };
         log!("online: bringing {} chao to garden {garden}", mine.len());
-        for (index, chao) in mine.into_iter().enumerate() {
+        crate::garden::set_mine(
+            mine.iter()
+                .enumerate()
+                .map(|(index, (slot, _))| (index as u8, *slot))
+                .collect(),
+        );
+        for (index, (_, chao)) in mine.into_iter().enumerate() {
             let body = Body::Chao {
                 index: index as u8,
                 data: Box::new(chao),
@@ -735,6 +822,52 @@ pub fn on_frame() {
         };
         online.session.send(body, true, now);
     }
+    if garden > 0 {
+        let (changes, held) = crate::garden::take_outgoing();
+        for (owner, index, changes) in changes {
+            let body = Body::ChaoChanges {
+                owner,
+                index,
+                changes,
+            };
+            online.session.send(body, true, now);
+        }
+        if online.frame.is_multiple_of(STATE_EVERY_FRAMES) {
+            for (owner, index, offset) in held {
+                let body = Body::ChaoHeld {
+                    owner,
+                    index,
+                    offset,
+                };
+                online.session.send(body, false, now);
+            }
+            let list = crate::garden::my_chao();
+            if !list.is_empty() {
+                online.session.send(Body::GardenChao(list), false, now);
+            }
+        }
+    }
+    // Shared garden items: ours to everyone, claims to the referee.
+    let area = u8::try_from(garden)
+        .ok()
+        .filter(|a| (1..=3).contains(a))
+        .unwrap_or(0);
+    for (area, items) in crate::items::on_frame(online.session.my_id(), area) {
+        online
+            .session
+            .send(Body::GardenItems { area, items }, false, now);
+    }
+    for id in crate::items::take_claims() {
+        online.session.send(Body::ItemClaim { id }, true, now);
+    }
+    if let Some((level, mission, objects)) = crate::coop::take_outgoing() {
+        let body = Body::StageKills {
+            level,
+            mission,
+            objects,
+        };
+        online.session.send(body, true, now);
+    }
     if let Some(pick) = room::take_outgoing() {
         let body = Body::RoomPick {
             level: pick.level,
@@ -827,13 +960,18 @@ pub fn hatched_chao() -> Vec<(usize, ChaoData)> {
 
 /// Our chosen Chao ("My Chao": a save slot, or the first hatched one).
 fn my_chosen_chao() -> Option<ChaoData> {
+    my_chosen_slot().map(|(_, c)| c)
+}
+
+/// "My Chao" and its save slot.
+fn my_chosen_slot() -> Option<(usize, ChaoData)> {
     let slot = MY_CHAO_SLOT.load(Ordering::Relaxed);
     let hatched = hatched_chao();
     hatched
         .iter()
         .find(|(s, _)| Some(*s) == usize::try_from(slot).ok())
         .or(hatched.first())
-        .map(|(_, c)| c.clone())
+        .cloned()
 }
 
 /// F9 / config: which save slot is "My Chao" (-1 = the first hatched one). Sent right away.
@@ -894,11 +1032,12 @@ pub fn karate_opponents() -> Vec<(Option<u8>, String)> {
     out
 }
 
-/// Up to `MAX_CARRIED_CHAO` hatched, valid Chao living in `garden` (read-only).
-fn carried_chao(garden: i32) -> Vec<ChaoData> {
+/// Up to `MAX_CARRIED_CHAO` hatched, valid Chao living in `garden`, with their save slots
+/// (read-only).
+fn carried_chao(garden: i32) -> Vec<(usize, ChaoData)> {
     (0..game::GARDEN_SLOTS)
-        .filter_map(game::read_chao_slot)
-        .filter(|c| {
+        .filter_map(|slot| game::read_chao_slot(slot).map(|c| (slot, c)))
+        .filter(|(_, c)| {
             i32::from(c.garden()) == garden
                 && c.chao_type() != chao::TYPE_EGG
                 && c.validate().is_ok()
@@ -930,6 +1069,7 @@ mod tests {
                 chao_race: true,
                 my_chao: -1,
                 visits: 2,
+                room_mode: crate::room::Mode::Race,
             }
         );
     }
@@ -946,6 +1086,7 @@ mod tests {
                 chao_race: true,
                 my_chao: -1,
                 visits: 2,
+                room_mode: crate::room::Mode::Race,
             }
         );
         let c = parse_config("MODE=client\nhost=10.0.0.5:27015").unwrap();

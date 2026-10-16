@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::protocol::{Body, GameBuild, MAX_PLAYERS, Message, PROTOCOL_VERSION};
+use super::referee::{Out, Referee, To};
 use super::udp::{Endpoint, Received};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(1);
@@ -68,10 +69,10 @@ impl Session {
         }
     }
 
-    /// Sends gameplay data to every other player.
+    /// Sends gameplay data to every other player (claims go to the host's referee).
     pub fn send(&mut self, body: Body, reliable: bool, now: Instant) {
         match self {
-            Self::Host(h) => h.broadcast(&Message::Game { from: 0, body }, reliable, None, now),
+            Self::Host(h) => h.send_own(body, reliable, now),
             Self::Client(c) => c.send(body, reliable, now),
         }
     }
@@ -107,6 +108,9 @@ pub struct Host {
     clients: BTreeMap<u8, Remote>,
     by_addr: HashMap<SocketAddr, u8>,
     last_heartbeat: Instant,
+    referee: Box<Referee>,
+    /// Referee answers for the hosting player, handed out by the next poll.
+    pending: Vec<Event>,
 }
 
 impl Host {
@@ -118,6 +122,47 @@ impl Host {
             clients: BTreeMap::new(),
             by_addr: HashMap::new(),
             last_heartbeat: now,
+            referee: Box::new(Referee::new()),
+            pending: Vec::new(),
+        }
+    }
+
+    /// The hosting player's own game message: through the referee, then to everyone.
+    fn send_own(&mut self, body: Body, reliable: bool, now: Instant) {
+        let mut out = Vec::new();
+        if self.referee.observe(0, &body, &mut out) {
+            self.broadcast(&Message::Game { from: 0, body }, reliable, None, now);
+        }
+        let mut events = std::mem::take(&mut self.pending);
+        self.deliver(out, now, &mut events);
+        self.pending = events;
+    }
+
+    /// Sends referee answers (always reliably); ours (a hosting player is id 0) become events.
+    /// A client ignores messages that seem to come from itself, and these aren't really from
+    /// anyone: each recipient gets them from someone else.
+    fn deliver(&mut self, out: Vec<Out>, now: Instant, events: &mut Vec<Event>) {
+        for Out { to, from, body } in out {
+            let targets: Vec<u8> = match to {
+                To::All => self.clients.keys().copied().collect(),
+                To::One(id) => vec![id],
+            };
+            for id in targets {
+                if let Some(addr) = self.clients.get(&id).map(|r| r.addr) {
+                    let msg = Message::Game {
+                        from: if from == id {
+                            (id + 1) % MAX_PLAYERS as u8
+                        } else {
+                            from
+                        },
+                        body: body.clone(),
+                    };
+                    self.ep.send_reliable(addr, &msg.encode(), now);
+                }
+            }
+            if !self.dedicated && matches!(to, To::All | To::One(0)) {
+                events.push(Event::Game { from, body });
+            }
         }
     }
 
@@ -183,6 +228,7 @@ impl Host {
     }
 
     fn drop_client(&mut self, id: u8, now: Instant, events: &mut Vec<Event>) {
+        self.referee.left(id);
         if let Some(r) = self.clients.remove(&id) {
             self.by_addr.remove(&r.addr);
             self.ep.remove(r.addr);
@@ -192,7 +238,7 @@ impl Host {
     }
 
     fn poll(&mut self, now: Instant) -> Vec<Event> {
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut self.pending);
         for (addr, received) in self.ep.poll(now) {
             let (data, reliable) = match received {
                 Received::Message { data, reliable } => (data, reliable),
@@ -234,12 +280,16 @@ impl Host {
                     }
                     match msg {
                         Message::Game { body, .. } => {
-                            let relayed = Message::Game {
-                                from: id,
-                                body: body.clone(),
-                            };
-                            self.broadcast(&relayed, reliable, Some(id), now);
-                            events.push(Event::Game { from: id, body });
+                            let mut out = Vec::new();
+                            if self.referee.observe(id, &body, &mut out) {
+                                let relayed = Message::Game {
+                                    from: id,
+                                    body: body.clone(),
+                                };
+                                self.broadcast(&relayed, reliable, Some(id), now);
+                                events.push(Event::Game { from: id, body });
+                            }
+                            self.deliver(out, now, &mut events);
                         }
                         Message::Bye => self.drop_client(id, now, &mut events),
                         // Duplicate Hello from a client whose Welcome was slow: ignore.
@@ -649,6 +699,76 @@ mod tests {
             assert!(ev.iter().any(|e| matches!(e, Event::Disconnected { reason } if reason.starts_with("rejected"))), "{ev:?}");
         }
         assert_eq!(lobby.host.players().len(), 1);
+    }
+
+    #[test]
+    fn the_hosts_referee_hands_items_over() {
+        use crate::net::protocol::{GardenItem, ItemId, ItemPlace};
+        let mut lobby = Lobby::new();
+        let a = lobby.join(&identity("a"));
+        lobby.run(300);
+        let a_id = lobby.clients[a].my_id().unwrap();
+        let mango = ItemId {
+            origin: 0,
+            serial: 3,
+        };
+        // The hosting player has a mango on the ground.
+        let now = lobby.now;
+        let report = Body::GardenItems {
+            area: 1,
+            items: vec![GardenItem {
+                id: mango,
+                category: 3,
+                kind: 0,
+                bites: 4,
+                place: ItemPlace::Ground,
+                position: [0.0; 3],
+            }],
+        };
+        lobby.host.send(report, false, now);
+        lobby.run(100);
+        // a picks it up and claims it: a owns it, and both games hear so.
+        let now = lobby.now;
+        lobby.clients[a].send(Body::ItemClaim { id: mango }, true, now);
+        lobby.run(200);
+        let granted = Body::ItemOwner {
+            id: mango,
+            owner: a_id,
+        };
+        assert!(
+            lobby
+                .host_events
+                .iter()
+                .any(|e| matches!(e, Event::Game { body, .. } if *body == granted))
+        );
+        assert!(
+            lobby.client_events[a]
+                .iter()
+                .any(|e| matches!(e, Event::Game { body, .. } if *body == granted))
+        );
+        // The claim itself goes no further than the referee.
+        assert!(!lobby.host_events.iter().any(|e| matches!(
+            e,
+            Event::Game {
+                body: Body::ItemClaim { .. },
+                ..
+            }
+        )));
+        // The host claiming it back now is refused: the answer says a has it, and only the
+        // host hears it.
+        let before = lobby.client_events[a].len();
+        let now = lobby.now;
+        lobby.host.send(Body::ItemClaim { id: mango }, true, now);
+        lobby.run(200);
+        assert_eq!(
+            lobby
+                .host_events
+                .iter()
+                .filter(|e| matches!(e, Event::Game { body, .. } if *body == granted))
+                .count(),
+            2
+        );
+        assert_eq!(lobby.client_events[a].len(), before);
     }
 
     #[test]

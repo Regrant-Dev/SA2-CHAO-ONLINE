@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -23,6 +23,10 @@ pub const MAX_VERSION: usize = 16;
 const MAX_COORD: f32 = 1.0e6;
 /// Karate HP/morale are stat + 1000, at most a few thousand.
 const MAX_KARATE_HP: f32 = 1.0e5;
+/// Changed fields per `ChaoChanges` (the whitelist in `chao::changes` has fewer).
+const MAX_CHAO_CHANGES: usize = 128;
+/// Stage object records per stage (`SETObjectData[0x600]`, re/stage-objects.md).
+pub const MAX_STAGE_OBJECTS: u16 = 0x600;
 /// Animation frames; real motions are a few hundred frames long.
 const MAX_FRAME: f32 = 1.0e5;
 
@@ -98,6 +102,46 @@ pub enum Body {
     KarateCheer {
         count: u8,
     },
+    /// Shared garden: the sender's visiting Chao (their `Body::Chao` indices) as they are in
+    /// the sender's game right now, ~30 per second.
+    GardenChao(Vec<GardenChao>),
+    /// Shared garden: the sender's interaction changed `owner`'s visiting Chao `index`
+    /// (`chao::changes::diff` output) for the owner to apply to the real one.
+    ChaoChanges {
+        owner: u8,
+        index: u8,
+        changes: Vec<(u16, f32)>,
+    },
+    /// Shared garden: the sender is holding `owner`'s Chao `index`, at `offset` from themselves
+    /// in their own frame. ~30 per second while held.
+    ChaoHeld {
+        owner: u8,
+        index: u8,
+        offset: [f32; 3],
+    },
+    /// Shared garden: items the sender owns in garden `area` (1..3), ~10 per second, in
+    /// chunks of at most `MAX_GARDEN_ITEMS`.
+    GardenItems {
+        area: u8,
+        items: Vec<GardenItem>,
+    },
+    /// Shared garden, to the host only: the sender picked up (or their Chao took) item `id`
+    /// and asks to own it. The host's referee answers with `ItemOwner` (net/referee.rs).
+    ItemClaim {
+        id: ItemId,
+    },
+    /// From the host's referee: item `id` belongs to `owner` (a granted claim, or the answer to
+    /// a refused one).
+    ItemOwner {
+        id: ItemId,
+        owner: u8,
+    },
+    /// Co-op room: these stage objects (SET record indices) were destroyed in this stage.
+    StageKills {
+        level: i16,
+        mission: u8,
+        objects: Vec<u16>,
+    },
 }
 
 /// Live karate: one fighter as the leader's game has it.
@@ -109,6 +153,74 @@ pub struct KarateFighter {
     pub morale: f32,
     pub motion: u8,
 }
+
+/// One of a player's Chao in their garden (re/chao-garden-sync.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GardenChao {
+    /// `Body::Chao` index (< MAX_CARRIED_CHAO).
+    pub index: u8,
+    pub position: [f32; 3],
+    /// Facing (BAMS).
+    pub rotation_y: i32,
+    /// Animation id (the shared Chao motion table).
+    pub motion: u16,
+    /// Held by its owner; `offset` is then where it is relative to them, in their own frame.
+    pub held: bool,
+    pub offset: [f32; 3],
+    /// Mood shown over it (heart, "?", "!", swirl, ...): current state (0..=5), timer, length.
+    pub bubble: (i16, i32, i32),
+    /// Face: eyes and mouth ids.
+    pub eyes: i16,
+    pub mouth: i16,
+}
+
+/// A shared garden item, the same in every game: who first had it and their number for it.
+/// It keeps this id when it changes hands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ItemId {
+    pub origin: u8,
+    pub serial: u16,
+}
+
+/// Where a shared garden item is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ItemPlace {
+    /// On the ground (or flying): `position` is where.
+    #[default]
+    Ground,
+    /// In its owner's hands: `position` is the offset from them, in their frame.
+    Player,
+    /// Held or being eaten by the owner's visiting Chao `n` (`Body::Chao` index): offset from
+    /// it, in its frame.
+    Chao(u8),
+    /// In use where others can't see it (one of the owner's other Chao has it): `position` is
+    /// where it is. Not claimable, like the others.
+    Busy,
+}
+
+/// A garden item its owner has (re/chao-garden-items.md 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GardenItem {
+    pub id: ItemId,
+    /// ALW category: 2 animal or Chaos Drive, 3 fruit, 7 seed, 9 hat.
+    pub category: u8,
+    /// Fruit/seed/hat kind, animal id (0..20) or Chaos Drive colour + 0x15.
+    pub kind: u8,
+    /// Fruit: bites left (shape).
+    pub bites: u8,
+    pub place: ItemPlace,
+    pub position: [f32; 3],
+}
+
+impl GardenItem {
+    /// The owner is using it (holding it, or their Chao is): nobody else may claim it.
+    pub fn busy(&self) -> bool {
+        self.place != ItemPlace::Ground
+    }
+}
+
+/// Items per `GardenItems` message.
+pub const MAX_GARDEN_ITEMS: usize = 24;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct KarateState {
@@ -162,6 +274,20 @@ mod tag {
     pub const KARATE_STATE: u8 = 7;
     pub const KARATE_END: u8 = 8;
     pub const KARATE_CHEER: u8 = 9;
+    pub const STAGE_KILLS: u8 = 10;
+    pub const GARDEN_CHAO: u8 = 11;
+    pub const CHAO_CHANGES: u8 = 12;
+    pub const CHAO_HELD: u8 = 13;
+    pub const GARDEN_ITEMS: u8 = 14;
+    pub const ITEM_CLAIM: u8 = 15;
+    pub const ITEM_OWNER: u8 = 16;
+}
+
+fn item_id(r: &mut Reader) -> Result<ItemId> {
+    Ok(ItemId {
+        origin: player_id(r)?,
+        serial: r.u16()?,
+    })
 }
 
 fn player_id(r: &mut Reader) -> Result<u8> {
@@ -335,6 +461,90 @@ impl Body {
                     .f32(hp[0])
                     .f32(hp[1]);
             }
+            Self::GardenChao(list) => {
+                w.u8(tag::GARDEN_CHAO).u8(list.len() as u8);
+                for c in list {
+                    w.u8(c.index);
+                    for v in c.position {
+                        w.f32(v);
+                    }
+                    w.i32(c.rotation_y).u16(c.motion).u8(u8::from(c.held));
+                    for v in c.offset {
+                        w.f32(v);
+                    }
+                    w.i16(c.bubble.0)
+                        .i32(c.bubble.1)
+                        .i32(c.bubble.2)
+                        .i16(c.eyes)
+                        .i16(c.mouth);
+                }
+            }
+            Self::ChaoChanges {
+                owner,
+                index,
+                changes,
+            } => {
+                w.u8(tag::CHAO_CHANGES)
+                    .u8(*owner)
+                    .u8(*index)
+                    .u8(changes.len() as u8);
+                for &(at, value) in changes {
+                    w.u16(at).f32(value);
+                }
+            }
+            Self::ChaoHeld {
+                owner,
+                index,
+                offset,
+            } => {
+                w.u8(tag::CHAO_HELD).u8(*owner).u8(*index);
+                for v in offset {
+                    w.f32(*v);
+                }
+            }
+            Self::GardenItems { area, items } => {
+                w.u8(tag::GARDEN_ITEMS).u8(*area).u8(items.len() as u8);
+                for i in items {
+                    let (place, chao) = match i.place {
+                        ItemPlace::Ground => (0, 0),
+                        ItemPlace::Player => (1, 0),
+                        ItemPlace::Chao(n) => (2, n),
+                        ItemPlace::Busy => (3, 0),
+                    };
+                    w.u8(i.id.origin)
+                        .u16(i.id.serial)
+                        .u8(i.category)
+                        .u8(i.kind)
+                        .u8(i.bites)
+                        .u8(place)
+                        .u8(chao);
+                    for v in i.position {
+                        w.f32(v);
+                    }
+                }
+            }
+            Self::ItemClaim { id } => {
+                w.u8(tag::ITEM_CLAIM).u8(id.origin).u16(id.serial);
+            }
+            Self::ItemOwner { id, owner } => {
+                w.u8(tag::ITEM_OWNER)
+                    .u8(id.origin)
+                    .u16(id.serial)
+                    .u8(*owner);
+            }
+            Self::StageKills {
+                level,
+                mission,
+                objects,
+            } => {
+                w.u8(tag::STAGE_KILLS)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u16(objects.len() as u16);
+                for &n in objects {
+                    w.u16(n);
+                }
+            }
         }
     }
 
@@ -419,6 +629,127 @@ impl Body {
                     hp: [r.f32(MAX_KARATE_HP)?, r.f32(MAX_KARATE_HP)?],
                 }
             }
+            tag::GARDEN_CHAO => {
+                let count = usize::from(r.u8()?);
+                if count > MAX_CARRIED_CHAO {
+                    return Err(WireError::BadValue("garden chao count"));
+                }
+                let mut list = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let index = r.u8()?;
+                    if usize::from(index) >= MAX_CARRIED_CHAO {
+                        return Err(WireError::BadValue("garden chao index"));
+                    }
+                    let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                    let (rotation_y, motion, held) = (r.i32()?, r.u16()?, r.u8()?);
+                    if held > 1 {
+                        return Err(WireError::BadValue("garden chao held"));
+                    }
+                    let offset = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                    let bubble = (r.i16()?, r.i32()?, r.i32()?);
+                    let (eyes, mouth) = (r.i16()?, r.i16()?);
+                    list.push(GardenChao {
+                        index,
+                        position,
+                        rotation_y,
+                        motion,
+                        held: held == 1,
+                        offset,
+                        bubble,
+                        eyes,
+                        mouth,
+                    });
+                }
+                Self::GardenChao(list)
+            }
+            tag::CHAO_CHANGES => {
+                let (owner, index, count) = (player_id(r)?, r.u8()?, usize::from(r.u8()?));
+                if usize::from(index) >= MAX_CARRIED_CHAO || count > MAX_CHAO_CHANGES {
+                    return Err(WireError::BadValue("chao changes"));
+                }
+                let changes = (0..count)
+                    .map(|_| {
+                        let at = r.u16()?;
+                        if usize::from(at) >= CHAO_SIZE {
+                            return Err(WireError::BadValue("chao field"));
+                        }
+                        Ok((at, r.f32(MAX_COORD)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::ChaoChanges {
+                    owner,
+                    index,
+                    changes,
+                }
+            }
+            tag::CHAO_HELD => {
+                let (owner, index) = (player_id(r)?, r.u8()?);
+                if usize::from(index) >= MAX_CARRIED_CHAO {
+                    return Err(WireError::BadValue("chao held"));
+                }
+                Self::ChaoHeld {
+                    owner,
+                    index,
+                    offset: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                }
+            }
+            tag::GARDEN_ITEMS => {
+                let (area, count) = (r.u8()?, usize::from(r.u8()?));
+                if !(1..=3).contains(&area) || count > MAX_GARDEN_ITEMS {
+                    return Err(WireError::BadValue("garden items"));
+                }
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let id = item_id(r)?;
+                    let (category, kind, bites) = (r.u8()?, r.u8()?, r.u8()?);
+                    let place = match (r.u8()?, r.u8()?) {
+                        (0, _) => ItemPlace::Ground,
+                        (1, _) => ItemPlace::Player,
+                        (2, n) if usize::from(n) < MAX_CARRIED_CHAO => ItemPlace::Chao(n),
+                        (3, _) => ItemPlace::Busy,
+                        _ => return Err(WireError::BadValue("item place")),
+                    };
+                    if !matches!(category, 2 | 3 | 7 | 9) || bites > 4 {
+                        return Err(WireError::BadValue("garden item"));
+                    }
+                    items.push(GardenItem {
+                        id,
+                        category,
+                        kind,
+                        bites,
+                        place,
+                        position: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                    });
+                }
+                Self::GardenItems { area, items }
+            }
+            tag::ITEM_CLAIM => Self::ItemClaim { id: item_id(r)? },
+            tag::ITEM_OWNER => Self::ItemOwner {
+                id: item_id(r)?,
+                owner: player_id(r)?,
+            },
+            tag::STAGE_KILLS => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                let count = r.u16()?;
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || count > MAX_STAGE_OBJECTS {
+                    return Err(WireError::BadValue("stage kills"));
+                }
+                let objects = (0..count)
+                    .map(|_| {
+                        let n = r.u16()?;
+                        if n < MAX_STAGE_OBJECTS {
+                            Ok(n)
+                        } else {
+                            Err(WireError::BadValue("stage object"))
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::StageKills {
+                    level,
+                    mission,
+                    objects,
+                }
+            }
             t => return Err(WireError::BadTag("body", t)),
         })
     }
@@ -490,6 +821,107 @@ mod tests {
             Message::Game {
                 from: 2,
                 body: Body::KarateCheer { count: 3 },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::GardenChao(vec![
+                    GardenChao {
+                        index: 0,
+                        position: [10.0, 0.5, -30.0],
+                        rotation_y: 0x8000,
+                        motion: 0x101,
+                        held: true,
+                        offset: [0.0, 4.0, 1.2],
+                        bubble: (4, 30, 180),
+                        eyes: 9,
+                        mouth: 3,
+                    },
+                    GardenChao::default(),
+                ]),
+            },
+            Message::Game {
+                from: 4,
+                body: Body::ChaoChanges {
+                    owner: 1,
+                    index: 0,
+                    changes: vec![(0x82, 1.0), (0xB0, -0.05), (0x11C, 7.0)],
+                },
+            },
+            Message::Game {
+                from: 4,
+                body: Body::ChaoHeld {
+                    owner: 1,
+                    index: 1,
+                    offset: [0.5, 6.0, 2.0],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::GardenItems {
+                    area: 1,
+                    items: vec![
+                        GardenItem {
+                            id: ItemId {
+                                origin: 2,
+                                serial: 7,
+                            },
+                            category: 3,
+                            kind: 2,
+                            bites: 4,
+                            place: ItemPlace::Player,
+                            position: [0.0, 5.0, 3.0],
+                        },
+                        GardenItem {
+                            id: ItemId {
+                                origin: 5,
+                                serial: 300,
+                            },
+                            category: 2,
+                            kind: 0x16,
+                            bites: 0,
+                            place: ItemPlace::Chao(1),
+                            position: [0.0, 1.5, 1.0],
+                        },
+                        GardenItem {
+                            id: ItemId {
+                                origin: 0,
+                                serial: 0,
+                            },
+                            category: 9,
+                            kind: 3,
+                            bites: 0,
+                            place: ItemPlace::Ground,
+                            position: [10.0, 0.5, -40.0],
+                        },
+                    ],
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::ItemClaim {
+                    id: ItemId {
+                        origin: 2,
+                        serial: 7,
+                    },
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::ItemOwner {
+                    id: ItemId {
+                        origin: 2,
+                        serial: 7,
+                    },
+                    owner: 3,
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::StageKills {
+                    level: 13,
+                    mission: 0,
+                    objects: vec![0, 57, 0x5FF],
+                },
             },
             Message::Game {
                 from: 1,

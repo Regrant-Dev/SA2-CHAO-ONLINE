@@ -262,6 +262,185 @@ pub mod file {
     }
 }
 
+/// What a friend's interaction changed in a visiting copy of a Chao, to apply to the real one
+/// (re/chao-garden-items.md 2): numbers travel as differences, so changes the owner's own game
+/// made in the meantime are kept; animal parts travel as the new values.
+pub mod changes {
+    use super::{CHAO_SIZE, ChaoData};
+
+    #[derive(Clone, Copy)]
+    enum Kind {
+        /// Unsigned byte, kept within min..=max.
+        U8(u8, u8),
+        /// Signed byte (bond "like"), within ±100.
+        I8,
+        /// Little-endian i16 within min..=max; `grow_only` drops decreases (lifespans age on
+        /// both sides, so only food's increases are forwarded).
+        I16(i16, i16, bool),
+        /// f32 within min..=max.
+        F32(f32, f32),
+        /// Byte copied as is (animal parts).
+        Set,
+        /// u32 bit mask, OR-ed (animals seen).
+        Or32,
+    }
+
+    /// (offset, count, stride, kind).
+    const FIELDS: &[(usize, usize, usize, Kind)] = &[
+        (0x20, 8, 1, Kind::U8(0, 99)),             // stat progress
+        (0x30, 8, 1, Kind::U8(0, 99)),             // stat levels
+        (0x38, 8, 2, Kind::I16(0, 4000, false)),   // stat points
+        (0x82, 1, 2, Kind::I16(-100, 100, false)), // happiness
+        (0x8A, 1, 2, Kind::I16(0, 9999, true)),    // lifespan
+        (0x8C, 1, 2, Kind::I16(0, 9999, true)),    // max lifespan
+        (0xA8, 1, 4, Kind::F32(-1.0, 1.0)),        // power/run
+        (0xAC, 1, 4, Kind::F32(-1.0, 1.0)),        // fly/swim
+        (0xB0, 1, 4, Kind::F32(-1.0, 1.0)),        // alignment
+        (0xC0, 1, 4, Kind::F32(0.0, 1.2)),         // evolution progress
+        (0x118, 1, 4, Kind::Or32),                 // animals seen
+        (0x11C, 8, 1, Kind::Set),                  // animal parts
+        (0x16C, 6, 6, Kind::I8),                   // bond "like", per character
+        (0x16D, 6, 6, Kind::U8(0, 200)),           // bond familiarity, per character
+    ];
+
+    fn read(b: &[u8; CHAO_SIZE], at: usize, kind: Kind) -> f32 {
+        match kind {
+            Kind::U8(..) | Kind::Set => f32::from(b[at]),
+            Kind::I8 => f32::from(b[at] as i8),
+            Kind::I16(..) => f32::from(i16::from_le_bytes([b[at], b[at + 1]])),
+            Kind::F32(..) => f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]),
+            // Exact for masks below 2^24; the animal mask is 21 + 4 bits.
+            Kind::Or32 => u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as f32,
+        }
+    }
+
+    fn each(mut f: impl FnMut(usize, Kind)) {
+        for &(start, count, stride, kind) in FIELDS {
+            for i in 0..count {
+                f(start + i * stride, kind);
+            }
+        }
+    }
+
+    /// The differences from `before` to `after` worth forwarding: (offset, delta), or for
+    /// `Set`/`Or32` fields (offset, new value).
+    pub fn diff(before: &ChaoData, after: &ChaoData) -> Vec<(u16, f32)> {
+        let mut out = Vec::new();
+        each(|at, kind| {
+            let (a, b) = (read(&before.bytes, at, kind), read(&after.bytes, at, kind));
+            if a == b {
+                return;
+            }
+            let value = match kind {
+                Kind::Set | Kind::Or32 => b,
+                Kind::I16(_, _, true) if b < a => return,
+                _ => b - a,
+            };
+            out.push((at as u16, value));
+        });
+        out
+    }
+
+    /// Applies `diff` output to `chao` with the game's limits. Unknown offsets are ignored.
+    pub fn apply(chao: &mut ChaoData, changes: &[(u16, f32)]) {
+        for &(at, value) in changes {
+            let at = usize::from(at);
+            let mut kind = None;
+            each(|o, k| {
+                if o == at {
+                    kind = Some(k);
+                }
+            });
+            let Some(kind) = kind else { continue };
+            let b = &mut chao.bytes;
+            let now = read(b, at, kind);
+            match kind {
+                Kind::U8(min, max) => {
+                    b[at] = (now + value).round().clamp(f32::from(min), f32::from(max)) as u8
+                }
+                Kind::I8 => b[at] = (now + value).round().clamp(-100.0, 100.0) as i8 as u8,
+                Kind::I16(min, max, _) => {
+                    let v = (now + value).round().clamp(f32::from(min), f32::from(max)) as i16;
+                    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                }
+                Kind::F32(min, max) => {
+                    let v = (now + value).clamp(min, max);
+                    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                Kind::Set => b[at] = value.clamp(0.0, 255.0) as u8,
+                Kind::Or32 => {
+                    let v = (now as u32) | (value.max(0.0) as u32);
+                    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{apply, diff};
+        use crate::chao::{CHAO_SIZE, ChaoData};
+
+        fn blank() -> ChaoData {
+            ChaoData {
+                bytes: [0; CHAO_SIZE],
+            }
+        }
+
+        #[test]
+        fn a_friends_petting_and_feeding_add_to_the_owners_chao() {
+            let before = blank();
+            let mut after = before.clone();
+            after.bytes[0x82] = 1; // happiness +1
+            after.bytes[0xB0..0xB4].copy_from_slice(&0.05f32.to_le_bytes());
+            after.bytes[0x16C + 6] = 1; // bond like +1 (character 1)
+            after.bytes[0x38..0x3A].copy_from_slice(&14i16.to_le_bytes()); // swim points
+            after.bytes[0x8A..0x8C].copy_from_slice(&3i16.to_le_bytes()); // lifespan +3
+            let changes = diff(&before, &after);
+
+            // The owner's Chao has moved on meanwhile; the changes add to it.
+            let mut owner = blank();
+            owner.bytes[0x82] = 10;
+            owner.bytes[0x38..0x3A].copy_from_slice(&100i16.to_le_bytes());
+            apply(&mut owner, &changes);
+            assert_eq!(owner.bytes[0x82], 11);
+            assert_eq!(
+                i16::from_le_bytes([owner.bytes[0x38], owner.bytes[0x39]]),
+                114
+            );
+            assert_eq!(owner.bytes[0x16C + 6], 1);
+            assert_eq!(
+                i16::from_le_bytes([owner.bytes[0x8A], owner.bytes[0x8B]]),
+                3
+            );
+            let align = f32::from_le_bytes(owner.bytes[0xB0..0xB4].try_into().unwrap());
+            assert!((align - 0.05).abs() < 1e-6);
+        }
+
+        #[test]
+        fn aging_and_limits() {
+            // Lifespan going down (aging) isn't forwarded; happiness stays within ±100.
+            let mut before = blank();
+            before.bytes[0x8A..0x8C].copy_from_slice(&50i16.to_le_bytes());
+            let mut after = before.clone();
+            after.bytes[0x8A..0x8C].copy_from_slice(&49i16.to_le_bytes());
+            after.bytes[0x82..0x84].copy_from_slice(&(-30i16).to_le_bytes());
+            let changes = diff(&before, &after);
+            assert_eq!(changes, vec![(0x82, -30.0)]);
+            let mut owner = blank();
+            owner.bytes[0x82..0x84].copy_from_slice(&(-90i16).to_le_bytes());
+            apply(&mut owner, &changes);
+            assert_eq!(
+                i16::from_le_bytes([owner.bytes[0x82], owner.bytes[0x83]]),
+                -100
+            );
+            // Unknown offsets from a newer build are ignored.
+            apply(&mut owner, &[(0x7FF, 5.0)]);
+            assert_eq!(owner.bytes[0x7FF], 0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

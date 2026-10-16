@@ -43,6 +43,7 @@ enum Row {
     RoomInfo,
     NameTags,
     Room,
+    RoomMode,
     Karate,
     KarateOpponent,
     Race,
@@ -72,7 +73,7 @@ fn rows(mode: usize) -> Vec<Row> {
     }
     rows.extend([Row::NameTags, Row::Room]);
     if room::summary().is_some() {
-        rows.push(Row::RoomInfo);
+        rows.extend([Row::RoomInfo, Row::RoomMode]);
     }
     if !online::karate_opponents().is_empty() {
         rows.push(Row::KarateOpponent);
@@ -113,6 +114,8 @@ pub struct Settings {
     pub my_chao: i32,
     /// Garden visits (index into `online::VISIT_MODES`).
     pub visits: usize,
+    /// Mode of rooms we create.
+    pub room_mode: room::Mode,
 }
 
 impl Settings {
@@ -127,6 +130,7 @@ impl Settings {
             chao_race: true,
             my_chao: -1,
             visits: 2,
+            room_mode: room::Mode::Race,
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -147,6 +151,7 @@ impl Settings {
                 "port" if !v.is_empty() => s.port = v,
                 "mychao" => s.my_chao = v.parse().unwrap_or(-1),
                 "visitwith" => s.visits = online::parse_visits(&v),
+                "roommode" => s.room_mode = room::Mode::parse(&v),
                 "chaorace" => {
                     s.chao_race = !matches!(
                         v.to_ascii_lowercase().as_str(),
@@ -168,7 +173,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\nRoomMode={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -176,7 +181,8 @@ impl Settings {
             if self.name_tags { "On" } else { "Off" },
             if self.chao_race { "On" } else { "Off" },
             self.my_chao,
-            ["Off", "MyChao", "Garden"][self.visits.min(2)]
+            ["Off", "MyChao", "Garden"][self.visits.min(2)],
+            self.room_mode.ini()
         )
     }
 }
@@ -227,6 +233,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         chao_race: true,
         my_chao: -1,
         visits: 2,
+        room_mode: crate::room::Mode::Race,
     },
     message: String::new(),
     keys: Vec::new(),
@@ -342,6 +349,21 @@ pub fn on_frame() {
             let n = options.len().max(1);
             let next = (at + if left { n - 1 } else { 1 }) % n;
             crate::karate_live::set_opponent(options.get(next).and_then(|(id, _)| *id));
+        }
+        // Only the room's creator sets its mode; members see the creator's.
+        Row::RoomMode if (left || right) && room::is_leader() => {
+            let all = room::Mode::ALL;
+            let at = all
+                .iter()
+                .position(|x| *x == m.settings.room_mode)
+                .unwrap_or(0);
+            let n = all.len();
+            m.settings.room_mode = all[(at + if left { n - 1 } else { 1 }) % n];
+            room::set_mode(m.settings.room_mode);
+            let _ = fs::write(
+                Path::new(online::mod_path()).join("config.ini"),
+                m.settings.to_ini(),
+            );
         }
         Row::Race if left || right => {
             m.settings.chao_race = !m.settings.chao_race;
@@ -489,6 +511,13 @@ fn draw(m: &Menu, rows: &[Row]) {
                 "  {}",
                 room::summary().unwrap_or_else(|| "Not in a room".into())
             ),
+            Row::RoomMode if room::is_leader() => {
+                format!("  Mode:       < {} >", room::mode().label())
+            }
+            Row::RoomMode => format!(
+                "  Mode:       {} (set by the creator)",
+                room::mode().label()
+            ),
             Row::Room => {
                 let choices = room::choices();
                 match choices.get(m.room_choice.min(choices.len().saturating_sub(1))) {
@@ -582,11 +611,13 @@ mod tests {
             chao_race: false,
             my_chao: 5,
             visits: 1,
+            room_mode: crate::room::Mode::Coop,
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.
         let c = crate::online::parse_config(&s.to_ini()).unwrap();
         assert_eq!(c.name, "Regrant");
+        assert_eq!(c.room_mode, crate::room::Mode::Coop);
     }
 
     #[test]

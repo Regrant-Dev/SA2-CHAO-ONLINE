@@ -13,6 +13,8 @@ uses was checked against the game's code, and most of it in game.
 | Chao Stadium: karate unlock, race opponents | `chao-stadium.md` | `src/race.rs`, `src/karate.rs` |
 | Race selection, start hold, racer progress | `chao-race-sync.md` | `src/race.rs`, `src/room.rs` |
 | Karate fight flow, start hold, fighters, live sync | `chao-karate-sync.md` | `src/karate_live.rs` |
+| Garden Chao update, motion, being held, mirroring a visitor | `chao-garden-sync.md` | `src/visitors.rs` |
+| Stage SET objects, kill/break flags, enemies and item boxes | `stage-objects.md` | (planned co-op kill sync) |
 | Stage Select confirm (Stage Rooms) | `characters.md` (end) and `src/room.rs` | `src/room.rs` |
 
 ## Core addresses

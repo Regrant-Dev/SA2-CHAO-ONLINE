@@ -40,7 +40,8 @@ use std::time::{Duration, Instant};
 use sa2_chao_online::chao::file;
 use sa2_chao_online::game::KNOWN_GAME_BUILD;
 use sa2_chao_online::net::protocol::{
-    Body, KarateFighter, KarateState, MAX_CARRIED_CHAO, Message, PlayerState,
+    Body, GardenChao, GardenItem, ItemId, ItemPlace, KarateFighter, KarateState, MAX_CARRIED_CHAO,
+    Message, PlayerState,
 };
 use sa2_chao_online::net::session::{Client, Event, Host, Identity, Session};
 use sa2_chao_online::net::udp::Endpoint;
@@ -207,6 +208,63 @@ fn main() {
                     from,
                     body: body @ (Body::RoomPick { .. } | Body::RacePick { .. }),
                 } => println!("player {from} picked: {body:?}"),
+                // Our visiting Chao copy the real player's live garden Chao (40 units to the
+                // side like our character; held ones stay in our character's hands).
+                Event::Game {
+                    body: Body::GardenChao(list),
+                    ..
+                } if !chao.is_empty() => {
+                    let list = list
+                        .into_iter()
+                        .filter(|c| usize::from(c.index) < chao.len())
+                        .map(|c| GardenChao {
+                            position: [c.position[0] + 40.0, c.position[1], c.position[2]],
+                            ..c
+                        })
+                        .collect();
+                    session.send(Body::GardenChao(list), false, now);
+                }
+                // Own a copy of each of the real player's garden items: same place (40 units
+                // to the side on the ground), our own ids. Claim them from us (we host, so our
+                // referee answers) to test hand-offs.
+                Event::Game {
+                    from,
+                    body: Body::GardenItems { area, items },
+                } => {
+                    let me = session.my_id().unwrap_or(0);
+                    let items: Vec<GardenItem> = items
+                        .into_iter()
+                        .filter(|i| i.id.origin == from)
+                        .map(|i| GardenItem {
+                            id: ItemId {
+                                origin: me,
+                                serial: i.id.serial | 0x8000,
+                            },
+                            position: if i.place == ItemPlace::Ground {
+                                [i.position[0] + 40.0, i.position[1], i.position[2]]
+                            } else {
+                                i.position
+                            },
+                            ..i
+                        })
+                        .collect();
+                    if !items.is_empty() {
+                        session.send(Body::GardenItems { area, items }, false, now);
+                    }
+                }
+                Event::Game {
+                    body: body @ Body::ItemOwner { .. },
+                    ..
+                } => println!("referee: {body:?}"),
+                Event::Game {
+                    from,
+                    body:
+                        Body::StageKills {
+                            level,
+                            mission,
+                            objects,
+                        },
+                } => println!("player {from}: level {level} mission {mission} kills {objects:?}"),
                 // Record a live karate fight someone leads against us.
                 Event::Game {
                     body: body @ Body::KarateState(_),

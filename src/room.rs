@@ -81,9 +81,56 @@ pub struct RoomId {
     pub owner: u8,
 }
 
-/// `PlayerState` encoding of "no room" (owner, kind); a room is (owner, `ROOM_KIND`).
+/// `PlayerState` encoding of "no room" (owner, kind); a room is (owner, its `Mode`'s kind).
+/// Any kind other than 0 is a room, so builds that only know kind 1 still see co-op rooms.
 pub const NO_ROOM: (u8, u8) = (0xFF, 0);
-const ROOM_KIND: u8 = 1;
+
+/// How a room plays stages, chosen by its creator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Everyone has their own enemies and item boxes.
+    #[default]
+    Race,
+    /// Enemies and item boxes destroyed by anyone are gone for everyone in that stage.
+    Coop,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 2] = [Mode::Race, Mode::Coop];
+
+    fn kind(self) -> u8 {
+        match self {
+            Mode::Race => 1,
+            Mode::Coop => 2,
+        }
+    }
+
+    fn from_kind(kind: u8) -> Self {
+        if kind == 2 { Mode::Coop } else { Mode::Race }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Race => "Race",
+            Mode::Coop => "Co-op",
+        }
+    }
+
+    /// `RoomMode=` in config.ini.
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "coop" | "co-op" => Mode::Coop,
+            _ => Mode::Race,
+        }
+    }
+
+    pub fn ini(self) -> &'static str {
+        match self {
+            Mode::Race => "Race",
+            Mode::Coop => "Coop",
+        }
+    }
+}
 
 impl RoomId {
     pub fn from_wire(owner: u8, kind: u8) -> Option<Self> {
@@ -105,6 +152,8 @@ pub struct Other {
     pub id: u8,
     pub name: String,
     pub room: Option<RoomId>,
+    /// Their room's `PlayerState` kind (the room's mode, as its creator sets it).
+    pub kind: u8,
 }
 
 /// A choice in the F9 room row.
@@ -140,6 +189,8 @@ struct Room {
     race_incoming: Option<(RacePick, String, std::time::Instant)>,
     /// We confirmed a leader's race for this player: skip the "press A" prompt.
     race_going: Option<u32>,
+    /// Our mode setting, used for rooms we create.
+    mode: Mode,
 }
 
 static ROOM: Mutex<Room> = Mutex::new(Room {
@@ -153,6 +204,7 @@ static ROOM: Mutex<Room> = Mutex::new(Room {
     race_outgoing: None,
     race_incoming: None,
     race_going: None,
+    mode: Mode::Race,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, Room> {
@@ -183,7 +235,41 @@ fn owner_name(r: &Room, owner: u8) -> String {
 
 /// Our room for `PlayerState` (owner, kind), or `NO_ROOM`.
 pub fn wire() -> (u8, u8) {
-    lock().room.map_or(NO_ROOM, |r| (r.owner, ROOM_KIND))
+    let r = lock();
+    r.room
+        .map_or(NO_ROOM, |room| (room.owner, mode_of(&r).kind()))
+}
+
+/// The mode of the room we're in: ours if we created it, else its creator's.
+fn mode_of(r: &Room) -> Mode {
+    match role(r) {
+        Role::Lead | Role::Off => r.mode,
+        Role::Follow => r
+            .others
+            .iter()
+            .find(|o| Some(o.id) == r.room.map(|room| room.owner))
+            .map_or(Mode::Race, |o| Mode::from_kind(o.kind)),
+    }
+}
+
+/// The room's mode right now (`Race` when not in a room).
+pub fn mode() -> Mode {
+    let r = lock();
+    if r.room.is_some() {
+        mode_of(&r)
+    } else {
+        Mode::Race
+    }
+}
+
+/// Our mode setting (applies to rooms we create; members follow the creator's).
+pub fn set_mode(mode: Mode) {
+    lock().mode = mode;
+}
+
+/// We created the room we're in (only the creator sets its mode).
+pub fn is_leader() -> bool {
+    role(&lock()) == Role::Lead
 }
 
 /// Call every frame with our id and the other players' rooms. Leaves a room whose creator is
@@ -218,6 +304,19 @@ pub fn update(me: Option<u8>, others: Vec<Other>) {
                     .any(|o| o.id == p.id && o.room == Some(room))
                 {
                     hud::toast(format!("{} left the room", p.name));
+                }
+            }
+            // The creator switched the room between Race and Co-op.
+            if room.owner != me.unwrap_or(0xFF) {
+                let kind_of = |list: &[Other]| {
+                    list.iter()
+                        .find(|o| o.id == room.owner && o.room == Some(room))
+                        .map(|o| Mode::from_kind(o.kind))
+                };
+                if let (Some(before), Some(now)) = (kind_of(&previous), kind_of(&r.others))
+                    && before != now
+                {
+                    hud::toast(format!("The room is now {}", now.label()));
                 }
             }
         }
@@ -577,12 +676,21 @@ fn go(pick: Pick) {
 
 #[cfg(test)]
 mod tests {
-    use super::{NO_ROOM, RoomId};
+    use super::{Mode, NO_ROOM, RoomId};
 
     #[test]
     fn rooms_round_trip_through_player_state() {
         assert_eq!(RoomId::from_wire(3, 1), Some(RoomId { owner: 3 }));
         assert_eq!(RoomId::from_wire(NO_ROOM.0, NO_ROOM.1), None);
         assert_eq!(RoomId::from_wire(9, 1), None);
+        // A co-op room is still a room to builds that only know kind 1.
+        assert_eq!(
+            RoomId::from_wire(3, Mode::Coop.kind()),
+            Some(RoomId { owner: 3 })
+        );
+        for mode in Mode::ALL {
+            assert_eq!(Mode::from_kind(mode.kind()), mode);
+            assert_eq!(Mode::parse(mode.ini()), mode);
+        }
     }
 }

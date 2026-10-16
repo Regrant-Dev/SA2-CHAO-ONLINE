@@ -30,6 +30,7 @@ Press **F9** in game. Pause first when typing: the game also reads letter keys a
 | Port | Shown in Host mode: the UDP port your game listens on (default 43902) |
 | Name tags | Names above other players |
 | Room | Create a room, join someone's, or leave (Left/Right to choose, Enter to do it) |
+| Mode (in a room) | Race or Co-op; only the room's creator can change it (see below) |
 | Live karate vs | In a room, at Karate: who your next fight is live against (first free player, or pick one) |
 | My Chao | Your Chao for friends' races and karate (default: your first hatched Chao) |
 | Garden visits | Which of your Chao visit friends' gardens: Garden Chao (up to 2 from that garden), My Chao, or Off |
@@ -111,6 +112,15 @@ place along:
 | **Chao Race entrance** | When anyone in the room confirms a race, everyone in the room at the race entrance (Chao chosen, course list open) races in it (see Chao). |
 | **Karate** | Anyone in the room can challenge another room player at Karate to a live fight (see Chao). |
 
+**Race or Co-op.** The room's creator picks how stages play in F9 > Room > Mode (members see
+it; "The room is now Co-op" pops up when it changes). **Race** (the default): everyone has their
+own enemies and item boxes, as in the normal game. **Co-op**: an enemy or item box destroyed by
+anyone in the room is gone for everyone in that stage and mission, so whoever is ahead clears the
+way. Only whoever destroys it gets the points, rings and animals. Things destroyed stay destroyed
+even if you die and restart, and someone who enters the stage later finds them gone too. Bosses
+and other objects aren't shared. Everyone in the room needs the same stage files (no different
+SET-file mods).
+
 **Starting together.** Each group in a room is its own game: if you and Sam go into one stage
 and Alex and Kim into another, those are two separate stages that start and play on their own;
 the same goes for races. While a start is held, the screen shows who's there with you
@@ -135,7 +145,22 @@ Other players only ever get **copies** of your Chao: nothing that happens to a v
 or fighting copy is saved anywhere, and your own Chao never leave your save.
 
 **Garden visits.** When you enter a garden while connected, your Chao visit the others in the
-same garden (F9 > Garden visits: Garden Chao, My Chao or Off).
+same garden (F9 > Garden visits: Garden Chao, My Chao or Off). The gardens are live:
+- A friend's Chao in your garden is a copy that does exactly what their real one does (walking,
+  animations), and when they pick it up you see it in their hands. The same goes for yours in
+  their garden.
+- You can pet a friend's Chao, pick it up, or give it a fruit, animal or Chaos Drive (hold it
+  next to the Chao). Their Chao reacts in your game, and the effects (happiness, alignment, how
+  much it likes your character, stats and lifespan from food, animal parts) go to their real Chao
+  in their save. While you hold it, they see it in your hands. Hitting or throwing it counts too.
+- Nothing about a visiting Chao is ever saved in your own save, and a visitor can't be carried
+  out of your garden.
+- Garden items are shared: everyone sees everyone's fruit, animals, Chaos Drives, hats and seeds,
+  on the ground and in hands. Each item belongs to one player and is saved only in their save.
+  Pick up a friend's item (or let your Chao take it) and it becomes yours, saved in your save,
+  and disappears from theirs. If two of you grab it at once, the first one gets it; an item its
+  owner is holding, or their Chao is eating, can't be taken. Fruit still on a tree is each
+  garden's own until it falls.
 
 **Chao Race.** While connected, friends' Chao take the other lanes of your Chao Races (F9 >
 Friends' Chao in races): each friend's My Chao first (or the Chao

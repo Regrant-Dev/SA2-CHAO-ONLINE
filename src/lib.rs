@@ -1,9 +1,12 @@
 //! SA2 Chao Online: mod DLL loaded by SA2 Mod Loader.
 
 pub mod chao;
+mod coop;
 pub mod game;
+mod garden;
 mod hud;
 mod input;
+mod items;
 mod karate;
 mod karate_live;
 mod log;
@@ -99,8 +102,10 @@ pub extern "C" fn OnFrame() {
         }
 
         visitors::on_frame();
+        garden::on_frame();
         let (peers, connected) = online::peers();
         together::on_frame(&peers, connected);
+        coop::on_frame(&peers, connected);
         room::on_frame(connected);
         race::start_frame(&peers, connected);
         race::on_frame();

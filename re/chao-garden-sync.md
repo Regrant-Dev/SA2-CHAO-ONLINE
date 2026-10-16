@@ -1,0 +1,288 @@
+# Chao Garden: per-frame update, motion, being held (for mirroring a visitor live)
+
+Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
+of `re/bin/sonic2app.dumped.exe` (most of this code has no Ghidra functions). Read
+`chao.md` and `chao-race-sync.md` first: garden, race and menu Chao are the same object type
+and share the Data1 layout.
+
+**Correction to `chao-race-sync.md`:** 0x56CCF0 is not the skeletal motion player. It updates
+the model/shape block at Data1+0x510 and builds the model matrix (0x56FC20). The motion
+(animation) controller is the struct at **Data1+0xAC**, advanced by **0x7938D0** (see section 2).
+
+Notation: `obj` = ObjectMaster*, `D` = `obj->Data1` (+0x34, `OBJ_DATA1` in the mod),
+`W` = `*(obj+0x38)` (physics work: velocity at +0/+4/+8).
+
+---
+
+## 1. Garden Chao object and its per-frame update
+
+### What CreateChao (0x5501D0) installs
+| ObjectMaster field | Value | Notes |
+|---|---|---|
+| +0x10 MainSub | **0x54FE20** | `LoadObject(list 2 or 4, "…", EDI=0x54FE20)` at 0x550263..0x55026D |
+| +0x14 DisplaySub | 0x54FF80 | Picks the draw by record byte `+0xDD` (jump table 0x55018C); normal Chao: **0x540B60** |
+| +0x18 DeleteSub | 0x54FF30 | Frees `D+0x5C` **only if `D+0x58 != 0`** (copy mode). With `copy=0` (what visitors.rs passes) our buffer is never freed by the game |
+| +0x1C or +0x20 | 0x5501A0 | Delayed display (area-dependent table at 0x550608); jumps to 0x53CEB0 (shadow etc.) |
+| +0x34 Data1 | 0x1D74-byte block | Allocated at 0x55028E |
+| +0x3C | world-entity entry | Set by 0x530750 (see below) |
+
+Flags CreateChao sets in **`D+0xA0`** (0x550515..0x5505A5): `|= 0x200, 0x8, 0x2, 0x4, 0x10,
+0x20000, 0x20, 0x40, 0x40000, 0x80000, 0x100000`, `&= ~0x80, ~0x2000`.
+
+### MainSub 0x54FE20 (cdecl, `void(ObjectMaster*)`)
+```
+if (D+0x30 <= 2)      0x53CAC0(EAX=obj)          // first frames: emotion-ball (D+0x6EC) init
+if (*0x1DBE634 != 0) {                            // global "update Chao" gate
+    0x53DC40(EAX=obj)                             // AI: interrupts + behaviour stack  [gated by D+0xA0 & 0x10]
+    if (D+0xA0 & 0x4)  0x7938D0(ESI=D+0xAC)       // advance the motion (animation)
+    0x53CB70(EAX=obj)                             // emotion ball (D+0x6EC)
+    0x53A3E0(EAX=obj)                             // face timers: eyes D+0x68C/0x692, mouth D+0x698/0x69E
+    0x56CCF0(EBX=obj)                             // model/shape block D+0x510, builds matrix from D+0x14/D+0xC
+    if (D+0xA0 & 0x2)  0x796780(EAX=obj)          // unknown (menu Chao clear this bit)
+    0x53DF00(EAX=obj)                             // physics, mode u16 D+0xA4: 0 ground 0x798300, 2 race path 0x53E3E0
+    D+0x30++                                      // frame counter
+    if (D+0xA0 & 0x8)  0x47E750(ESI=obj)          // register collision (others can hit / pick up)
+    else               0x47E6C0(EAX=obj)          // clear collision
+    if (rec+0xDD == 3) 0x7938D0(ESI=D+0xF8)       // second motion table, special record type only
+    if (D+0xA0 & 0x80000) 0x540FD0(...)           // something at D+0x5C0..0x5D4
+}
+```
+- 0x53DF00 returns immediately when `W+0x40 & 0x10`.
+
+### AI tick 0x53DC40 (EAX=obj)
+- **Returns at once when `D+0xA0 & 0x10` is clear.** That is the same bit as the race (0x53FAF0),
+  and it skips everything below:
+  - **interrupt checks 0x53DB10**: water 0x561630, whistle 0x5637B0, being held 0x566720, hit
+    0x563D30, fruit/toys/etc.
+  - "think" timers 0x562C00 (skipped when `D+0xA0 & 0x2000`)
+  - the behaviour stack: `D+0x434` count, `D+0x438` index, `D+0x43C[]` fn, `D+0x47C[]` timers.
+    A behaviour returns 1 = pop, 2 = choose next (0x562A80/0x562C50), 3 = reset to 0x565BE0.
+- Behaviour struct at D+0x1B4: `+0x1B6` u16 mode (sub-state), `+0x1B8`, `+0x1C0` timer,
+  `+0x1C4` timer, `+0x430` previous fn. `AL_SetBehavior` 0x53D890 (EAX=obj, push timer, push fn,
+  cdecl pop 8) as in the race notes. 0x53D970 (EAX=obj, EDX=fn) pushes a follow-up behaviour.
+
+### How the game itself makes a "display-only" Chao
+Menu code does exactly this right after `CreateChao` (0x5560CD, also 0x556695, 0x556D16,
+0x55721D, 0x579504, 0x58745D, 0x590E17, ...):
+```
+D+0xA0 &= ~0x8;  &= ~0x2;  &= ~0x10;  &= ~0x20;  &= ~0x80000
+```
+MainSub stays 0x54FE20. With 0x10 clear there is no AI, with 0x8 clear there is no collision,
+and with 0x4 still set the motion keeps playing.
+
+### World entity list (finding a Chao object from its record)
+- Counts: `0x1DC0F80[cat]` (u32). Limits: `0x8AB838[cat]`: cat 0 (Chao) = **32**.
+- Entries: `0x1DC0FC0 + cat*0x1200 + i*0x48`.
+  - +0x2 u8 → copied to `D+3`
+  - +0x4 u16 kind
+  - **+0x8 ChaoData\***
+  - +0xC int
+  - **+0x3C ObjectMaster\*** (0 = free)
+  - +0x40 linked entry (interaction partner)
+- Registered by 0x530750 (ECX=cat, EBX=obj, stack: kind, data), called from CreateChao with
+  cat 0. Removed by 0x5307F0. `obj+0x3C` points back at the entry.
+- To find the owner's Chao for save slot `n`: scan cat 0 entries for
+  `+0x3C != 0 && +0x8 == &ChaoSlots[n]` (0x19F6EC4 + n*0x800).
+
+---
+
+## 2. Motion (animation) controller
+
+### `MotionTable` at **D+0xAC** (0x4C bytes)
+| off | type | meaning |
+|---|---|---|
+| +0x00 | u16 | flags. **bit 0x2 = blending into the next motion**. Bit 0x1 = "reached end / loop" pulse (cleared each frame by 0x7938D0; read by 0x793F70) |
+| +0x02 | u16 | from table entry +6 |
+| **+0x04** | int | **current motion id** |
+| **+0x08** | int | **next id**: blend target while bit 0x2 is set, otherwise the motion queued after the current one (table entry +8, -1 = none) |
+| +0x0C | f32 | speed multiplier, reset to 1.0 every frame |
+| +0x10 | f32 | blend step (1/frames) |
+| +0x14 | f32 | blend progress 0..1 |
+| +0x18 | u16 | play mode of the current motion (0..7, jump table 0x793C1C: loop, hold, chain, ping-pong ...) |
+| **+0x1C** | f32 | **current frame** |
+| +0x20 / +0x24 | f32 | start / end frame |
+| +0x28 | f32 | frame step |
+| +0x2C | ptr | current NJS_MOTION* |
+| +0x30..+0x44 | | the same fields for the next motion (mode, start, end, step, motion*) |
+| +0x48 | ptr | motion table: entries of 0x1C bytes `{motion*, u16 mode, u16, int next, int blendFrames, f32 start, f32 end, f32 step}` |
+
+- The table comes from the Chao DLL export **"al_motion_table"** (string 0x1304824). 0x55C370 does
+  `GetProcAddress(*(*0x1AF0220), …)` via the import at 0x8730D4, then `0x793880(EAX=D+0xAC, push table)`.
+  Every Chao uses the same table, so **motion ids are global**. An id read on the owner's game
+  plays the same animation on any other Chao.
+- `D+0xF8` is a second MotionTable used only for records with `+0xDD == 3`.
+
+### Functions (all usercall, no return value)
+| Addr | Call | Effect |
+|---|---|---|
+| **0x793C40** | **EAX = D+0xAC, EDX = id**, no stack args; clobbers ECX/EDX | **`SetMotionLink`**: blend into `id`: `+8=id`, flags=2. Blend length from the table (default constant if negative). This is what behaviours use (e.g. `0x793C40(D+0xAC, 0x101)` = held) |
+| 0x793E40 | EAX = mt, EDX = id | Hard switch to `id` without a blend, frame = start, `+8` = table next |
+| 0x793D30 | EAX = mt, EDX = id, push u16 frames (caller pops 4) | Blend with an explicit length (used by 0x565BE0) |
+| 0x793D90 | EAX = mt, EDX = id | Blend that keeps the phase |
+| 0x7938D0 | ESI = mt | Per-frame advance (MainSub calls it when `D+0xA0 & 4`) |
+| 0x793880 | EAX = mt, push table | Init, starts motion 0 |
+| 0x793F70 | EAX = mt | Returns flags & 1 |
+
+Motion ids seen in code: 0x101 held (calm); 0x102/0x103/0x105/0x107 held happy; 0x109..0x10E
+held struggling (dislikes holder); 0x3E/0xC/6/0x1B race idle; 0, 1, 3, 0xEE, 0xEF after being
+put down (0x565BE0).
+
+### Face (optional to sync)
+| Addr | Call | Effect |
+|---|---|---|
+| 0x53A4B0 | ECX = obj, EDX = eye id, EAX = duration (-1 = until changed) | eyes. Writes `D+0x68C` (timer) and `D+0x692` (eye id) |
+| 0x53A5A0 | ECX = obj, EDX = duration, push mouth id (caller pops 4) | mouth. Writes `D+0x698` (timer) and `D+0x69E` (mouth id) |
+
+The default eye is at `D+0x694`. 0x53A3E0 counts the timers down.
+
+---
+
+## 3. Being held by the player
+
+### Player side
+`CO2 = *(u8**)0x1DE9600` (player 1 CharObj2), `P = *(u8**)0x1DEA6C0` (player 1 EntityData1).
+| Field | Meaning |
+|---|---|
+| **CO2+0x94** | **HeldObject** (ObjectMaster*) |
+| CO2+0x98 | object to pick up (throw/catch path) |
+| CO2+0x9C | object in front, the pickup candidate. Found by 0x45A160 from the player's collision hits: needs the target's `Data1+4 & 0x40` and not `& 0x8000`, within ±0x3000 of the player's facing |
+| P+4 bit 0x800 | player is holding something |
+
+**Pick up** (Sonic-family code at 0x725582; the same pattern is at 0x722921, 0x73FAD7 and in
+every character):
+```
+CO2+0x94 = CO2+0x9C (or +0x98);  held->Data1+4 |= 0x8000 (0x8200 on the 0x725582 path);
+held->Data1+2 = 0xA;  P+4 = (P+4 & ~8) | 0x800;  player action/anim set to the carry anim
+```
+**Release:** 0x46E5E0 (EAX=player index, EDX=P), 0x475600 (EAX=P, push CO2) and 0x4755D1:
+`held->Data1+4 &= 0x7FFF; P+4 &= ~0x800; CO2+0x94 = 0`. A throw also writes a velocity into
+`held->W+0..+8`.
+
+The type the game uses for a Chao is 0x45A0C0: `Data1+2` 0xA or 0xC → 0x200, "two-handed
+carry".
+
+**Position each frame (written by the player, not the Chao):** 0x725C70 (Sonic/Shadow family,
+called from 0x720B1B) and 0x740950 (other characters, from 0x73F196 and 0x750C36). When the
+held object is type 0x200, these write `held->Data1+0x14/18/1C`:
+```
+pos = (handA + handB) * 0.5 + 1.2 * normalize(dirA + dirB)
+handA = CO2ext+0x1E8, handB = CO2ext+0x1F4, dirA = +0x284, dirB = +0x290
+```
+A second formula is used for carry anims 0x31..0x34 and 0x49 (+0x26C ×2.5).
+
+### Chao side
+- "Held" is **`D+4` (u16 Status) bit 0x8000**. Nothing else is needed.
+- Interrupt **0x566720**: if Status & 0x8000 and the current behaviour is not a held one, it
+  zeroes W, sets `W+0x1C` from the player angle, and `AL_SetBehavior(obj, 0x566670)`.
+  0x566670 then picks, by the bond with the current character (record +0x16C table, via
+  0x53E0C0):
+  - **0x5660A0**: likes (> 50). Motion 0x101/0x102/0x103/0x105/0x107, happy face
+  - **0x5662B0**: neutral. Motion 0x101
+  - **0x566300**: dislikes (< -50). Motion 0x109..0x10E, struggle voice
+  - **0x566580**: sleepy (emotion +0x136 > 500). Motion 0x101 and sleep icon
+- All held behaviours clear `D+0xA0 & 0x8` (no collision while held) and call **0x565DC0**
+  every frame. While held, 0x565DC0:
+  - eases `W+0x1C` toward `W+0x18` (0x446960) and sets `D+0xC = W+0x1C - P->Rot.y`
+    (facing relative to the holder),
+  - zeroes the velocity,
+  - every 600 frames may move between happy/neutral/dislike. At the extreme it calls
+    0x46E5E0 and the Chao **jumps out of the hands**.
+- When 0x8000 is cleared, 0x565DC0 sets `D+0xA0 |= 0x8`, then sets one of:
+  - 0x565BE0: put down (player action list contains 0x14)
+  - 0x564320: dropped
+  - 0x53D720: thrown, using the velocity in W
+- Drawing: the Chao draw 0x540B60 adds **(0, -1.0, 0)** before the position when Status &
+  0x8000 (0x540CBB). The delayed display 0x53CEB0 also lowers something (0x53D01E/0x53D1FF).
+  So a held Chao is drawn 1 unit below `D+0x14`.
+
+---
+
+## 4. Save risk for a visitor
+
+- Own Chao objects point straight into the save slots (`D+0x5C` = &ChaoSlots[n], `D+0x58=0`).
+  The game updates the record in place, and saving writes the whole region
+  `0x19F6460 + file*0xCA6C` (0xCA6C bytes; save/load 0x52E570/0x52E630 → 0x532570/0x532360).
+- The pre-save sync 0x52F090 walks only world-entity categories 2, 3, 7 and 9 (0x52E710: copies
+  object positions into their records) and calls 0x52E6B0 for categories 4 and 5. **Category 0
+  (Chao) is never walked**. This pass found no code that copies a live Chao's record into a
+  free slot (only 0x800-byte copies: the stadium select at 0x5536A0/0x553B57 into its own buffers).
+- A visitor created with `copy=0` keeps our buffer as `D+0x5C`. The game writes only into our
+  buffer: garden byte, stats, emotion. The delete sub does not free it (`D+0x58 == 0`), and
+  0x531B10 (spawn from slots) never sees it.
+- Residual risks (not fully traced):
+  - The 4-entry carry/transfer buffer at `*0x1A5CB54` (4 × 0x1084, a 0x800 record copy at
+    +0x9C, source pointer at +0x88). 0x531CAC checks it while spawning garden Chao. It looks
+    like the transporter/"take a Chao along" system. A visitor the local player picks up and
+    carries through an exit could end up there.
+  - Picking up a visitor at all lets the local AI-side code run on our buffer.
+  
+  **Mitigation:** make the mirror unpickable. Keep `D+0xA0 & 0x8` clear (no collision
+  registration, so 0x45A160 never finds it), and/or keep Status 0x8000 set (0x45A260 rejects
+  held objects). Both are part of the recipe below. Do not use `copy=1`: the game would then
+  own a heap copy, and the delete sub frees it, but the record would still not reach the
+  slots. It gains nothing.
+
+---
+
+## Driving a visitor from the network
+
+### Owner (reporting its real Chao)
+1. Find the object: scan the cat 0 world entities (section 1) for `+0x8 == &ChaoSlots[n]`.
+   Re-scan after area changes.
+2. Each tick send, from `D = obj->Data1`:
+   - position `D+0x14..0x1C` (3 f32) and rotation Y `D+0xC` (i32; X/Z at +0x8/+0x10 are
+     normally 0)
+   - motion: flags `u16 D+0xAC`, cur `int D+0xB0`, next `int D+0xB4`, frame `f32 D+0xC8`
+   - held = `(u16 D+4) & 0x8000`. To be sure it is *this* player holding:
+     `*(u32*)(CO2+0x94) == obj`.
+   - while held, also send the offset from the holder:
+     `off = rotateY(-P.rotY, D.pos - P.pos)` (P = `*0x1DEA6C0`, pos +0x14, rotY +0xC).
+     The offset keeps the mirror glued to the puppet's hands despite puppet interpolation.
+   - optional: eye `s16 D+0x692` and mouth `s16 D+0x69E`.
+
+### Mirror (the visitor object on other clients)
+1. Spawn with `CreateChao(buffer, 0, 0, &pos, ang)` as `visitors::spawn_remote` does. Then,
+   the same way the game's display-only Chao are made:
+   `D+0xA0 &= ~0x10` (no AI), `&= ~0x8` (no collision, so the local player can't push it or pick
+   it up). Keep `0x4` (motion) set. Optionally `&= ~0x20000`, as the race does.
+2. Replace `obj+0x10` with a wrapper:
+   ```
+   write pos/rot   // before: 0x56CCF0 builds the model matrix from them
+   call 0x54FE20(obj)   // original: motion advance, face, emotion ball, physics, (no AI, no collision)
+   write pos/rot again; W+0..+8 = 0    // after: undo ground physics 0x798300 / gravity
+   ```
+   With bit 0x10 clear, the original never changes behaviour. The garden AI cannot overwrite
+   anything except through physics, which the post-write undoes.
+3. Motion: `target = (owner.flags & 2) ? owner.next : owner.cur`, and
+   `mine = (D+0xAC & 2) ? D+0xB4 : D+0xB0`. If `target != mine`, call
+   **0x793C40(EAX = D+0xAC, EDX = target)** (one call on change, not every frame). To stop
+   drift on long loops, when neither side is blending and the ids match, copy `owner.frame`
+   into `D+0xC8` if it differs by more than a few frames.
+4. Held:
+   - While the owner reports held: `D+4 |= 0x8000` and
+     `pos = puppet.pos + rotateY(puppet.rotY, off)`. Use the puppet's rendered (interpolated)
+     pose, and send rotY as is.
+   - Setting 0x8000 gives the same -1.0 Y draw offset and shadow as a real held Chao, and
+     makes the mirror unpickable.
+   - The motion (0x101/0x10x) arrives through step 3. The puppet's carry animation arrives
+     through the normal pose sync (the owner's player plays its carry anim).
+   - On release: `D+4 &= 0x7FFF`. With AI off this triggers no put-down or throw behaviour.
+     The owner's stream shows the fall and landing (motion and position).
+5. Never re-enable bit 0x10 while 0x8000 is set: the interrupt 0x566720 would put the mirror
+   into the held behaviour with no holder.
+
+## Confidence
+- MainSub layout, the 0x10 AI gate and the display-only flag pattern: **high** (read directly;
+  the game's own menus use the same flags).
+- MotionTable layout, 0x793C40/0x793E40 call convention, shared "al_motion_table": **high**.
+  Play mode semantics of +0x18 and the meaning of every flag bit: medium.
+- Held = Status 0x8000, CO2+0x94 HeldObject, pickup/release writers, held behaviours, motion
+  ids: **high**. Held position formula (0x725C70/0x740950) and which characters use which copy:
+  medium-high. Status 0x40 as "holdable": medium (checked at 0x45A2AD, writer not found).
+- Draw offset under 0x8000: medium-high (0x540CBB read; 0x53CEB0 effect not decoded).
+- 0x796780 (bit 0x2) and 0x540FD0 (bit 0x80000): unknown. Leaving them on is harmless for a
+  mirror because the position is re-written after MainSub.
+- Save safety: high that the Chao slots are only written in place and that the pre-save walker
+  skips Chao. Medium for the carry buffer `*0x1A5CB54` (not decoded), which is why the mirror
+  must stay unpickable.
+- None of this has been run in game yet.

@@ -43,8 +43,29 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
     spawned: Vec::new(),
 });
 
+/// The Chao a player carries to the next area (re/chao-garden-items.md 5): `ChaoData*` or 0.
+const CARRIED_CHAO: usize = 0x01A5_CA5C;
+
 /// Call every frame: frees the visitor slots once the player is out of the garden.
 pub fn on_frame() {
+    {
+        // A visitor must never be carried out of the garden: the next area would recreate it
+        // from our buffer, which is reused for other visitors.
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a static game pointer, only compared and cleared on the game thread.
+        unsafe {
+            let carried = (CARRIED_CHAO as *mut usize).read_volatile();
+            if carried != 0
+                && pool
+                    .buffers
+                    .iter()
+                    .any(|b| std::ptr::from_ref::<ChaoData>(b) as usize == carried)
+            {
+                (CARRIED_CHAO as *mut usize).write_volatile(0);
+                log!("visitors: a visitor was being carried out of the garden; left behind");
+            }
+        }
+    }
     if !game::in_garden() {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         if pool.active > 0 {
@@ -54,6 +75,7 @@ pub fn on_frame() {
             );
             pool.active = 0;
             pool.spawned.clear();
+            crate::garden::clear();
         }
     }
 }
@@ -186,12 +208,19 @@ pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -
         y: near.y + 5.0,
         z: near.z + 6.0,
     };
-    spawn(&mut pool, source, chao, position, 0);
+    let object = spawn(&mut pool, source, chao, position, 0);
+    crate::garden::spawned(player, index, object);
     true
 }
 
-/// Copies `chao` into a free visitor buffer and creates the Chao object.
-fn spawn(pool: &mut Pool, source: Source, chao: ChaoData, position: game::Vector, angle: i32) {
+/// Copies `chao` into a free visitor buffer and creates the Chao object (returned, or 0).
+fn spawn(
+    pool: &mut Pool,
+    source: Source,
+    chao: ChaoData,
+    position: game::Vector,
+    angle: i32,
+) -> usize {
     // Buffers at index >= active are not in use by any Chao object.
     let index = pool.active;
     if index == pool.buffers.len() {
@@ -213,4 +242,5 @@ fn spawn(pool: &mut Pool, source: Source, chao: ChaoData, position: game::Vector
     log!("visitors: CreateChao returned {object:p}");
     pool.active += 1;
     pool.spawned.push(source);
+    object as usize
 }

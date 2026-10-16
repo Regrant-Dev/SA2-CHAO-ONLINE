@@ -406,12 +406,11 @@ extern "C" fn display(_object: usize) {
                     })
             };
             let result = match source {
-                // Mechs and walkers like ours: the game's own walker display draws them, with
-                // their upgrade parts (re/characters.md "Walker extra parts").
-                // SAFETY: display callback on the game thread; same character as ours.
-                Some(source) if pose.character == me.character && is_walker(pose.character) => unsafe {
-                    draw_walker(&source, &pose, co2 as usize)
-                },
+                // Mechs and walkers: their own walker display draws them with their upgrade parts
+                // when every model it reads is loaded; otherwise just the body
+                // (re/characters.md "Drawing other players' walkers").
+                // SAFETY: display callback on the game thread.
+                Some(source) if is_walker(pose.character) => unsafe { draw_walker(&source, &pose) },
                 // SAFETY: display callback runs on the game thread inside the display pass.
                 Some(source) => unsafe { draw(&source, &pose) },
                 None if character_files(pose.character).is_some() => {
@@ -580,31 +579,36 @@ impl Source {
     }
 }
 
-// ---- Mechs and walkers (re/characters.md "Walker extra parts") ----
+// ---- Mechs and walkers (re/characters.md "Drawing other players' walkers") ----
 //
-// The walker display 0x7444F0 (cdecl, ObjectMaster*) draws the body and then the upgrade parts
-// from bone matrices its per-bone callback records into the CharObj2. Puppets of the same
-// walker as ours get a private copy of our CharObj2 (so every pointer in it is valid for this
-// character) with their pose and upgrades written in, and a private EntityData1, and the game
-// draws them itself. The globals the display and its callback write are saved and restored, so
-// our own walker is untouched.
+// Each walker type has its own display (Eggman's 0x7444F0, Tails' 0x747DD0, ...): it draws the
+// body, then the upgrade parts from bone matrices its per-bone callback records, reading the
+// part models straight from the model table. A puppet gets a fresh CharObj2 and EntityData1
+// with only what the display reads (its type, upgrades, animation, tables), drawn by its own
+// type's display once every model slot that display reads unchecked is loaded; otherwise just
+// the body. The globals the display and its callback write are saved and restored, so our own
+// character is untouched. (Drawing a Tails walker with Eggman's display, whose models a Tails
+// stage never loads, crashed at 0x744ACA and 0x42EB40.)
 
 /// Walker CharObj2 size (the walker loader allocates 0x458 bytes, 0x740CD9).
 const WALKER_CO2_SIZE: usize = 0x458;
-/// EntityData1: action byte, status (+6 bit 1 = blinking, skipped), angles, position, scale.
+/// EntityData1: angles, position, scale.
 const ENTITY_SIZE: usize = 0x40;
-const ENTITY_ACTION: usize = 0x00;
-const ENTITY_STATUS: usize = 0x06;
 const ENTITY_ROTATION: usize = 0x08;
 const ENTITY_POSITION: usize = 0x14;
+const ENTITY_SCALE: usize = 0x20;
 const OBJ_DATA1: usize = 0x34;
 const OBJ_DATA2: usize = 0x40;
-/// CharObj2 animation block: mode (2 = blending), requested and current animation, frame.
+/// CharObj2: player number, character (+1 and +3), animation block (mode, requested animation),
+/// body texlist.
+const CO2_PLAYER: usize = 0x00;
+const CO2_CHARACTER: usize = 0x01;
 const CO2_MOTION_MODE: usize = 0x174;
 const CO2_NEXT_ANIM: usize = 0x176;
-/// Globals the walker display and its bone callback write: (address, length).
+const CO2_TEXLIST: usize = 0x448;
+/// Globals the walker displays and their bone callbacks write: (address, length).
 const WALKER_GLOBALS: [(usize, usize); 5] = [
-    (0x01A5_1D00, 0x400), // bone matrices and the drawn CharObj2 (0x1A51D2C..0x1A520F0)
+    (0x01A5_1D00, 0x450), // bone matrices and the drawn CharObj2 (Tails' callback to 0x1A52120)
     (0x01A5_57FC, 0x50),  // matrix stack top, bone callback, draw flags (0x1A557FC..0x1A5584C)
     (0x01DE_4660, 0x08),  // per-player light index
     (0x01DE_B6A0, 0x10),  // render flags it saves
@@ -628,32 +632,94 @@ fn is_walker(character: u8) -> bool {
     matches!(character, 6 | 7 | 10 | 11)
 }
 
-/// Draws `pose` with the game's walker display, from a copy of our own walker's CharObj2.
+/// The display of a walker type: Tails' and Eggman's. (The Chao walkers' displays, 0x746290 and
+/// 0x7470D0, read slots not mapped yet: those get the body only.)
+fn walker_display_of(character: u8) -> Option<usize> {
+    match character {
+        6 => Some(0x0074_7DD0),
+        7 => Some(0x0074_44F0),
+        _ => None,
+    }
+}
+
+/// Every model slot `character`'s display reads without a null check, for these upgrades and
+/// this animation (re/characters.md). The animation-dependent slots (thrown parts, boost) are
+/// left out by keeping those CharObj2 counters at 0.
+fn walker_slots(character: u8, upgrades: u32, anim: u16) -> Vec<usize> {
+    let pick = |bit: u32, set: usize, clear: usize| if upgrades & bit != 0 { set } else { clear };
+    let mut slots = Vec::new();
+    match character {
+        // Eggman's walker.
+        7 => {
+            slots.push(pick(0x40_0000, 260, 258));
+            if upgrades & 0x20_0000 != 0 {
+                slots.extend([262, 263]);
+            } else {
+                slots.extend([265, 266]);
+            }
+            if anim == 0x80 {
+                slots.push(268);
+            }
+            if upgrades & 0x10_0000 != 0 {
+                slots.extend([274, 276]);
+            }
+            if upgrades & 0x80_0000 != 0 {
+                slots.extend([278, 291]);
+            }
+        }
+        // Tails' walker.
+        6 => {
+            slots.push(pick(0x100, 306, 304));
+            slots.push(pick(0x80, 309, 312));
+            if anim == 0xB4 {
+                slots.push(313);
+            }
+            if upgrades & 0x40 != 0 {
+                slots.extend([319, 321]);
+            }
+        }
+        _ => {}
+    }
+    slots
+}
+
+/// Draws a walker `pose` with its own type's display, or just its body when that display can't
+/// be used safely.
 ///
 /// # Safety
-/// Display pass on the game thread; `co2` is our CharObj2 and our character is `pose`'s.
-unsafe fn draw_walker(source: &Source, pose: &Pose, co2: usize) -> Result<(), &'static str> {
+/// Display pass on the game thread.
+unsafe fn draw_walker(source: &Source, pose: &Pose) -> Result<(), &'static str> {
     unsafe {
         let (_, _, frame) = resolve(source, pose)?;
-        let entity = game::local_entity() as usize;
-        if entity == 0 {
-            return Err("no local player");
+        let Some(display) = walker_display_of(pose.character) else {
+            return draw(source, pose);
+        };
+        let loaded = |slot: usize| read::<usize>(MODEL_TABLE + slot * TABLE_STRIDE) != 0;
+        if !walker_slots(pose.character, pose.upgrades, pose.anim)
+            .into_iter()
+            .all(loaded)
+        {
+            return draw(source, pose);
         }
         let walker = &mut *std::ptr::addr_of_mut!(WALKER);
-        ptr::copy_nonoverlapping(co2 as *const u8, walker.co2.as_mut_ptr(), WALKER_CO2_SIZE);
-        ptr::copy_nonoverlapping(entity as *const u8, walker.entity.as_mut_ptr(), ENTITY_SIZE);
+        walker.co2 = [0; WALKER_CO2_SIZE + 8];
+        walker.entity = [0; ENTITY_SIZE];
+        walker.object = [0; 0x50];
         let c = walker.co2.as_mut_ptr() as usize;
+        write(c + CO2_PLAYER, 0u8);
+        write(c + CO2_CHARACTER, pose.character);
+        write(c + game::CO2_CHAR_ID, pose.character);
         write(c + game::CO2_UPGRADES, pose.upgrades);
         write(c + CO2_MOTION_MODE, 0u16);
         write(c + CO2_NEXT_ANIM, pose.anim);
         write(c + game::CO2_ANIM, pose.anim);
         write(c + game::CO2_FRAME, frame);
+        write(c + game::CO2_ANIM_INFO, source.anim_info);
+        write(c + CO2_TEXLIST, source.texlist);
         let e = walker.entity.as_mut_ptr() as usize;
-        write(e + ENTITY_ACTION, 0u8);
-        write(e + ENTITY_STATUS, read::<u8>(e + ENTITY_STATUS) & !2);
         write(e + ENTITY_ROTATION, pose.rotation);
         write(e + ENTITY_POSITION, pose.position);
-        walker.object = [0; 0x50];
+        write(e + ENTITY_SCALE, [1.0f32; 3]);
         let object = walker.object.as_mut_ptr() as usize;
         write(object + OBJ_DATA1, e);
         write(object + OBJ_DATA2, c);
@@ -668,7 +734,7 @@ unsafe fn draw_walker(source: &Source, pose: &Pose, co2: usize) -> Result<(), &'
         } else {
             0
         };
-        walker_display(object);
+        std::mem::transmute::<usize, extern "C" fn(usize)>(display)(object);
         for (&(at, len), bytes) in WALKER_GLOBALS.iter().zip(&saved) {
             ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, len);
         }
@@ -940,13 +1006,6 @@ mod ffi {
         unsafe { std::mem::transmute::<usize, extern "C" fn()>(REFRESH_FOG)() }
     }
 
-    const WALKER_DISPLAY: usize = 0x0074_44F0;
-
-    /// The walker display 0x7444F0 (cdecl, ObjectMaster*).
-    pub unsafe fn walker_display(object: usize) {
-        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(WALKER_DISPLAY)(object) }
-    }
-
     /// `LoadSonEffTex` 0x755DA0: Sonic's effect textures (no arguments; safe to call twice).
     pub unsafe fn load_sonic_effects() {
         unsafe { std::mem::transmute::<usize, extern "C" fn()>(LOAD_SONIC_EFFECTS)() }
@@ -1099,7 +1158,6 @@ mod ffi {
     pub unsafe fn draw_motion(_: usize, _: usize, _: f32) {}
     pub unsafe fn scale(_: f32) {}
     pub unsafe fn draw_object(_: usize) {}
-    pub unsafe fn walker_display(_: usize) {}
     pub unsafe fn refresh_fog() {}
     pub unsafe fn load_sonic_effects() {}
     pub unsafe fn calc_point(_: usize, p: [f32; 3]) -> [f32; 3] {
@@ -1125,7 +1183,7 @@ mod ffi {
 use ffi::{
     calc_point, draw_motion, draw_object, free_models, free_motions, free_texlist, load_models,
     load_motions, load_object, load_sonic_effects, load_texlist, project_screen, refresh_fog,
-    rotate, scale, translate, walker_display,
+    rotate, scale, translate,
 };
 
 #[cfg(test)]

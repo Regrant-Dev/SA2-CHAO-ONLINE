@@ -214,20 +214,46 @@ pub fn center(line: &str) {
     let fit = w * 0.95 / line.chars().count().max(1) as f32;
     let size = (h / 45.0).min(fit).round().max(8.0);
     let width = size * line.chars().count() as f32;
-    draw(&hud, (w - width) / 2.0, h * 0.3, size, TOAST_COLOR, line);
+    let (x, y) = ((w - width) / 2.0, h * 0.3);
+    backdrop(x, y, x + width, y + size, size);
+    draw(&hud, x, y, size, TOAST_COLOR, line);
+}
+
+/// The menu's dark panel behind text spanning (x1, y1)..(x2, y2), with a margin of half a
+/// character (`size`).
+fn backdrop(x1: f32, y1: f32, x2: f32, y2: f32, size: f32) {
+    let m = size * 0.5;
+    let b = (size / 8.0).round().max(1.0);
+    let rect = |x1: f32, y1: f32, x2: f32, y2: f32| [x1, y1, x2, y2].map(|v| v.round() as i32);
+    rects::push(
+        rect(x1 - m - b, y1 - m - b, x2 + m + b, y2 + m + b),
+        PANEL_BORDER,
+    );
+    rects::push(rect(x1 - m, y1 - m, x2 + m, y2 + m), PANEL_COLOR);
 }
 
 /// Two lines of large text, centred like `center` (the second a little smaller).
 pub fn center2(first: &str, second: &str) {
     let hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
     let (w, h) = screen_size();
-    let mut y = h * 0.3;
+    let top = h * 0.3;
+    let mut y = top;
+    let mut lines = Vec::new();
     for (line, big) in [(first, 45.0), (second, 55.0)] {
         let fit = w * 0.95 / line.chars().count().max(1) as f32;
         let size = (h / big).min(fit).round().max(8.0);
         let width = size * line.chars().count() as f32;
-        draw(&hud, (w - width) / 2.0, y, size, TOAST_COLOR, line);
+        lines.push(((w - width) / 2.0, y, size, line, width));
         y += size * 1.6;
+    }
+    // One panel behind both lines.
+    let left = lines.iter().map(|l| l.0).fold(f32::MAX, f32::min);
+    let right = lines.iter().map(|l| l.0 + l.4).fold(f32::MIN, f32::max);
+    let (last_y, last_size) = lines.last().map_or((top, 0.0), |l| (l.1, l.2));
+    let size = lines.first().map_or(10.0, |l| l.2);
+    backdrop(left, top, right, last_y + last_size, size);
+    for (x, y, size, line, _) in lines {
+        draw(&hud, x, y, size, TOAST_COLOR, line);
     }
 }
 
