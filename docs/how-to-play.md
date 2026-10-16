@@ -115,7 +115,9 @@ place along:
 and Alex and Kim into another, those are two separate stages that start and play on their own;
 the same goes for races. While a start is held, the screen shows who's there with you
 ("Players: You, Sam" in stages, "Opponents: Sam" in races and karate) and what to press. **Anyone** there can start it for everyone there: **F8**,
-controller **Start** (stages and story), or F9 > Start now; then 3-2-1-GO. So in story mode, if
+controller **Start** (stages and story), or F9 > Start now; then 3-2-1-GO. In stages, if a room
+player is still loading (slower PCs take longer), the start waits for them and shows "Waiting for
+Sam to load"; press again to go without them (it also goes by itself after 20 seconds). So in story mode, if
 you skip the cutscenes and your friend watches them, you wait until their name shows up and
 then start. A live karate fight starts when either fighter presses F8. The room's creator is
 just who made the room; they're not in charge of anything.

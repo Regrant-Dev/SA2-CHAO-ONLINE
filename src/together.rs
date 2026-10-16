@@ -3,7 +3,9 @@
 //! On a fresh entry into a stage, while other players are connected, the stage is frozen at
 //! its first frame (drawn like under the pause screen, nothing updates, the timer stands).
 //! Anyone in that group (the room's players in the same stage and mission) starts it for the
-//! whole group with Start, F8 or F9 > Start now: 3-2-1 and all go at once.
+//! whole group with Start, F8 or F9 > Start now: 3-2-1 and all go at once. Start waits until
+//! every room member is held at this start (slower PCs load longer); pressing again, or
+//! `WAIT_LIMIT`, goes without them.
 //! Restarts and Chao World are never held.
 
 use std::sync::Mutex;
@@ -17,6 +19,8 @@ const COUNTDOWN: Duration = Duration::from_secs(3);
 /// How long our "start now" flag stays up so others surely see it.
 const GO_FLAG_TIME: Duration = Duration::from_secs(2);
 const GO_TEXT_TIME: Duration = Duration::from_secs(1);
+/// How long Start waits for room members still loading before going without them.
+const WAIT_LIMIT: Duration = Duration::from_secs(20);
 
 /// What we know about another player for this.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +55,10 @@ struct Together {
     flags: u8,
     /// "Start now" was chosen in the menu.
     start_now: bool,
+    /// We asked to start at this time; waiting for room members still loading.
+    want_go: Option<Instant>,
+    /// Someone started while we were still loading: count down as soon as we're held.
+    go_seen: bool,
     /// A stage started together with others still in it (pausing doesn't stop it).
     live: bool,
 }
@@ -61,6 +69,8 @@ static TOGETHER: Mutex<Together> = Mutex::new(Together {
     go_until: None,
     flags: 0,
     start_now: false,
+    want_go: None,
+    go_seen: false,
     live: false,
 });
 
@@ -90,6 +100,8 @@ fn release(t: &mut Together) {
         game::hold_player(false);
         t.phase = Phase::Idle;
     }
+    t.want_go = None;
+    t.go_seen = false;
 }
 
 /// "Players: You, Sam, Alex" for the players held at the same start (`ids`, without us).
@@ -154,6 +166,7 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
         Phase::Pending => {
             // Freeze before the stage's first frames run, so nobody gets a head start.
             game::freeze_world_after(2);
+            t.go_seen |= someone_said_go;
             if game::game_state() == game::GAME_STATE_INGAME {
                 t.phase = Phase::Holding;
                 log!("together: holding at the start of level {level} mission {mission}");
@@ -162,22 +175,54 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
         Phase::Holding => {
             game::hold_player(true);
             // Anyone in this group goes for everyone in it: Start on the pad (the stage is
-            // frozen, so it doesn't pause), F8 or F9 > Start now.
+            // frozen, so it doesn't pause), F8 or F9 > Start now. The first press waits for room
+            // members still loading; a second press goes without them.
             let pressed = pressed || game::start_pressed();
-            if pressed {
+            let force = pressed && t.want_go.is_some();
+            if pressed && t.want_go.is_none() {
+                t.want_go = Some(now);
+                log!("together: start asked, waiting for everyone to load");
+            }
+            // Room members coming here: in this stage but not held yet (still loading), or
+            // between screens (level 0 or below, e.g. taken along from Stage Select). Members in
+            // another stage or Chao World play their own game and aren't waited for.
+            let loading: Vec<u8> = peers
+                .iter()
+                .filter(|p| members.contains(&p.id))
+                .filter(|p| {
+                    let here = p.level == level && p.mission == mission;
+                    (here && p.flags & (POSE_WAITING | POSE_GO) == 0) || p.level <= 0
+                })
+                .map(|p| p.id)
+                .collect();
+            let we_go = t.want_go.is_some_and(|asked| {
+                loading.is_empty() || force || now.duration_since(asked) >= WAIT_LIMIT
+            });
+            if we_go {
                 t.go_until = Some(now + GO_FLAG_TIME);
             }
-            if pressed || someone_said_go {
+            if we_go || someone_said_go || t.go_seen {
                 t.phase = Phase::Countdown {
                     go_at: now + COUNTDOWN,
                 };
                 log!(
                     "together: countdown ({})",
-                    if pressed {
+                    if !we_go {
+                        "someone started"
+                    } else if loading.is_empty() {
                         "we started"
                     } else {
-                        "someone started"
+                        "we started without everyone"
                     }
+                );
+                t.want_go = None;
+                t.go_seen = false;
+            } else if t.want_go.is_some() {
+                let names: Vec<String> =
+                    loading.iter().map(|id| crate::room::name_of(*id)).collect();
+                hud::center2(
+                    &format!("Waiting for {} to load", names.join(", ")),
+                    "Press Start or F8 again to go now",
                 );
             } else {
                 hud::center2(
