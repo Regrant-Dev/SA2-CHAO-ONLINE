@@ -449,10 +449,58 @@ pub fn read_chao_slot(index: usize) -> Option<ChaoData> {
     if index >= GARDEN_SLOTS {
         return None;
     }
+    // The game loads the Chao into memory when Chao World first opens; until then, the save
+    // file has them.
+    if !chao_in_memory() {
+        return saved_chao().get(index).cloned().flatten();
+    }
     let ptr = (CHAO_SLOTS + index * CHAO_SIZE) as *const u8;
     // SAFETY: ChaoSlots is a static array in the game's data section; index is bounds-checked.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, CHAO_SIZE) };
     ChaoData::from_bytes(bytes)
+}
+
+/// Any Chao (or egg) in memory: Chao World has loaded the Chao save.
+fn chao_in_memory() -> bool {
+    (0..GARDEN_SLOTS).any(|n| {
+        // SAFETY: the `ChaoType` byte of each static slot.
+        unsafe { ((CHAO_SLOTS + n * CHAO_SIZE + 0x80) as *const u8).read_volatile() != 0 }
+    })
+}
+
+static CHAO_SAVE_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The Chao save as last read: (file time, slots).
+type SavedChao = (Option<std::time::SystemTime>, Vec<Option<ChaoData>>);
+static SAVED_CHAO: std::sync::Mutex<Option<SavedChao>> = std::sync::Mutex::new(None);
+/// Where the Chao slots are in the save file (memory's 0x19F6EC4, in the file's layout).
+const FILE_CHAO_SLOTS: usize = 0x3AA4;
+
+/// From the loader at startup: the Chao save file.
+pub fn set_chao_save_path(path: String) {
+    let _ = CHAO_SAVE_PATH.set(path);
+}
+
+/// The Chao in the save file, re-read when it changes.
+fn saved_chao() -> Vec<Option<ChaoData>> {
+    let Some(path) = CHAO_SAVE_PATH.get() else {
+        return Vec::new();
+    };
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut cache = SAVED_CHAO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, slots)) = cache.as_ref()
+        && *at == modified
+    {
+        return slots.clone();
+    }
+    let data = std::fs::read(path).unwrap_or_default();
+    let slots: Vec<Option<ChaoData>> = (0..GARDEN_SLOTS)
+        .map(|n| {
+            let at = FILE_CHAO_SLOTS + n * CHAO_SIZE;
+            data.get(at..at + CHAO_SIZE).and_then(ChaoData::from_bytes)
+        })
+        .collect();
+    *cache = Some((modified, slots.clone()));
+    slots
 }
 
 /// The Chao we picked for a Chao Race, while at the race entrance or in the race (lane 0's

@@ -33,7 +33,7 @@ uses was checked against the game's code, and most of it in game.
 | MainCharObj1 / MainCharObj2 | 0x1DEA6C0 / 0x1DE9600 | player 1's EntityData1 / CharObj2 |
 | ControllerEnabled / TimerStopped | 0x174AFFF / 0x174AFDA | u8 |
 | HaveBattleDLC | 0x1A556F4 | set from Steam at startup; only read |
-| Chao slots | 0x19F6EC4 | 0x800-byte records |
+| Chao slots | 0x19F6EC4 | 0x800-byte records, filled when Chao World first loads. In the Chao save file (`SONIC2B__ALF`, path from the loader's GetChaoSavePath) they are at file offset 0x3AA4 + n*0x800 (matched byte for byte, 2026-10-16) |
 | CreateChao | 0x5501D0 | cdecl (record, 0, 0, &pos, angle) |
 | LoadObject | 0x46F680 | ESI = list, EDI = main, name on the stack |
 

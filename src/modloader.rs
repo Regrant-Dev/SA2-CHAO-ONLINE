@@ -54,7 +54,8 @@ pub struct HelperFunctions {
     _register_2p_intro_position: Fn0,
     _clear_2p_intro_position_list: Fn0,
     _get_main_save_path: Fn0,
-    _get_chao_save_path: Fn0,
+    /// The Chao save file's path (the loader may redirect saves).
+    pub get_chao_save_path: unsafe extern "C" fn() -> *const std::ffi::c_char,
     _register_end_position: Fn0,
     _clear_end_position_list: Fn0,
     _register_mission23_end_position: Fn0,
