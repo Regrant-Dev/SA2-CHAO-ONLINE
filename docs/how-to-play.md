@@ -34,7 +34,7 @@ Press **F9** in game. Pause first when typing: the game also reads letter keys a
 | Go to | Pick a player (Left/Right) and Enter: join them where they are (see Chat and friends) |
 | Live karate vs | In a room, at Karate: who your next fight is live against (first free player, or pick one) |
 | My Chao (races, karate) | Your one Chao for friends' races and karate (default: your first hatched Chao) |
-| Visit friends | On: up to 2 of the Chao living in the garden you're in visit friends in that same garden. Off: they stay home (takes effect right away) |
+| Visit friends | On: up to 2 of the Chao living in the garden you're in visit friends in that same garden (your My Chao first, if it lives there). Off: they stay home (takes effect right away) |
 | Friends' Chao in races | Friends' Chao take the CPU lanes of your Chao Races (default On) |
 | Practice karate | CPU, or a **copy** of a friend's Chao that your own game fights (Battle DLC) |
 | Export my Chao / Bring visitor Chao | Chao files (see Chao) |

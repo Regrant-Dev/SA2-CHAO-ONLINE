@@ -1150,6 +1150,8 @@ fn my_chosen_slot() -> Option<(usize, ChaoData)> {
 pub fn set_my_chao(slot: i32) {
     MY_CHAO_SLOT.store(slot, Ordering::Relaxed);
     RESEND_MY_CHAO.store(true, Ordering::Relaxed);
+    // It visits first: the garden visitors may change too.
+    RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
 }
 
 /// Visit friends: whether our Chao (up to 2 from the garden we're in) visit the others in it.
@@ -1209,15 +1211,15 @@ pub fn karate_opponents() -> Vec<(Option<u8>, String)> {
 /// Up to `MAX_CARRIED_CHAO` hatched, valid Chao living in `garden`, with their save slots
 /// (read-only).
 fn carried_chao(garden: i32) -> Vec<(usize, ChaoData)> {
-    (0..game::GARDEN_SLOTS)
-        .filter_map(|slot| game::read_chao_slot(slot).map(|c| (slot, c)))
-        .filter(|(_, c)| {
-            i32::from(c.garden()) == garden
-                && c.chao_type() != chao::TYPE_EGG
-                && c.validate().is_ok()
-        })
-        .take(MAX_CARRIED_CHAO)
-        .collect()
+    // My Chao first when it lives here, then the others in save order.
+    let mine = my_chosen_slot().map(|(slot, _)| slot);
+    let mut here: Vec<(usize, ChaoData)> = hatched_chao()
+        .into_iter()
+        .filter(|(_, c)| i32::from(c.garden()) == garden)
+        .collect();
+    here.sort_by_key(|(slot, _)| (Some(*slot) != mine, *slot));
+    here.truncate(MAX_CARRIED_CHAO);
+    here
 }
 
 pub fn shutdown() {

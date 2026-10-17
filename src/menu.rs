@@ -515,7 +515,11 @@ fn my_chao_label(slot: i32) -> String {
             GARDENS[usize::from(chao.garden()).min(3)],
             s + 1
         ),
-        None => "first Chao".into(),
+        // Automatic: the first hatched Chao.
+        None => match hatched.first() {
+            Some((s, chao)) => format!("Auto: {} (slot {})", karate::chao_name(chao), s + 1),
+            None => "Auto (no hatched Chao yet)".into(),
+        },
     }
 }
 
