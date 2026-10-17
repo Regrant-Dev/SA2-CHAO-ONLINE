@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::chao::{self, ChaoData, file};
@@ -111,13 +112,16 @@ fn log_save_chao() {
 
 /// When we entered the current garden, and whether the visitors from files came yet.
 static IN_GARDEN: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+/// The garden we're in (0 outside): the transporter goes straight from one garden to the next
+/// (0x52B030), and the old one's Chao objects are gone then too.
+static AREA: AtomicI32 = AtomicI32::new(0);
 /// Visitors from files come this long after entering a garden (it has loaded by then).
 const IMPORT_AFTER: Duration = Duration::from_secs(2);
 
 /// Brings the visitors from `chao/import` once per garden visit, shortly after arriving.
-fn auto_import() {
+fn auto_import(changed: bool) {
     let mut g = IN_GARDEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !game::in_garden() {
+    if !game::in_garden() || changed {
         *g = None;
         return;
     }
@@ -132,7 +136,13 @@ fn auto_import() {
 /// Call every frame: frees the visitor slots once the player is out of the garden.
 pub fn on_frame() {
     log_save_chao();
-    auto_import();
+    let area = if game::in_garden() {
+        game::current_chao_area()
+    } else {
+        0
+    };
+    let changed = AREA.swap(area, Ordering::Relaxed) != area;
+    auto_import(changed);
     {
         // A visitor must never be carried out of the garden: the next area would recreate it
         // from our buffer, which is reused for other visitors.
@@ -151,7 +161,9 @@ pub fn on_frame() {
             }
         }
     }
-    if !game::in_garden() {
+    if changed {
+        // Left the garden, or went straight to another one.
+        crate::garden::clear();
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         if pool
             .buffers
@@ -159,14 +171,13 @@ pub fn on_frame() {
             .any(|b| b.used_by.is_some() || b.freed.is_some())
         {
             log!(
-                "visitors: left garden, {} visitor buffer(s) released",
+                "visitors: left the garden, {} visitor buffer(s) released",
                 pool.count()
             );
             for b in &mut pool.buffers {
                 b.used_by = None;
                 b.freed = None;
             }
-            crate::garden::clear();
             drop(pool);
             // The garden may have changed them (the game saves on leaving too).
             export_all(crate::online::mod_path());
@@ -345,5 +356,9 @@ fn spawn(
     // not reused until the player leaves the garden.
     let object = unsafe { game::create_chao(data, position, angle) };
     log!("visitors: CreateChao returned {object:p}");
+    if object.is_null() {
+        // Nothing uses the buffer: free it so this Chao can come again.
+        pool.buffers[index].used_by = None;
+    }
     object as usize
 }

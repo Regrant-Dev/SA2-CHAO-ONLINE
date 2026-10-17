@@ -33,6 +33,8 @@ const SEND_EVERY: u32 = 15;
 const STALE: Duration = Duration::from_secs(3);
 /// Search this many route points around the last match before searching all of it.
 const NEAR_POINTS: usize = 40;
+/// How long after a finish an unfinished status from the same player is taken as a late one.
+const LATE_STATUS: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy)]
 struct Other {
@@ -49,6 +51,8 @@ type RouteOut = (i16, u8, Vec<[f32; 3]>);
 
 struct Race {
     stage: Option<(i16, u8)>,
+    /// `game::stage_run` of `stage`: a replay is a new race.
+    run: u32,
     route: Option<Vec<Vector>>,
     recording: Vec<Vector>,
     near: usize,
@@ -68,6 +72,7 @@ fn with<R>(f: impl FnOnce(&mut Race) -> R) -> R {
     let mut r = RACE.lock().unwrap_or_else(|e| e.into_inner());
     f(r.get_or_insert_with(|| Race {
         stage: None,
+        run: 0,
         route: None,
         recording: Vec::new(),
         near: 0,
@@ -133,6 +138,10 @@ fn distance2(a: Vector, b: Vector) -> f32 {
 /// Adds `at` to a route being recorded: a point every `STEP`; coming back near an earlier point
 /// (a restart after a death) cuts the loop off.
 fn record(points: &mut Vec<Vector>, at: Vector) {
+    // Longer routes couldn't be shared (`MAX_ROUTE`).
+    if points.len() >= crate::net::protocol::MAX_ROUTE {
+        return;
+    }
     let Some(&last) = points.last() else {
         points.push(at);
         return;
@@ -189,6 +198,25 @@ fn progress(route: &[Vector], at: Vector, near: &mut usize) -> f32 {
     ((i as f32 + frac) / (n - 1).max(1) as f32).clamp(0.0, 1.0)
 }
 
+/// Whether `to` is further along this stage's route than `from`: always without `from`, never
+/// without a route (the stage hasn't been cleared here yet, so there's no telling).
+pub fn is_further(from: Option<[f32; 3]>, to: [f32; 3]) -> bool {
+    let v = |p: [f32; 3]| Vector {
+        x: p[0],
+        y: p[1],
+        z: p[2],
+    };
+    let Some(from) = from else {
+        return true;
+    };
+    with(|r| {
+        r.route.as_ref().is_some_and(|route| {
+            let (mut a, mut b) = (0, 0);
+            progress(route, v(to), &mut b) >= progress(route, v(from), &mut a)
+        })
+    })
+}
+
 /// The game's clear time in centiseconds.
 fn game_time() -> u32 {
     // SAFETY: the game's static timer bytes.
@@ -226,10 +254,19 @@ pub fn received_status(
     finish: Option<(u32, u32)>,
 ) {
     with(|r| {
-        let announced = r
+        let before = r
             .others
             .get(&from)
-            .is_some_and(|(l, m, o)| (*l, *m) == (level, mission) && o.announced);
+            .filter(|(l, m, _)| (*l, *m) == (level, mission))
+            .map(|(_, _, o)| *o);
+        // A status from before their finish arriving after it (sent unreliably) doesn't
+        // take the finish back.
+        if finish.is_none()
+            && before.is_some_and(|o| o.finish.is_some() && o.at.elapsed() < LATE_STATUS)
+        {
+            return;
+        }
+        let announced = before.is_some_and(|o| o.announced);
         r.others.insert(
             from,
             (
@@ -252,16 +289,32 @@ pub fn received_route(level: i16, mission: u8, points: Vec<[f32; 3]>) {
         .into_iter()
         .map(|[x, y, z]| Vector { x, y, z })
         .collect();
-    if points.len() < 2 || load_route(level, mission).is_some() {
+    if points.len() < 2 {
         return;
     }
-    save_route(level, mission, &points);
-    with(|r| {
-        if r.stage == Some((level, mission)) {
-            r.route = Some(points);
-        }
-    });
+    // The files are read and written on a thread of their own: the network thread holds the
+    // lock the game thread waits on, and a disk can be slow.
+    let saved = std::thread::Builder::new()
+        .name("sa2-chao-online route".into())
+        .spawn(move || {
+            let _one_at_a_time = ROUTE_FILES.lock().unwrap_or_else(|e| e.into_inner());
+            if load_route(level, mission).is_some() {
+                return;
+            }
+            save_route(level, mission, &points);
+            with(|r| {
+                if r.stage == Some((level, mission)) && r.route.is_none() {
+                    r.route = Some(points);
+                }
+            });
+        });
+    if let Err(e) = saved {
+        log!("race: can't save a route: {e}");
+    }
 }
+
+/// Held while a received route is checked and saved.
+static ROUTE_FILES: Mutex<()> = Mutex::new(());
 
 /// To send: our race status (level, mission, progress, finish, reliably), and a route we
 /// recorded.
@@ -276,8 +329,10 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
     let in_stage = level > 0 && level != game::LEVEL_CHAO_WORLD && !game::two_player();
     with(|r| {
         let stage = in_stage.then_some((level, mission));
-        if r.stage != stage {
+        let run = game::stage_run();
+        if r.stage != stage || r.run != run {
             r.stage = stage;
+            r.run = run;
             r.route = stage.and_then(|(l, m)| load_route(l, m));
             r.recording.clear();
             r.near = 0;

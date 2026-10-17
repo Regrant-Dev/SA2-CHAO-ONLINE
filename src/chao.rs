@@ -288,7 +288,9 @@ pub mod changes {
         Or32,
     }
 
-    /// (offset, count, stride, kind).
+    /// (offset, count, stride, kind). Not evolution progress (0xC0): the game raises it by
+    /// itself over time, in the owner's game too, so a friend's copy forwarding it while they
+    /// touch it would count that time twice.
     const FIELDS: &[(usize, usize, usize, Kind)] = &[
         (0x20, 8, 1, Kind::U8(0, 99)),             // stat progress
         (0x30, 8, 1, Kind::U8(0, 99)),             // stat levels
@@ -299,12 +301,14 @@ pub mod changes {
         (0xA8, 1, 4, Kind::F32(-1.0, 1.0)),        // power/run
         (0xAC, 1, 4, Kind::F32(-1.0, 1.0)),        // fly/swim
         (0xB0, 1, 4, Kind::F32(-1.0, 1.0)),        // alignment
-        (0xC0, 1, 4, Kind::F32(0.0, 1.2)),         // evolution progress
         (0x118, 1, 4, Kind::Or32),                 // animals seen
         (0x11C, 8, 1, Kind::Set),                  // animal parts
         (0x16C, 6, 6, Kind::I8),                   // bond "like", per character
         (0x16D, 6, 6, Kind::U8(0, 200)),           // bond familiarity, per character
     ];
+
+    /// Offsets a friend's changes may only increase (stat levels, stat points, lifespans).
+    const GROW_ONLY: [std::ops::Range<usize>; 2] = [0x30..0x48, 0x8A..0x8E];
 
     fn read(b: &[u8; CHAO_SIZE], at: usize, kind: Kind) -> f32 {
         match kind {
@@ -355,6 +359,11 @@ pub mod changes {
                 }
             });
             let Some(kind) = kind else { continue };
+            // A friend can only add to these, whatever their game sends: stat levels and
+            // points, lifespan and max lifespan (a shortened life could end it).
+            if value < 0.0 && GROW_ONLY.iter().any(|r| r.contains(&at)) {
+                continue;
+            }
             let b = &mut chao.bytes;
             let now = read(b, at, kind);
             match kind {
@@ -388,6 +397,21 @@ pub mod changes {
             ChaoData {
                 bytes: [0; CHAO_SIZE],
             }
+        }
+
+        #[test]
+        fn a_friend_cannot_shorten_life_or_lower_stats() {
+            let mut owner = blank();
+            owner.bytes[0x8A..0x8C].copy_from_slice(&500i16.to_le_bytes());
+            owner.bytes[0x30] = 10;
+            apply(&mut owner, &[(0x8A, -500.0), (0x30, -10.0), (0x82, -5.0)]);
+            assert_eq!(
+                i16::from_le_bytes([owner.bytes[0x8A], owner.bytes[0x8B]]),
+                500
+            );
+            assert_eq!(owner.bytes[0x30], 10);
+            // Happiness can drop (hitting it counts, as in the game).
+            assert_eq!(owner.bytes[0x82] as i8, -5);
         }
 
         #[test]

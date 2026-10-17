@@ -290,6 +290,8 @@ fn main() {
                             yaw,
                             wheel,
                             kind,
+                            accel,
+                            tilt,
                             frame,
                         },
                     ..
@@ -300,6 +302,8 @@ fn main() {
                         yaw,
                         wheel,
                         kind,
+                        accel,
+                        tilt,
                         frame,
                     };
                     session.send(body, false, now);

@@ -109,13 +109,9 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
             } else {
                 format!("{host}:{DEFAULT_PORT}")
             };
-            let addr = full
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut a| a.next())
-                .ok_or_else(|| {
-                    format!("bad host address '{host}' (use a name or IP, :port optional)")
-                })?;
+            let addr = resolve(&full).ok_or_else(|| {
+                format!("bad host address '{host}' (use a name or IP, :port optional)")
+            })?;
             Mode::Client { host: addr }
         }
         other => return Err(format!("unknown mode '{other}'")),
@@ -180,8 +176,6 @@ struct Online {
     resend_chao: bool,
     /// Our visitors' looks as last sent (index -> type and animal bytes).
     sent_looks: std::collections::HashMap<u8, Vec<u8>>,
-    /// Flags of our last sent state (to log spin ball changes).
-    last_flags: u8,
     /// "My Chao" as last sent to the others (live karate uses it on both sides).
     my_chao: Option<ChaoData>,
     /// The Chao we picked for a Chao Race, sent in place of My Chao while racing so friends'
@@ -197,6 +191,38 @@ static MOD_PATH: OnceLock<String> = OnceLock::new();
 
 /// Reads `config.ini` (F9 menu / SA Mod Manager), or an `online.ini` from older versions;
 /// defaults (off) when neither exists.
+/// Longest we wait for a host name to be looked up (this runs when settings are applied, and
+/// the game waits for it).
+const RESOLVE_LIMIT: Duration = Duration::from_secs(3);
+
+/// `host:port` as an address: an IP at once, a name looked up on a thread of its own and given
+/// up after `RESOLVE_LIMIT`. Our socket is IPv4, so an IPv4 address is preferred ("localhost"
+/// can give ::1 first).
+fn resolve(full: &str) -> Option<SocketAddr> {
+    if let Ok(addr) = full.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = full.to_string();
+    thread::Builder::new()
+        .name("sa2-chao-online resolve".into())
+        .spawn(move || {
+            let found = name.to_socket_addrs().ok().and_then(|a| {
+                let all: Vec<SocketAddr> = a.collect();
+                all.iter().find(|a| a.is_ipv4()).or(all.first()).copied()
+            });
+            let _ = tx.send(found);
+        })
+        .ok()?;
+    match rx.recv_timeout(RESOLVE_LIMIT) {
+        Ok(found) => found,
+        Err(_) => {
+            log!("online: looking up '{full}' took too long");
+            None
+        }
+    }
+}
+
 fn load_config(mod_path: &str) -> Result<Config, String> {
     let dir = Path::new(mod_path);
     for file in ["config.ini", "online.ini"] {
@@ -250,7 +276,6 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
         garden: -1,
         resend_chao: false,
         sent_looks: std::collections::HashMap::new(),
-        last_flags: 0,
         my_chao: None,
         race_chao: None,
         rejoin,
@@ -384,7 +409,14 @@ pub fn init(mod_path: &str) {
         .spawn(|| {
             while !STOP.load(Ordering::Relaxed) {
                 if let Some(online) = ONLINE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                    pump(online, Instant::now());
+                    // A bug in one message's handling must not stop networking for good (the
+                    // panic hook logs it).
+                    let pumped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pump(online, Instant::now());
+                    }));
+                    if pumped.is_err() {
+                        log!("online: the network thread recovered from a panic");
+                    }
                 }
                 thread::sleep(POLL_EVERY);
             }
@@ -423,6 +455,11 @@ fn pump(online: &mut Online, now: Instant) {
             Event::Disconnected { reason } => {
                 log!("online: disconnected: {reason}");
                 online.remote.clear();
+                crate::garden::player_left(None);
+                // A different version won't get any better by retrying.
+                if reason.starts_with("rejected: protocol") || reason.starts_with("rejected: mod") {
+                    online.rejoin = None;
+                }
                 if let Some((_, _, at)) = &mut online.rejoin {
                     *at = Some(now + RECONNECT_AFTER);
                     hud::toast(format!("Disconnected ({reason}), retrying..."));
@@ -452,6 +489,7 @@ fn pump(online: &mut Online, now: Instant) {
                     .map(|r| r.name)
                     .unwrap_or_default();
                 log!("online: player {id} '{name}' left");
+                crate::garden::player_left(Some(id));
                 hud::toast(format!("{name} left"));
             }
             Event::Game {
@@ -619,9 +657,22 @@ fn pump(online: &mut Online, now: Instant) {
                         yaw,
                         wheel,
                         kind,
+                        accel,
+                        tilt,
                         frame,
                     },
-            } => crate::kart::received_state(from, (position, rotation, yaw, wheel, kind), frame),
+            } => {
+                let kart = crate::kart::MyKart {
+                    position,
+                    rotation,
+                    yaw,
+                    wheel,
+                    kind,
+                    accel,
+                    tilt,
+                };
+                crate::kart::received_state(from, kart, frame);
+            }
             Event::Game {
                 from,
                 body:
@@ -667,15 +718,16 @@ fn pump(online: &mut Online, now: Instant) {
                 ..
             } => {}
             Event::Game {
+                from,
                 body:
                     Body::ChaoChanges {
                         owner,
                         index,
                         changes,
                     },
-                ..
             } => {
-                if Some(owner) == online.session.my_id() {
+                // Only from someone in our garden: our Chao are only there.
+                if Some(owner) == online.session.my_id() && in_my_garden(online, from) {
                     crate::garden::received_changes(index, changes);
                 }
             }
@@ -688,27 +740,121 @@ fn pump(online: &mut Online, now: Instant) {
                         offset,
                     },
             } => {
-                if Some(owner) == online.session.my_id() {
+                if Some(owner) == online.session.my_id() && in_my_garden(online, from) {
                     crate::garden::received_held(from, index, offset);
                 }
             }
             Event::Game {
+                from,
                 body:
                     Body::StageKills {
                         level,
                         mission,
                         objects,
                     },
-                ..
             } => {
-                // From a room player, or the referee's list for this stage (sent with a
-                // stand-in sender, see net/session.rs `deliver`).
-                if room::in_room() {
+                // Co-op messages count only from players in our room.
+                if room::shares_room(from) {
                     crate::coop::received(level, mission, objects);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::Shot {
+                        level,
+                        mission,
+                        kind,
+                        position,
+                        direction,
+                    },
+            } => {
+                if room::shares_room(from)
+                    && level == game::current_level()
+                    && mission == game::mission()
+                {
+                    crate::shots::received((kind, position, direction));
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::Switch {
+                        level,
+                        mission,
+                        id,
+                        on,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::coop::received_switch(level, mission, id, on);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::KeyUsed {
+                        level,
+                        mission,
+                        key,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::coop::received_key(level, mission, key);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::Checkpoint {
+                        level,
+                        mission,
+                        record,
+                        position,
+                        rotation,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::coop::received_checkpoint(level, mission, record, position, rotation);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::Ball {
+                        area,
+                        claim,
+                        position,
+                        velocity,
+                    },
+            } => crate::toys::received(from, (area, claim, position, velocity)),
+            Event::Game {
+                from,
+                body:
+                    Body::BossHp {
+                        level,
+                        mission,
+                        hp,
+                        full,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::bosses::received(level, mission, hp, full);
                 }
             }
         }
     }
+}
+
+/// Player `id` is in the garden we're in.
+fn in_my_garden(online: &Online, id: u8) -> bool {
+    game::in_garden()
+        && online.remote.get(&id).is_some_and(|r| {
+            r.latest.is_some_and(|s| {
+                s.level == game::LEVEL_CHAO_WORLD
+                    && i32::from(s.chao_area) == game::current_chao_area()
+            })
+        })
 }
 
 /// Game thread: hand remote poses to the puppets and send our own state.
@@ -1003,6 +1149,28 @@ pub fn on_frame() {
         .ok()
         .filter(|a| (1..=3).contains(a))
         .unwrap_or(0);
+    let friends: Vec<u8> = online
+        .remote
+        .iter()
+        .filter(|(_, r)| {
+            area != 0
+                && r.latest.is_some_and(|s| {
+                    s.level == game::LEVEL_CHAO_WORLD && i32::from(s.chao_area) == i32::from(area)
+                })
+        })
+        .map(|(&id, _)| id)
+        .collect();
+    if let Some((area, claim, position, velocity)) =
+        crate::toys::on_frame(online.session.my_id(), area, &friends)
+    {
+        let body = Body::Ball {
+            area,
+            claim,
+            position,
+            velocity,
+        };
+        online.session.send(body, false, now);
+    }
     for (area, items) in crate::items::on_frame(online.session.my_id(), area) {
         online
             .session
@@ -1012,14 +1180,16 @@ pub fn on_frame() {
         online.session.send(Body::KartPick { course }, true, now);
     }
     if online.frame.is_multiple_of(STATE_EVERY_FRAMES)
-        && let Some(((position, rotation, yaw, wheel, kind), frame)) = crate::kart::take_mine()
+        && let Some((kart, frame)) = crate::kart::take_mine()
     {
         let body = Body::KartState {
-            position,
-            rotation,
-            yaw,
-            wheel,
-            kind,
+            position: kart.position,
+            rotation: kart.rotation,
+            yaw: kart.yaw,
+            wheel: kart.wheel,
+            kind: kart.kind,
+            accel: kart.accel,
+            tilt: kart.tilt,
             frame,
         };
         online.session.send(body, false, now);
@@ -1069,6 +1239,57 @@ pub fn on_frame() {
     }
     for id in crate::items::take_claims() {
         online.session.send(Body::ItemClaim { id }, true, now);
+    }
+    for (kind, position, direction) in crate::shots::take_outgoing() {
+        let body = Body::Shot {
+            level: game::current_level(),
+            mission: game::mission(),
+            kind,
+            position,
+            direction,
+        };
+        online.session.send(body, false, now);
+    }
+    for (level, mission, id) in crate::coop::take_switches() {
+        let body = Body::Switch {
+            level,
+            mission,
+            id,
+            on: true,
+        };
+        online.session.send(body, true, now);
+    }
+    for (level, mission, key) in crate::coop::take_keys() {
+        online.session.send(
+            Body::KeyUsed {
+                level,
+                mission,
+                key,
+            },
+            true,
+            now,
+        );
+    }
+    if let Some((level, mission, hp, full)) = crate::bosses::take_outgoing() {
+        let body = Body::BossHp {
+            level,
+            mission,
+            hp,
+            full,
+        };
+        online.session.send(body, true, now);
+    }
+    if let Some((level, mission, checkpoints)) = crate::coop::take_checkpoints() {
+        for (record, position, rotation) in checkpoints {
+            let body = Body::Checkpoint {
+                level,
+                mission,
+                record,
+                position,
+                rotation,
+            };
+            online.session.send(body, true, now);
+        }
     }
     if let Some((level, mission, objects)) = crate::coop::take_outgoing() {
         let body = Body::StageKills {
@@ -1123,17 +1344,6 @@ pub fn on_frame() {
             state.anim = 0;
             state.flags |= game::POSE_RACE_CHAO;
         }
-        if (state.flags ^ online.last_flags) & game::POSE_BALL != 0 {
-            log!(
-                "online: spin ball {}",
-                if state.flags & game::POSE_BALL != 0 {
-                    "on"
-                } else {
-                    "off"
-                }
-            );
-        }
-        online.last_flags = state.flags;
         online.session.send(Body::PlayerState(state), false, now);
         let (karate_state, karate_end) = crate::karate_live::take_outgoing();
         if let Some(state) = karate_state {

@@ -317,3 +317,16 @@ motion slots 88..135 (same 33-node skeleton, so a mismatch only looks wrong, nev
 Confidence: high for the display table, both crash causes and slot lists; medium that nothing
 else (e.g. 0x42FD10's per-character effect textures, 0x173B3D8[char]) is needed for a different
 walker type — the display itself doesn't read it.
+
+## Walker shots (2026-10-17)
+
+- Bullet: `CreateWalkerBullet` 0x75D7D0 (EAX parent or 0, ECX &velocity, stack &position, caller
+  pops 4); object `WalkerBulletExecutor` (name 0x901660) in list 3, main 0x75D520 (until it
+  dies: main = DeleteObject), Data1 +0x14 position, +0x20 velocity; then 0x75D630 and the muzzle
+  effect 0x755690(&position). One caller: the walker fire code at 0x741734 (position =
+  CharObj2+0x248).
+- Bazooka: 0x75DCA0 (EAX parent or 0, EBX &position, stack &velocity), `WalkerBazookaExecutor`
+  (0x901678), main 0x75D9F0, same Data1 layout; callers 0x7416A0, 0x7416EE.
+- `WalkerJetExecutor` (0x901690, creator near 0x75EE9B) is the booster flame; `EWalker2PLaserMan`
+  is 2P only.
+- Co-op mirrors bullets and shells (`src/shots.rs`, `Body::Shot`).

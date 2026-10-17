@@ -33,6 +33,9 @@ const MAX_TRIES: u32 = 40;
 const REORDER_WINDOW: u32 = 256;
 /// Links to unknown addresses we accept; the session layer drops unwanted ones.
 const MAX_LINKS: usize = 16;
+/// A link that has heard nothing this long and has nothing left to deliver is dropped (the
+/// session gave up on it long before), so stray packets can't fill the table.
+const LINK_IDLE: Duration = Duration::from_secs(20);
 
 mod kind {
     pub const UNRELIABLE: u8 = 0;
@@ -64,6 +67,8 @@ struct Link {
     out_of_order: BTreeMap<u32, Vec<u8>>,
     fragments: Vec<u8>,
     next_fragment: u8,
+    /// When the peer last sent us anything.
+    last_heard: Option<Instant>,
 }
 
 impl Link {
@@ -76,6 +81,7 @@ impl Link {
             out_of_order: BTreeMap::new(),
             fragments: Vec::new(),
             next_fragment: 0,
+            last_heard: None,
         }
     }
 
@@ -165,7 +171,7 @@ impl Endpoint {
         let mut buf = [0u8; 2048];
         loop {
             match self.socket.recv_from(&mut buf) {
-                Ok((n, from)) => self.handle_packet(from, &buf[..n], &mut out),
+                Ok((n, from)) => self.handle_packet(from, &buf[..n], now, &mut out),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 // Windows reports ICMP port-unreachable as ConnectionReset on UDP; ignore it.
                 Err(e) if e.kind() == ErrorKind::ConnectionReset => continue,
@@ -180,6 +186,7 @@ impl Endpoint {
         &mut self,
         from: SocketAddr,
         packet: &[u8],
+        now: Instant,
         out: &mut Vec<(SocketAddr, Received)>,
     ) {
         let Ok((kind, epoch, seq, payload)) = parse_header(packet) else {
@@ -192,6 +199,7 @@ impl Endpoint {
             self.links.insert(from, Link::new());
         }
         let link = self.links.get_mut(&from).expect("inserted above");
+        link.last_heard = Some(now);
         match link.remote_epoch {
             None => link.reset_receive(epoch),
             // The peer restarted: it lost everything, so start both directions over.
@@ -219,13 +227,19 @@ impl Endpoint {
                 }
             }
             kind::RELIABLE => {
+                let ahead = seq.wrapping_sub(link.next_recv_seq);
+                // Too far ahead: not kept, so not acked either (it's sent again later). A
+                // duplicate of something delivered is acked again and dropped.
+                let duplicate = ahead > u32::MAX / 2;
+                if ahead >= REORDER_WINDOW && !duplicate {
+                    return;
+                }
                 let ack = self.packet(kind::ACK, seq, &[]);
                 self.raw_send(from, &ack);
-                let link = self.links.get_mut(&from).expect("inserted above");
-                let ahead = seq.wrapping_sub(link.next_recv_seq);
-                if ahead >= REORDER_WINDOW {
-                    return; // duplicate (already delivered) or absurdly far ahead
+                if duplicate {
+                    return;
                 }
+                let link = self.links.get_mut(&from).expect("inserted above");
                 link.out_of_order.insert(seq, payload.to_vec());
                 while let Some(payload) = link.out_of_order.remove(&link.next_recv_seq) {
                     link.next_recv_seq = link.next_recv_seq.wrapping_add(1);
@@ -274,6 +288,12 @@ impl Endpoint {
             self.links.remove(&addr);
             out.push((addr, Received::LinkFailed));
         }
+        self.links.retain(|_, link| {
+            !link.unacked.is_empty()
+                || link
+                    .last_heard
+                    .is_none_or(|at| now.duration_since(at) < LINK_IDLE)
+        });
     }
 
     fn packet(&self, kind: u8, seq: u32, payload: &[u8]) -> Vec<u8> {

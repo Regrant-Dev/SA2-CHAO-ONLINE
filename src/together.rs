@@ -49,6 +49,8 @@ enum Phase {
 
 struct Together {
     level: i16,
+    /// `game::stage_run` of `level`: a replay of the same stage is a new start.
+    run: u32,
     phase: Phase,
     go_until: Option<Instant>,
     /// Flags to send in our next player state.
@@ -65,6 +67,7 @@ struct Together {
 
 static TOGETHER: Mutex<Together> = Mutex::new(Together {
     level: -1,
+    run: 0,
     phase: Phase::Idle,
     go_until: None,
     flags: 0,
@@ -147,9 +150,11 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
     let mission = game::mission();
     let pressed = std::mem::take(&mut t.start_now);
 
-    if level != t.level {
+    let run = game::stage_run();
+    if level != t.level || run != t.run {
         release(&mut t);
         t.level = level;
+        t.run = run;
         t.go_until = None;
         t.phase = if crate::room::in_room() && connected && is_stage(level) && !game::two_player() {
             Phase::Pending

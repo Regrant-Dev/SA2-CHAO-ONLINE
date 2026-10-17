@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -35,6 +35,8 @@ pub const MAX_CHAT: usize = 80;
 const MAX_CHAO_CHANGES: usize = 128;
 /// Stage object records per stage (`SETObjectData[0x600]`, re/stage-objects.md).
 pub const MAX_STAGE_OBJECTS: u16 = 0x600;
+/// Largest boss HP accepted (bosses use single digits).
+pub const MAX_BOSS_HP: f32 = 1000.0;
 /// Animation frames; real motions are a few hundred frames long.
 const MAX_FRAME: f32 = 1.0e5;
 
@@ -163,13 +165,16 @@ pub enum Body {
         course: u8,
     },
     /// The sender's kart in a Kart Race, ~30 per second: where, facing, the display's extra yaw
-    /// and wheel angle (BAMS), and the kart type (2..=7).
+    /// and wheel angle (BAMS), the kart type (2..=7), accelerator held (bright exhaust) and the
+    /// body tilt from jumps and bumps (BAMS).
     KartState {
         position: [f32; 3],
         rotation: [i32; 3],
         yaw: i32,
         wheel: i32,
         kind: u8,
+        accel: bool,
+        tilt: [i32; 3],
         /// The sender's game frame it was taken on (wraps): exact timing for its motion.
         frame: u16,
     },
@@ -207,6 +212,62 @@ pub enum Body {
         mission: u8,
         objects: Vec<u16>,
     },
+    /// Co-op room: stage key `key` (0 or 1) went into its keyhole in this stage; the others'
+    /// keys go in too, so their doors open.
+    KeyUsed {
+        level: i16,
+        mission: u8,
+        key: u8,
+    },
+    /// Co-op room: the sender's mech fired (kind 0 bullet, 1 bazooka) from `position` along
+    /// `direction`; the others fire the same shot in their game.
+    Shot {
+        level: i16,
+        mission: u8,
+        kind: u8,
+        position: [f32; 3],
+        direction: [f32; 3],
+    },
+    /// Co-op room: stage switch `id` (< 32) turned on or off in the sender's game; doors and
+    /// gates that watch it follow in everyone's game.
+    Switch {
+        level: i16,
+        mission: u8,
+        id: u8,
+        on: bool,
+    },
+    /// Co-op room: the sender passed checkpoint `record` (a SET record index) in this stage and
+    /// was at `position`/`rotation`; the others mark it passed and restart there too.
+    Checkpoint {
+        level: i16,
+        mission: u8,
+        record: u16,
+        position: [f32; 3],
+        rotation: [i32; 3],
+    },
+    /// Shared garden: the garden ball as the sender (whoever kicked or held it last, claim
+    /// `claim`) has it; the others' ball follows.
+    Ball {
+        area: u8,
+        claim: u16,
+        position: [f32; 3],
+        velocity: [f32; 3],
+    },
+    /// Co-op room: the sender's boss in this stage is down to `hp` (its bar started at `full`);
+    /// the others' boss drops to it too.
+    BossHp {
+        level: i16,
+        mission: u8,
+        hp: f32,
+        full: f32,
+    },
+}
+
+/// A short signature of a treasure hunt's 3 pieces (kind, id): claims name the hunt they're for.
+pub fn hunt_signature(pieces: &[(u8, u8, [f32; 3]); 3]) -> u32 {
+    pieces.iter().fold(0x811C_9DC5u32, |h, (k, i, _)| {
+        (h ^ u32::from(*k)).wrapping_mul(0x0100_0193) ^ u32::from(*i)
+    })
 }
 
 /// Live karate: one fighter as the leader's game has it.
@@ -237,7 +298,17 @@ pub struct GardenChao {
     /// Face: eyes and mouth ids.
     pub eyes: i16,
     pub mouth: i16,
+    /// Toys and instruments in its hands: per attach point (`garden::PROP_NODES`), 0 for none
+    /// or 1 + an index into `garden::PROPS` (a fixed table: no game addresses on the wire).
+    pub props: [u8; 3],
+    /// The drum in front of it: its size 0..=255 (0 = none).
+    pub drum: u8,
+    /// In a cocoon: 0 none, else 1 + its kind (0..=2, `MayuObjectList`).
+    pub cocoon: u8,
 }
+
+/// Entries in `garden::PROPS` (`GardenChao::props` values go up to this).
+pub const MAX_CHAO_PROP: u8 = 20;
 
 /// A shared garden item, the same in every game: who first had it and their number for it.
 /// It keeps this id when it changes hands.
@@ -354,6 +425,12 @@ mod tag {
     pub const HUNT_SET: u8 = 22;
     pub const HUNT_CLAIM: u8 = 23;
     pub const HUNT_TAKEN: u8 = 24;
+    pub const KEY_USED: u8 = 25;
+    pub const SHOT: u8 = 26;
+    pub const SWITCH: u8 = 27;
+    pub const CHECKPOINT: u8 = 28;
+    pub const BALL: u8 = 29;
+    pub const BOSS_HP: u8 = 30;
 }
 
 fn item_id(r: &mut Reader) -> Result<ItemId> {
@@ -550,6 +627,10 @@ impl Body {
                         .i32(c.bubble.2)
                         .i16(c.eyes)
                         .i16(c.mouth);
+                    for p in c.props {
+                        w.u8(p);
+                    }
+                    w.u8(c.drum).u8(c.cocoon);
                 }
             }
             Self::ChaoChanges {
@@ -662,6 +743,8 @@ impl Body {
                 yaw,
                 wheel,
                 kind,
+                accel,
+                tilt,
                 frame,
             } => {
                 w.u8(tag::KART_STATE);
@@ -671,7 +754,11 @@ impl Body {
                 for a in rotation {
                     w.i32(*a);
                 }
-                w.i32(*yaw).i32(*wheel).u8(*kind).u16(*frame);
+                w.i32(*yaw).i32(*wheel).u8(*kind).u8(u8::from(*accel));
+                for a in tilt {
+                    w.i32(*a);
+                }
+                w.u16(*frame);
             }
             Self::Route {
                 level,
@@ -709,6 +796,75 @@ impl Body {
                 for &n in objects {
                     w.u16(n);
                 }
+            }
+            Self::KeyUsed {
+                level,
+                mission,
+                key,
+            } => {
+                w.u8(tag::KEY_USED).i16(*level).u8(*mission).u8(*key);
+            }
+            Self::Shot {
+                level,
+                mission,
+                kind,
+                position,
+                direction,
+            } => {
+                w.u8(tag::SHOT).i16(*level).u8(*mission).u8(*kind);
+                for v in position.iter().chain(direction) {
+                    w.f32(*v);
+                }
+            }
+            Self::Switch {
+                level,
+                mission,
+                id,
+                on,
+            } => {
+                w.u8(tag::SWITCH)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u8(*id)
+                    .u8(u8::from(*on));
+            }
+            Self::Checkpoint {
+                level,
+                mission,
+                record,
+                position,
+                rotation,
+            } => {
+                w.u8(tag::CHECKPOINT).i16(*level).u8(*mission).u16(*record);
+                for v in position {
+                    w.f32(*v);
+                }
+                for a in rotation {
+                    w.i32(*a);
+                }
+            }
+            Self::Ball {
+                area,
+                claim,
+                position,
+                velocity,
+            } => {
+                w.u8(tag::BALL).u8(*area).u16(*claim);
+                for v in position.iter().chain(velocity) {
+                    w.f32(*v);
+                }
+            }
+            Self::BossHp {
+                level,
+                mission,
+                hp,
+                full,
+            } => {
+                w.u8(tag::BOSS_HP)
+                    .i16(*level)
+                    .u8(*mission)
+                    .f32(*hp)
+                    .f32(*full);
             }
         }
     }
@@ -814,6 +970,14 @@ impl Body {
                     let offset = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
                     let bubble = (r.i16()?, r.i32()?, r.i32()?);
                     let (eyes, mouth) = (r.i16()?, r.i16()?);
+                    let props = [r.u8()?, r.u8()?, r.u8()?];
+                    if props.iter().any(|&p| p > MAX_CHAO_PROP) {
+                        return Err(WireError::BadValue("garden chao prop"));
+                    }
+                    let (drum, cocoon) = (r.u8()?, r.u8()?);
+                    if cocoon > 3 {
+                        return Err(WireError::BadValue("garden chao cocoon"));
+                    }
                     list.push(GardenChao {
                         index,
                         position,
@@ -824,6 +988,9 @@ impl Body {
                         bubble,
                         eyes,
                         mouth,
+                        props,
+                        drum,
+                        cocoon,
                     });
                 }
                 Self::GardenChao(list)
@@ -962,9 +1129,11 @@ impl Body {
             tag::KART_STATE => {
                 let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
                 let rotation = [r.i32()?, r.i32()?, r.i32()?];
-                let (yaw, wheel, kind, frame) = (r.i32()?, r.i32()?, r.u8()?, r.u16()?);
-                if !(2..=7).contains(&kind) {
-                    return Err(WireError::BadValue("kart kind"));
+                let (yaw, wheel, kind, accel) = (r.i32()?, r.i32()?, r.u8()?, r.u8()?);
+                let tilt = [r.i32()?, r.i32()?, r.i32()?];
+                let frame = r.u16()?;
+                if !(2..=7).contains(&kind) || accel > 1 {
+                    return Err(WireError::BadValue("kart state"));
                 }
                 Self::KartState {
                     position,
@@ -972,6 +1141,8 @@ impl Body {
                     yaw,
                     wheel,
                     kind,
+                    accel: accel == 1,
+                    tilt,
                     frame,
                 }
             }
@@ -1020,6 +1191,86 @@ impl Body {
                     level,
                     mission,
                     objects,
+                }
+            }
+            tag::KEY_USED => {
+                let (level, mission, key) = (r.i16()?, r.u8()?, r.u8()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || key > 1 {
+                    return Err(WireError::BadValue("key used"));
+                }
+                Self::KeyUsed {
+                    level,
+                    mission,
+                    key,
+                }
+            }
+            tag::SHOT => {
+                let (level, mission, kind) = (r.i16()?, r.u8()?, r.u8()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || kind > 1 {
+                    return Err(WireError::BadValue("shot"));
+                }
+                let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                let direction = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                Self::Shot {
+                    level,
+                    mission,
+                    kind,
+                    position,
+                    direction,
+                }
+            }
+            tag::SWITCH => {
+                let (level, mission, id, on) = (r.i16()?, r.u8()?, r.u8()?, r.u8()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || id >= 32 || on > 1 {
+                    return Err(WireError::BadValue("switch"));
+                }
+                Self::Switch {
+                    level,
+                    mission,
+                    id,
+                    on: on == 1,
+                }
+            }
+            tag::CHECKPOINT => {
+                let (level, mission, record) = (r.i16()?, r.u8()?, r.u16()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || record >= MAX_STAGE_OBJECTS {
+                    return Err(WireError::BadValue("checkpoint"));
+                }
+                let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                let rotation = [r.i32()?, r.i32()?, r.i32()?];
+                Self::Checkpoint {
+                    level,
+                    mission,
+                    record,
+                    position,
+                    rotation,
+                }
+            }
+            tag::BALL => {
+                let (area, claim) = (r.u8()?, r.u16()?);
+                if !(1..=3).contains(&area) {
+                    return Err(WireError::BadValue("ball"));
+                }
+                let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                let velocity = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                Self::Ball {
+                    area,
+                    claim,
+                    position,
+                    velocity,
+                }
+            }
+            tag::BOSS_HP => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                let (hp, full) = (r.f32(MAX_BOSS_HP)?, r.f32(MAX_BOSS_HP)?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || hp < 0.0 || full <= 0.0 {
+                    return Err(WireError::BadValue("boss hp"));
+                }
+                Self::BossHp {
+                    level,
+                    mission,
+                    hp,
+                    full,
                 }
             }
             _ => return Err(WireError::BadTag("body", t)),
@@ -1107,6 +1358,9 @@ mod tests {
                         bubble: (4, 30, 180),
                         eyes: 9,
                         mouth: 3,
+                        props: [5, 0, 20],
+                        drum: 200,
+                        cocoon: 2,
                     },
                     GardenChao::default(),
                 ]),
@@ -1229,6 +1483,8 @@ mod tests {
                     yaw: 0x100,
                     wheel: -0x2000,
                     kind: 4,
+                    accel: true,
+                    tilt: [0x100, -0x200, 0],
                     frame: 0xFFF0,
                 },
             },
@@ -1271,6 +1527,61 @@ mod tests {
                     level: 13,
                     mission: 0,
                     objects: vec![0, 57, 0x5FF],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::KeyUsed {
+                    level: 26,
+                    mission: 0,
+                    key: 1,
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::Shot {
+                    level: 11,
+                    mission: 0,
+                    kind: 1,
+                    position: [1.0, 2.0, -3.0],
+                    direction: [0.0, 0.5, 8.0],
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::Switch {
+                    level: 26,
+                    mission: 0,
+                    id: 31,
+                    on: true,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::Checkpoint {
+                    level: 13,
+                    mission: 1,
+                    record: 0x5FF,
+                    position: [10.0, -20.5, 3000.0],
+                    rotation: [0, -0x4000, 0x10],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::Ball {
+                    area: 2,
+                    claim: 7,
+                    position: [1.5, 0.0, -40.0],
+                    velocity: [0.25, -0.5, 1.0],
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::BossHp {
+                    level: 61,
+                    mission: 0,
+                    hp: 2.5,
+                    full: 8.0,
                 },
             },
             Message::Game {

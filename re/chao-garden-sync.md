@@ -286,3 +286,59 @@ A second formula is used for carry anims 0x31..0x34 and 0x49 (+0x26C ×2.5).
   skips Chao. Medium for the carry buffer `*0x1A5CB54` (not decoded), which is why the mirror
   must stay unpickable.
 - None of this has been run in game yet.
+
+## Toys and instruments in a Chao's hands (2026-10-17, static, not yet seen in game)
+
+- Attach points: `Data1+0x514 + 4*n` points at a body node; behaviors use n = 4, 11 (hands)
+  and 35. Node +0x98 model, +0x9C texture list (`AL_TOY` 0x1366AFC), +0xA0 a timer reset on a
+  new model, +0xA4 shown, +0xA8, +0xAC.. parameters.
+- 0x5669B0 (EAX Chao object, ECX node, EDX model): attach with the toy textures; 15 callers
+  (garden 0x55Dxxx/0x55Exxx, stadium 0x59Dxxx). 0x566A20 (EDX = block {model, texlist, 5
+  floats}): 7 callers; blocks 0x12F5954/0x12F5974 have a null model filled at run time.
+- 0x566AF0 (cdecl node) hides a node and its children (+0xA4 = 0; child +0x2C, sibling +0x30).
+- The drum is separate: `Data1+0x660` model 0x12FD9DC, +0x664 texlist, +0x668 size, +0x66C
+  1.0, set by the behavior at 0x55E4F9 (motion 0x14F), drawn by the Chao display at 0x540E68
+  when +0x660 is set.
+- Not instruments: 0x55CB90 & co. build the garden's fixed toys (ball, horse, TV...).
+
+The mod mirrors these onto copies (`garden::PROPS`, `GardenChao::props`/`drum`).
+
+## Garden toys and fruit trees (2026-10-17, objdump of the dumped exe, not run in game)
+
+Object = LoadObject 0x46F680 (push name, EDI init sub, ESI list). Init subs then set +0x10 main.
+All toys register in ALW category 6 (0x530750, ECX=6, push save 0, push kind).
+
+| Toy | Create | Name | List | Init / main / display / delete | ALW kind | Global |
+|---|---|---|---|---|---|---|
+| Ball | 0x55D6B0 cdecl (arg1 ?, arg2 &pos) | ALO_Ball | 2 | 0x55D640 / **0x55D310** / 0x55D3B0 / 0x57B9B0 | 4 | **0x1DBE570** = ball object |
+| TV | 0x55CB90 (arg &pos) | ALO_TVExecutor | 4 | 0x55C540 is main; display 0x55C9E0; delete 0x55CB70 | 2 | 0x1AED288 = TV object |
+| Radio | ~0x57CCA0 | ALO_RadicaseExecutor | 4 | main 0x57C840 | 3 | |
+| Box | ~0x580890 | ALO_BoxExecutor | 4 | main 0x5801C0 | 8 | |
+| Horse | 0x580F30 | ALO_Horse | ? | 0x580E80 / 0x580BC0 / 0x580CA0 / 0x57B9B0 | 7 | |
+| Race toy | 0x5604F0 | ALO_RaceKariToy | ? | 0x560470 / 0x5601C0 / 0x560220 | 0 | |
+
+Garden loader 0x54CA20.. calls the ball (0x55D6B0), TV (0x55CB90) and box (0x580890).
+
+Ball: Data1[0] mode 0..3 (table 0x55D39C: 0 0x55CC40, **1 free/rolling 0x55CCC0**, 2 0x55D150
+release (unlinks 0x530690, back to 1), 3 0x55D230 held by a Chao (0x56D170), back to 1).
+Position Data1+0x14, **velocity Data2+0x00..0x08** (Data2 = obj+0x38; gravity/bounce in 0x55CCC0,
+the player kick goes through 0x54B1F0). 0x1DBE574 = 1 while mode 1 and |vel| > 0x904EB0;
+0x1DBE56C cleared every frame. Held by the player: CharObj2+0x94 == ball (as items).
+TV mode Data1[0] 0..11 (table 0x55C9AC), radio 0..5 (0x57CA64): not decoded; they're turned on by
+Chao AI, which runs separately in each game.
+
+### Trees
+GrowTree object (0x548210, cdecl (save record*), "ALO_GrowTreeExecutor", list 2, main **0x546810**,
+display 0x547E70, delete 0x5481E0). Save record (8 bytes, `0x19F6480 + garden*0x38 + i*8`, 7 per
+garden): +0 kind, +1 state, +2 growth, +3 life, +4..+6 fruit growth per slot.
+Data1 (0x100 bytes): +0 mode (0..10, table 0x547414), +6 frame counter, +0x30 kind, +0x31 state (5
+= the garden's own tree), +0x34 scale, +0x38 growth, +0x3C life (a 0x54B1F0(ECX=4, EDX=obj,
+push 0xAD) hit sets it to 10000: probably watering, medium), **fruit slots +0x44, 3 × 0x20**
+(+0 ripeness f32, +8 drop timer), +0xCC/+0xD0 shake latch / shaking, +0xD4 shake strength,
++0xE8 garden (1..3). Data2+0xC..0x14 = push from the player, cleared every frame.
+Shaking (0x546CEB): |push| > 0x905030 → sound 0x1008 and +0xD0 = 1; each ripe slot's timer
+counts down while shaking. A ripe slot also drops on its own (frame % 10 == 1 and a random roll,
+0x546F42). Fruit only ripens while fewer than 40 fruit records are used (0x546F04).
+Drop (0x5470C0): position 0x546670, record 0x52F9E0(ECX=3), then **0x546180(kind, &pos, ang,
+NULL, record)**; kind = garden-1 (0/1/2) for state-5 trees, else tree kind+2. So a dropped fruit
+is an ordinary saved fruit and already syncs as an item.

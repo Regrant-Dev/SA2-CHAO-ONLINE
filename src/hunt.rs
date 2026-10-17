@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crate::game;
 use crate::hud;
 use crate::log;
+use crate::net::protocol::hunt_signature as signature;
 
 /// The hunt manager's data: +0 state (4 = hunting), +3/+4 hint state for the target, +5 pieces
 /// left, slots at +0x2C/+0x3C/+0x4C (`{u8 kind (0xFE collected, 0xFF none), u8 id, u16,
@@ -47,13 +48,20 @@ const SUB_HIDDEN: u8 = 3;
 
 /// Send the leader's set this often (it's small; late arrivals get it soon).
 const SET_EVERY: Duration = Duration::from_secs(1);
+/// The leader waits this long for a set already going round (someone started before it
+/// loaded) before giving the room its own pieces.
+const SET_WAIT: Duration = Duration::from_secs(2);
 
 type Piece = (u8, u8, [f32; 3]);
 
 struct Hunt {
     stage: Option<(i16, u8)>,
+    /// `game::stage_run` of `stage`: a replay starts a new hunt.
+    run: u32,
     /// The room's pieces for this stage entry, once known.
     set: Option<[Piece; 3]>,
+    /// When we started hunting without a set.
+    waiting: Option<Instant>,
     /// Who has each piece (referee's word), and what we already saw collected locally.
     owner: [Option<u8>; 3],
     claimed: [bool; 3],
@@ -70,7 +78,9 @@ fn with<R>(f: impl FnOnce(&mut Hunt) -> R) -> R {
     let mut h = HUNT.lock().unwrap_or_else(|e| e.into_inner());
     f(h.get_or_insert_with(|| Hunt {
         stage: None,
+        run: 0,
         set: None,
+        waiting: None,
         owner: [None; 3],
         claimed: [false; 3],
         sent: None,
@@ -89,13 +99,6 @@ fn read<T: Copy>(address: usize) -> T {
 fn write<T>(address: usize, value: T) {
     // SAFETY: as in `read`, on the game thread.
     unsafe { (address as *mut T).write_volatile(value) }
-}
-
-/// A short signature of a set (claims name the hunt they're for).
-fn signature(set: &[Piece; 3]) -> u32 {
-    set.iter().fold(0x811C_9DC5u32, |h, (k, i, _)| {
-        (h ^ u32::from(*k)).wrapping_mul(0x0100_0193) ^ u32::from(*i)
-    })
 }
 
 fn slot(m: usize, s: usize) -> usize {
@@ -164,10 +167,13 @@ pub fn on_frame(me: Option<u8>, here: &[u8]) {
     let mission = game::mission();
     with(|h| {
         let stage = (level > 0 && level != game::LEVEL_CHAO_WORLD).then_some((level, mission));
-        if h.stage != stage {
+        let run = game::stage_run();
+        if h.stage != stage || h.run != run {
             *h = Hunt {
                 stage,
+                run,
                 set: None,
+                waiting: None,
                 owner: [None; 3],
                 claimed: [false; 3],
                 sent: None,
@@ -190,9 +196,13 @@ pub fn on_frame(me: Option<u8>, here: &[u8]) {
         }
         let hunting = read::<u8>(m + M_STATE) >= STATE_HUNTING;
 
-        // The leader shares its game's pick (and keeps to it).
+        // The leader gives the room its game's pick, unless a set is already going round.
         let leader = here.iter().all(|&id| me < id);
-        if leader && h.set.is_none() && hunting {
+        if h.set.is_none() && hunting {
+            h.waiting.get_or_insert_with(Instant::now);
+        }
+        let waited = h.waiting.is_some_and(|at| at.elapsed() >= SET_WAIT);
+        if leader && waited && h.set.is_none() && hunting {
             let pieces: [Piece; 3] = std::array::from_fn(|s| {
                 let a = slot(m, s);
                 (read::<u8>(a), read::<u8>(a + 1), read::<[f32; 3]>(a + 4))
@@ -207,7 +217,8 @@ pub fn on_frame(me: Option<u8>, here: &[u8]) {
         }
         let Some(set) = h.set else { return };
         let sig = signature(&set);
-        if leader && h.sent.is_none_or(|at| at.elapsed() >= SET_EVERY) {
+        // Everyone with the set keeps it going round, for anyone who loads later.
+        if h.sent.is_none_or(|at| at.elapsed() >= SET_EVERY) {
             h.sent = Some(Instant::now());
             h.set_out = Some((level, mission, set));
         }

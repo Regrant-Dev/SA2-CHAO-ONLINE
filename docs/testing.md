@@ -65,3 +65,14 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
 - **Chat:** T, type, Enter; fakepeer answers "heard: ...".
 - **Room battles:** main menu 2P button > Kart Race (fakepeer's kart, no CPU karts) and
   Treasure Hunt.
+
+These need a second real player (fakepeer only copies your state):
+
+- **Co-op stage** (a room in Co-op mode): enemies, boxes, breakables and rings someone takes are
+  gone for both; keys and switches open both doors; mech shots show. One passes a checkpoint,
+  the other dies and restarts there (log: `coop: checkpoint N passed by a friend`).
+- **Co-op boss:** both hit it; the bar drops for both, and each one's last hit defeats it
+  (log: `bosses: boss up`, `bosses: a friend's hit`).
+- **Shared garden:** kick the ball, it rolls the same way for the other (log: `toys: we have the
+  ball`); fruit piles up no faster than alone; Chao instruments and toys show on the copies.
+- **Kart Race:** the other kart's exhaust brightens on the accelerator and it tilts over jumps.

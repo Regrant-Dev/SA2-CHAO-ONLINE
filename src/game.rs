@@ -51,7 +51,8 @@ const CO2_MOTION_MODE: usize = 0x174;
 pub const MOTION_TABLE: usize = 0x01DE_A704;
 pub const MOTION_COUNT: usize = 300;
 
-/// `LocalPlayer::flags`: in a jump, with the blue spin ball (JumpAura) around the player.
+/// `LocalPlayer::flags`: curled up (jump, spin dash, homing), with the blue spin ball around the
+/// player.
 pub const POSE_BALL: u8 = 1;
 /// `LocalPlayer::flags`: blending into `anim` (animation state `co2+0x174 == 2`, see
 /// FUN_004692A0). `frame` is then the blend progress 0..1, and the blend motion at `co2+0x19C`
@@ -85,6 +86,39 @@ pub fn mission() -> u8 {
 pub fn game_state() -> i16 {
     // SAFETY: static short in the game's data section.
     unsafe { (GAME_STATE as *const i16).read_volatile() }
+}
+
+/// Game states inside a stage: in game, paused, a death's fade and restart, and the restarts
+/// (re/stage-race.md 3, 4).
+pub const STAGE_STATES: [i16; 7] = [GAME_STATE_INGAME, GAME_STATE_INGAME + 1, 5, 7, 9, 13, 15];
+
+/// Stage runs: +1 each time a stage starts after we were out of one (no player, outside the
+/// stage states) for a moment. The level number alone can't tell a replay of the same stage.
+static RUN: std::sync::Mutex<(u32, Option<std::time::Instant>, bool)> =
+    std::sync::Mutex::new((0, None, false));
+
+/// Call once per frame (game thread).
+pub fn track_run() {
+    let out = local_entity().is_null() && !STAGE_STATES.contains(&game_state());
+    let mut r = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    let (run, since, left) = &mut *r;
+    if out {
+        let at = *since.get_or_insert_with(std::time::Instant::now);
+        if at.elapsed() >= std::time::Duration::from_secs(1) {
+            *left = true;
+        }
+    } else {
+        *since = None;
+        if *left && game_state() == GAME_STATE_INGAME {
+            *left = false;
+            *run = run.wrapping_add(1);
+        }
+    }
+}
+
+/// The current stage run (see `track_run`).
+pub fn stage_run() -> u32 {
+    RUN.lock().unwrap_or_else(|e| e.into_inner()).0
 }
 
 /// Holds (or releases) player 1 at the start line: the whole stage frozen, movement off and
@@ -598,10 +632,11 @@ pub fn local_player() -> Option<LocalPlayer> {
         };
         // Same test as the player's display before it swaps in the ball model.
         let blending = (co2.add(CO2_MOTION_MODE) as *const i16).read_unaligned() == 2;
-        // Sonic's main spawns the blue "JumpAura" ball every frame while the action is Jump (6)
-        // or the bounce bracelet (69) (case 0x718544; re/spin-ball.md). Sonic family only.
+        // Sonic's main spawns the blue ball every frame while the action is Jump (6), the bounce
+        // bracelet (69), spin charge (3) or spin dash / rolling (4, 5), and once as the homing
+        // attack starts (13) (re/spin-ball.md, re/effects.md). Sonic family only.
         let action = entity.read();
-        let ball = matches!(character, 0 | 1 | 8 | 9) && matches!(action, 6 | 69);
+        let ball = matches!(character, 0 | 1 | 8 | 9) && matches!(action, 3..=6 | 13 | 69);
         Some(LocalPlayer {
             character,
             position: (entity.add(ENTITY_POSITION) as *const Vector).read_unaligned(),

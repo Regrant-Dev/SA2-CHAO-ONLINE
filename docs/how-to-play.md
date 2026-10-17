@@ -67,7 +67,12 @@ them. From Stage Select you're taken into their stage.
 - A stage someone picks on Stage Select takes along everyone in the room who's on Stage Select.
 - **Race mode:** everyone has their own enemies. Your position shows at the top right.
 - **Co-op mode:** enemies, item boxes and other breakable things someone destroys are gone for
-  everyone. A ring one of you picks up is gone for both, and you both get it.
+  everyone. A ring one of you picks up is gone for both, and you both get it. Keys and
+  switches open everyone's doors and gates, and you see each other's mech shots. A checkpoint
+  one of you passes counts for everyone: if you fall behind and die, you restart there, unless
+  you passed a checkpoint further along yourself.
+  Bosses share one health bar: every hit anyone lands counts, and each of you lands your own
+  final hit.
 
 **Room battles:** while online, the main menu's 2P button becomes **ROOM BATTLES**:
 
@@ -88,7 +93,9 @@ or "You 2", with the Chao's name if it has one. Eggs and Chao without a tag stay
 only; an egg that hatches can visit right away.
 
 You can pet, hold and feed each other's Chao, and that affects the real Chao in its owner's
-save. Garden items are shared too: pick up a friend's fruit and it's yours.
+save. Garden items are shared too: pick up a friend's fruit and it's yours. The garden ball is
+shared: kick it and it rolls the same way for everyone. Trees drop ripe fruit by themselves for
+only one of you, so fruit doesn't pile up twice as fast; shaking a tree works for everyone.
 
 Set **Visit friends** to Off and your Chao go home within a few seconds.
 

@@ -5,15 +5,19 @@
 //!   it) claims it here: the first claim wins, unless the owner is using it right now (holding
 //!   it, or their Chao is). The answer goes to everyone as `ItemOwner`, so the old owner's game
 //!   lets it go and the new owner's game keeps it.
-//! - **Co-op kills**: each room's destroyed stage objects per stage, sent to a room player who
-//!   enters that stage later (even after everyone else left it). Forgotten when the room closes.
-//!
 //! - **Treasure hunt pieces**: the first player to collect each piece of a room's hunt gets it
-//!   (`HuntClaim` -> `HuntTaken` to everyone; a late claim hears who has it).
+//!   (`HuntClaim` -> `HuntTaken` to everyone; a late claim hears who has it). A new hunt in
+//!   that stage (`HuntSet`) starts over.
+//!
+//! Its answers (`ItemOwner`, `HuntTaken`) come only from here: the same bodies from a player
+//! aren't passed on.
+//!
+//! Co-op kills aren't kept here: players in a stage send theirs to a room player who arrives,
+//! and a stage everyone left starts fresh next time.
 //!
 //! The dedicated server and a hosting player run the same referee (`session::Host`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use super::protocol::{Body, ItemId};
 
@@ -39,26 +43,15 @@ struct Ledger {
     busy: bool,
 }
 
-/// Where a player is, from their latest state.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Seen {
-    level: i16,
-    mission: u8,
-    /// The room they're in: its creator's id.
-    room: Option<u8>,
-}
-
-/// (room, level, mission).
-type StageKey = (u8, i16, u8);
-
 #[derive(Default)]
 pub struct Referee {
     items: HashMap<ItemId, Ledger>,
-    players: HashMap<u8, Seen>,
-    kills: HashMap<StageKey, BTreeSet<u16>>,
     /// Treasure hunt pieces: (level, mission, set signature, slot) -> who got it first.
     pieces: HashMap<(i16, u8, u32, u8), u8>,
 }
+
+/// Most hunt pieces remembered (a few per hunt); past it the oldest hunts are forgotten.
+const MAX_PIECES: usize = 256;
 
 impl Referee {
     pub fn new() -> Self {
@@ -76,6 +69,9 @@ impl Referee {
                 slot,
             } => {
                 let key = (*level, *mission, *sig, *slot);
+                if self.pieces.len() >= MAX_PIECES && !self.pieces.contains_key(&key) {
+                    self.pieces.clear();
+                }
                 let first = !self.pieces.contains_key(&key);
                 let owner = *self.pieces.entry(key).or_insert(from);
                 out.push(Out {
@@ -91,52 +87,19 @@ impl Referee {
                 });
                 false
             }
-            Body::PlayerState(s) => {
-                let room = (s.room.1 != 0 && s.room.0 < 8).then_some(s.room.0);
-                let now = Seen {
-                    level: s.level,
-                    mission: s.mission,
-                    room,
-                };
-                let before = self.players.insert(from, now);
-                // Our room closed (we created it and left it): its kills go too.
-                if before.is_some_and(|b| b.room == Some(from)) && room != Some(from) {
-                    self.kills.retain(|&(r, _, _), _| r != from);
-                }
-                // Entered a stage: what the room has destroyed there so far.
-                let entered = before.is_none_or(|b| {
-                    (b.level, b.mission, b.room) != (now.level, now.mission, now.room)
-                });
-                if entered
-                    && let Some(r) = room
-                    && let Some(objects) = self.kills.get(&(r, now.level, now.mission))
-                    && !objects.is_empty()
-                {
-                    out.push(Out {
-                        to: To::One(from),
-                        from: r,
-                        body: Body::StageKills {
-                            level: now.level,
-                            mission: now.mission,
-                            objects: objects.iter().copied().collect(),
-                        },
-                    });
-                }
-                true
-            }
-            Body::StageKills {
+            // A different hunt in this stage: who got what in the last one no longer counts.
+            Body::HuntSet {
                 level,
                 mission,
-                objects,
+                pieces,
             } => {
-                if let Some(r) = self.players.get(&from).and_then(|p| p.room) {
-                    self.kills
-                        .entry((r, *level, *mission))
-                        .or_default()
-                        .extend(objects.iter().copied());
-                }
+                let sig = super::protocol::hunt_signature(pieces);
+                self.pieces
+                    .retain(|&(l, m, s, _), _| (l, m) != (*level, *mission) || s == sig);
                 true
             }
+            // Only the referee decides these.
+            Body::ItemOwner { .. } | Body::HuntTaken { .. } => false,
             Body::GardenItems { items, .. } => {
                 for item in items {
                     let entry = self.items.entry(item.id).or_insert(Ledger {
@@ -186,18 +149,16 @@ impl Referee {
         }
     }
 
-    /// Player `id` left the lobby: their items went with them, and their room closed.
+    /// Player `id` left the lobby: their items went with them.
     pub fn left(&mut self, id: u8) {
         self.items.retain(|_, l| l.owner != id);
-        self.players.remove(&id);
-        self.kills.retain(|&(r, _, _), _| r != id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::protocol::{GardenItem, ItemPlace, PlayerState};
+    use crate::net::protocol::{GardenItem, ItemPlace};
 
     const MANGO: ItemId = ItemId {
         origin: 1,
@@ -313,54 +274,39 @@ mod tests {
         assert_eq!(out[1].body, taken(To::One(1)).body);
     }
 
-    fn state(level: i16, room: (u8, u8)) -> Body {
-        Body::PlayerState(PlayerState {
-            time: 0,
-            level,
-            mission: 0,
-            chao_area: -1,
-            character: 0,
-            position: [0.0; 3],
-            rotation: [0; 3],
-            anim: 0,
-            frame: 0.0,
-            flags: 0,
-            room,
-            upgrades: 0,
-        })
-    }
-
     #[test]
-    fn a_late_room_player_gets_the_stage_kills() {
+    fn a_new_hunt_starts_over_and_players_cant_decide() {
         let mut r = Referee::new();
         let mut out = Vec::new();
-        // Player 0 created room 0 and destroyed things in level 13, then left the stage.
-        r.observe(0, &state(13, (0, 2)), &mut out);
-        let kills = Body::StageKills {
-            level: 13,
+        let claim = Body::HuntClaim {
+            level: 16,
             mission: 0,
-            objects: vec![5, 9],
+            sig: 7,
+            slot: 2,
         };
-        assert!(r.observe(0, &kills, &mut out));
-        r.observe(0, &state(0, (0, 2)), &mut out);
-        assert!(out.is_empty());
-        // Player 4 of the same room enters level 13 afterwards.
-        r.observe(4, &state(0, (0, 2)), &mut out);
-        r.observe(4, &state(13, (0, 2)), &mut out);
-        assert_eq!(
-            out,
-            vec![Out {
-                to: To::One(4),
-                from: 0,
-                body: kills
-            }]
-        );
-        // Someone outside the room gets nothing; the room closing forgets them.
+        r.observe(3, &claim, &mut out);
+        let set = Body::HuntSet {
+            level: 16,
+            mission: 0,
+            pieces: [(0, 0, [0.0; 3]); 3],
+        };
+        assert!(r.observe(1, &set, &mut out));
         out.clear();
-        r.observe(5, &state(13, (0xFF, 0)), &mut out);
-        assert!(out.is_empty());
-        r.observe(0, &state(0, (0xFF, 0)), &mut out);
-        r.observe(6, &state(13, (0, 2)), &mut out);
-        assert!(out.is_empty());
+        r.observe(1, &claim, &mut out);
+        assert_eq!(out[0].to, To::All);
+        // A player can't hand out pieces or items themselves.
+        let forged = Body::HuntTaken {
+            level: 16,
+            mission: 0,
+            sig: 7,
+            slot: 2,
+            player: 5,
+        };
+        assert!(!r.observe(5, &forged, &mut out));
+        let forged = Body::ItemOwner {
+            id: MANGO,
+            owner: 5,
+        };
+        assert!(!r.observe(5, &forged, &mut out));
     }
 }

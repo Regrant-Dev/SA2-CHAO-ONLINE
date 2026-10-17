@@ -169,6 +169,11 @@ State byte Data1[0]. Jump table at 0x6D9B30: 0 init 0x6D99EF, 1 idle 0x6D9ACB, 2
   index is greater than the new one.
 - Restore: 0x43E3F0 (EBX = player), called by the player placement **0x43DA40** (EAX = player) at
   every restart.
+- The touch (0x6DA2F7) passes the **player's** position and rotation (player Data1 +0x14 / +0x8
+  via 0x1DEA6C0[p]), not the checkpoint's. The object's record pointer is ObjectMaster +0x30.
+- Co-op sharing (src/coop.rs): a record gaining 0x40 is sent with RestartPoint[0] +8/+0x14; the
+  others set 0x40, move a live idle one (state 1) to state 3, and call 0x43E520(0, 0) with the
+  sender's position/rotation when it's further along the stage route.
 
 ---
 

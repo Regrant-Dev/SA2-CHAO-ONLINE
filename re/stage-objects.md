@@ -293,3 +293,29 @@ Confidence:
   the internals were only skimmed), the enemy whitelist (built from names; only KUMI, AI and
   SHOUKO were read), and the claim that the SET-file swap never runs.
 - Low: 0x6B80B0 argument meaning. No part of this has been tested in game yet.
+
+## Keys (2026-10-17, REA on a slice + objdump)
+
+- KEY: init 0x702880, main 0x7029F0. Each frame it registers at `0x1AF00A8 + 4*type` (type =
+  `|Data1+0x28|` rounded, 0 or 1) and runs a state machine in Data2 (+0x40): +0 state, +4 next
+  state (-1 none), +8 frames in state; on-enter table 0xAA91C4, per-frame table 0xAA946C.
+- States: 0 on the ground (0x703130/0x7031B0), 1 carried (enter plays sound 8 + a voice),
+  2 going into the keyhole (lines up with the keyhole at `0x1AF00B0 + 4*type`), 3 in (sound 9;
+  the keyhole and door react), 4 back to its start position (Data2+0x18).
+- KEYHOLE init 0x6FDC80 registers at 0x1AF00B0; KEYDOOR 0x6FFE40.
+- Co-op: a key reaching state 3 is sent (`KeyUsed`); the others set their own key's next state
+  to 2 when it's on the ground or returning, so their door opens the game's way. State 2 reads
+  the keyhole slot unchecked (0x7035F0), and an unloaded keyhole clears its slot (0x6FDDD4), so
+  only while the keyhole is registered.
+
+## Switches (2026-10-17)
+
+- `SwitchFlags` **0x1DE9460**: one byte per switch id (0..31). Pressing sets `|= 3` (0x6DE040 /
+  0x6DE0B0, with sound 0x800E the first time); a switch shows itself pressed when bit 0 is set
+  (Data1+1 = 1). Doors and gates read the byte for their id.
+- SWITCH init 0x6DCDC0: state 0 sets update 0x6DD7E0 / delete 0x6DDCA0 and Data2 (+4 type 0..4
+  from SET rotX, +6 id 0..31 from rotY); GSWITCH2, LIGHT SW, GRAV_SW etc. are other switch kinds.
+- The table is 32 bytes (0x1DE9460..0x1DE947F, cleared by 0x47E4B0). That clear runs on both
+  restart paths (0x43C822, 0x43C90F), so a death switches everything off locally.
+- Co-op shares switches turning **on** only (`Body::Switch`), and sets the room's switches again
+  after a restart; sharing "off" would close the others' doors when one player died.

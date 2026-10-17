@@ -53,6 +53,11 @@ const W_YAW: usize = 0x68;
 const W_GATE: usize = 0xBC;
 const W_LAPS: usize = 0xC4;
 const W_WHEEL: usize = 0xD4;
+/// Body tilt from jumps and bumps: the display adds +0xF0/+0xFC, +0xF4/+0x100, +0xF8/+0x104.
+const W_TILT: usize = 0xF0;
+const W_TILT_2: usize = 0xFC;
+/// 1 while the accelerator is held (0x61D8A0): the exhaust burns bright.
+const W_ACCEL: usize = 0x114;
 const LAPS: i32 = 3;
 const GATE_COUNT: usize = 0x01D7_C3C8;
 /// The race clock (frames; stopped while held and after the goal), and the post-goal counter
@@ -87,6 +92,8 @@ struct KartState {
     yaw: i32,
     wheel: i32,
     kind: u8,
+    accel: bool,
+    tilt: [i32; 3],
     /// When it came.
     at: Instant,
     /// The sender's frame stamp.
@@ -127,8 +134,18 @@ fn sample_at(samples: &VecDeque<(f64, [f32; 3])>, at: f64) -> Option<[f32; 3]> {
     Some(std::array::from_fn(|k| pa[k] + (pb[k] - pa[k]) * t))
 }
 
-/// Our kart to send: position, rotation, extra yaw, wheel angle, type.
-pub type MyKart = ([f32; 3], [i32; 3], i32, i32, u8);
+/// A kart as sent: position, rotation, extra yaw and wheel angle (BAMS), type (2..=7),
+/// accelerator held, body tilt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MyKart {
+    pub position: [f32; 3],
+    pub rotation: [i32; 3],
+    pub yaw: i32,
+    pub wheel: i32,
+    pub kind: u8,
+    pub accel: bool,
+    pub tilt: [i32; 3],
+}
 
 struct Kart {
     /// A pick we sent for this start (so it's sent once).
@@ -219,13 +236,24 @@ pub fn received_pick(course: u8, from: u8, name: &str) {
 }
 
 /// Network: another player's kart, taken on their game frame `frame`.
-pub fn received_state(from: u8, (position, rotation, yaw, wheel, kind): MyKart, frame: u16) {
+pub fn received_state(from: u8, kart: MyKart, frame: u16) {
+    let MyKart {
+        position,
+        rotation,
+        yaw,
+        wheel,
+        kind,
+        accel,
+        tilt,
+    } = kart;
     with(|k| {
         let latest = KartState {
             rotation,
             yaw,
             wheel,
             kind,
+            accel,
+            tilt,
             at: Instant::now(),
             frame,
         };
@@ -285,14 +313,19 @@ fn my_state() -> Option<MyKart> {
     }
     let p = read::<Vector>(e + E_POSITION);
     let kind = read::<i32>(w + W_KIND);
-    (2..=7).contains(&kind).then(|| {
-        (
-            [p.x, p.y, p.z],
-            read::<[i32; 3]>(w + W_ROTATION),
-            read::<i32>(w + W_YAW),
-            read::<i32>(w + W_WHEEL),
-            kind as u8,
-        )
+    let (a, b) = (read::<[i32; 3]>(w + W_TILT), read::<[i32; 3]>(w + W_TILT_2));
+    (2..=7).contains(&kind).then(|| MyKart {
+        position: [p.x, p.y, p.z],
+        rotation: read::<[i32; 3]>(w + W_ROTATION),
+        yaw: read::<i32>(w + W_YAW),
+        wheel: read::<i32>(w + W_WHEEL),
+        kind: kind as u8,
+        accel: read::<i32>(w + W_ACCEL) == 1,
+        tilt: [
+            a[0].wrapping_add(b[0]),
+            a[1].wrapping_add(b[1]),
+            a[2].wrapping_add(b[2]),
+        ],
     })
 }
 
@@ -497,6 +530,8 @@ extern "C" fn display(_object: usize) {
                 write(w + W_YAW, s.yaw);
                 write(w + 0x70, -1i32);
                 write(w + W_WHEEL, s.wheel);
+                write(w + W_TILT, s.tilt);
+                write(w + W_ACCEL, i32::from(s.accel));
                 std::mem::transmute::<usize, extern "C" fn(usize)>(KART_DISPLAY)(o);
             }
         }

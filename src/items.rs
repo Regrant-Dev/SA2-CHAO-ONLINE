@@ -211,6 +211,42 @@ fn entry_of(object: usize) -> Option<usize> {
         .map(|(e, _)| e)
 }
 
+/// Animals' display (re/chao-garden-items.md); it reads `+0x3C` unchecked.
+const ANIMAL_DISPLAY: usize = 0x0054_89D0;
+/// Object list 2 holds the animals and drives (list heads at 0x1A5A254).
+const OBJECT_LIST_2: usize = 0x01A5_A254 + 2 * 4;
+
+/// An animal drawn with no item-list entry (`+0x3C` empty) crashes the game's animal display
+/// (0x548BB2, twice on 2026-10-17). The normal game never has one; a mirrored animal that was
+/// eaten or absorbed while we skipped its update can. Those stop being drawn.
+fn hide_detached_animals() {
+    if game::current_level() != game::LEVEL_CHAO_WORLD {
+        return;
+    }
+    // SAFETY: the game's object list 2 (circular through +4), on the game thread, before the
+    // display pass.
+    unsafe {
+        let head = (OBJECT_LIST_2 as *const usize).read();
+        let mut object = head;
+        for _ in 0..1024 {
+            if object == 0 {
+                break;
+            }
+            let display = (object + 0x14) as *mut usize;
+            if display.read() == ANIMAL_DISPLAY
+                && ((object + OBJ_ENTRY) as *const usize).read() == 0
+            {
+                display.write(0);
+                crate::log!("items: an animal lost its item entry; not drawing it");
+            }
+            object = ((object + 0x04) as *const usize).read();
+            if object == head {
+                break;
+            }
+        }
+    }
+}
+
 /// Animals' MainSub (re/chao-garden-items.md); their update reads `+0x3C` unchecked.
 const ANIMAL_MAIN: usize = 0x0054_8C50;
 
@@ -434,6 +470,7 @@ fn place(owner: u8, item: &GardenItem) -> Option<(Vector, bool)> {
 
 /// Call every frame with our player id and the garden we're in (1..3, or 0).
 pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
+    hide_detached_animals();
     let mut s = lock();
     s.me = me;
     if area == 0 || me.is_none() {

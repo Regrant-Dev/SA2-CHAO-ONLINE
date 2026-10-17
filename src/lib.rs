@@ -1,6 +1,7 @@
 //! SA2 Chao Online: mod DLL loaded by SA2 Mod Loader.
 
 mod battles;
+mod bosses;
 pub mod chao;
 mod chat;
 mod coop;
@@ -24,9 +25,11 @@ pub mod places;
 mod puppet;
 mod race;
 mod room;
+mod shots;
 mod stage_race;
 mod timeline;
 mod together;
+mod toys;
 mod visitors;
 mod watch;
 
@@ -125,10 +128,15 @@ pub extern "C" fn OnFrame() {
         garden::on_frame();
         watch::mark("let ");
         let (peers, connected) = online::peers();
+        game::track_run();
         watch::mark("together::on_frame");
         together::on_frame(&peers, connected);
         watch::mark("coop::on_frame");
         coop::on_frame(&peers, connected);
+        watch::mark("bosses::on_frame");
+        bosses::on_frame(connected);
+        watch::mark("shots::on_frame");
+        shots::on_frame(connected);
         watch::mark("goto::on_frame");
         goto::on_frame();
         watch::mark("stage_race::on_frame");
