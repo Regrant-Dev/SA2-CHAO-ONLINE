@@ -44,9 +44,7 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
 
 - **Lobby:** connect/join/leave toasts; stopping fakepeer shows "left" and play goes on.
 - **Room toasts:** "X created a room", "X joined the room", "X left the room", "X's room closed".
-- **Puppets:** the fake player appears with a name tag (F9 > Name tags); other characters with
-  `FAKEPEER_CHAR`; mechs in Tails/Eggman stages. Copying you in a mech stage, its mech shows
-  your upgrade parts (drawn by the game's own walker display).
+- **Puppets:** the fake player appears with a name tag; other characters with `FAKEPEER_CHAR`.
 - **Rooms:** create a room (fakepeer joins by copying you): a stage freezes at load and shows
   "Players: You, fakepeer"; F8, Start or F9 > Start now starts it (3-2-1-GO). With `FAKEPEER_ROOM=1`,
   its room is listed in F9 > Room and you can join it; stopping fakepeer closes it.
@@ -64,4 +62,6 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
   ("Opponent: fakepeer"), then runs, and fakepeer records it.
 - **Live karate, following:** `FAKEPEER_ROOM=1 FAKEPEER_KARATE=1`, join its room and wait
   at the first karate menu; the fight starts by itself and replays the recorded fight.
-- **Menu:** dark panel behind the F9 text in stages and menus.
+- **Chat:** T, type, Enter; fakepeer answers "heard: ...".
+- **Room battles:** main menu 2P button > Kart Race (fakepeer's kart, no CPU karts) and
+  Treasure Hunt.

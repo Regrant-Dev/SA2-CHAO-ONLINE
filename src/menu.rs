@@ -17,7 +17,6 @@ use crate::puppet;
 use crate::race;
 use crate::room;
 use crate::together;
-use crate::visitors;
 
 const VK_BACK: i32 = 0x08;
 const VK_RETURN: i32 = 0x0D;
@@ -53,8 +52,6 @@ enum Row {
     StartStop,
     Apply,
     StartNow,
-    Export,
-    Visitors,
 }
 
 /// Rows shown right now: "Start now" first while held at a start, then the connection and
@@ -83,14 +80,7 @@ fn rows(mode: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([
-        Row::MyChao,
-        Row::Visits,
-        Row::Race,
-        Row::Karate,
-        Row::Export,
-        Row::Visitors,
-    ]);
+    rows.extend([Row::MyChao, Row::Visits, Row::Race, Row::Karate]);
     if online::status().is_some() {
         rows.extend([Row::Apply, Row::StartStop]);
     } else {
@@ -437,14 +427,6 @@ pub fn on_frame() {
                 crate::karate_live::start_now();
                 Some("Starting...".to_string())
             }
-            Row::Export => {
-                visitors::export_all(online::mod_path());
-                Some("Exported your Chao to chao\\export".to_string())
-            }
-            Row::Visitors => {
-                visitors::import_visitors(online::mod_path());
-                Some("Brought visitors from chao\\import (in a garden)".to_string())
-            }
             _ => None,
         };
         // Close right away: Enter is also the game's Start button, so the next press (to
@@ -518,7 +500,7 @@ fn my_chao_label(slot: i32) -> String {
         // Automatic: the first hatched Chao.
         None => match hatched.first() {
             Some((s, chao)) => format!("Auto: {} (slot {})", karate::chao_name(chao), s + 1),
-            None => "Auto (load your save first)".into(),
+            None => "Auto (visit Chao World once to load them)".into(),
         },
     }
 }
@@ -596,8 +578,6 @@ fn draw(m: &Menu, rows: &[Row]) {
             Row::StartStop if status.is_some() => "[ Stop multiplayer ]".into(),
             Row::StartStop => "[ Save & Start ]".into(),
             Row::StartNow => "[ Start now ] (everyone in this stage)".into(),
-            Row::Export => "[ Export my Chao to files ]".into(),
-            Row::Visitors => "[ Bring visitor Chao from files ]".into(),
         };
         let selected = i == m.row;
         let cursor = if selected && matches!(row, Row::Name | Row::Host | Row::Port) {

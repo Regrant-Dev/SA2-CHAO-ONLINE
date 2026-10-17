@@ -71,8 +71,8 @@ type SlotChao = (usize, u8, u8);
 /// Frames counted, and the save's Chao as last logged.
 static SAVE_SEEN: Mutex<(u32, Vec<SlotChao>)> = Mutex::new((0, Vec::new()));
 
-/// Every few seconds: when the save's Chao change (the save loaded, a Chao hatched or moved),
-/// logs each one and whether online play can use it.
+/// Every few seconds: when the save's Chao change (Chao World loaded them, a Chao hatched or
+/// moved), logs each one and whether online play can use it, and exports them to files.
 fn log_save_chao() {
     let mut seen = SAVE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
     seen.0 = seen.0.wrapping_add(1);
@@ -100,11 +100,35 @@ fn log_save_chao() {
         };
         log!("save: slot {:02} {} [{usable}]", slot + 1, c.summary());
     }
+    if !chao.is_empty() {
+        export_all(crate::online::mod_path());
+    }
+}
+
+/// When we entered the current garden, and whether the visitors from files came yet.
+static IN_GARDEN: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+/// Visitors from files come this long after entering a garden (it has loaded by then).
+const IMPORT_AFTER: Duration = Duration::from_secs(2);
+
+/// Brings the visitors from `chao/import` once per garden visit, shortly after arriving.
+fn auto_import() {
+    let mut g = IN_GARDEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !game::in_garden() {
+        *g = None;
+        return;
+    }
+    let (since, done) = g.get_or_insert((Instant::now(), false));
+    if !*done && since.elapsed() >= IMPORT_AFTER && game::player_position().is_some() {
+        *done = true;
+        drop(g);
+        import_visitors(crate::online::mod_path());
+    }
 }
 
 /// Call every frame: frees the visitor slots once the player is out of the garden.
 pub fn on_frame() {
     log_save_chao();
+    auto_import();
     {
         // A visitor must never be carried out of the garden: the next area would recreate it
         // from our buffer, which is reused for other visitors.
@@ -139,6 +163,9 @@ pub fn on_frame() {
                 b.freed = None;
             }
             crate::garden::clear();
+            drop(pool);
+            // The garden may have changed them (the game saves on leaving too).
+            export_all(crate::online::mod_path());
         }
     }
 }
@@ -147,7 +174,7 @@ fn chao_dir(mod_path: &str, sub: &str) -> PathBuf {
     PathBuf::from(mod_path).join("chao").join(sub)
 }
 
-pub fn export_all(mod_path: &str) {
+fn export_all(mod_path: &str) {
     let dir = chao_dir(mod_path, "export");
     if let Err(e) = fs::create_dir_all(&dir) {
         log!("export: can't create {}: {e}", dir.display());
@@ -161,31 +188,16 @@ pub fn export_all(mod_path: &str) {
         if chao.is_empty() {
             continue;
         }
-        let valid = match chao.validate() {
-            Ok(()) => "ok".to_string(),
-            Err(e) => format!("INVALID ({e})"),
-        };
         let path = dir.join(format!("slot{slot:02}.sa2chao"));
         match fs::write(&path, file::encode(&chao)) {
-            Ok(()) => {
-                count += 1;
-                log!(
-                    "export: slot {slot:02} -> {} [{valid}] {}",
-                    path.display(),
-                    chao.summary()
-                );
-            }
+            Ok(()) => count += 1,
             Err(e) => log!("export: slot {slot:02} write failed: {e}"),
         }
     }
-    log!(
-        "export: {count} chao exported (level {}, chao area {})",
-        game::current_level(),
-        game::current_chao_area()
-    );
+    log!("export: {count} Chao written to {}", dir.display());
 }
 
-pub fn import_visitors(mod_path: &str) {
+fn import_visitors(mod_path: &str) {
     if !game::in_garden() {
         log!(
             "import: not in a garden (level {}, chao area {}); skipped",
@@ -216,7 +228,6 @@ pub fn import_visitors(mod_path: &str) {
     };
     files.sort();
     if files.is_empty() {
-        log!("import: no .sa2chao files in {}", dir.display());
         return;
     }
 

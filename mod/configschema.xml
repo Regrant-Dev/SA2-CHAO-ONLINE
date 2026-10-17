@@ -3,31 +3,31 @@
   <Groups>
     <Group name="Multiplayer" display="Multiplayer">
       <Property name="Mode" display="Multiplayer" type="Mode" defaultvalue="Off" alwaysinclude="true">
-        <HelpText>Off: play alone. Host: others join you (they need your address and the port). Join: connect to a host. In game, F9 turns multiplayer off/on.</HelpText>
+        <HelpText>Off, Host (others join you) or Join (connect to a host or server). You can also change it in game with F9.</HelpText>
       </Property>
       <Property name="Name" display="Your name" type="string" defaultvalue="Player" alwaysinclude="true">
-        <HelpText>Shown above your character and in join messages (up to 10 characters).</HelpText>
+        <HelpText>Shown above your character (up to 10 characters).</HelpText>
       </Property>
       <Property name="Host" display="Host address (when joining)" type="string" defaultvalue="127.0.0.1:43902" alwaysinclude="true">
-        <HelpText>When joining: the host's or server's name or IP, e.g. 100.101.102.103 (Tailscale). Add :port only if it isn't 43902.</HelpText>
+        <HelpText>The host's or server's address, e.g. 100.101.102.103. Add :port only if it isn't 43902.</HelpText>
       </Property>
       <Property name="Port" display="Port (when hosting)" type="int" defaultvalue="43902" minvalue="1024" maxvalue="65535" alwaysinclude="true">
-        <HelpText>When hosting: the UDP port to listen on (default 43902). Other players must be able to reach it (port forwarding or Tailscale).</HelpText>
+        <HelpText>The UDP port others connect to (default 43902).</HelpText>
       </Property>
       <Property name="NameTags" display="Name tags" type="bool" defaultvalue="True" alwaysinclude="true">
-        <HelpText>Show other players' names above them (smaller when they are far away).</HelpText>
+        <HelpText>Show names above other players.</HelpText>
       </Property>
       <Property name="MyChao" display="My Chao (save slot, -1 = first)" type="int" defaultvalue="-1" minvalue="-1" maxvalue="23" alwaysinclude="true">
-        <HelpText>The Chao that represents you in friends' Chao Races and karate. Easier to pick in game: F9 > My Chao.</HelpText>
+        <HelpText>The Chao you race and fight with. Easier to pick in game: F9 > My Chao.</HelpText>
       </Property>
-      <Property name="VisitWith" display="Garden visits" type="VisitWith" defaultvalue="Garden" alwaysinclude="true">
-        <HelpText>Which of your Chao visit friends in a shared garden: Garden = up to 2 from the garden you're in, MyChao = only your chosen Chao, Off = none.</HelpText>
+      <Property name="VisitWith" display="Visit friends" type="VisitWith" defaultvalue="On" alwaysinclude="true">
+        <HelpText>On: up to 2 Chao from the garden you're in visit friends in the same garden. Off: they stay home.</HelpText>
       </Property>
       <Property name="RoomMode" display="Room mode (rooms you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
-        <HelpText>Race: everyone has their own enemies and item boxes. Coop: an enemy or item box destroyed by anyone in the room is gone for everyone in that stage. Members of a room follow its creator's mode.</HelpText>
+        <HelpText>Race: everyone has their own enemies. Coop: enemies someone destroys are gone for everyone.</HelpText>
       </Property>
       <Property name="ChaoRace" display="Friends' Chao in races" type="bool" defaultvalue="True" alwaysinclude="true">
-        <HelpText>Friends' Chao take the CPU lanes in your Chao Races (labelled with the owner's name). Outside a room they're copies your game races; in a room they follow your friends' real Chao live.</HelpText>
+        <HelpText>Friends' Chao fill the other lanes in your Chao Races.</HelpText>
       </Property>
     </Group>
   </Groups>
@@ -42,8 +42,7 @@
       <EnumMember name="Coop" />
     </Enum>
     <Enum name="VisitWith">
-      <EnumMember name="Garden" />
-      <EnumMember name="MyChao" />
+      <EnumMember name="On" />
       <EnumMember name="Off" />
     </Enum>
   </Enums>
