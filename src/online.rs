@@ -33,6 +33,8 @@ use crate::visitors;
 pub const DEFAULT_PORT: u16 = 43_902;
 /// Send our state every N frames (60 fps / 2 = 30 Hz).
 const STATE_EVERY_FRAMES: u32 = 2;
+/// How often our visitors' looks are checked for changes.
+const LOOK_EVERY_FRAMES: u32 = 60;
 /// Network thread poll interval.
 const POLL_EVERY: Duration = Duration::from_millis(10);
 /// Wait before rejoining after a disconnect (client mode).
@@ -176,6 +178,8 @@ struct Online {
     garden: i32,
     /// Send our Chao again (we entered a garden, or someone joined).
     resend_chao: bool,
+    /// Our visitors' looks as last sent (index -> type and animal bytes).
+    sent_looks: std::collections::HashMap<u8, Vec<u8>>,
     /// Flags of our last sent state (to log spin ball changes).
     last_flags: u8,
     /// "My Chao" as last sent to the others (live karate uses it on both sides).
@@ -245,6 +249,7 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
         remote: BTreeMap::new(),
         garden: -1,
         resend_chao: false,
+        sent_looks: std::collections::HashMap::new(),
         last_flags: 0,
         my_chao: None,
         race_chao: None,
@@ -485,6 +490,8 @@ fn pump(online: &mut Online, now: Instant) {
                 from,
                 body: Body::Chao { index, data },
             } => {
+                // A visitor already here takes on its new look (animal parts, evolution).
+                crate::garden::received_look(from, index, &data);
                 if let Some(remote) = online.remote.get_mut(&from) {
                     log!(
                         "online: player {from} '{}' brought chao {index}: {}",
@@ -793,6 +800,8 @@ pub fn on_frame() {
     }
     if online.resend_chao && garden > 0 && online.session.my_id().is_some() {
         online.resend_chao = false;
+        // Sent in full just below: look changes count from here.
+        online.sent_looks.clear();
         // Each visitor keeps its row number as its index (friends see "Regrant 2").
         let rows = match VISITS.load(Ordering::Relaxed) {
             VISITS_OFF => [None, None],
@@ -971,6 +980,25 @@ pub fn on_frame() {
             let list = crate::garden::my_chao();
             if !list.is_empty() {
                 online.session.send(Body::GardenChao(list), false, now);
+            }
+            // A visitor's look changed (it took an animal, evolved): send it again.
+            if online.frame.is_multiple_of(LOOK_EVERY_FRAMES) {
+                for (index, slot) in crate::garden::mine() {
+                    let Some(chao) = game::read_chao_slot(slot) else {
+                        continue;
+                    };
+                    let look = crate::garden::look(&chao);
+                    if online.sent_looks.get(&index) != Some(&look)
+                        && online.sent_looks.insert(index, look).is_some()
+                    {
+                        log!("online: our Chao {index} changed its look; sending it again");
+                        let body = Body::Chao {
+                            index,
+                            data: Box::new(chao),
+                        };
+                        online.session.send(body, true, now);
+                    }
+                }
             }
         }
     }

@@ -283,6 +283,9 @@ pub fn on_frame() {
     log!("puppets: object created at {object:#x}");
 }
 
+/// The game's shared player motion list (PLCOMMTN.PRS, loaded by 0x459469 and kept).
+const COMMON_MOTIONS: usize = 0x01A5_A240;
+
 /// The model (`{i32 index, NJS_OBJECT*}`, ends at index -1) with this index in a loaded list.
 unsafe fn list_model(models: usize, index: usize) -> usize {
     unsafe {
@@ -596,7 +599,15 @@ impl Source {
     unsafe fn motion(&self, index: usize) -> usize {
         unsafe {
             match self.lists {
-                Some((_, motions)) => list_motion(motions, index),
+                // Their own file, then the shared player motions (PLCOMMTN: walking, standing...,
+                // loaded once by the game for every character, list at 0x1A5A240).
+                Some((_, motions)) => match list_motion(motions, index) {
+                    0 => match read::<usize>(COMMON_MOTIONS) {
+                        0 => 0,
+                        common => list_motion(common, index),
+                    },
+                    motion => motion,
+                },
                 None => read::<usize>(MOTION_TABLE + index * TABLE_STRIDE),
             }
         }

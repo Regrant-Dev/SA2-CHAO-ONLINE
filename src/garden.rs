@@ -165,6 +165,8 @@ struct Garden {
     heard: HashMap<(u8, u8), Instant>,
     /// Friends' Chao that left our garden, for `take_left`.
     left: Vec<(u8, u8)>,
+    /// New looks of friends' Chao to apply: (owner, index) -> `look`.
+    looks_in: HashMap<(u8, u8), Vec<u8>>,
 }
 
 static GARDEN: Mutex<Option<Garden>> = Mutex::new(None);
@@ -182,6 +184,7 @@ fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
         changes_in: Vec::new(),
         heard: HashMap::new(),
         left: Vec::new(),
+        looks_in: HashMap::new(),
     }))
 }
 
@@ -267,6 +270,70 @@ pub fn visitors() -> Vec<([f32; 3], u8, u8, Option<String>)> {
             })
             .collect()
     })
+}
+
+/// What a visiting copy has to match: its type (form) and animal parts with their mask.
+pub fn look(chao: &ChaoData) -> Vec<u8> {
+    let mut look = vec![chao.chao_type()];
+    look.extend_from_slice(&chao.bytes[LOOK_PARTS]);
+    look
+}
+
+/// Animal part mask and parts (re/chao-garden-items.md: 0x118 mask, 0x11C..0x123 parts).
+const LOOK_PARTS: std::ops::Range<usize> = 0x118..0x124;
+/// `Data1+0x674` bit 2: the game rebuilds the Chao's appearance from its record.
+const D_REFRESH: usize = 0x674;
+
+/// Network: friend `owner` sent Chao `index` again; a copy of it here takes on its look.
+pub fn received_look(owner: u8, index: u8, chao: &ChaoData) {
+    let look = look(chao);
+    with(|g| {
+        g.looks_in.insert((owner, index), look);
+    });
+}
+
+/// Applies looks from `received_look` (game thread): animal parts are copied into the copy's
+/// record and redrawn; a new form (evolution) needs a new copy, so the old one goes.
+fn looks_frame(g: &mut Garden) {
+    for ((owner, index), look) in std::mem::take(&mut g.looks_in) {
+        let Some(m) = g.mirrors.get(&(owner, index)) else {
+            continue;
+        };
+        // SAFETY: our visitor's live object and its record (our own visitor buffer).
+        unsafe {
+            let d = data1(m.object);
+            if d == 0 {
+                continue;
+            }
+            let record = ((d + D_RECORD) as *const usize).read();
+            if record == 0 {
+                continue;
+            }
+            let copy = (record as *mut ChaoData)
+                .as_mut()
+                .expect("checked for null");
+            if self::look(copy) == look {
+                continue;
+            }
+            if copy.chao_type() != look[0] {
+                ((m.object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT);
+                log!("garden: player {owner}'s Chao {index} changed form; making a new copy");
+                g.mirrors.remove(&(owner, index));
+                g.heard.remove(&(owner, index));
+                g.left.push((owner, index));
+                continue;
+            }
+            copy.bytes[LOOK_PARTS].copy_from_slice(&look[1..]);
+            let flags = (d + D_REFRESH) as *mut u8;
+            flags.write(flags.read() | 2);
+            log!("garden: player {owner}'s Chao {index} got new animal parts");
+        }
+    }
+}
+
+/// Our visiting Chao: (index, save slot).
+pub fn mine() -> Vec<(u8, usize)> {
+    with(|g| g.mine.clone())
 }
 
 /// Our Chao visiting friends, for their tags: (where, index, the Chao's name if it has one).
@@ -490,6 +557,7 @@ pub fn on_frame() {
     let now = Instant::now();
     with(|g| {
         mirrors_frame(g, now);
+        looks_frame(g);
         mine_frame(g);
     });
 }
