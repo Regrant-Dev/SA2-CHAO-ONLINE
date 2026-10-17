@@ -475,9 +475,15 @@ static SAVED_CHAO: std::sync::Mutex<Option<SavedChao>> = std::sync::Mutex::new(N
 /// Where the Chao slots are in the save file (memory's 0x19F6EC4, in the file's layout).
 const FILE_CHAO_SLOTS: usize = 0x3AA4;
 
-/// From the loader at startup: the Chao save file.
+/// From the loader at startup: where the Chao save is (the loader gives its folder).
 pub fn set_chao_save_path(path: String) {
-    let _ = CHAO_SAVE_PATH.set(path);
+    let path = std::path::Path::new(&path);
+    let file = if path.is_dir() {
+        path.join("SONIC2B__ALF")
+    } else {
+        path.to_path_buf()
+    };
+    let _ = CHAO_SAVE_PATH.set(file.to_string_lossy().into_owned());
 }
 
 /// The Chao in the save file, re-read when it changes.
@@ -493,6 +499,7 @@ fn saved_chao() -> Vec<Option<ChaoData>> {
         return slots.clone();
     }
     let data = std::fs::read(path).unwrap_or_default();
+    crate::log!("chao save: read {} bytes from {path}", data.len());
     let slots: Vec<Option<ChaoData>> = (0..GARDEN_SLOTS)
         .map(|n| {
             let at = FILE_CHAO_SLOTS + n * CHAO_SIZE;

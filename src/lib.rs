@@ -91,7 +91,6 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
         let chao_save = unsafe { CStr::from_ptr(chao_save) }
             .to_string_lossy()
             .into_owned();
-        log!("chao save: {chao_save}");
         game::set_chao_save_path(chao_save);
     }
     game::install_freeze();
