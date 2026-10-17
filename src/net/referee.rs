@@ -8,6 +8,9 @@
 //! - **Co-op kills**: each room's destroyed stage objects per stage, sent to a room player who
 //!   enters that stage later (even after everyone else left it). Forgotten when the room closes.
 //!
+//! - **Treasure hunt pieces**: the first player to collect each piece of a room's hunt gets it
+//!   (`HuntClaim` -> `HuntTaken` to everyone; a late claim hears who has it).
+//!
 //! The dedicated server and a hosting player run the same referee (`session::Host`).
 
 use std::collections::{BTreeSet, HashMap};
@@ -53,6 +56,8 @@ pub struct Referee {
     items: HashMap<ItemId, Ledger>,
     players: HashMap<u8, Seen>,
     kills: HashMap<StageKey, BTreeSet<u16>>,
+    /// Treasure hunt pieces: (level, mission, set signature, slot) -> who got it first.
+    pieces: HashMap<(i16, u8, u32, u8), u8>,
 }
 
 impl Referee {
@@ -64,6 +69,28 @@ impl Referee {
     /// others; answers (if any) go to `out`.
     pub fn observe(&mut self, from: u8, body: &Body, out: &mut Vec<Out>) -> bool {
         match body {
+            Body::HuntClaim {
+                level,
+                mission,
+                sig,
+                slot,
+            } => {
+                let key = (*level, *mission, *sig, *slot);
+                let first = !self.pieces.contains_key(&key);
+                let owner = *self.pieces.entry(key).or_insert(from);
+                out.push(Out {
+                    to: if first { To::All } else { To::One(from) },
+                    from,
+                    body: Body::HuntTaken {
+                        level: *level,
+                        mission: *mission,
+                        sig: *sig,
+                        slot: *slot,
+                        player: owner,
+                    },
+                });
+                false
+            }
             Body::PlayerState(s) => {
                 let room = (s.room.1 != 0 && s.room.0 < 8).then_some(s.room.0);
                 let now = Seen {
@@ -255,6 +282,35 @@ mod tests {
                 owner: 1
             }
         );
+    }
+
+    #[test]
+    fn the_first_to_collect_a_piece_gets_it() {
+        let mut r = Referee::new();
+        let mut out = Vec::new();
+        let claim = Body::HuntClaim {
+            level: 16,
+            mission: 0,
+            sig: 7,
+            slot: 2,
+        };
+        assert!(!r.observe(3, &claim, &mut out));
+        assert!(!r.observe(1, &claim, &mut out));
+        let taken = |to| Out {
+            to,
+            from: 0,
+            body: Body::HuntTaken {
+                level: 16,
+                mission: 0,
+                sig: 7,
+                slot: 2,
+                player: 3,
+            },
+        };
+        assert_eq!(out[0].to, taken(To::All).to);
+        assert_eq!(out[0].body, taken(To::All).body);
+        assert_eq!(out[1].to, To::One(1));
+        assert_eq!(out[1].body, taken(To::One(1)).body);
     }
 
     fn state(level: i16, room: (u8, u8)) -> Body {

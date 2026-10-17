@@ -58,7 +58,7 @@ pub struct Config {
     pub chao_race: bool,
     /// "My Chao": save slot of the Chao for races and karate (-1 = the first hatched one).
     pub my_chao: i32,
-    /// Garden visits mode (index into `VISIT_MODES`).
+    /// Visit friends: 0 off, 1 on (index into `VISIT_MODES`).
     pub visits: usize,
     /// Mode of rooms we create.
     pub room_mode: crate::room::Mode,
@@ -305,6 +305,24 @@ fn peer_of(id: u8, s: &PlayerState) -> together::Peer {
 }
 
 /// Other players' stage/mission/flags for start-together, and whether we're connected.
+/// Our player id in the lobby.
+pub fn my_id() -> Option<u8> {
+    let guard = ONLINE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|online| online.session.my_id())
+}
+
+/// The other players: (id, name, latest state).
+pub fn others() -> Vec<(u8, String, Option<PlayerState>)> {
+    let guard = ONLINE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map_or_else(Vec::new, |online| {
+        online
+            .remote
+            .iter()
+            .map(|(&id, r)| (id, r.name.clone(), r.latest))
+            .collect()
+    })
+}
+
 pub fn peers() -> (Vec<together::Peer>, bool) {
     let guard = ONLINE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(online) = guard.as_ref() else {
@@ -532,11 +550,101 @@ fn pump(online: &mut Online, now: Instant) {
             Event::Game {
                 from,
                 body: Body::GardenChao(list),
-            } => crate::garden::received(from, list),
+            } => {
+                // Only from a friend in our garden: elsewhere their Chao aren't visiting us (and
+                // ours of theirs go home).
+                let here = online
+                    .remote
+                    .get(&from)
+                    .and_then(|r| r.latest)
+                    .is_some_and(|s| {
+                        s.level == game::LEVEL_CHAO_WORLD
+                            && i32::from(s.chao_area) == game::current_chao_area()
+                    });
+                if here {
+                    crate::garden::received(from, list);
+                }
+            }
             Event::Game {
                 from,
                 body: Body::GardenItems { area, items },
             } => crate::items::received(from, area, items),
+            Event::Game {
+                from,
+                body:
+                    Body::RaceStatus {
+                        level,
+                        mission,
+                        progress,
+                        finish,
+                    },
+            } => crate::stage_race::received_status(from, level, mission, progress, finish),
+            Event::Game {
+                body:
+                    Body::Route {
+                        level,
+                        mission,
+                        points,
+                    },
+                ..
+            } => crate::stage_race::received_route(level, mission, points),
+            Event::Game {
+                from,
+                body: Body::KartPick { course },
+            } => {
+                let name = online
+                    .remote
+                    .get(&from)
+                    .map_or_else(|| format!("player {from}"), |r| r.name.clone());
+                crate::kart::received_pick(course, from, &name);
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::KartState {
+                        position,
+                        rotation,
+                        yaw,
+                        wheel,
+                        kind,
+                        frame,
+                    },
+            } => crate::kart::received_state(from, (position, rotation, yaw, wheel, kind), frame),
+            Event::Game {
+                from,
+                body:
+                    Body::HuntSet {
+                        level,
+                        mission,
+                        pieces,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::hunt::received_set(level, mission, pieces);
+                }
+            }
+            Event::Game {
+                body: Body::HuntTaken {
+                    sig, slot, player, ..
+                },
+                ..
+            } => crate::hunt::received_taken(sig, slot, player),
+            // For the host's referee only (net/referee.rs).
+            Event::Game {
+                body: Body::HuntClaim { .. },
+                ..
+            } => {}
+            Event::Game {
+                from,
+                body: Body::Chat { text },
+            } => {
+                let name = online
+                    .remote
+                    .get(&from)
+                    .map_or_else(|| format!("player {from}"), |r| r.name.clone());
+                log!("chat: {name}: {text}");
+                crate::chat::received(&name, &text);
+            }
             Event::Game {
                 body: Body::ItemOwner { id, owner },
                 ..
@@ -670,7 +778,7 @@ pub fn on_frame() {
             .collect();
         crate::garden::set_holders(holders);
     }
-    if garden != online.garden {
+    if garden != online.garden || RESEND_GARDEN_CHAO.swap(false, Ordering::Relaxed) {
         online.garden = garden;
         online.resend_chao = true;
     }
@@ -678,7 +786,6 @@ pub fn on_frame() {
         online.resend_chao = false;
         let mine = match VISITS.load(Ordering::Relaxed) {
             VISITS_OFF => Vec::new(),
-            VISITS_MY_CHAO => my_chosen_slot().into_iter().collect(),
             _ => carried_chao(garden),
         };
         log!("online: bringing {} chao to garden {garden}", mine.len());
@@ -760,6 +867,9 @@ pub fn on_frame() {
             .send(Body::KaratePick { opponent }, true, now);
     }
 
+    for (id, index) in crate::garden::take_left() {
+        visitors::forget(id, index);
+    }
     if garden > 0 {
         for (&id, remote) in &online.remote {
             let Some(state) = remote.latest else { continue };
@@ -768,7 +878,10 @@ pub fn on_frame() {
             }
             let [x, y, z] = state.position;
             for (index, chao) in remote.chao.iter().take(MAX_CARRIED_CHAO).enumerate() {
-                if let Some(chao) = chao {
+                // Only while their game sends it (they can take it home any time).
+                if let Some(chao) = chao
+                    && crate::garden::visiting(id, index as u8)
+                {
                     visitors::spawn_remote(
                         id,
                         index as u8,
@@ -856,6 +969,65 @@ pub fn on_frame() {
         online
             .session
             .send(Body::GardenItems { area, items }, false, now);
+    }
+    if let Some(course) = crate::kart::take_pick() {
+        online.session.send(Body::KartPick { course }, true, now);
+    }
+    if online.frame.is_multiple_of(STATE_EVERY_FRAMES)
+        && let Some(((position, rotation, yaw, wheel, kind), frame)) = crate::kart::take_mine()
+    {
+        let body = Body::KartState {
+            position,
+            rotation,
+            yaw,
+            wheel,
+            kind,
+            frame,
+        };
+        online.session.send(body, false, now);
+    }
+    let (set, claims) = crate::hunt::take_outgoing();
+    if let Some((level, mission, pieces)) = set {
+        let body = Body::HuntSet {
+            level,
+            mission,
+            pieces,
+        };
+        online.session.send(body, false, now);
+    }
+    for (level, mission, sig, slot) in claims {
+        let body = Body::HuntClaim {
+            level,
+            mission,
+            sig,
+            slot,
+        };
+        online.session.send(body, true, now);
+    }
+    let (status, route) = crate::stage_race::take_outgoing();
+    if let Some((level, mission, progress, finish, reliable)) = status {
+        let body = Body::RaceStatus {
+            level,
+            mission,
+            progress,
+            finish,
+        };
+        online.session.send(body, reliable, now);
+    }
+    if let Some((level, mission, points)) = route {
+        online.session.send(
+            Body::Route {
+                level,
+                mission,
+                points,
+            },
+            true,
+            now,
+        );
+    }
+    for text in crate::chat::take_outgoing() {
+        log!("chat: me: {text}");
+        online.session.send(Body::Chat { text }, true, now);
     }
     for id in crate::items::take_claims() {
         online.session.send(Body::ItemClaim { id }, true, now);
@@ -980,24 +1152,26 @@ pub fn set_my_chao(slot: i32) {
     RESEND_MY_CHAO.store(true, Ordering::Relaxed);
 }
 
-/// Garden visits: which of our Chao visit the others in a shared garden.
-pub const VISIT_MODES: [&str; 3] = ["Off", "My Chao", "Garden Chao"];
+/// Visit friends: whether our Chao (up to 2 from the garden we're in) visit the others in it.
+pub const VISIT_MODES: [&str; 2] = ["Off (they stay home)", "On (up to 2 Chao from this garden)"];
 const VISITS_OFF: u8 = 0;
-const VISITS_MY_CHAO: u8 = 1;
-const VISITS_GARDEN: u8 = 2;
-static VISITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(VISITS_GARDEN);
+const VISITS_ON: u8 = 1;
+static VISITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(VISITS_ON);
 
-/// F9 / config: garden visits mode (index into `VISIT_MODES`). Applies on the next garden.
+/// F9 / config: visits on or off (index into `VISIT_MODES`).
 pub fn set_visits(mode: usize) {
     VISITS.store(mode.min(VISIT_MODES.len() - 1) as u8, Ordering::Relaxed);
+    // Takes effect right away: visiting Chao leave (or come) without re-entering the garden.
+    RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
 }
 
-/// Parses a `VisitWith` value ("Off", "MyChao", "Garden").
+static RESEND_GARDEN_CHAO: AtomicBool = AtomicBool::new(false);
+
+/// Parses a `VisitWith` value ("Off" or "On"; older "Garden" and "MyChao" mean On).
 pub fn parse_visits(text: &str) -> usize {
     match text.trim().to_ascii_lowercase().replace(' ', "").as_str() {
         "off" | "none" => usize::from(VISITS_OFF),
-        "mychao" => usize::from(VISITS_MY_CHAO),
-        _ => usize::from(VISITS_GARDEN),
+        _ => usize::from(VISITS_ON),
     }
 }
 
@@ -1068,7 +1242,7 @@ mod tests {
                 name_tags: true,
                 chao_race: true,
                 my_chao: -1,
-                visits: 2,
+                visits: 1,
                 room_mode: crate::room::Mode::Race,
             }
         );
@@ -1085,7 +1259,7 @@ mod tests {
                 name_tags: true,
                 chao_race: true,
                 my_chao: -1,
-                visits: 2,
+                visits: 1,
                 room_mode: crate::room::Mode::Race,
             }
         );

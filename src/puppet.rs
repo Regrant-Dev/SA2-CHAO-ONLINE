@@ -406,6 +406,8 @@ extern "C" fn display(_object: usize) {
                     })
             };
             let result = match source {
+                // In a Kart Race the others are drawn as karts (kart.rs); keep their name tags.
+                _ if crate::kart::in_kart_race() => Ok(()),
                 // Mechs and walkers: their own walker display draws them with their upgrade parts
                 // when every model it reads is loaded; otherwise just the body
                 // (re/characters.md "Drawing other players' walkers").
@@ -607,12 +609,13 @@ const CO2_MOTION_MODE: usize = 0x174;
 const CO2_NEXT_ANIM: usize = 0x176;
 const CO2_TEXLIST: usize = 0x448;
 /// Globals the walker displays and their bone callbacks write: (address, length).
-const WALKER_GLOBALS: [(usize, usize); 5] = [
+const WALKER_GLOBALS: [(usize, usize); 6] = [
     (0x01A5_1D00, 0x450), // bone matrices and the drawn CharObj2 (Tails' callback to 0x1A52120)
     (0x01A5_57FC, 0x50),  // matrix stack top, bone callback, draw flags (0x1A557FC..0x1A5584C)
     (0x01DE_4660, 0x08),  // per-player light index
     (0x01DE_B6A0, 0x10),  // render flags it saves
     (0x025E_FFCC, 0x14),  // fog switch and colour
+    (0x01D1_9CC0, 0x70),  // Chao walkers' extra matrix (Dark at +0, Chao at +0x40)
 ];
 
 #[repr(C, align(16))]
@@ -632,13 +635,33 @@ fn is_walker(character: u8) -> bool {
     matches!(character, 6 | 7 | 10 | 11)
 }
 
-/// The display of a walker type: Tails' and Eggman's. (The Chao walkers' displays, 0x746290 and
-/// 0x7470D0, read slots not mapped yet: those get the body only.)
+/// The display of a walker type: Tails', Eggman's, the Chao Walker's and the Dark one's.
 fn walker_display_of(character: u8) -> Option<usize> {
     match character {
         6 => Some(0x0074_7DD0),
         7 => Some(0x0074_44F0),
+        10 => Some(0x0074_6290),
+        11 => Some(0x0074_70D0),
         _ => None,
+    }
+}
+
+/// CharObj2 +1 and +3 for a walker type: the Chao walkers are Tails'/Eggman's frames (+1)
+/// with their own id (+3: 0xD / 0xE).
+fn walker_ids(character: u8) -> (u8, u8) {
+    match character {
+        10 => (6, 0x0D),
+        11 => (7, 0x0E),
+        c => (c, c),
+    }
+}
+
+/// Motion slots a walker display reads without a null check (only the Chao walkers' throw).
+fn walker_motion_slots(character: u8, anim: u16) -> Vec<usize> {
+    match (character, anim) {
+        (10, 0xB4) => vec![193],
+        (11, 0xB4) => vec![198],
+        _ => Vec::new(),
     }
 }
 
@@ -678,6 +701,20 @@ fn walker_slots(character: u8, upgrades: u32, anim: u16) -> Vec<usize> {
                 slots.extend([319, 321]);
             }
         }
+        // Chao Walker: no upgrade parts; its bone callback reads 442 unchecked.
+        10 => {
+            slots.push(442);
+            if anim == 0xB4 {
+                slots.push(451);
+            }
+        }
+        // Dark Chao Walker.
+        11 => {
+            slots.push(465);
+            if anim == 0xB4 {
+                slots.push(474);
+            }
+        }
         _ => {}
     }
     slots
@@ -695,9 +732,13 @@ unsafe fn draw_walker(source: &Source, pose: &Pose) -> Result<(), &'static str> 
             return draw(source, pose);
         };
         let loaded = |slot: usize| read::<usize>(MODEL_TABLE + slot * TABLE_STRIDE) != 0;
+        let motion_loaded = |slot: usize| read::<usize>(MOTION_TABLE + slot * TABLE_STRIDE) != 0;
         if !walker_slots(pose.character, pose.upgrades, pose.anim)
             .into_iter()
             .all(loaded)
+            || !walker_motion_slots(pose.character, pose.anim)
+                .into_iter()
+                .all(motion_loaded)
         {
             return draw(source, pose);
         }
@@ -707,8 +748,9 @@ unsafe fn draw_walker(source: &Source, pose: &Pose) -> Result<(), &'static str> 
         walker.object = [0; 0x50];
         let c = walker.co2.as_mut_ptr() as usize;
         write(c + CO2_PLAYER, 0u8);
-        write(c + CO2_CHARACTER, pose.character);
-        write(c + game::CO2_CHAR_ID, pose.character);
+        let (frames, id) = walker_ids(pose.character);
+        write(c + CO2_CHARACTER, frames);
+        write(c + game::CO2_CHAR_ID, id);
         write(c + game::CO2_UPGRADES, pose.upgrades);
         write(c + CO2_MOTION_MODE, 0u16);
         write(c + CO2_NEXT_ANIM, pose.anim);

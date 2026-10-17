@@ -190,8 +190,9 @@ its loader on the ObjectMaster (+0x14 display, +0x1C delayed display, +0x18 dele
 |---|---|---|---|---|---|---|
 | Eggman 7 | 0x740C50 | 7 / 7 | **0x7444F0** | 0x744020 | 0x7454B0 | EWALKTEX / EWALKMDL / EWALKMTN |
 | Tails 6 | 0x740EB0 | 6 / 6 | **0x747DD0** | 0x747940 | 0x748CA0 | TWALKTEX / TWALKMDL / TWALKMTN |
-| Chao Walker (Tails 2P alt) | 0x741110 | 6 / **0xD** | 0x746290 | (own) | 0x746850 | CWALK* |
-| Dark Chao Walker (Eggman 2P alt) | 0x7412F0 | 7 / **0xE** | 0x7470D0 | (own) | 0x7476A0 | DWALK* |
+| Chao Walker (Tails 2P alt) | 0x741110 | 6 / **0xD** | **0x746290** | 0x745CC0 | 0x746850 | CWALKTEX / CWALKMDL / CWALKMTN |
+| Dark Chao Walker (Eggman 2P alt) | 0x7412F0 | 7 / **0xE** | **0x7470D0** | 0x746B00 | 0x7476A0 | DWALKTEX / DWALKMDL / DWALKMTN |
+AnimInfo (co2+0x198): Eggman 0xA0E1F0, Tails 0xA0EAA0, Chao 0xA0F680 (0xC6 entries), Dark 0xA102E0.
 The alt loaders run instead when `0x174AFDE` (2P mode) and `0x174B015[player]`; EWALK2/TWALK1
 (`0x174B013[player] == 1`, co2+2 = 1) are the other 2P costumes. All four allocate a 0x458-byte
 CharObj2 and keep the body texlist at **+0x448** (also the Chao walkers; the slot table above saying
@@ -234,7 +235,7 @@ obj+0x34 (Data1) and obj+0x40 (Data2) from the object.
   Tails 0x747DD0: 306 (0x1DE9FB4, bit 0x100) or 304 (0x1DE9FA4), 309 (bit 0x80) or 312, 313 (anim
   0xB4, with AnimInfo[0xB5] motion), 319 + 321 (bit 0x40), 325 (co2+0x374 > 0); 303/305 are only
   compared / null-tested. Delayed 0x748CA0: 317 (only anim 0xB3).
-  Chao 0x746290: 451, 458; Dark 0x7470D0: 474, 481.
+  Chao / Dark: see "Chao walkers" below.
   Bone callbacks only compare bone pointers against slots (null never matches) — safe.
 - Globals written (save/restore around a puppet call): 0x1A51D00..**0x1A52150** (bone matrices
   0x1A51D2C..0x1A52120 + drawing co2 0x1A51F0C + view copy 0x1A51F70; Tails' callback writes
@@ -246,6 +247,37 @@ obj+0x34 (Data1) and obj+0x40 (Data2) from the object.
   display/callback/delayed code: 0x744020..0x7458EF, 0x746290..0x748FFF; walker main 0x741530 doesn't).
 - 0x420510 (light from 0x19341C0..C8) is called only for the cockpit model when 0x1A55808 == 0 —
   plain globals, safe.
+
+### Chao walkers (0x746290 / 0x7470D0, 2026-10-16)
+Both are the same code with different slots (diffed instruction by instruction); same shape as
+Tails' display, but **no upgrade parts at all**: they never read co2+1, +2, +3 or +0x24.
+| | Chao Walker (10) | Dark Chao Walker (11) | condition |
+|---|---|---|---|
+| display / bone callback / delayed | 0x746290 / 0x745CC0 / 0x746850 | 0x7470D0 / 0x746B00 / 0x7476A0 | |
+| body (via AnimInfo, `resolve`) | 450 (451 for 0x81/0xB5, 287 for 0x82) | 473 (**451** for 0x81, 474 for 0xB5, 287 for 0x82) | 287 is an EWALKMDL slot; 451 a CWALKMDL slot |
+| callback root, **always** | **442** (same NJS_OBJECT as 450) | **465** (same object as 473) | callback does `bone == slot ? … : bone == [slot+0x2C]` — null slot → read of 0x2C |
+| held object | **451** + motion **193** (AnimInfo[0xC1].motion) | **474** + motion **198** (AnimInfo[0xC1].motion) | anim == 0xB4 && co2+0x174 != 2 |
+| effect | 458 | 481 | co2+0x374 > 0 (keep 0) |
+| delayed, null-checked | 460; 283 (anim 0xB3) | 461; 283 (anim 0x7F) | 283's child (+0x2C) is not checked, but every file's 283 (C/D/EWALKMDL) has a child with a model → safe |
+| bone matrix it keeps outside 0x1A51D00.. | **0x1D19D00** (0x30) | **0x1D19CC0** (0x30) | written by the callback, read only by its delayed display |
+Only compared (never dereferenced) in the callbacks: Chao 443..449, 451..454; Dark 466..472, 475..477.
+CharObj2 reads: +0 (player: 0x1DE4664[], light 0x486E50, and the callback reads
+`*(u8*)MainCharObj1[co2+0] == 1` for bone 443/466 with **no null check** on 0x1DEA6C0[co2+0] — +0 = our
+own player number keeps it valid), +0x174, +0x178, +0x184, +0x198, +0x19C (mode 2 only), +0x374,
++0x448 texlist; +0x2C (only if that action == 1; 0 → skipped), +0x428 (callback angle, 0 → skipped);
++0x134 / +0xBC only for entity actions 0x33 / 0x36. So the zeroed private co2 recipe is enough
+(+1/+3 = 6/0xD and 7/0xE for consistency, +0x24 irrelevant). Writes: +0x1E8..+0x2FC, +0x3A0..+0x3E8
+(only when +0x374 > 0), +0x3F4..+0x424, +0x438..+0x440.
+Globals: matrices 0x1A51D5C/D8C/E1C/EAC/F70/FA0/0x1A52120 (Chao), 0x1A51DBC/DEC/E7C/EAC/F40/F70/FD0
+(Dark) — all inside 0x1A51D00..0x1A52150; plus 0x1D19D00 / 0x1D19CC0 above (nothing else in the exe
+references 0x1D19CC0..0x1D19D30 → one `(0x1D19CC0, 0x70)` save covers both); 0x1DEB6A0..AC,
+0x1DE4664, fog 0x25EFFCC..DC, 0x1A55834, 0x1A55844 (delayed): already covered. The tail helpers
+0x748AF0 (Chao, shared with Tails: body 293 only) / 0x745310 (Dark, Eggman's: body 248 only) just
+push/pop the matrix for these bodies.
+Assets: CWALKMDL 267, 283, 442..460 / DWALKMDL 267, 283, 461, 465..482: disjoint from each other and
+from E/TWALK except 267/283 (in all three of C/D/EWALK; first loaded wins, any copy is safe). Motions:
+CWALKMTN 88..127, 133..135, 190..197; DWALKMTN the same + 198..201 — 88..135 shared with EWALKMTN,
+190..197 shared between Chao and Dark (first loaded wins: looks wrong, never crashes; same skeleton).
 
 ### Slot ranges per walker (decoded from gd_PC/*.prs, big-endian {id, offset} lists)
 | file | model slots | motion slots |
@@ -269,7 +301,8 @@ motion slots 88..135 (same 33-node skeleton, so a mismatch only looks wrong, nev
 3. Preflight (every frame, cheap): body model and motion for the anim non-null (`resolve`), and
    **every unguarded slot listed above for that display non-null** (for Eggman: 258, 259, 260,
    262, 263, 265, 266, 268, 274, 276, 278, 287, 291 + motion 130; for Tails: 304, 306, 309, 312,
-   313, 319, 321, 325; also require 259 / 305, which the loops test). Any null → draw body-only with `draw()` (texlist +0x448) instead.
+   313, 319, 321, 325; also require 259 / 305, which the loops test; Chao: 442, +451 & motion 193
+   for anim 0xB4; Dark: 465, +474 & motion 198 for anim 0xB4). Any null → draw body-only with `draw()` (texlist +0x448) instead.
 4. Build a zeroed 0x458(+8)-byte CharObj2 (don't copy ours: different layouts/meanings per
    type, and ours may not be a walker): +0 = our player number (0), +1 = 6/7, +2 = 0, +3 = 6/7,
    +0x24 = remote upgrades, +0x174 = 0, +0x176 = +0x178 = anim, +0x184 = frame, +0x198 = that
@@ -277,7 +310,8 @@ motion slots 88..135 (same 33-node skeleton, so a mismatch only looks wrong, nev
    at 0. (A copy of our own co2 is also fine when the type matches; then still force +2 = 0.)
 5. Zeroed 0x40-byte EntityData1: action 0, status 0, rotation, position, scale = 1.0 x3.
 6. Fake 0x50-byte object with +0x34 = entity, +0x40 = co2. Save the globals above
-   (0x1A51D00 len 0x450 etc.) and the render texlist, call, restore, `refresh_fog`.
+   (0x1A51D00 len 0x450 etc.; for the Chao walkers also 0x1D19CC0 len 0x70) and the render
+   texlist, call, restore, `refresh_fog`.
 7. Optional: the delayed display (+0x1C column) right after, before restoring — it draws the
    transparent parts from the matrices just computed (Eggman's needs slots 279..286, 462).
 Confidence: high for the display table, both crash causes and slot lists; medium that nothing

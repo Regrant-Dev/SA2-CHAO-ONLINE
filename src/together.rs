@@ -79,6 +79,14 @@ pub fn live() -> bool {
     TOGETHER.lock().unwrap_or_else(|e| e.into_inner()).live
 }
 
+/// When the stage we're in started together (the GO), if it did.
+pub fn started_at() -> Option<Instant> {
+    match TOGETHER.lock().unwrap_or_else(|e| e.into_inner()).phase {
+        Phase::Started { at } => Some(at),
+        _ => None,
+    }
+}
+
 /// Menu: start this stage now (for everyone waiting in it).
 pub fn start_now() {
     TOGETHER.lock().unwrap_or_else(|e| e.into_inner()).start_now = true;
@@ -202,8 +210,14 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                 t.go_until = Some(now + GO_FLAG_TIME);
             }
             if we_go || someone_said_go || t.go_seen {
+                // Karts: the game's own fly-by and lights follow the release, in step.
+                let countdown = if level == crate::kart::KART_LEVEL {
+                    Duration::ZERO
+                } else {
+                    COUNTDOWN
+                };
                 t.phase = Phase::Countdown {
-                    go_at: now + COUNTDOWN,
+                    go_at: now + countdown,
                 };
                 log!(
                     "together: countdown ({})",

@@ -44,6 +44,7 @@ enum Row {
     NameTags,
     Room,
     RoomMode,
+    GoTo,
     Karate,
     KarateOpponent,
     Race,
@@ -74,6 +75,9 @@ fn rows(mode: usize) -> Vec<Row> {
     rows.extend([Row::NameTags, Row::Room]);
     if room::summary().is_some() {
         rows.extend([Row::RoomInfo, Row::RoomMode]);
+    }
+    if !online::others().is_empty() {
+        rows.push(Row::GoTo);
     }
     if !online::karate_opponents().is_empty() {
         rows.push(Row::KarateOpponent);
@@ -112,7 +116,7 @@ pub struct Settings {
     pub chao_race: bool,
     /// Save slot of "My Chao" (-1 = the first hatched one).
     pub my_chao: i32,
-    /// Garden visits (index into `online::VISIT_MODES`).
+    /// Visit friends: 0 off, 1 on (index into `online::VISIT_MODES`).
     pub visits: usize,
     /// Mode of rooms we create.
     pub room_mode: room::Mode,
@@ -129,7 +133,7 @@ impl Settings {
             name_tags: true,
             chao_race: true,
             my_chao: -1,
-            visits: 2,
+            visits: 1,
             room_mode: room::Mode::Race,
         };
         for line in text.lines() {
@@ -181,7 +185,7 @@ impl Settings {
             if self.name_tags { "On" } else { "Off" },
             if self.chao_race { "On" } else { "Off" },
             self.my_chao,
-            ["Off", "MyChao", "Garden"][self.visits.min(2)],
+            ["Off", "On"][self.visits.min(1)],
             self.room_mode.ini()
         )
     }
@@ -201,6 +205,8 @@ struct Menu {
     row: usize,
     /// Which room choice the Room row shows.
     room_choice: usize,
+    /// Which player the Go to row shows.
+    goto_choice: usize,
     settings: Settings,
     message: String,
     keys: Vec<Hotkey>,
@@ -224,6 +230,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
     open: false,
     row: 0,
     room_choice: 0,
+    goto_choice: 0,
     settings: Settings {
         mode: 0,
         name: String::new(),
@@ -232,12 +239,17 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         name_tags: true,
         chao_race: true,
         my_chao: -1,
-        visits: 2,
+        visits: 1,
         room_mode: crate::room::Mode::Race,
     },
     message: String::new(),
     keys: Vec::new(),
 });
+
+/// The F9 menu is open.
+pub fn is_open() -> bool {
+    MENU.lock().unwrap_or_else(|e| e.into_inner()).open
+}
 
 /// F9: open/close the menu.
 pub fn toggle() {
@@ -309,6 +321,10 @@ pub fn on_frame() {
     match row {
         Row::Mode if left => m.settings.mode = (m.settings.mode + MODES.len() - 1) % MODES.len(),
         Row::Mode if right => m.settings.mode = (m.settings.mode + 1) % MODES.len(),
+        Row::GoTo if left || right => {
+            let n = online::others().len().max(1);
+            m.goto_choice = (m.goto_choice + if left { n - 1 } else { 1 }) % n;
+        }
         Row::Room if left || right => {
             // Browse the room choices; Enter applies the one shown.
             let n = room::choices().len().max(1);
@@ -405,6 +421,12 @@ pub fn on_frame() {
                 .get(m.room_choice)
                 .map(|(choice, _)| room::choose(*choice)),
             Row::StartStop => Some(start_stop(&mut m)),
+            Row::GoTo => {
+                let others = online::others();
+                others
+                    .get(m.goto_choice.min(others.len().saturating_sub(1)))
+                    .map(|(id, _, _)| crate::goto::go_to(*id))
+            }
             Row::Apply => {
                 online::stop();
                 Some(start_stop(&mut m))
@@ -518,6 +540,19 @@ fn draw(m: &Menu, rows: &[Row]) {
                 "  Mode:       {} (set by the creator)",
                 room::mode().label()
             ),
+            Row::GoTo => {
+                let others = online::others();
+                match others.get(m.goto_choice.min(others.len().saturating_sub(1))) {
+                    Some((_, name, state)) => {
+                        let place = state.map_or_else(
+                            || "joining".to_string(),
+                            |s| crate::places::place(s.level, s.chao_area),
+                        );
+                        format!("Go to:        < {name} - {place} >  (Enter)")
+                    }
+                    None => "Go to:        (nobody else online)".into(),
+                }
+            }
             Row::Room => {
                 let choices = room::choices();
                 match choices.get(m.room_choice.min(choices.len().saturating_sub(1))) {
@@ -525,10 +560,13 @@ fn draw(m: &Menu, rows: &[Row]) {
                     None => "Room:         (connect first)".into(),
                 }
             }
-            Row::MyChao => format!("My Chao:      < {} >", my_chao_label(m.settings.my_chao)),
+            Row::MyChao => format!(
+                "My Chao (races, karate): < {} >",
+                my_chao_label(m.settings.my_chao)
+            ),
             Row::Visits => format!(
-                "Garden visits: < {} >",
-                online::VISIT_MODES[m.settings.visits.min(2)]
+                "Visit friends: < {} >",
+                online::VISIT_MODES[m.settings.visits.min(1)]
             ),
             Row::KarateOpponent => {
                 let options = online::karate_opponents();

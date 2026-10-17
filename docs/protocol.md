@@ -62,6 +62,14 @@ Game bodies:
 | 14 | GardenItems | ~10 Hz, unreliable | area u8 (1..=3), count u8 (≤ 24), then per item: id (origin u8, serial u16), category u8 (2/3/7/9), kind u8, bites u8 (≤ 4), place u8 (0 ground, 1 held by the sender, 2 held/eaten by their visiting Chao, 3 in use unseen), chao u8 (place 2: Chao index < 2), position f32×3 (ground/unseen: where; held: offset in the holder's frame): items the sender owns in that garden (src/items.rs) |
 | 15 | ItemClaim | reliable, to the host only | id: the sender picked up (or a Chao in their game took) item `id` and asks to own it. The host's referee answers; it is never passed on |
 | 16 | ItemOwner | reliable, from the host | id, owner u8: item `id` belongs to `owner` (to everyone when a claim is granted, to the claimer alone when refused) |
+| 17 | Chat | reliable | text str (1..=80 printable ASCII) |
+| 18 | RaceStatus | ~4 Hz unreliable, reliable at the finish | level i16, mission u8, progress u16 (0..=10000, 0xFFFF unknown), finished u8 (0/1) [race u32, game u32 centiseconds]: room race status |
+| 19 | Route | reliable | level i16, mission u8, count u16 (≤ 2000), count × f32×3: a stage route (first clear), for race positions |
+| 20 | KartPick | reliable | course u8 (0..=2): a room player started a Kart Race |
+| 21 | KartState | 30 Hz unreliable | position f32×3, rotation i32×3, yaw i32, wheel i32, kind u8 (2..=7), frame u16 (the sender's game frame, wrapping; repeats and late ones are dropped, speeds come from it): the sender's kart |
+| 22 | HuntSet | ~1 Hz unreliable | level i16, mission u8, 3 × (kind u8, id u8, position f32×3): the room's treasure hunt pieces |
+| 23 | HuntClaim | reliable, to the host only | level, mission, sig u32, slot u8 (0..=2): we collected this piece. Not passed on |
+| 24 | HuntTaken | reliable, from the host | level, mission, sig, slot, player u8: who got the piece first (everyone; a late claimer alone) |
 
 `PlayerState.flags` (`game::POSE_*`): 1 spin ball (jump), 2 blending into `anim`, 4 waiting at
 a synced start, 8 "start now", 16 in a Chao Race the state is the player's racing Chao (position
@@ -84,6 +92,7 @@ everyone. It reads every `Game` message before passing it on:
 - `GardenItems`: who owns each item, and whether its owner is using it (held, or a Chao has it).
 - `ItemClaim`: the first claim for an item that isn't in use wins; the answer is `ItemOwner`.
   Claims aren't passed on.
+- `HuntClaim`: the first claim for each piece of a room's hunt wins; answered with `HuntTaken`.
 - `PlayerState` / `StageKills`: each room's destroyed stage objects per (level, mission). A room
   player who enters such a stage gets them as `StageKills`; they're forgotten when the room
   closes (its creator leaves it or the lobby).

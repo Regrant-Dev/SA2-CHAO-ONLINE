@@ -41,7 +41,7 @@ use sa2_chao_online::chao::file;
 use sa2_chao_online::game::KNOWN_GAME_BUILD;
 use sa2_chao_online::net::protocol::{
     Body, GardenChao, GardenItem, ItemId, ItemPlace, KarateFighter, KarateState, MAX_CARRIED_CHAO,
-    Message, PlayerState,
+    MAX_CHAT, Message, PlayerState, RACE_PROGRESS_UNKNOWN,
 };
 use sa2_chao_online::net::session::{Client, Event, Host, Identity, Session};
 use sa2_chao_online::net::udp::Endpoint;
@@ -256,6 +256,64 @@ fn main() {
                     body: body @ Body::ItemOwner { .. },
                     ..
                 } => println!("referee: {body:?}"),
+                // Race a little behind the real player (positions), and finish just after them.
+                Event::Game {
+                    body:
+                        Body::RaceStatus {
+                            level,
+                            mission,
+                            progress,
+                            finish,
+                        },
+                    ..
+                } => {
+                    let progress = if progress == RACE_PROGRESS_UNKNOWN {
+                        progress
+                    } else {
+                        progress.saturating_sub(300)
+                    };
+                    let finish = finish.map(|(race, game)| (race + 150, game + 150));
+                    let body = Body::RaceStatus {
+                        level,
+                        mission,
+                        progress,
+                        finish,
+                    };
+                    session.send(body, finish.is_some(), now);
+                }
+                // Drive a kart 40 units to the side of the real player's.
+                Event::Game {
+                    body:
+                        Body::KartState {
+                            position,
+                            rotation,
+                            yaw,
+                            wheel,
+                            kind,
+                            frame,
+                        },
+                    ..
+                } => {
+                    let body = Body::KartState {
+                        position: [position[0] + 40.0, position[1], position[2]],
+                        rotation,
+                        yaw,
+                        wheel,
+                        kind,
+                        frame,
+                    };
+                    session.send(body, false, now);
+                }
+                // Answer chat so it can be tested alone.
+                Event::Game {
+                    from,
+                    body: Body::Chat { text },
+                } => {
+                    println!("chat from player {from}: {text}");
+                    let reply = format!("heard: {text}");
+                    let text: String = reply.chars().take(MAX_CHAT).collect();
+                    session.send(Body::Chat { text }, true, now);
+                }
                 Event::Game {
                     from,
                     body:

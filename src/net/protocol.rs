@@ -23,6 +23,14 @@ pub const MAX_VERSION: usize = 16;
 const MAX_COORD: f32 = 1.0e6;
 /// Karate HP/morale are stat + 1000, at most a few thousand.
 const MAX_KARATE_HP: f32 = 1.0e5;
+/// `Body::RaceStatus::progress` at the goal, and without a route.
+pub const RACE_PROGRESS_MAX: u16 = 10_000;
+pub const RACE_PROGRESS_UNKNOWN: u16 = 0xFFFF;
+/// Points in a `Body::Route`.
+pub const MAX_ROUTE: usize = 2000;
+
+/// Chat message length (printable ASCII).
+pub const MAX_CHAT: usize = 80;
 /// Changed fields per `ChaoChanges` (the whitelist in `chao::changes` has fewer).
 const MAX_CHAO_CHANGES: usize = 128;
 /// Stage object records per stage (`SETObjectData[0x600]`, re/stage-objects.md).
@@ -135,6 +143,63 @@ pub enum Body {
     ItemOwner {
         id: ItemId,
         owner: u8,
+    },
+    /// Chat: the sender says `text` (printable ASCII, at most `MAX_CHAT`).
+    Chat {
+        text: String,
+    },
+    /// Room race in a stage: the sender's progress (0..=`RACE_PROGRESS_MAX`, or
+    /// `RACE_PROGRESS_UNKNOWN` without a route) and, once they reached the goal, their race time
+    /// (counted from the room's GO; deaths included) and the game's clear time, in centiseconds.
+    RaceStatus {
+        level: i16,
+        mission: u8,
+        progress: u16,
+        finish: Option<(u32, u32)>,
+    },
+    /// Room: someone started a Kart Race on `course` (0..=2); members in the Kart Race course
+    /// list go along (each with their own driver).
+    KartPick {
+        course: u8,
+    },
+    /// The sender's kart in a Kart Race, ~30 per second: where, facing, the display's extra yaw
+    /// and wheel angle (BAMS), and the kart type (2..=7).
+    KartState {
+        position: [f32; 3],
+        rotation: [i32; 3],
+        yaw: i32,
+        wheel: i32,
+        kind: u8,
+        /// The sender's game frame it was taken on (wraps): exact timing for its motion.
+        frame: u16,
+    },
+    /// Treasure hunt battle: the room's 3 pieces in a hunt stage (kind, id, position), chosen by
+    /// its leader's game; everyone hunts the same ones.
+    HuntSet {
+        level: i16,
+        mission: u8,
+        pieces: [(u8, u8, [f32; 3]); 3],
+    },
+    /// To the referee: we collected piece `slot` (0..3) of the hunt with set `sig`.
+    HuntClaim {
+        level: i16,
+        mission: u8,
+        sig: u32,
+        slot: u8,
+    },
+    /// From the referee: piece `slot` of hunt `sig` went to `player` (first to collect it).
+    HuntTaken {
+        level: i16,
+        mission: u8,
+        sig: u32,
+        slot: u8,
+        player: u8,
+    },
+    /// A stage's route (points ~50 units apart, start to goal), for live race positions.
+    Route {
+        level: i16,
+        mission: u8,
+        points: Vec<[f32; 3]>,
     },
     /// Co-op room: these stage objects (SET record indices) were destroyed in this stage.
     StageKills {
@@ -281,6 +346,14 @@ mod tag {
     pub const GARDEN_ITEMS: u8 = 14;
     pub const ITEM_CLAIM: u8 = 15;
     pub const ITEM_OWNER: u8 = 16;
+    pub const CHAT: u8 = 17;
+    pub const RACE_STATUS: u8 = 18;
+    pub const ROUTE: u8 = 19;
+    pub const KART_PICK: u8 = 20;
+    pub const KART_STATE: u8 = 21;
+    pub const HUNT_SET: u8 = 22;
+    pub const HUNT_CLAIM: u8 = 23;
+    pub const HUNT_TAKEN: u8 = 24;
 }
 
 fn item_id(r: &mut Reader) -> Result<ItemId> {
@@ -523,6 +596,98 @@ impl Body {
                     }
                 }
             }
+            Self::Chat { text } => {
+                w.u8(tag::CHAT).str(text);
+            }
+            Self::RaceStatus {
+                level,
+                mission,
+                progress,
+                finish,
+            } => {
+                w.u8(tag::RACE_STATUS)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u16(*progress);
+                match finish {
+                    Some((race, game)) => w.u8(1).u32(*race).u32(*game),
+                    None => w.u8(0),
+                };
+            }
+            Self::HuntSet {
+                level,
+                mission,
+                pieces,
+            } => {
+                w.u8(tag::HUNT_SET).i16(*level).u8(*mission);
+                for (kind, id, pos) in pieces {
+                    w.u8(*kind).u8(*id);
+                    for v in pos {
+                        w.f32(*v);
+                    }
+                }
+            }
+            Self::HuntClaim {
+                level,
+                mission,
+                sig,
+                slot,
+            } => {
+                w.u8(tag::HUNT_CLAIM)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u32(*sig)
+                    .u8(*slot);
+            }
+            Self::HuntTaken {
+                level,
+                mission,
+                sig,
+                slot,
+                player,
+            } => {
+                w.u8(tag::HUNT_TAKEN)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u32(*sig)
+                    .u8(*slot)
+                    .u8(*player);
+            }
+            Self::KartPick { course } => {
+                w.u8(tag::KART_PICK).u8(*course);
+            }
+            Self::KartState {
+                position,
+                rotation,
+                yaw,
+                wheel,
+                kind,
+                frame,
+            } => {
+                w.u8(tag::KART_STATE);
+                for v in position {
+                    w.f32(*v);
+                }
+                for a in rotation {
+                    w.i32(*a);
+                }
+                w.i32(*yaw).i32(*wheel).u8(*kind).u16(*frame);
+            }
+            Self::Route {
+                level,
+                mission,
+                points,
+            } => {
+                w.u8(tag::ROUTE)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u16(points.len() as u16);
+                for p in points {
+                    for v in p {
+                        w.f32(*v);
+                    }
+                }
+            }
             Self::ItemClaim { id } => {
                 w.u8(tag::ITEM_CLAIM).u8(id.origin).u16(id.serial);
             }
@@ -549,7 +714,8 @@ impl Body {
     }
 
     fn decode(r: &mut Reader) -> Result<Self> {
-        Ok(match r.u8()? {
+        let t = r.u8()?;
+        Ok(match t {
             tag::PLAYER_STATE => Self::PlayerState(PlayerState {
                 time: r.u32()?,
                 level: r.i16()?,
@@ -724,6 +890,112 @@ impl Body {
                 Self::GardenItems { area, items }
             }
             tag::ITEM_CLAIM => Self::ItemClaim { id: item_id(r)? },
+            tag::RACE_STATUS => {
+                let (level, mission, progress) = (r.i16()?, r.u8()?, r.u16()?);
+                let finish = match r.u8()? {
+                    0 => None,
+                    1 => Some((r.u32()?, r.u32()?)),
+                    _ => return Err(WireError::BadValue("race finish")),
+                };
+                if !(1..=MAX_LEVEL).contains(&level)
+                    || mission > 4
+                    || (progress > RACE_PROGRESS_MAX && progress != RACE_PROGRESS_UNKNOWN)
+                {
+                    return Err(WireError::BadValue("race status"));
+                }
+                Self::RaceStatus {
+                    level,
+                    mission,
+                    progress,
+                    finish,
+                }
+            }
+            tag::HUNT_SET => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                let mut pieces = [(0, 0, [0.0; 3]); 3];
+                for p in &mut pieces {
+                    let (kind, id) = (r.u8()?, r.u8()?);
+                    *p = (
+                        kind,
+                        id,
+                        [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                    );
+                }
+                if !(1..=MAX_LEVEL).contains(&level) || mission > 4 {
+                    return Err(WireError::BadValue("hunt set"));
+                }
+                Self::HuntSet {
+                    level,
+                    mission,
+                    pieces,
+                }
+            }
+            tag::HUNT_CLAIM | tag::HUNT_TAKEN => {
+                let (level, mission, sig, slot) = (r.i16()?, r.u8()?, r.u32()?, r.u8()?);
+                if !(1..=MAX_LEVEL).contains(&level) || mission > 4 || slot > 2 {
+                    return Err(WireError::BadValue("hunt piece"));
+                }
+                if t == tag::HUNT_CLAIM {
+                    Self::HuntClaim {
+                        level,
+                        mission,
+                        sig,
+                        slot,
+                    }
+                } else {
+                    Self::HuntTaken {
+                        level,
+                        mission,
+                        sig,
+                        slot,
+                        player: player_id(r)?,
+                    }
+                }
+            }
+            tag::KART_PICK => {
+                let course = r.u8()?;
+                if course > 2 {
+                    return Err(WireError::BadValue("kart course"));
+                }
+                Self::KartPick { course }
+            }
+            tag::KART_STATE => {
+                let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                let rotation = [r.i32()?, r.i32()?, r.i32()?];
+                let (yaw, wheel, kind, frame) = (r.i32()?, r.i32()?, r.u8()?, r.u16()?);
+                if !(2..=7).contains(&kind) {
+                    return Err(WireError::BadValue("kart kind"));
+                }
+                Self::KartState {
+                    position,
+                    rotation,
+                    yaw,
+                    wheel,
+                    kind,
+                    frame,
+                }
+            }
+            tag::ROUTE => {
+                let (level, mission, count) = (r.i16()?, r.u8()?, usize::from(r.u16()?));
+                if !(1..=MAX_LEVEL).contains(&level) || mission > 4 || count > MAX_ROUTE {
+                    return Err(WireError::BadValue("route"));
+                }
+                let points = (0..count)
+                    .map(|_| Ok([r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?]))
+                    .collect::<Result<Vec<_>>>()?;
+                Self::Route {
+                    level,
+                    mission,
+                    points,
+                }
+            }
+            tag::CHAT => {
+                let text = r.str(MAX_CHAT)?;
+                if text.is_empty() || !text.bytes().all(|b| (0x20..0x7F).contains(&b)) {
+                    return Err(WireError::BadValue("chat"));
+                }
+                Self::Chat { text }
+            }
             tag::ITEM_OWNER => Self::ItemOwner {
                 id: item_id(r)?,
                 owner: player_id(r)?,
@@ -750,7 +1022,7 @@ impl Body {
                     objects,
                 }
             }
-            t => return Err(WireError::BadTag("body", t)),
+            _ => return Err(WireError::BadTag("body", t)),
         })
     }
 }
@@ -894,6 +1166,84 @@ mod tests {
                             position: [10.0, 0.5, -40.0],
                         },
                     ],
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::RaceStatus {
+                    level: 13,
+                    mission: 0,
+                    progress: 4567,
+                    finish: Some((8345, 8000)),
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::RaceStatus {
+                    level: 13,
+                    mission: 1,
+                    progress: RACE_PROGRESS_UNKNOWN,
+                    finish: None,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::KartPick { course: 2 },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::HuntSet {
+                    level: 16,
+                    mission: 0,
+                    pieces: [
+                        (1, 3, [10.0, 20.0, 30.0]),
+                        (2, 9, [-5.0, 0.0, 400.0]),
+                        (7, 1, [0.0, 0.0, 0.0]),
+                    ],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::HuntClaim {
+                    level: 16,
+                    mission: 0,
+                    sig: 0xDEAD_BEEF,
+                    slot: 1,
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::HuntTaken {
+                    level: 16,
+                    mission: 0,
+                    sig: 0xDEAD_BEEF,
+                    slot: 1,
+                    player: 2,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::KartState {
+                    position: [100.0, 5.0, -300.0],
+                    rotation: [0, 0x4000, 0],
+                    yaw: 0x100,
+                    wheel: -0x2000,
+                    kind: 4,
+                    frame: 0xFFF0,
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::Route {
+                    level: 13,
+                    mission: 0,
+                    points: vec![[0.0, 1.0, 2.0], [50.0, 0.0, -10.0]],
+                },
+            },
+            Message::Game {
+                from: 5,
+                body: Body::Chat {
+                    text: "gg, nice run!".into(),
                 },
             },
             Message::Game {

@@ -257,6 +257,34 @@ pub fn center2(first: &str, second: &str) {
     }
 }
 
+/// A line at the top right (race position).
+pub fn corner(line: &str) {
+    let (w, h) = screen_size();
+    let size = (h / 72.0)
+        .min(w * 0.6 / line.chars().count().max(1) as f32)
+        .round()
+        .max(8.0);
+    let width = size * line.chars().count() as f32;
+    let (x, y) = (w - width - size * 2.0, size * 2.0);
+    backdrop(x, y, x + width, y + size, size);
+    let hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
+    draw(&hud, x, y, size, TOAST_COLOR, line);
+}
+
+/// The chat line being typed, bottom left on the menu panel.
+pub fn chat_line(line: &str) {
+    let (w, h) = screen_size();
+    let size = (h / 45.0)
+        .min(w * 0.9 / line.chars().count().max(1) as f32)
+        .round()
+        .max(8.0);
+    let (x, y) = (size * 2.0, h * 0.82);
+    let width = size * line.chars().count() as f32;
+    backdrop(x, y, x + width, y + size, size);
+    let hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
+    draw(&hud, x, y, size, TOAST_COLOR, line);
+}
+
 /// A line of text centred near the bottom of the screen (hints on Stage Select).
 pub fn banner(line: &str) {
     let (w, h) = screen_size();

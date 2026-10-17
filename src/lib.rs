@@ -1,23 +1,30 @@
 //! SA2 Chao Online: mod DLL loaded by SA2 Mod Loader.
 
+mod battles;
 pub mod chao;
+mod chat;
 mod coop;
 pub mod game;
 mod garden;
+mod goto;
 mod hud;
+mod hunt;
 mod input;
 mod items;
 mod karate;
 mod karate_live;
+mod kart;
 mod log;
 mod menu;
 mod modloader;
 pub mod net;
 mod online;
 mod patch;
+pub mod places;
 mod puppet;
 mod race;
 mod room;
+mod stage_race;
 mod timeline;
 mod together;
 mod visitors;
@@ -106,6 +113,20 @@ pub extern "C" fn OnFrame() {
         let (peers, connected) = online::peers();
         together::on_frame(&peers, connected);
         coop::on_frame(&peers, connected);
+        goto::on_frame();
+        stage_race::on_frame(&peers, connected);
+        kart::on_frame(stage_race::others_racing());
+        {
+            // Room players in our stage, for the treasure hunt battle.
+            let members = room::members();
+            let (level, mission) = (game::current_level(), game::mission());
+            let here: Vec<u8> = peers
+                .iter()
+                .filter(|p| members.contains(&p.id) && p.level == level && p.mission == mission)
+                .map(|p| p.id)
+                .collect();
+            hunt::on_frame(online::my_id(), &here);
+        }
         room::on_frame(connected);
         race::start_frame(&peers, connected);
         race::on_frame();
@@ -114,13 +135,20 @@ pub extern "C" fn OnFrame() {
         game::set_live_pause(together::live() || race::live() || karate_live::live());
         game::restore_after_background();
         // Online: the main menu's 1P entry reads MULTIPLAYER (online play goes through the 1P
-        // modes), 2P can't be picked, and the status shows at the bottom.
+        // modes), 2P opens the battles picker, and the status shows at the bottom.
         game::block_two_player_menu(connected);
         if connected && let Some((x, y, selected)) = game::main_menu_1p_label() {
             // (x, y) is the label's centre; cover the whole 1P button (about 314 x 50).
             hud::menu_label(x, y, 318.0, 52.0, "MULTIPLAYER", selected);
         }
+        // Online, local two-player (split screen) can't be picked: its button reads ROOM BATTLES
+        // and opens the battles picker.
+        if connected && let Some((x, y, selected)) = game::main_menu_2p_label() {
+            hud::menu_label(x, y, 318.0, 52.0, "ROOM BATTLES", selected);
+        }
+        battles::on_frame(connected);
         if game::on_main_menu()
+            && !battles::is_open()
             && let Some(status) = online::status()
         {
             hud::banner(&format!("Multiplayer on: {status}  (F9)"));
@@ -133,6 +161,7 @@ pub extern "C" fn OnFrame() {
         online::on_frame();
         puppet::on_frame();
         menu::on_frame();
+        chat::on_frame(connected, menu::is_open());
         hud::on_frame();
 
         if state.menu_key.pressed() {

@@ -87,6 +87,12 @@ pub fn game_state() -> i16 {
 
 /// Holds (or releases) player 1 at the start line: the whole stage frozen, movement off and
 /// the stage timer stopped.
+/// Turns the game's controller input off or on (without freezing anything).
+pub fn set_controls(on: bool) {
+    // SAFETY: a static byte the game itself toggles (goal routine 0x43E6D0).
+    unsafe { (CONTROLLER_ENABLED as *mut u8).write_volatile(u8::from(on)) };
+}
+
 pub fn hold_player(hold: bool) {
     freeze_world(hold);
     // SAFETY: static bytes the game itself toggles (goal routine 0x43E6D0).
@@ -267,32 +273,124 @@ pub fn two_player() -> bool {
 
 const TWO_PLAYER_MODE: usize = 0x0174_AFDE;
 
-/// While online, the main menu's 2P entry only plays the "can't select" sound: its `jz` to
-/// that path (0x6650D9) becomes a `jmp` (re/main-menu.md). Safe to switch at any time.
-pub fn block_two_player_menu(block: bool) {
+/// While online, the main menu's 2P entry (ROOM BATTLES) does nothing in the game itself:
+/// its `jz` at 0x6650D9 becomes a `jmp` to the end of the "can't select" path, past the sound
+/// (0x6654A4 cleans the 3 pushed arguments and returns), and `battles` opens its picker.
+pub fn block_two_player_menu(online: bool) {
     const SITE: usize = 0x0066_50D9;
-    let (from, to): ([u8; 2], [u8; 2]) = if block {
-        ([0x0F, 0x84], [0x90, 0xE9])
-    } else {
-        ([0x90, 0xE9], [0x0F, 0x84])
-    };
-    if TWO_PLAYER_BLOCKED.swap(block, Ordering::Relaxed) != block
-        && !crate::patch::replace_code(SITE, &from, &to)
-    {
-        crate::log!("game: 2P menu patch at {SITE:#x} didn't apply");
+    const ORIGINAL: [u8; 6] = [0x0F, 0x84, 0xBB, 0x03, 0x00, 0x00];
+    const SILENT: [u8; 6] = [0x90, 0xE9, 0xC5, 0x03, 0x00, 0x00];
+    if TWO_PLAYER_BLOCKED.swap(online, Ordering::Relaxed) != online {
+        let (from, to) = if online {
+            (ORIGINAL, SILENT)
+        } else {
+            (SILENT, ORIGINAL)
+        };
+        if !crate::patch::replace_code(SITE, &from, &to) {
+            crate::log!("game: 2P menu patch at {SITE:#x} didn't apply");
+        }
     }
 }
 
 static TWO_PLAYER_BLOCKED: AtomicBool = AtomicBool::new(false);
 
+const MAIN_MENU: usize = 0x00C7_7F14;
+const MENU_HEADER: usize = 0x00C7_7F00;
+const CURRENT_SUB_MENU: usize = 0x01D7_BB14;
+const SUB_MAIN_LIST: i32 = 2;
+/// Past the main menu's SubMenu jump table (0..0x1B): its update does nothing then.
+const SUB_WAITING: i32 = 0x1C;
+
+/// The menu buttons pressed this frame (`MenuButtons_Pressed`: 0x10 up, 0x20 down, 0x0C
+/// A/Start, 0x02 B; the stick counts).
+pub fn menu_buttons_pressed() -> u32 {
+    // SAFETY: static int in the game's data section.
+    unsafe { (0x01DE_FAB0 as *const u32).read_volatile() }
+}
+
+/// Holds the main menu's entry list still (a SubMenu its update ignores) while one of ours is
+/// shown, or lets it go again. Holding needs the list idle; returns whether it's held.
+pub fn hold_main_menu(hold: bool) -> bool {
+    if !on_main_menu() {
+        return false;
+    }
+    // SAFETY: the SubMenu int and the main menu's data (pointer checked).
+    unsafe {
+        let sub = (CURRENT_SUB_MENU as *mut i32).read_volatile();
+        let menu = (MAIN_MENU as *const usize).read_volatile();
+        if hold
+            && sub == SUB_MAIN_LIST
+            && menu != 0
+            && ((menu + 8) as *const u32).read_volatile() == 0
+        {
+            (CURRENT_SUB_MENU as *mut i32).write_volatile(SUB_WAITING);
+            return true;
+        }
+        if !hold && sub == SUB_WAITING {
+            (CURRENT_SUB_MENU as *mut i32).write_volatile(SUB_MAIN_LIST);
+        }
+    }
+    false
+}
+
+/// The 1P panel's entries `leave_main_menu` can go to.
+pub const PANEL_STAGE_SELECT: u8 = 1;
+pub const PANEL_KART: u8 = 2;
+
+/// Leaves the main menu for a 1P panel entry the way that panel does (re/main-menu.md): the
+/// panels slide out (0x664DA0, 0x671B80), then SubMenu 5 opens the entry under the panel's
+/// cursor (0x1D1BC00) once they're idle. Kart Race goes 1P (kart work +0x88 = 0); Stage
+/// Select clears the stage panel's +0x14 like its handler does. No unlock checks.
+pub fn leave_main_menu(entry: u8) {
+    const HIDE_MAIN: usize = 0x0066_4DA0;
+    const HIDE_HEADER: usize = 0x0067_1B80;
+    const KART_WORK: usize = 0x00C7_7F34;
+    const STAGE_PANEL: usize = 0x00C7_7F44;
+    // SAFETY: the menus' data pointers (checked) and two argument-less cdecl functions the
+    // game's own handlers call from this update.
+    unsafe {
+        let menu = (MAIN_MENU as *const usize).read_volatile();
+        if menu == 0 || (MENU_HEADER as *const usize).read_volatile() == 0 {
+            return;
+        }
+        let other = match entry {
+            PANEL_KART => (KART_WORK, 0x88),
+            _ => (STAGE_PANEL, 0x14),
+        };
+        let work = (other.0 as *const usize).read_volatile();
+        if work == 0 {
+            return;
+        }
+        ((menu + 0x40) as *mut u8).write_volatile(entry);
+        std::mem::transmute::<usize, extern "C" fn()>(HIDE_MAIN)();
+        std::mem::transmute::<usize, extern "C" fn()>(HIDE_HEADER)();
+        if entry == PANEL_KART {
+            ((work + other.1) as *mut u8).write_volatile(0);
+        } else {
+            ((work + other.1) as *mut i32).write_volatile(0);
+        }
+        (CURRENT_SUB_MENU as *mut i32).write_volatile(5);
+    }
+}
+
 /// Where the main menu's 1P label is drawn right now (its centre, in the game's 640x480 menu
 /// space; it slides in with the menu), and whether the cursor is on it, while the main menu's
 /// entry list is showing.
 pub fn main_menu_1p_label() -> Option<(f32, f32, bool)> {
+    main_menu_label(0)
+}
+
+/// The same for the 2P entry (the live positions are 12 bytes apart, 1P first).
+pub fn main_menu_2p_label() -> Option<(f32, f32, bool)> {
+    main_menu_label(1)
+}
+
+fn main_menu_label(entry: usize) -> Option<(f32, f32, bool)> {
     const CURRENT_SUB_MENU: usize = 0x01D7_BB14;
     const CURSOR: usize = 0x01D1_BBE4;
-    const LABEL_X: usize = 0x01A3_D678;
-    const LABEL_Y: usize = 0x01A3_D67C;
+    const ENTRY_SIZE: usize = 12;
+    let label_x = 0x01A3_D678 + entry * ENTRY_SIZE;
+    let label_y = label_x + 4;
     if !on_main_menu() {
         return None;
     }
@@ -300,13 +398,13 @@ pub fn main_menu_1p_label() -> Option<(f32, f32, bool)> {
     let (sub, x, y, cursor) = unsafe {
         (
             (CURRENT_SUB_MENU as *const i32).read_volatile(),
-            (LABEL_X as *const f32).read_volatile(),
-            (LABEL_Y as *const f32).read_volatile(),
+            (label_x as *const f32).read_volatile(),
+            (label_y as *const f32).read_volatile(),
             (CURSOR as *const i8).read_volatile(),
         )
     };
     let on_screen = (-300.0..940.0).contains(&x) && (-100.0..580.0).contains(&y);
-    (sub == 2 && on_screen).then_some((x, y, cursor == 0))
+    (sub == 2 && on_screen).then_some((x, y, cursor as usize == entry))
 }
 
 /// On the game's main menu (the 1P / 2P / options screen).
@@ -408,6 +506,15 @@ pub struct LocalPlayer {
 }
 
 /// Player 1's EntityData1 (position, angles, action), or null when no player exists.
+/// Moves our player to `at` (teleport).
+pub fn set_player_position(at: Vector) {
+    let entity = local_entity();
+    if !entity.is_null() {
+        // SAFETY: the player's live EntityData1, on the game thread.
+        unsafe { (entity.add(ENTITY_POSITION) as *mut Vector).write_unaligned(at) };
+    }
+}
+
 pub fn local_entity() -> *const u8 {
     // SAFETY: static pointer array in the game's data section.
     unsafe { (MAIN_CHAR_OBJ1 as *const *const u8).read_volatile() }
@@ -430,7 +537,13 @@ pub fn local_player() -> Option<LocalPlayer> {
             return None;
         }
         let rot = entity.add(ENTITY_ROTATION) as *const i32;
-        let character = co2.add(CO2_CHAR_ID).read();
+        // The Chao walkers keep Tails'/Eggman's walker frames at +1 and 0xD/0xE at +3, which
+        // would read as Chaos/... : they're walkers 10 and 11 (re/characters.md).
+        let character = match (co2.add(1).read(), co2.add(CO2_CHAR_ID).read()) {
+            (6, 0x0D) => 10,
+            (7, 0x0E) => 11,
+            (_, id) => id,
+        };
         // Same test as the player's display before it swaps in the ball model.
         let blending = (co2.add(CO2_MOTION_MODE) as *const i16).read_unaligned() == 2;
         // Sonic's main spawns the blue "JumpAura" ball every frame while the action is Jump (6)

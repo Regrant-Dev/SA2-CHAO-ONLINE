@@ -31,9 +31,10 @@ Press **F9** in game. Pause first when typing: the game also reads letter keys a
 | Name tags | Names above other players |
 | Room | Create a room, join someone's, or leave (Left/Right to choose, Enter to do it) |
 | Mode (in a room) | Race or Co-op; only the room's creator can change it (see below) |
+| Go to | Pick a player (Left/Right) and Enter: join them where they are (see Chat and friends) |
 | Live karate vs | In a room, at Karate: who your next fight is live against (first free player, or pick one) |
-| My Chao | Your Chao for friends' races and karate (default: your first hatched Chao) |
-| Garden visits | Which of your Chao visit friends' gardens: Garden Chao (up to 2 from that garden), My Chao, or Off |
+| My Chao (races, karate) | Your one Chao for friends' races and karate (default: your first hatched Chao) |
+| Visit friends | On: up to 2 of the Chao living in the garden you're in visit friends in that same garden. Off: they stay home (takes effect right away) |
 | Friends' Chao in races | Friends' Chao take the CPU lanes of your Chao Races (default On) |
 | Practice karate | CPU, or a **copy** of a friend's Chao that your own game fights (Battle DLC) |
 | Export my Chao / Bring visitor Chao | Chao files (see Chao) |
@@ -54,7 +55,7 @@ Port=43902            ; when hosting: the UDP port to listen on (default 43902)
 NameTags=On           ; On/Off: names above other players (default On)
 ChaoRace=On           ; On/Off: friends' Chao in your Chao Races (default On)
 MyChao=-1             ; save slot of your Chao for races and karate, -1 = first hatched (default)
-VisitWith=Garden      ; Garden, MyChao or Off: which Chao visit friends' gardens (default Garden)
+VisitWith=On          ; On or Off: your garden's Chao visit friends in the same garden (default On)
 ```
 
 Delete the file to go back to all defaults.
@@ -93,6 +94,15 @@ same mod version as the players, which it prints when it starts.
 The server's computer is the one that needs to be reachable (Tailscale or a UDP port forward).
 Update it together with the mod: an older server turns newer players away.
 
+## Chat and friends
+
+- **Chat:** press **T**, type, **Enter** to send (Esc cancels). Everyone in the lobby sees it at the
+  top left. Your controls are off while you type; the game keeps running.
+- **Go to a friend:** F9 > Go to, pick them, Enter. In the same stage or garden you're moved next
+  to them. On Stage Select you're taken into their stage and mission (as their character). In
+  Chao World you're taken to their garden or area. Anywhere else the menu says where to go first.
+- **Who's playing:** the Boyz Hub's SA2 card lists who's online and where.
+
 ## Free roam and rooms
 
 **Free roam (always on).** You see every player in the lobby whenever you're in the same stage
@@ -111,6 +121,24 @@ place along:
 | **Stage Select** | When anyone in the room picks a stage and mission, everyone in the room who is on Stage Select goes into it with the right character, then it starts together. (You can be taken into a stage your own save hasn't unlocked.) |
 | **Chao Race entrance** | When anyone in the room confirms a race, everyone in the room at the race entrance (Chao chosen, course list open) races in it (see Chao). |
 | **Karate** | Anyone in the room can challenge another room player at Karate to a live fight (see Chao). |
+
+**Racing in a room.** In a stage started together, your race time counts from GO (deaths
+included); the game's own clock, which rewinds to the last checkpoint when you die, is shown next
+to it. In a Race room a line at the top right shows your position
+("2nd / 3"), and finishes are announced to everyone. Positions need the stage's route:
+the first clear of a stage records it (in `routes/`) and shares it with the others, so the first
+race on a new stage shows positions only at the finish.
+
+**Kart Race (rooms).** Whoever in the room starts a Kart Race (main menu > Kart Race) takes the
+others who wait in the Kart Race course list along, each with their own driver. The CPU karts are
+switched off: you race each other. Everyone starts on the same lights, sees the others' karts,
+positions and finish times.
+
+**Treasure hunt (rooms).** In a Knuckles/Rouge hunting stage (missions 1, 4 and 5) started
+together, the whole room hunts the same 3 pieces. The first to grab a piece gets it and it
+disappears for everyone else (the radar and hints move on). The top right shows the score; the
+last piece ends the round for everyone. In a Race room the most pieces wins; in a Co-op room
+you're a team (enemies you beat are gone for everyone too) and nobody is named the winner.
 
 **Race or Co-op.** The room's creator picks how stages play in F9 > Room > Mode (members see
 it; "The room is now Co-op" pops up when it changes). **Race** (the default): everyone has their
@@ -144,8 +172,9 @@ Elsewhere pausing works as normal, and the others see you stand still.
 Other players only ever get **copies** of your Chao: nothing that happens to a visiting, racing
 or fighting copy is saved anywhere, and your own Chao never leave your save.
 
-**Garden visits.** When you enter a garden while connected, your Chao visit the others in the
-same garden (F9 > Garden visits: Garden Chao, My Chao or Off). The gardens are live:
+**Garden visits.** When you enter a garden while connected, up to 2 of the Chao living there visit
+the others in the same garden (F9 > Visit friends: On or Off). My Chao is only for races and
+karate. The gardens are live:
 - A friend's Chao in your garden is a copy that does exactly what their real one does (walking,
   animations), and when they pick it up you see it in their hands. The same goes for yours in
   their garden.
@@ -155,6 +184,9 @@ same garden (F9 > Garden visits: Garden Chao, My Chao or Off). The gardens are l
   in their save. While you hold it, they see it in your hands. Hitting or throwing it counts too.
 - Nothing about a visiting Chao is ever saved in your own save, and a visitor can't be carried
   out of your garden.
+- You can take your Chao home any time: F9 > Visit friends: Off (or leave the garden, or
+  disconnect). Within a few seconds they're gone from everyone else's garden; switch visits back
+  on and they come again. Friends' interactions only reach your Chao while it's visiting.
 - Garden items are shared: everyone sees everyone's fruit, animals, Chaos Drives, hats and seeds,
   on the ground and in hands. Each item belongs to one player and is saved only in their save.
   Pick up a friend's item (or let your Chao take it) and it becomes yours, saved in your save,
@@ -190,7 +222,10 @@ visit without being online together.
 ## Local two-player
 
 While you're connected, the main menu's 1P button reads **MULTIPLAYER** and the 2P button
-can't be picked; turn Multiplayer off in F9 to play local 2P. If a 2P game is running anyway,
+becomes **ROOM BATTLES**: it opens a picker with **Kart Race** (the course list; Kart Race doesn't
+need to be unlocked) and **Treasure Hunt** (Stage Select, to pick a hunt stage); see the room
+sections above. Chao Race and Karate stay in Chao World. Only you go: the rest of your room
+is asked to come along, and anyone busy elsewhere (say, in their garden) keeps playing. Local split-screen 2P can't be picked online; turn Multiplayer off in F9 for it. If a 2P game is running anyway,
 online play steps aside for it: nobody else is drawn, there are no synced starts or room picks, and the others don't see
 you until the 2P game ends.
 

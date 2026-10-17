@@ -5,6 +5,9 @@
 //! sa2co-server [port]          (default 43902, or SA2CO_PORT)
 //! ```
 //!
+//! With `SA2CO_STATUS=<file>` it keeps a JSON file up to date (every few seconds) with who's
+//! online, where they are and their rooms, for a web page (the Boyz Hub) to show.
+//!
 //! Players join it like any host: F9 > Multiplayer: Join, Host address `<server>:<port>`.
 //! They need the mod version printed at start. Stops cleanly on Ctrl+C / SIGTERM.
 
@@ -14,13 +17,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sa2_chao_online::game::KNOWN_GAME_BUILD;
-use sa2_chao_online::net::protocol::PROTOCOL_VERSION;
+use sa2_chao_online::net::protocol::{Body, PROTOCOL_VERSION, PlayerState};
 use sa2_chao_online::net::session::{Event, Host, Identity};
 use sa2_chao_online::net::udp::Endpoint;
 
 const DEFAULT_PORT: u16 = 43902;
 /// How often the server checks the network.
 const TICK: Duration = Duration::from_millis(5);
+/// How often the status file is rewritten.
+const STATUS_EVERY: Duration = Duration::from_secs(3);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -57,7 +62,10 @@ fn main() {
     );
     println!("Players need mod version {}.", env!("CARGO_PKG_VERSION"));
 
+    let status_file = std::env::var("SA2CO_STATUS").ok().filter(|f| !f.is_empty());
+    let mut last_status = Instant::now() - STATUS_EVERY;
     let mut names: BTreeMap<u8, String> = BTreeMap::new();
+    let mut states: BTreeMap<u8, PlayerState> = BTreeMap::new();
     while !STOP.load(Ordering::Relaxed) {
         for event in host.poll_events(Instant::now()) {
             match event {
@@ -67,15 +75,90 @@ fn main() {
                 }
                 Event::Left { id } => {
                     let name = names.remove(&id).unwrap_or_else(|| format!("player {id}"));
+                    states.remove(&id);
                     println!("{name} left ({} online)", names.len());
+                }
+                Event::Game {
+                    from,
+                    body: Body::PlayerState(s),
+                } => {
+                    states.insert(from, s);
                 }
                 _ => {}
             }
         }
+        if let Some(file) = &status_file
+            && last_status.elapsed() >= STATUS_EVERY
+        {
+            last_status = Instant::now();
+            if let Err(e) = write_status(file, &names, &states) {
+                eprintln!("can't write {file}: {e}");
+            }
+        }
         std::thread::sleep(TICK);
+    }
+    if let Some(file) = &status_file {
+        let _ = write_status(file, &BTreeMap::new(), &BTreeMap::new());
     }
     println!("Stopping: telling {} player(s)", names.len());
     host.shutdown(Instant::now());
+}
+
+/// A JSON string literal.
+fn json(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The status file: `{"updated": unix seconds, "version": "...", "players": [{"name", "place",
+/// "room", "mode"}]}`. Written to a temporary file and renamed, so readers never see half.
+fn write_status(
+    file: &str,
+    names: &BTreeMap<u8, String>,
+    states: &BTreeMap<u8, PlayerState>,
+) -> std::io::Result<()> {
+    let updated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let players: Vec<String> = names
+        .iter()
+        .map(|(id, name)| {
+            let s = states.get(id);
+            let place = s.map_or_else(
+                || "Joining".to_string(),
+                |s| sa2_chao_online::places::place(s.level, s.chao_area),
+            );
+            let (room, mode) = match s.map(|s| s.room) {
+                Some((owner, kind)) if kind != 0 => (
+                    names.get(&owner).map_or("null".to_string(), |n| json(n)),
+                    json(if kind == 2 { "Co-op" } else { "Race" }),
+                ),
+                _ => ("null".to_string(), "null".to_string()),
+            };
+            format!(
+                r#"{{"name":{},"place":{},"room":{room},"mode":{mode}}}"#,
+                json(name),
+                json(&place)
+            )
+        })
+        .collect();
+    let text = format!(
+        r#"{{"updated":{updated},"version":{},"players":[{}]}}"#,
+        json(env!("CARGO_PKG_VERSION")),
+        players.join(",")
+    );
+    let tmp = format!("{file}.tmp");
+    std::fs::write(&tmp, text + "\n")?;
+    std::fs::rename(&tmp, file)
 }
 
 /// Ctrl+C and SIGTERM (docker stop) end the main loop so players get a clean goodbye.

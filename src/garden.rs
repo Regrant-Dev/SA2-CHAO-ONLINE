@@ -109,6 +109,11 @@ const ITEM_NEAR: f32 = 25.0;
 const PLAYER_NEAR: f32 = 12.0;
 /// An item this close to a touched Chao is in its hands (eating, holding).
 const BUSY_NEAR: f32 = 6.0;
+/// A friend's Chao whose owner stopped sending it this long ago (visits off, left the garden,
+/// gone) leaves our garden. Long enough to ride out a hiccup.
+const LEFT: Duration = Duration::from_secs(8);
+/// Setting an object's MainSub to DeleteObject removes it on the next object pass.
+const DELETE_OBJECT: usize = 0x0046_F720;
 /// A friend holding our Chao: their updates count this long.
 const HELD_STALE: Duration = Duration::from_millis(500);
 
@@ -129,6 +134,8 @@ struct Mirror {
     snapshot: Option<Box<ChaoData>>,
     /// Running its own AI (touched) until then.
     local_until: Option<Instant>,
+    /// Created then.
+    since: Instant,
 }
 
 /// Our Chao held by a friend.
@@ -154,6 +161,10 @@ struct Garden {
     held_out: Vec<(u8, u8, [f32; 3])>,
     /// Received: changes to our Chao (by index).
     changes_in: Vec<(u8, Changes)>,
+    /// When each friend's Chao (owner, index) was last in their updates.
+    heard: HashMap<(u8, u8), Instant>,
+    /// Friends' Chao that left our garden, for `take_left`.
+    left: Vec<(u8, u8)>,
 }
 
 static GARDEN: Mutex<Option<Garden>> = Mutex::new(None);
@@ -169,6 +180,8 @@ fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
         changes_out: Vec::new(),
         held_out: Vec::new(),
         changes_in: Vec::new(),
+        heard: HashMap::new(),
+        left: Vec::new(),
     }))
 }
 
@@ -185,6 +198,7 @@ pub fn spawned(owner: u8, index: u8, object: usize) {
                     driven: false,
                     snapshot: None,
                     local_until: None,
+                    since: Instant::now(),
                 },
             )
         });
@@ -198,6 +212,7 @@ pub fn clear() {
         g.held.clear();
         g.wrapped.clear();
         g.changes_in.clear();
+        g.heard.clear();
     });
 }
 
@@ -211,11 +226,26 @@ pub fn received(owner: u8, list: Vec<GardenChao>) {
     let now = Instant::now();
     with(|g| {
         for c in list {
+            g.heard.insert((owner, c.index), now);
             if let Some(m) = g.mirrors.get_mut(&(owner, c.index)) {
                 m.target = Some((c, now));
             }
         }
     });
+}
+
+/// Friend `owner`'s Chao `index` is visiting: their game sends it (or just started to).
+pub fn visiting(owner: u8, index: u8) -> bool {
+    with(|g| {
+        g.heard
+            .get(&(owner, index))
+            .is_some_and(|at| at.elapsed() < LEFT)
+    })
+}
+
+/// Friends' Chao that left our garden since last asked: (owner, index).
+pub fn take_left() -> Vec<(u8, u8)> {
+    with(|g| std::mem::take(&mut g.left))
 }
 
 /// Network: a friend's interaction changed our Chao `index`.
@@ -418,11 +448,24 @@ pub fn on_frame() {
 /// own AI and forward what it changes.
 fn mirrors_frame(g: &mut Garden, now: Instant) {
     let player = game::player_position();
+    let mut gone = Vec::new();
     for (&(owner, index), m) in &mut g.mirrors {
         // SAFETY: our visitor's live object (cleared when we leave the garden), on the game thread.
         unsafe {
             let d = data1(m.object);
             if d == 0 {
+                continue;
+            }
+            // Its owner took it home (visits off, left, disconnected): it leaves, unless we're
+            // holding or still touching it (then once we let go).
+            let heard = g
+                .heard
+                .get(&(owner, index))
+                .map_or(m.since, |at| (*at).max(m.since));
+            if heard.elapsed() > LEFT && player_held() != m.object && m.local_until.is_none() {
+                ((m.object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT);
+                log!("garden: player {owner}'s Chao {index} went home; removing its copy");
+                gone.push((owner, index));
                 continue;
             }
             let record = ((d + D_RECORD) as *const usize).read();
@@ -504,6 +547,11 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                 g.held_out.push((owner, index, offset));
             }
         }
+    }
+    for key in gone {
+        g.mirrors.remove(&key);
+        g.heard.remove(&key);
+        g.left.push(key);
     }
 }
 

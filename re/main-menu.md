@@ -164,3 +164,22 @@ screenshot before relying on it.
 - FUN_00664EC0 main-menu update; FUN_006695C0 main-menu draw; FUN_006687A0 entry drawer;
   FUN_00668730 sprite draw; FUN_00669200 panel anim; FUN_00666790 init; FUN_00664B60 entry/setup.
 - Cursor 0x1D1BBE4; P2 pad 0x1DEFDB4; sound fn 0x437260 (ESI = id).
+
+## 2P → Kart Race menu (ROOM BATTLES)
+
+The 1P panel's Kart Race handler is 0x66541F: unless `[0x1DEF428]` or `[0x1DEF4EC]` is set
+(kart unlocked) it buzzes; otherwise 3 pushes, sound 0x8001 (0x665434), 0x664DA0 (main panel
+out), 0x671B80 (header out), `[*0xC77F34+0x88] = 0` (1P), SubMenu = 5. SubMenu 5 (0x6654AE)
+waits for both panels to be idle, then switches on the 1P panel cursor `[0x1D1BC00]`; case 2
+(0x665516) opens the kart menu (CurrentMenu 10).
+
+The mod now patches 0x6650D9 to `90 E9 C5 03 00 00` (jmp 0x6654A4: clean the 3 pushes, return
+0, no sound), holds the main list with SubMenu 0x1C (past the table, the update does nothing)
+while its picker shows, then does the handler's steps itself (+0x40 = entry, 0x664DA0,
+0x671B80, kart +0x88 = 0 or stage panel +0x14 = 0, SubMenu 5). Stage Select is panel entry 1
+(case 0x6654EB: 0x672640, CurrentMenu 3).
+
+Patching 0x6650D9 to `90 E9 55 03 00 00` (jmp 0x665434, past the unlock check) sends the 2P entry there, with the
+same stack (the 2P handler already pushed 3 zeros, EBX = 0); the 1P panel cursor must be 2.
+Calling 0x672B10 / CurrentMenu = 10 directly from SubMenu 2 crashes at 0x77D0F1 (sprite draw
+with a null animation, from the kart menu's display 0x670830): the panels never slid out.

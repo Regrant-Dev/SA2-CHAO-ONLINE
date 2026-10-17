@@ -591,7 +591,7 @@ fn write<T>(address: usize, value: T) {
     unsafe { (address as *mut T).write_volatile(value) }
 }
 
-fn on_stage_select() -> bool {
+pub fn on_stage_select() -> bool {
     read::<i32>(GAME_MODE) == MODE_MENUS && read::<i32>(CURRENT_MENU) == MENU_STAGE_SELECT
 }
 
@@ -652,7 +652,7 @@ pub fn on_frame(connected: bool) {
 }
 
 /// Does what Stage Select does when a stage is picked, with the leader's values.
-fn go(pick: Pick) {
+pub fn go(pick: Pick) {
     write::<i16>(LAST_LEVEL, read(CURRENT_LEVEL));
     write(CURRENT_LEVEL, pick.level);
     write(MISSION_NUM, pick.mission);

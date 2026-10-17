@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::chao::{self, ChaoData, file};
 use crate::game;
@@ -28,19 +29,38 @@ enum Source {
 }
 
 /// Visitor buffers. Leaked so their addresses never move: the game keeps a pointer
-/// for the Chao object's lifetime. Buffers are reused after leaving the garden, when
-/// the game has deleted the Chao objects.
+/// for the Chao object's lifetime. All are free again after leaving the garden, when the game
+/// has deleted the Chao objects; one whose visitor left earlier (`forget`) is reused only after
+/// `REUSE_AFTER`, once the game is surely done deleting it.
+struct Buffer {
+    data: &'static mut ChaoData,
+    /// The visitor in it (this garden visit).
+    used_by: Option<Source>,
+    /// Its visitor left mid-visit at this time.
+    freed: Option<Instant>,
+}
+
 struct Pool {
-    buffers: Vec<&'static mut ChaoData>,
-    active: usize,
-    /// Visitors spawned during this garden visit, so they aren't duplicated.
-    spawned: Vec<Source>,
+    buffers: Vec<Buffer>,
+}
+
+const REUSE_AFTER: Duration = Duration::from_secs(3);
+
+impl Pool {
+    /// Visitors in the garden now.
+    fn count(&self) -> usize {
+        self.buffers.iter().filter(|b| b.used_by.is_some()).count()
+    }
+
+    fn has(&self, source: &Source) -> bool {
+        self.buffers
+            .iter()
+            .any(|b| b.used_by.as_ref() == Some(source))
+    }
 }
 
 static POOL: Mutex<Pool> = Mutex::new(Pool {
     buffers: Vec::new(),
-    active: 0,
-    spawned: Vec::new(),
 });
 
 /// The Chao a player carries to the next area (re/chao-garden-items.md 5): `ChaoData*` or 0.
@@ -59,7 +79,7 @@ pub fn on_frame() {
                 && pool
                     .buffers
                     .iter()
-                    .any(|b| std::ptr::from_ref::<ChaoData>(b) as usize == carried)
+                    .any(|b| std::ptr::from_ref::<ChaoData>(b.data) as usize == carried)
             {
                 (CARRIED_CHAO as *mut usize).write_volatile(0);
                 log!("visitors: a visitor was being carried out of the garden; left behind");
@@ -68,13 +88,19 @@ pub fn on_frame() {
     }
     if !game::in_garden() {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.active > 0 {
+        if pool
+            .buffers
+            .iter()
+            .any(|b| b.used_by.is_some() || b.freed.is_some())
+        {
             log!(
                 "visitors: left garden, {} visitor buffer(s) released",
-                pool.active
+                pool.count()
             );
-            pool.active = 0;
-            pool.spawned.clear();
+            for b in &mut pool.buffers {
+                b.used_by = None;
+                b.freed = None;
+            }
             crate::garden::clear();
         }
     }
@@ -159,11 +185,11 @@ pub fn import_visitors(mod_path: &str) {
 
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     for path in files {
-        if pool.spawned.contains(&Source::File(path.clone())) {
+        if pool.has(&Source::File(path.clone())) {
             log!("import: {} is already visiting", path.display());
             continue;
         }
-        if pool.active >= MAX_VISITORS {
+        if pool.count() >= MAX_VISITORS {
             log!("import: visitor limit ({MAX_VISITORS}) reached");
             break;
         }
@@ -182,7 +208,7 @@ pub fn import_visitors(mod_path: &str) {
             continue;
         }
 
-        let n = pool.active as f32;
+        let n = pool.count() as f32;
         let position = game::Vector {
             x: origin.x + 10.0 + n * 8.0,
             y: origin.y + 5.0,
@@ -200,7 +226,7 @@ pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let source = Source::Player { id: player, index };
-    if pool.spawned.contains(&source) || pool.active >= MAX_VISITORS {
+    if pool.has(&source) || pool.count() >= MAX_VISITORS {
         return false;
     }
     let position = game::Vector {
@@ -213,6 +239,19 @@ pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -
     true
 }
 
+/// Player `id`'s Chao `index` left the garden (its copy is being deleted): it may visit again,
+/// and its buffer is reused later.
+pub fn forget(id: u8, index: u8) {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let source = Source::Player { id, index };
+    for b in &mut pool.buffers {
+        if b.used_by.as_ref() == Some(&source) {
+            b.used_by = None;
+            b.freed = Some(Instant::now());
+        }
+    }
+}
+
 /// Copies `chao` into a free visitor buffer and creates the Chao object (returned, or 0).
 fn spawn(
     pool: &mut Pool,
@@ -221,14 +260,28 @@ fn spawn(
     position: game::Vector,
     angle: i32,
 ) -> usize {
-    // Buffers at index >= active are not in use by any Chao object.
-    let index = pool.active;
-    if index == pool.buffers.len() {
-        pool.buffers.push(Box::leak(Box::new(chao)));
-    } else {
-        *pool.buffers[index] = chao;
-    }
-    let data: &mut ChaoData = pool.buffers[index];
+    let free = pool
+        .buffers
+        .iter()
+        .position(|b| b.used_by.is_none() && b.freed.is_none_or(|at| at.elapsed() >= REUSE_AFTER));
+    let index = match free {
+        Some(index) => {
+            *pool.buffers[index].data = chao;
+            index
+        }
+        None => {
+            pool.buffers.push(Buffer {
+                data: Box::leak(Box::new(chao)),
+                used_by: None,
+                freed: None,
+            });
+            pool.buffers.len() - 1
+        }
+    };
+    let buffer = &mut pool.buffers[index];
+    buffer.used_by = Some(source.clone());
+    buffer.freed = None;
+    let data: &mut ChaoData = buffer.data;
     log!(
         "visitors: spawning {source:?} at ({:.1}, {:.1}, {:.1}): {}",
         position.x,
@@ -240,7 +293,5 @@ fn spawn(
     // not reused until the player leaves the garden.
     let object = unsafe { game::create_chao(data, position, angle) };
     log!("visitors: CreateChao returned {object:p}");
-    pool.active += 1;
-    pool.spawned.push(source);
     object as usize
 }
