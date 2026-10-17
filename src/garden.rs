@@ -269,6 +269,30 @@ pub fn visitors() -> Vec<([f32; 3], u8, u8, Option<String>)> {
     })
 }
 
+/// Our Chao visiting friends, for their tags: (where, index, the Chao's name if it has one).
+pub fn my_visitors() -> Vec<([f32; 3], u8, Option<String>)> {
+    if !game::in_garden() {
+        return Vec::new();
+    }
+    let mine = with(|g| g.mine.clone());
+    mine.into_iter()
+        .filter_map(|(index, slot)| {
+            let object = live_object(slot)?;
+            // SAFETY: our Chao's live object (from the game's registry).
+            let d = unsafe { data1(object) };
+            if d == 0 {
+                return None;
+            }
+            // SAFETY: as above.
+            let p = unsafe { ((d + D_POSITION) as *const Vector).read_unaligned() };
+            let name = game::read_chao_slot(slot)
+                .map(|c| crate::karate::chao_name(&c))
+                .filter(|n| n != "Chao");
+            Some(([p.x, p.y, p.z], index, name))
+        })
+        .collect()
+}
+
 /// Friends' Chao that left our garden since last asked: (owner, index).
 pub fn take_left() -> Vec<(u8, u8)> {
     with(|g| std::mem::take(&mut g.left))

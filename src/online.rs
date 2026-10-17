@@ -793,18 +793,23 @@ pub fn on_frame() {
     }
     if online.resend_chao && garden > 0 && online.session.my_id().is_some() {
         online.resend_chao = false;
-        let mine = match VISITS.load(Ordering::Relaxed) {
-            VISITS_OFF => Vec::new(),
+        // Each visitor keeps its row number as its index (friends see "Regrant 2").
+        let rows = match VISITS.load(Ordering::Relaxed) {
+            VISITS_OFF => [None, None],
             _ => carried_chao(garden),
         };
+        let mine: Vec<(usize, (usize, ChaoData))> = rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, c)| c.map(|c| (row, c)))
+            .collect();
         log!("online: bringing {} chao to garden {garden}", mine.len());
         crate::garden::set_mine(
             mine.iter()
-                .enumerate()
-                .map(|(index, (slot, _))| (index as u8, *slot))
+                .map(|(index, (slot, _))| (*index as u8, *slot))
                 .collect(),
         );
-        for (index, (_, chao)) in mine.into_iter().enumerate() {
+        for (index, (_, chao)) in mine {
             let body = Body::Chao {
                 index: index as u8,
                 data: Box::new(chao),
@@ -1178,6 +1183,11 @@ pub fn set_visits(mode: usize) {
 
 static RESEND_GARDEN_CHAO: AtomicBool = AtomicBool::new(false);
 
+/// Our Chao changed (an egg hatched, a Chao moved gardens): work out the visitors again.
+pub fn refresh_visitors() {
+    RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
+}
+
 /// A visitor row: pick Chao automatically, or send nobody.
 pub const VISITOR_AUTO: i32 = -1;
 pub const VISITOR_NONE: i32 = -2;
@@ -1192,6 +1202,14 @@ pub fn set_visitor(i: usize, slot: i32) {
         v.store(slot, Ordering::Relaxed);
         RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
     }
+}
+
+/// Both visitor rows on the same Chao: the second goes back to Auto.
+pub fn tidy_visitors(mut rows: [i32; 2]) -> [i32; 2] {
+    if rows[0] >= 0 && rows[0] == rows[1] {
+        rows[1] = VISITOR_AUTO;
+    }
+    rows
 }
 
 /// Parses a `Visitor1`/`Visitor2` value: a save slot, "Auto" (-1, the default) or "None" (-2).
@@ -1247,7 +1265,8 @@ pub fn karate_opponents() -> Vec<(Option<u8>, String)> {
 
 /// Up to `MAX_CARRIED_CHAO` hatched, valid Chao living in `garden`, with their save slots
 /// (read-only).
-fn carried_chao(garden: i32) -> Vec<(usize, ChaoData)> {
+/// Our visitors from `garden`, by visitor row: `[visitor 1, visitor 2]` (save slot and Chao).
+fn carried_chao(garden: i32) -> [Option<(usize, ChaoData)>; 2] {
     // Only Chao living in this garden can visit from it (their real ones are here to follow).
     // Auto picks My Chao first, then the others in save order.
     let mine = my_chosen_slot().map(|(slot, _)| slot);
@@ -1259,31 +1278,36 @@ fn carried_chao(garden: i32) -> Vec<(usize, ChaoData)> {
     let picks = VISITORS.each_ref().map(|v| v.load(Ordering::Relaxed));
     let slots: Vec<usize> = here.iter().map(|(slot, _)| *slot).collect();
     pick_visitors(&slots, picks)
-        .into_iter()
-        .filter_map(|slot| here.iter().find(|(s, _)| *s == slot).cloned())
-        .collect()
+        .map(|slot| slot.and_then(|slot| here.iter().find(|(s, _)| *s == slot).cloned()))
 }
 
-/// Which of `here` (save slots in this garden, in Auto order) visit for the two visitor rows:
-/// a chosen Chao that lives here, then Auto fills with the next ones nobody chose.
-fn pick_visitors(here: &[usize], picks: [i32; 2]) -> Vec<usize> {
-    let mut out: Vec<usize> = Vec::new();
-    for pick in picks {
-        if let Some(&slot) = here.iter().find(|&&s| s as i32 == pick)
-            && !out.contains(&slot)
-        {
-            out.push(slot);
-        }
+/// What the two visitor rows come to in the garden we're in (None outside a garden).
+pub fn visitor_preview() -> Option<[Option<(usize, ChaoData)>; 2]> {
+    game::in_garden().then(|| carried_chao(game::current_chao_area()))
+}
+
+/// The two visitor rows over `here` (save slots in this garden, in Auto order): a chosen Chao
+/// that lives here keeps its row; Auto rows take the next ones nobody chose. No Chao twice.
+fn pick_visitors(here: &[usize], picks: [i32; 2]) -> [Option<usize>; 2] {
+    let mut out = [None; 2];
+    for (row, &pick) in picks.iter().enumerate() {
+        out[row] = here
+            .iter()
+            .copied()
+            .find(|&s| s as i32 == pick)
+            .filter(|s| !out.contains(&Some(*s)));
     }
-    let autos = picks.iter().filter(|&&p| p == VISITOR_AUTO).count();
-    let extra: Vec<usize> = here
+    let free: Vec<usize> = here
         .iter()
         .copied()
-        .filter(|&s| !out.contains(&s) && !picks.contains(&(s as i32)))
-        .take(autos)
+        .filter(|&s| !out.contains(&Some(s)) && !picks.contains(&(s as i32)))
         .collect();
-    out.extend(extra);
-    out.truncate(MAX_CARRIED_CHAO);
+    let mut free = free.into_iter();
+    for (row, &pick) in picks.iter().enumerate() {
+        if pick == VISITOR_AUTO {
+            out[row] = free.next();
+        }
+    }
     out
 }
 
@@ -1304,15 +1328,18 @@ mod tests {
         let (auto, none) = (VISITOR_AUTO, VISITOR_NONE);
         // Slots living in this garden, My Chao (3) first.
         let here = [3, 0, 1];
-        assert_eq!(pick_visitors(&here, [auto, auto]), vec![3, 0]);
-        assert_eq!(pick_visitors(&here, [1, auto]), vec![1, 3]);
-        assert_eq!(pick_visitors(&here, [auto, 1]), vec![1, 3]);
-        assert_eq!(pick_visitors(&here, [0, none]), vec![0]);
-        assert_eq!(pick_visitors(&here, [none, none]), Vec::<usize>::new());
+        assert_eq!(pick_visitors(&here, [auto, auto]), [Some(3), Some(0)]);
+        assert_eq!(pick_visitors(&here, [1, auto]), [Some(1), Some(3)]);
+        assert_eq!(pick_visitors(&here, [auto, 1]), [Some(3), Some(1)]);
+        assert_eq!(pick_visitors(&here, [0, none]), [Some(0), None]);
+        assert_eq!(pick_visitors(&here, [none, none]), [None, None]);
         // A pick living in another garden doesn't come; it isn't replaced either.
-        assert_eq!(pick_visitors(&here, [7, auto]), vec![3]);
+        assert_eq!(pick_visitors(&here, [7, auto]), [None, Some(3)]);
         // The same Chao twice comes once.
-        assert_eq!(pick_visitors(&here, [0, 0]), vec![0]);
+        assert_eq!(pick_visitors(&here, [0, 0]), [Some(0), None]);
+        // One Chao: row 1 has it, row 2 is empty. None: both empty.
+        assert_eq!(pick_visitors(&[5], [auto, auto]), [Some(5), None]);
+        assert_eq!(pick_visitors(&[], [auto, auto]), [None, None]);
         assert_eq!(parse_visitor("None"), none);
         assert_eq!(parse_visitor(" 4 "), 4);
         assert_eq!(parse_visitor("99"), auto);

@@ -79,8 +79,10 @@ doesn't stop it for the others.
 
 **Visiting:** when you're in a garden with friends, up to 2 of your Chao from that garden visit
 theirs. Pick them in F9 > Visitor 1 and Visitor 2, or leave them on Auto (your My Chao first).
-A Chao only visits while you're in the garden it lives in. A friend's Chao shows its owner over
-its head, like "Mason 1" (their visitor 1), with its name if it has one.
+A Chao only visits while you're in the garden it lives in, and the same Chao can't fill both
+rows. Visiting Chao show who they belong to over their heads, like "Mason 1" (Mason's visitor 1)
+or "You 2", with the Chao's name if it has one. Eggs and Chao without a tag stay in your game
+only; an egg that hatches can visit right away.
 
 You can pet, hold and feed each other's Chao, and that affects the real Chao in its owner's
 save. Garden items are shared too: pick up a friend's fruit and it's yours.

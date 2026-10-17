@@ -382,10 +382,21 @@ extern "C" fn display(_object: usize) {
         } else {
             None
         };
-        // Friends' visiting Chao: "Mason 1" (their visitor 1), plus its name if it has one.
+        // Visiting Chao: "Mason 1" (their visitor 1), ours "You 1", plus a name if it has one.
         if let Some(tags) = &tags {
-            for (at, owner, index, name) in crate::garden::visitors() {
-                let who = crate::room::name_of(owner);
+            let ours = if crate::online::my_id().is_some() {
+                crate::garden::my_visitors()
+            } else {
+                Vec::new()
+            };
+            let ours = ours
+                .into_iter()
+                .map(|(at, index, name)| (at, None, index, name));
+            let theirs = crate::garden::visitors()
+                .into_iter()
+                .map(|(at, owner, index, name)| (at, Some(owner), index, name));
+            for (at, owner, index, name) in theirs.chain(ours) {
+                let who = owner.map_or_else(|| "You".to_string(), crate::room::name_of);
                 let label = match name {
                     Some(name) => format!("{who} {}: {name}", index + 1),
                     None => format!("{who} {}", index + 1),

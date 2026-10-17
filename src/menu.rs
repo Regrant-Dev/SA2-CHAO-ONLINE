@@ -172,6 +172,7 @@ impl Settings {
                 _ => {}
             }
         }
+        s.visitors = online::tidy_visitors(s.visitors);
         s
     }
 
@@ -351,9 +352,15 @@ pub fn on_frame() {
             );
         }
         Row::Visitor(i) if left || right => {
-            // Auto, then each hatched Chao, then None.
+            // Auto, then each hatched Chao the other row hasn't picked, then None.
+            let other = m.settings.visitors[1 - i];
             let mut options = vec![online::VISITOR_AUTO];
-            options.extend(online::hatched_chao().iter().map(|(slot, _)| *slot as i32));
+            options.extend(
+                online::hatched_chao()
+                    .iter()
+                    .map(|(slot, _)| *slot as i32)
+                    .filter(|&slot| slot != other),
+            );
             options.push(online::VISITOR_NONE);
             let at = options
                 .iter()
@@ -518,20 +525,41 @@ fn start_stop(m: &mut Menu) -> String {
 }
 
 /// "Name (Hero garden)" for a save slot, or "first Chao" for -1.
-fn visitor_label(slot: i32) -> String {
+/// A Chao for the menu: "Chao (Neutral garden, slot 2)".
+fn chao_label(slot: usize, chao: &crate::chao::ChaoData) -> String {
     const GARDENS: [&str; 4] = ["?", "Neutral", "Hero", "Dark"];
-    if slot == online::VISITOR_NONE {
-        return "None".into();
-    }
-    let hatched = online::hatched_chao();
-    match hatched.iter().find(|(s, _)| *s as i32 == slot) {
-        Some((s, chao)) => format!(
-            "{} ({} garden, slot {})",
-            karate::chao_name(chao),
-            GARDENS[usize::from(chao.garden()).min(3)],
-            s + 1
-        ),
-        None => "Auto".into(),
+    format!(
+        "{} ({} garden, slot {})",
+        karate::chao_name(chao),
+        GARDENS[usize::from(chao.garden()).min(3)],
+        slot + 1
+    )
+}
+
+/// Visitor row `row` set to `slot`: what it comes to in this garden ("empty" when nobody).
+fn visitor_label(row: usize, slot: i32) -> String {
+    let now = online::visitor_preview().map(|rows| rows[row].clone());
+    let shown = |c: &Option<(usize, crate::chao::ChaoData)>| match c {
+        Some((slot, chao)) => chao_label(*slot, chao),
+        None => "empty".into(),
+    };
+    match slot {
+        online::VISITOR_NONE => "None".into(),
+        online::VISITOR_AUTO => match now {
+            Some(c) => format!("Auto: {}", shown(&c)),
+            None => "Auto".into(),
+        },
+        slot => {
+            let picked = online::hatched_chao()
+                .into_iter()
+                .find(|(s, _)| *s as i32 == slot)
+                .map_or_else(|| format!("slot {}", slot + 1), |(s, c)| chao_label(s, &c));
+            // In a garden it doesn't live in, it stays home.
+            match now {
+                Some(None) => format!("{picked}: not in this garden"),
+                _ => picked,
+            }
+        }
     }
 }
 
@@ -597,7 +625,7 @@ fn draw(m: &Menu, rows: &[Row]) {
             Row::Visitor(i) => format!(
                 "  Visitor {}: < {} >",
                 i + 1,
-                visitor_label(m.settings.visitors[*i])
+                visitor_label(*i, m.settings.visitors[*i])
             ),
             Row::MyChao => format!(
                 "My Chao (races, karate): < {} >",

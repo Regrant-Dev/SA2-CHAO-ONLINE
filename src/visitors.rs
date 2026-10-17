@@ -90,6 +90,10 @@ fn log_save_chao() {
     if now == seen.1 {
         return;
     }
+    // A hatched egg (or a Chao that moved) may fill an Auto visitor row now.
+    if !seen.1.is_empty() {
+        crate::online::refresh_visitors();
+    }
     seen.1 = now;
     log!("save: {} Chao", chao.len());
     for (slot, c) in &chao {
