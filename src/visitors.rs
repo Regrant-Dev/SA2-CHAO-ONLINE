@@ -66,8 +66,45 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
 /// The Chao a player carries to the next area (re/chao-garden-items.md 5): `ChaoData*` or 0.
 const CARRIED_CHAO: usize = 0x01A5_CA5C;
 
+/// A save slot's Chao: (slot, type, garden).
+type SlotChao = (usize, u8, u8);
+/// Frames counted, and the save's Chao as last logged.
+static SAVE_SEEN: Mutex<(u32, Vec<SlotChao>)> = Mutex::new((0, Vec::new()));
+
+/// Every few seconds: when the save's Chao change (the save loaded, a Chao hatched or moved),
+/// logs each one and whether online play can use it.
+fn log_save_chao() {
+    let mut seen = SAVE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    seen.0 = seen.0.wrapping_add(1);
+    if seen.0 % 300 != 1 {
+        return;
+    }
+    let chao: Vec<(usize, ChaoData)> = (0..game::GARDEN_SLOTS)
+        .filter_map(|slot| game::read_chao_slot(slot).map(|c| (slot, c)))
+        .filter(|(_, c)| !c.is_empty())
+        .collect();
+    let now: Vec<SlotChao> = chao
+        .iter()
+        .map(|(slot, c)| (*slot, c.chao_type(), c.garden()))
+        .collect();
+    if now == seen.1 {
+        return;
+    }
+    seen.1 = now;
+    log!("save: {} Chao", chao.len());
+    for (slot, c) in &chao {
+        let usable = match c.validate() {
+            _ if c.chao_type() == chao::TYPE_EGG => "egg, stays home".to_string(),
+            Ok(()) => "ok for online".to_string(),
+            Err(e) => format!("NOT used online: {e}"),
+        };
+        log!("save: slot {:02} {} [{usable}]", slot + 1, c.summary());
+    }
+}
+
 /// Call every frame: frees the visitor slots once the player is out of the garden.
 pub fn on_frame() {
+    log_save_chao();
     {
         // A visitor must never be carried out of the garden: the next area would recreate it
         // from our buffer, which is reused for other visitors.
