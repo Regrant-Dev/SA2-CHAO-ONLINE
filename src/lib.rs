@@ -28,6 +28,7 @@ mod stage_race;
 mod timeline;
 mod together;
 mod visitors;
+mod watch;
 
 use std::ffi::{CStr, c_char};
 use std::panic;
@@ -97,6 +98,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     karate::install();
     race::install();
     guarded("online init", || online::init(&path));
+    watch::start();
 }
 
 #[unsafe(no_mangle)]
@@ -117,13 +119,21 @@ pub extern "C" fn OnFrame() {
             state.chao_area = chao_area;
         }
 
+        watch::mark("visitors::on_frame");
         visitors::on_frame();
+        watch::mark("garden::on_frame");
         garden::on_frame();
+        watch::mark("let ");
         let (peers, connected) = online::peers();
+        watch::mark("together::on_frame");
         together::on_frame(&peers, connected);
+        watch::mark("coop::on_frame");
         coop::on_frame(&peers, connected);
+        watch::mark("goto::on_frame");
         goto::on_frame();
+        watch::mark("stage_race::on_frame");
         stage_race::on_frame(&peers, connected);
+        watch::mark("kart::on_frame");
         kart::on_frame(stage_race::others_racing());
         {
             // Room players in our stage, for the treasure hunt battle.
@@ -134,14 +144,20 @@ pub extern "C" fn OnFrame() {
                 .filter(|p| members.contains(&p.id) && p.level == level && p.mission == mission)
                 .map(|p| p.id)
                 .collect();
+            watch::mark("hunt::on_frame");
             hunt::on_frame(online::my_id(), &here);
         }
+        watch::mark("room::on_frame");
         room::on_frame(connected);
+        watch::mark("race::start_frame");
         race::start_frame(&peers, connected);
+        watch::mark("race::on_frame");
         race::on_frame();
+        watch::mark("race::drive_frame");
         race::drive_frame();
         // Pausing doesn't stop play that others are in.
         game::set_live_pause(together::live() || race::live() || karate_live::live());
+        watch::mark("game::restore_after_background");
         game::restore_after_background();
         // Online: the main menu's 1P entry reads MULTIPLAYER (online play goes through the 1P
         // modes), 2P opens the battles picker, and the status shows at the bottom.
@@ -155,6 +171,7 @@ pub extern "C" fn OnFrame() {
         if connected && let Some((x, y, selected)) = game::main_menu_2p_label() {
             hud::menu_label(x, y, 318.0, 52.0, "ROOM BATTLES", selected);
         }
+        watch::mark("battles::on_frame");
         battles::on_frame(connected);
         if game::on_main_menu()
             && !battles::is_open()
@@ -163,14 +180,20 @@ pub extern "C" fn OnFrame() {
             hud::banner(&format!("Multiplayer on: {status}  (F9)"));
         }
         // Online, controller changes don't stop the game with the "Reboot" dialog.
+        watch::mark("game::block_reboot_dialog");
         game::block_reboot_dialog(connected);
         if connected {
             game::close_reboot_dialog();
         }
+        watch::mark("online::on_frame");
         online::on_frame();
+        watch::mark("puppet::on_frame");
         puppet::on_frame();
+        watch::mark("menu::on_frame");
         menu::on_frame();
+        watch::mark("chat::on_frame");
         chat::on_frame(connected, menu::is_open());
+        watch::mark("hud::on_frame");
         hud::on_frame();
 
         if state.menu_key.pressed() {
@@ -182,6 +205,7 @@ pub extern "C" fn OnFrame() {
             race::start_now();
             karate_live::start_now();
         }
+        watch::mark("OnFrame done");
     });
 }
 

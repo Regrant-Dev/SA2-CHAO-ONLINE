@@ -915,6 +915,7 @@ fn update_at(object: usize, d: usize, spot: Option<(Vector, i32, bool)>) {
 /// MainSub of a friend's Chao copy: where the owner's real one is (unless we're touching it),
 /// then the game's own update.
 extern "C" fn mirror_main(object: usize) {
+    crate::watch::mark("garden: friend's Chao");
     // SAFETY: a visitor Chao we wrapped; its Data1 is checked for null.
     let d = unsafe { data1(object) };
     let spot = if d == 0 {
@@ -933,6 +934,7 @@ extern "C" fn mirror_main(object: usize) {
 /// MainSub of our own Chao while a friend may hold it: in their (puppet's) hands with its AI
 /// off; back to normal when they let go.
 extern "C" fn held_main(object: usize) {
+    crate::watch::mark("garden: our held Chao");
     // SAFETY: one of our Chao objects we wrapped; its Data1 is checked for null.
     let d = unsafe { data1(object) };
     let spot = if d == 0 {

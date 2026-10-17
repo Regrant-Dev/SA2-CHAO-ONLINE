@@ -365,6 +365,7 @@ extern "C" fn delete(_object: usize) {
 }
 
 extern "C" fn display(_object: usize) {
+    crate::watch::mark("puppet display");
     let _ = std::panic::catch_unwind(|| {
         // Asked before taking our lock: the online code takes its lock, then ours.
         let connected = crate::online::my_id().is_some();

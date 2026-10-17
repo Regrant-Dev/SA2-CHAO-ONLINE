@@ -231,6 +231,7 @@ pub fn install_freeze() {
 }
 
 extern "C" fn pause_draw() {
+    crate::watch::mark("pause draw");
     let update = INGAME_UPDATE.load(Ordering::SeqCst);
     if LIVE_PAUSE.load(Ordering::Relaxed) && !FROZEN.load(Ordering::Relaxed) && update != 0 {
         // SAFETY: static game variables, and the game's own cdecl frame update without
@@ -253,6 +254,7 @@ extern "C" fn pause_draw() {
 }
 
 extern "C" fn ingame_update() -> i32 {
+    crate::watch::mark("stage update");
     let grace = GRACE.load(Ordering::Relaxed);
     if grace > 0 {
         GRACE.store(grace - 1, Ordering::Relaxed);

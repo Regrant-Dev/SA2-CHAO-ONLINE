@@ -427,6 +427,7 @@ static mut FAKE: Fake = Fake {
 
 /// Draws the others' karts with the game's kart display (re/kart.md 4.3).
 extern "C" fn display(_object: usize) {
+    crate::watch::mark("kart display");
     let _ = std::panic::catch_unwind(|| {
         let karts: Vec<(KartState, [f32; 3])> = with(|k| {
             k.others

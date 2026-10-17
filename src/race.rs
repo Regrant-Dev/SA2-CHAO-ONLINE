@@ -204,6 +204,7 @@ fn racers() -> Vec<Racer> {
 
 /// Labels over your Chao ("You") and friends' Chao; CPU racers have none.
 extern "C" fn display_tags(_object: usize) {
+    crate::watch::mark("race tags");
     let _ = std::panic::catch_unwind(|| {
         let r = RACE.lock().unwrap_or_else(|e| e.into_inner());
         if crate::game::current_chao_area() != AREA_RACE || r.lanes.is_empty() {
