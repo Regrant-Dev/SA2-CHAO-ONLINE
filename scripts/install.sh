@@ -8,6 +8,11 @@ SAVES="$GAME/resource/gd_PC/SAVEDATA"
 BACKUPS="${SA2_BACKUP_DIR:-$HOME/sa2-savedata-backups}"
 cd "$(dirname "$0")/.."
 
+if [ ! -f "$GAME/sonic2app.exe" ]; then
+    echo "No game in $GAME. Set SA2_DIR to your Sonic Adventure 2 folder." >&2
+    exit 1
+fi
+
 if [ -d "$SAVES" ] && [ -n "$(ls -A "$SAVES")" ]; then
     hash=$(cd "$SAVES" && sha256sum * | sha256sum | cut -c1-12)
     if ! ls "$BACKUPS" 2>/dev/null | grep -q -- "-$hash$"; then
