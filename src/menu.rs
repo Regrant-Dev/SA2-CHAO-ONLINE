@@ -518,7 +518,7 @@ fn my_chao_label(slot: i32) -> String {
         // Automatic: the first hatched Chao.
         None => match hatched.first() {
             Some((s, chao)) => format!("Auto: {} (slot {})", karate::chao_name(chao), s + 1),
-            None => "Auto (no hatched Chao yet)".into(),
+            None => "Auto (load your save first)".into(),
         },
     }
 }

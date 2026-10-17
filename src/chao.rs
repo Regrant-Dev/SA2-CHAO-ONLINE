@@ -22,6 +22,9 @@ mod off {
 
 /// Number of stats stored per Chao (swim, fly, run, power, stamina, luck, intelligence, unknown).
 pub const STAT_COUNT: usize = 8;
+/// The ones the game uses and checks: swim .. stamina. The others can keep the egg's filler
+/// after hatching (seen in game: grade 0x48 in stat 6 of a child Chao, 2026-10-16).
+const CHECKED_STATS: usize = 5;
 
 /// `ChaoType`: 0 = empty slot, 1 = egg, 2 = child, 3..=0x19 = adult forms.
 pub const TYPE_EMPTY: u8 = 0x00;
@@ -104,7 +107,7 @@ impl ChaoData {
         if t == TYPE_EGG {
             return Ok(());
         }
-        for stat in 0..STAT_COUNT {
+        for stat in 0..CHECKED_STATS {
             let (grade, level, points) = (self.grade(stat), self.level(stat), self.points(stat));
             if grade > GRADE_MAX || level > LEVEL_MAX || !(0..=POINTS_MAX).contains(&points) {
                 return Err(InvalidChao::Stat {
@@ -473,19 +476,16 @@ mod tests {
     }
 
     #[test]
-    fn egg_with_unfilled_stats_passes() {
+    fn egg_filler_in_unused_stats_passes() {
         // Grades from a real unhatched egg (export of slot 00, 2026-10-14).
         let mut c = sample();
         c.bytes[off::TYPE] = TYPE_EGG;
         c.bytes[off::STAT_GRADES..off::STAT_GRADES + 8]
             .copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x48, 0xC4]);
         assert_eq!(c.validate(), Ok(()));
-        // The same bytes on a hatched Chao are still rejected.
+        // A Chao just hatched from it keeps that filler in stats 6 and 7: still fine.
         c.bytes[off::TYPE] = 0x02;
-        assert!(matches!(
-            c.validate(),
-            Err(InvalidChao::Stat { stat: 6, .. })
-        ));
+        assert_eq!(c.validate(), Ok(()));
     }
 
     #[test]

@@ -62,7 +62,6 @@ struct Hunt {
     claims_out: Vec<(i16, u8, u32, u8)>,
     taken_in: Vec<(u32, u8, u8)>,
     ended: bool,
-    seen: Option<(u8, u8, [[u8; 2]; 3])>,
 }
 
 static HUNT: Mutex<Option<Hunt>> = Mutex::new(None);
@@ -79,7 +78,6 @@ fn with<R>(f: impl FnOnce(&mut Hunt) -> R) -> R {
         claims_out: Vec::new(),
         taken_in: Vec::new(),
         ended: false,
-        seen: None,
     }))
 }
 
@@ -177,22 +175,9 @@ pub fn on_frame(me: Option<u8>, here: &[u8]) {
                 claims_out: Vec::new(),
                 taken_in: Vec::new(),
                 ended: false,
-                seen: h.seen,
             };
         }
         let m = read::<usize>(MANAGER);
-        // Diagnostics: the manager's state and pieces left as they change.
-        let seen = (m != 0).then(|| {
-            (
-                read::<u8>(m + M_STATE),
-                read::<u8>(m + M_LEFT),
-                std::array::from_fn::<_, 3, _>(|s| read::<[u8; 2]>(slot(m, s))),
-            )
-        });
-        if seen != h.seen {
-            log!("hunt: manager (state, left, slots) {seen:?}");
-            h.seen = seen;
-        }
         let (Some(me), Some((level, mission))) = (me, stage) else {
             return;
         };
