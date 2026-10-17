@@ -49,6 +49,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: sa2-chao-online
@@ -57,8 +59,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Players get an update prompt (SA Mod Manager) for every release, so only release when
+          # something in the zip changed since the last one.
+          prev=$(git rev-list -n 1 latest 2>/dev/null || true)
+          if [ -n "$prev" ] && git diff --quiet "$prev" "$GITHUB_SHA" -- \
+              src mod Cargo.toml Cargo.lock .cargo docs/how-to-play.md LICENSE scripts/package.sh; then
+            echo "Nothing for players changed since ${prev::7}; keeping the current release."
+            exit 0
+          fi
           # SA Mod Manager shows these notes when it offers the update: what changed first.
-          changes=$(git log -1 --format=%B "$GITHUB_SHA")
+          if [ -n "$prev" ]; then
+            changes=$(git log --format='- %s' "$prev..$GITHUB_SHA")
+          else
+            changes=$(git log -1 --format='- %s' "$GITHUB_SHA")
+          fi
           # Remove every release and tag, then publish the one release at this commit.
           for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
             gh release delete "$tag" --yes --cleanup-tag
@@ -69,7 +83,8 @@ jobs:
           gh release create latest sa2-chao-online.zip sa2co-server.exe \
             --target "$GITHUB_SHA" --latest \
             --title "SA2 Chao Online $version" \
-            --notes "**What's new:** $changes
+            --notes "**What's new:**
+          $changes
 
           Download **sa2-chao-online.zip** below, extract it into the game's \`mods\` folder and enable **SA2 Chao Online** in SA Mod Manager. The same zip works on Windows and on Linux (Proton). See \`how-to-play.md\` inside the zip.
 

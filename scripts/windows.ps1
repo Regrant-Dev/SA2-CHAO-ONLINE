@@ -57,6 +57,8 @@ if ($Install) {
     New-Item -ItemType Directory -Force "$Mod\chao\import" | Out-Null
     Copy-Item mod\mod.ini, mod\configschema.xml $Mod
     Copy-Item $Dll "$Mod\sa2-chao-online.dll"
+    # SA Mod Manager offers a GitHub release as an update when it's newer than this.
+    (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") | Set-Content "$Mod\mod.version"
     Write-Host "Installed to $Mod"
 }
 

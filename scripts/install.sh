@@ -26,4 +26,7 @@ cargo build --release
 mkdir -p "$DEST/chao/import"
 cp mod/mod.ini mod/configschema.xml "$DEST/"
 cp target/i686-pc-windows-gnu/release/sa2_chao_online.dll "$DEST/sa2-chao-online.dll"
+# SA Mod Manager offers a GitHub release as an update when it's newer than this: a local build
+# counts as current until something newer is published.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$DEST/mod.version"
 echo "Installed to $DEST"
