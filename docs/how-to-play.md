@@ -75,8 +75,8 @@ them. From Stage Select you're taken into their stage.
 - **Treasure Hunt:** pick a Knuckles or Rouge hunting stage. Everyone hunts the same 3 pieces and
   whoever grabs a piece first gets it.
 
-While connected the game keeps running when you tab out, and pausing during a room stage
-doesn't stop it for the others.
+Tabbing out pauses your game like normal SA2 (the others see you stand still); you stay
+connected. Pausing during a room stage doesn't stop it for the others.
 
 ## Chao
 

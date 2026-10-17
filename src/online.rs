@@ -396,10 +396,6 @@ pub fn init(mod_path: &str) {
 
 /// Network thread: receive, handle lobby events, keep the session alive, rejoin.
 fn pump(online: &mut Online, now: Instant) {
-    // Online, the game keeps running in the background (others are playing).
-    if online.session.my_id().is_some() {
-        game::keep_running_in_background();
-    }
     if let Some((host, me, at)) = &mut online.rejoin
         && at.is_some_and(|at| now >= at)
     {

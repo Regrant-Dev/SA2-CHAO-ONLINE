@@ -135,35 +135,9 @@ pub fn freeze_world_after(frames: u32) {
     }
 }
 
-/// In a stage started together, the pause screen doesn't stop the game (like online games):
-/// the stage keeps running behind the menu, only our player ignores the controller.
-/// Keeps the game running while its window is in the background (multiplayer).
-///
-/// The Mod Loader's "pause when inactive" sets `WindowActive` (0x174F5AC) to 0 when the window
-/// loses focus, which stops the game loop, and stops sounds and inputs. While connected we set
-/// it back to 1 (from the network thread, as the game loop isn't running then), and restore the
-/// sounds when the window is focused again (`on_frame`).
-pub fn keep_running_in_background() {
-    // SAFETY: static int in the game's data section.
-    unsafe {
-        let active = WINDOW_ACTIVE as *mut i32;
-        if active.read_volatile() == 0 {
-            active.write_volatile(1);
-            KEPT_RUNNING.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Call every frame: brings the sounds back after `keep_running_in_background` once the window
-/// is focused again.
-pub fn restore_after_background() {
-    if KEPT_RUNNING.load(Ordering::Relaxed) && crate::input::game_focused() {
-        KEPT_RUNNING.store(false, Ordering::Relaxed);
-        // SAFETY: the game's own RestoreSounds (0x435FD0, no arguments), on the game thread,
-        // as the Mod Loader calls it when the window is activated.
-        unsafe { std::mem::transmute::<usize, extern "C" fn()>(RESTORE_SOUNDS)() };
-    }
-}
+// Tabbing out pauses the game as usual: forcing the Mod Loader's `WindowActive` back on to keep
+// playing in the background froze the game under Proton (2026-10-17): fullscreen D3D9 loses its
+// device on focus loss and the loader waits for focus before resetting it.
 
 /// While online, the game's "Reboot to change the control scheme" dialog (opened when the number
 /// of connected XInput pads changes) never opens: it stops the whole game update until
@@ -207,10 +181,10 @@ pub fn close_reboot_dialog() {
 
 static REBOOT_DIALOG_BLOCKED: AtomicBool = AtomicBool::new(false);
 
-const WINDOW_ACTIVE: usize = 0x0174_F5AC;
 const RESTORE_SOUNDS: usize = 0x0043_5FD0;
-static KEPT_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// In a stage started together, the pause screen doesn't stop the game (like online games):
+/// the stage keeps running behind the menu, only our player ignores the controller.
 pub fn set_live_pause(live: bool) {
     LIVE_PAUSE.store(live, Ordering::Relaxed);
 }

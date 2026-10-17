@@ -159,8 +159,6 @@ pub extern "C" fn OnFrame() {
         race::drive_frame();
         // Pausing doesn't stop play that others are in.
         game::set_live_pause(together::live() || race::live() || karate_live::live());
-        watch::mark("game::restore_after_background");
-        game::restore_after_background();
         // Online: the main menu's 1P entry reads MULTIPLAYER (online play goes through the 1P
         // modes), 2P opens the battles picker, and the status shows at the bottom.
         game::block_two_player_menu(connected);
