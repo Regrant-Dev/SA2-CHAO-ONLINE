@@ -23,6 +23,12 @@
       <Property name="VisitWith" display="Visit friends" type="VisitWith" defaultvalue="On" alwaysinclude="true">
         <HelpText>On: up to 2 Chao from the garden you're in visit friends in the same garden. Off: they stay home.</HelpText>
       </Property>
+      <Property name="Visitor1" display="Visitor 1 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Which Chao visits first. Easier to pick in game: F9 > Visitor 1.</HelpText>
+      </Property>
+      <Property name="Visitor2" display="Visitor 2 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Which Chao visits second. Easier to pick in game: F9 > Visitor 2.</HelpText>
+      </Property>
       <Property name="RoomMode" display="Room mode (rooms you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
         <HelpText>Race: everyone has their own enemies. Coop: enemies someone destroys are gone for everyone.</HelpText>
       </Property>

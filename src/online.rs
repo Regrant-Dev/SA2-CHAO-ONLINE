@@ -60,6 +60,8 @@ pub struct Config {
     pub my_chao: i32,
     /// Visit friends: 0 off, 1 on (index into `VISIT_MODES`).
     pub visits: usize,
+    /// Visitor 1 and 2: a save slot, `VISITOR_AUTO` or `VISITOR_NONE`.
+    pub visitors: [i32; 2],
     /// Mode of rooms we create.
     pub room_mode: crate::room::Mode,
 }
@@ -126,6 +128,10 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         name_tags,
         my_chao: get("mychao").trim().parse().unwrap_or(-1),
         visits: parse_visits(get("visitwith")),
+        visitors: [
+            parse_visitor(get("visitor1")),
+            parse_visitor(get("visitor2")),
+        ],
         room_mode: crate::room::Mode::parse(get("roommode")),
         chao_race: !matches!(
             get("chaorace").to_ascii_lowercase().as_str(),
@@ -204,6 +210,9 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
     crate::race::set_enabled(config.chao_race);
     set_my_chao(config.my_chao);
     set_visits(config.visits);
+    for (i, slot) in config.visitors.into_iter().enumerate() {
+        set_visitor(i, slot);
+    }
     crate::room::set_mode(config.room_mode);
     let me = Identity {
         name: config.name.clone(),
@@ -1169,6 +1178,34 @@ pub fn set_visits(mode: usize) {
 
 static RESEND_GARDEN_CHAO: AtomicBool = AtomicBool::new(false);
 
+/// A visitor row: pick Chao automatically, or send nobody.
+pub const VISITOR_AUTO: i32 = -1;
+pub const VISITOR_NONE: i32 = -2;
+static VISITORS: [std::sync::atomic::AtomicI32; 2] = [
+    std::sync::atomic::AtomicI32::new(VISITOR_AUTO),
+    std::sync::atomic::AtomicI32::new(VISITOR_AUTO),
+];
+
+/// F9 / config: which Chao is visitor `i` (a save slot, auto or none). Applies right away.
+pub fn set_visitor(i: usize, slot: i32) {
+    if let Some(v) = VISITORS.get(i) {
+        v.store(slot, Ordering::Relaxed);
+        RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Parses a `Visitor1`/`Visitor2` value: a save slot, "Auto" (-1, the default) or "None" (-2).
+pub fn parse_visitor(text: &str) -> i32 {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => VISITOR_NONE,
+        t => t
+            .parse()
+            .ok()
+            .filter(|&n| (VISITOR_NONE..game::GARDEN_SLOTS as i32).contains(&n))
+            .unwrap_or(VISITOR_AUTO),
+    }
+}
+
 /// Parses a `VisitWith` value ("Off" or "On"; older "Garden" and "MyChao" mean On).
 pub fn parse_visits(text: &str) -> usize {
     match text.trim().to_ascii_lowercase().replace(' ', "").as_str() {
@@ -1211,15 +1248,43 @@ pub fn karate_opponents() -> Vec<(Option<u8>, String)> {
 /// Up to `MAX_CARRIED_CHAO` hatched, valid Chao living in `garden`, with their save slots
 /// (read-only).
 fn carried_chao(garden: i32) -> Vec<(usize, ChaoData)> {
-    // My Chao first when it lives here, then the others in save order.
+    // Only Chao living in this garden can visit from it (their real ones are here to follow).
+    // Auto picks My Chao first, then the others in save order.
     let mine = my_chosen_slot().map(|(slot, _)| slot);
     let mut here: Vec<(usize, ChaoData)> = hatched_chao()
         .into_iter()
         .filter(|(_, c)| i32::from(c.garden()) == garden)
         .collect();
     here.sort_by_key(|(slot, _)| (Some(*slot) != mine, *slot));
-    here.truncate(MAX_CARRIED_CHAO);
-    here
+    let picks = VISITORS.each_ref().map(|v| v.load(Ordering::Relaxed));
+    let slots: Vec<usize> = here.iter().map(|(slot, _)| *slot).collect();
+    pick_visitors(&slots, picks)
+        .into_iter()
+        .filter_map(|slot| here.iter().find(|(s, _)| *s == slot).cloned())
+        .collect()
+}
+
+/// Which of `here` (save slots in this garden, in Auto order) visit for the two visitor rows:
+/// a chosen Chao that lives here, then Auto fills with the next ones nobody chose.
+fn pick_visitors(here: &[usize], picks: [i32; 2]) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for pick in picks {
+        if let Some(&slot) = here.iter().find(|&&s| s as i32 == pick)
+            && !out.contains(&slot)
+        {
+            out.push(slot);
+        }
+    }
+    let autos = picks.iter().filter(|&&p| p == VISITOR_AUTO).count();
+    let extra: Vec<usize> = here
+        .iter()
+        .copied()
+        .filter(|&s| !out.contains(&s) && !picks.contains(&(s as i32)))
+        .take(autos)
+        .collect();
+    out.extend(extra);
+    out.truncate(MAX_CARRIED_CHAO);
+    out
 }
 
 pub fn shutdown() {
@@ -1235,6 +1300,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn visitors_follow_the_two_rows() {
+        let (auto, none) = (VISITOR_AUTO, VISITOR_NONE);
+        // Slots living in this garden, My Chao (3) first.
+        let here = [3, 0, 1];
+        assert_eq!(pick_visitors(&here, [auto, auto]), vec![3, 0]);
+        assert_eq!(pick_visitors(&here, [1, auto]), vec![1, 3]);
+        assert_eq!(pick_visitors(&here, [auto, 1]), vec![1, 3]);
+        assert_eq!(pick_visitors(&here, [0, none]), vec![0]);
+        assert_eq!(pick_visitors(&here, [none, none]), Vec::<usize>::new());
+        // A pick living in another garden doesn't come; it isn't replaced either.
+        assert_eq!(pick_visitors(&here, [7, auto]), vec![3]);
+        // The same Chao twice comes once.
+        assert_eq!(pick_visitors(&here, [0, 0]), vec![0]);
+        assert_eq!(parse_visitor("None"), none);
+        assert_eq!(parse_visitor(" 4 "), 4);
+        assert_eq!(parse_visitor("99"), auto);
+    }
+
+    #[test]
     fn default_config_is_off() {
         assert_eq!(
             parse_config(DEFAULT_CONFIG).unwrap(),
@@ -1245,6 +1329,7 @@ mod tests {
                 chao_race: true,
                 my_chao: -1,
                 visits: 1,
+                visitors: [VISITOR_AUTO; 2],
                 room_mode: crate::room::Mode::Race,
             }
         );
@@ -1262,6 +1347,7 @@ mod tests {
                 chao_race: true,
                 my_chao: -1,
                 visits: 1,
+                visitors: [VISITOR_AUTO; 2],
                 room_mode: crate::room::Mode::Race,
             }
         );

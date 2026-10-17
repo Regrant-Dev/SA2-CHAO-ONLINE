@@ -49,6 +49,8 @@ enum Row {
     Race,
     MyChao,
     Visits,
+    /// Visitor 1 or 2: which Chao visits (Auto, a save slot, or None).
+    Visitor(usize),
     StartStop,
     Apply,
     StartNow,
@@ -57,7 +59,7 @@ enum Row {
 /// Rows shown right now: "Start now" first while held at a start, then the connection and
 /// play settings, then actions, and connecting/stopping at the bottom. `mode` (index into
 /// `MODES`) picks the address row: Host address only when joining, Port only when hosting.
-fn rows(mode: usize) -> Vec<Row> {
+fn rows(mode: usize, visits: usize) -> Vec<Row> {
     let mut rows = Vec::new();
     if together::is_holding() || race::is_holding() || crate::karate_live::is_holding() {
         rows.push(Row::StartNow);
@@ -80,7 +82,11 @@ fn rows(mode: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([Row::MyChao, Row::Visits, Row::Race, Row::Karate]);
+    rows.extend([Row::MyChao, Row::Visits]);
+    if visits != 0 {
+        rows.extend([Row::Visitor(0), Row::Visitor(1)]);
+    }
+    rows.extend([Row::Race, Row::Karate]);
     if online::status().is_some() {
         rows.extend([Row::Apply, Row::StartStop]);
     } else {
@@ -108,6 +114,8 @@ pub struct Settings {
     pub my_chao: i32,
     /// Visit friends: 0 off, 1 on (index into `online::VISIT_MODES`).
     pub visits: usize,
+    /// Visitor 1 and 2: a save slot, `online::VISITOR_AUTO` or `online::VISITOR_NONE`.
+    pub visitors: [i32; 2],
     /// Mode of rooms we create.
     pub room_mode: room::Mode,
 }
@@ -124,6 +132,7 @@ impl Settings {
             chao_race: true,
             my_chao: -1,
             visits: 1,
+            visitors: [online::VISITOR_AUTO; 2],
             room_mode: room::Mode::Race,
         };
         for line in text.lines() {
@@ -145,6 +154,8 @@ impl Settings {
                 "port" if !v.is_empty() => s.port = v,
                 "mychao" => s.my_chao = v.parse().unwrap_or(-1),
                 "visitwith" => s.visits = online::parse_visits(&v),
+                "visitor1" => s.visitors[0] = online::parse_visitor(&v),
+                "visitor2" => s.visitors[1] = online::parse_visitor(&v),
                 "roommode" => s.room_mode = room::Mode::parse(&v),
                 "chaorace" => {
                     s.chao_race = !matches!(
@@ -167,7 +178,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\nRoomMode={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\nVisitor1={}\nVisitor2={}\nRoomMode={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -176,6 +187,8 @@ impl Settings {
             if self.chao_race { "On" } else { "Off" },
             self.my_chao,
             ["Off", "On"][self.visits.min(1)],
+            self.visitors[0],
+            self.visitors[1],
             self.room_mode.ini()
         )
     }
@@ -230,6 +243,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         chao_race: true,
         my_chao: -1,
         visits: 1,
+        visitors: [-1; 2],
         room_mode: crate::room::Mode::Race,
     },
     message: String::new(),
@@ -298,7 +312,7 @@ pub fn on_frame() {
         m.open = false;
         return;
     }
-    let rows = rows(m.settings.mode);
+    let rows = rows(m.settings.mode, m.settings.visits);
     m.row = m.row.min(rows.len() - 1);
     if m.pressed(VK_UP) {
         m.row = (m.row + rows.len() - 1) % rows.len();
@@ -331,6 +345,23 @@ pub fn on_frame() {
             let n = options.len();
             m.settings.my_chao = options[(at + if left { n - 1 } else { 1 }) % n];
             online::set_my_chao(m.settings.my_chao);
+            let _ = fs::write(
+                Path::new(online::mod_path()).join("config.ini"),
+                m.settings.to_ini(),
+            );
+        }
+        Row::Visitor(i) if left || right => {
+            // Auto, then each hatched Chao, then None.
+            let mut options = vec![online::VISITOR_AUTO];
+            options.extend(online::hatched_chao().iter().map(|(slot, _)| *slot as i32));
+            options.push(online::VISITOR_NONE);
+            let at = options
+                .iter()
+                .position(|&o| o == m.settings.visitors[i])
+                .unwrap_or(0);
+            let n = options.len();
+            m.settings.visitors[i] = options[(at + if left { n - 1 } else { 1 }) % n];
+            online::set_visitor(i, m.settings.visitors[i]);
             let _ = fs::write(
                 Path::new(online::mod_path()).join("config.ini"),
                 m.settings.to_ini(),
@@ -487,6 +518,23 @@ fn start_stop(m: &mut Menu) -> String {
 }
 
 /// "Name (Hero garden)" for a save slot, or "first Chao" for -1.
+fn visitor_label(slot: i32) -> String {
+    const GARDENS: [&str; 4] = ["?", "Neutral", "Hero", "Dark"];
+    if slot == online::VISITOR_NONE {
+        return "None".into();
+    }
+    let hatched = online::hatched_chao();
+    match hatched.iter().find(|(s, _)| *s as i32 == slot) {
+        Some((s, chao)) => format!(
+            "{} ({} garden, slot {})",
+            karate::chao_name(chao),
+            GARDENS[usize::from(chao.garden()).min(3)],
+            s + 1
+        ),
+        None => "Auto".into(),
+    }
+}
+
 fn my_chao_label(slot: i32) -> String {
     const GARDENS: [&str; 4] = ["?", "Neutral", "Hero", "Dark"];
     let hatched = online::hatched_chao();
@@ -546,6 +594,11 @@ fn draw(m: &Menu, rows: &[Row]) {
                     None => "Room:         (connect first)".into(),
                 }
             }
+            Row::Visitor(i) => format!(
+                "  Visitor {}: < {} >",
+                i + 1,
+                visitor_label(m.settings.visitors[*i])
+            ),
             Row::MyChao => format!(
                 "My Chao (races, karate): < {} >",
                 my_chao_label(m.settings.my_chao)
@@ -633,6 +686,7 @@ mod tests {
             chao_race: false,
             my_chao: 5,
             visits: 1,
+            visitors: [3, -2],
             room_mode: crate::room::Mode::Coop,
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);

@@ -26,6 +26,7 @@ Pause the game before typing, since letter keys also move your character.
 | Go to | Jump to a friend |
 | My Chao | The Chao you race and fight with |
 | Visit friends | Whether your Chao visit friends' gardens |
+| Visitor 1 / 2 | Which Chao visit: Auto, a Chao you pick, or None |
 | Friends' Chao in races | Friends' Chao fill the other lanes in your Chao Races |
 | Practice karate | Fight a copy of a friend's Chao |
 | Save & Start / Apply / Stop | Connect, reconnect with new settings, or disconnect |
@@ -77,7 +78,8 @@ doesn't stop it for the others.
 ## Chao
 
 **Visiting:** when you're in a garden with friends, up to 2 of your Chao from that garden visit
-theirs. Your My Chao goes first if it lives there. You can pet, hold and feed each other's Chao,
+theirs. Pick them in F9 > Visitor 1 and Visitor 2, or leave them on Auto (your My Chao first).
+A Chao only visits while you're in the garden it lives in. You can pet, hold and feed each other's Chao,
 and that affects the real Chao in its owner's save. Garden items are shared too: pick up a
 friend's fruit and it's yours.
 
