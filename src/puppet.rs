@@ -382,6 +382,17 @@ extern "C" fn display(_object: usize) {
         } else {
             None
         };
+        // Friends' visiting Chao: "Mason 1" (their visitor 1), plus its name if it has one.
+        if let Some(tags) = &tags {
+            for (at, owner, index, name) in crate::garden::visitors() {
+                let who = crate::room::name_of(owner);
+                let label = match name {
+                    Some(name) => format!("{who} {}: {name}", index + 1),
+                    None => format!("{who} {}", index + 1),
+                };
+                tags.draw_scaled(at, CHAO_TAG_HEIGHT, &label, CHAO_TAG_SCALE);
+            }
+        }
         for (pose, name) in poses {
             if let (Some(tags), Some(name)) = (&tags, &name) {
                 tags.draw(pose.position, name);
@@ -887,6 +898,9 @@ unsafe fn draw(source: &Source, pose: &Pose) -> Result<(), &'static str> {
 /// Height above a character's position (its middle, not its feet) for the name tag, in world
 /// units: just above the head (22 was far too high in game).
 const TAG_HEIGHT: f32 = 10.0;
+/// Friends' Chao: tags just over their heads, smaller than players'.
+const CHAO_TAG_HEIGHT: f32 = 6.0;
+const CHAO_TAG_SCALE: f32 = 0.7;
 /// Hide tags beyond this distance (world units).
 const TAG_RANGE: f32 = 1500.0;
 /// Camera depth up to which tags are drawn at full size (about the usual follow distance).
@@ -932,6 +946,11 @@ impl TagProjector {
 
     /// Draws `name` centred `height` units above world point `feet`.
     pub(crate) fn draw_at(&self, feet: [f32; 3], height: f32, name: &str) {
+        self.draw_scaled(feet, height, name, 1.0);
+    }
+
+    /// `draw_at`, with the text `scale` times the usual size.
+    pub(crate) fn draw_scaled(&self, feet: [f32; 3], height: f32, name: &str, scale: f32) {
         let head = [feet[0], feet[1] + height, feet[2]];
         let distance = (0..3)
             .map(|i| (head[i] - self.me[i]).powi(2))
@@ -954,7 +973,7 @@ impl TagProjector {
         }
         // The 640x480 HUD space is the largest 4:3 area that fits the screen, centred.
         let (sx, sy) = crate::hud::from_virtual(x, y);
-        crate::hud::name_tag(sx, sy, shrink, name);
+        crate::hud::name_tag(sx, sy, shrink * scale, name);
     }
 }
 

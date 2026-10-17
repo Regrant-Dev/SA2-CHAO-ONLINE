@@ -243,6 +243,32 @@ pub fn visiting(owner: u8, index: u8) -> bool {
     })
 }
 
+/// Friends' Chao visiting us, for their name tags: (where, owner, index, the Chao's name if it
+/// has one).
+pub fn visitors() -> Vec<([f32; 3], u8, u8, Option<String>)> {
+    with(|g| {
+        g.mirrors
+            .iter()
+            .filter_map(|(&(owner, index), m)| {
+                // SAFETY: our visitor's live object (cleared when we leave the garden); its
+                // record is our own visitor buffer.
+                unsafe {
+                    let d = data1(m.object);
+                    if d == 0 {
+                        return None;
+                    }
+                    let p = ((d + D_POSITION) as *const Vector).read_unaligned();
+                    let record = ((d + D_RECORD) as *const usize).read();
+                    let name = (record != 0)
+                        .then(|| crate::karate::chao_name(&(record as *const ChaoData).read()))
+                        .filter(|n| n != "Chao");
+                    Some(([p.x, p.y, p.z], owner, index, name))
+                }
+            })
+            .collect()
+    })
+}
+
 /// Friends' Chao that left our garden since last asked: (owner, index).
 pub fn take_left() -> Vec<(u8, u8)> {
     with(|g| std::mem::take(&mut g.left))
