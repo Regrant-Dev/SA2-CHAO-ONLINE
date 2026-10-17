@@ -7,7 +7,8 @@
    Mod Manager.
 3. Start the game. Multiplayer is off until you turn it on.
 
-Everyone playing together needs the same version of the mod.
+Everyone playing together needs the same version of the mod. SA Mod Manager checks for a new
+version when it starts and asks before installing it; your settings are kept.
 
 ## The F9 menu
 

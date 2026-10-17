@@ -57,6 +57,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # SA Mod Manager shows these notes when it offers the update: what changed first.
+          changes=$(git log -1 --format=%B "$GITHUB_SHA")
           # Remove every release and tag, then publish the one release at this commit.
           for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
             gh release delete "$tag" --yes --cleanup-tag
@@ -67,7 +69,9 @@ jobs:
           gh release create latest sa2-chao-online.zip sa2co-server.exe \
             --target "$GITHUB_SHA" --latest \
             --title "SA2 Chao Online $version" \
-            --notes "Download **sa2-chao-online.zip** below, extract it into the game's \`mods\` folder and enable **SA2 Chao Online** in SA Mod Manager. The same zip works on Windows and on Linux (Proton). See \`how-to-play.md\` inside the zip.
+            --notes "**What's new:** $changes
+
+          Download **sa2-chao-online.zip** below, extract it into the game's \`mods\` folder and enable **SA2 Chao Online** in SA Mod Manager. The same zip works on Windows and on Linux (Proton). See \`how-to-play.md\` inside the zip.
 
           **Dedicated server** (optional, keeps a lobby up without anyone's game hosting it): \`sa2co-server.exe\` below for Windows, or the Docker image \`ghcr.io/regrant-dev/sa2-chao-online-server:latest\`.
 
