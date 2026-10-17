@@ -240,9 +240,14 @@ Item boxes:
 | 0x6E9350 | KDITEMBOX | 0x8000 cleared (0x488DA0) |
 | 0x6EABC0 | SGITEMBOX / SG_ITEMBOX | 0x4 and 0x8000 cleared |
 
+Breakables (synced since 2026-10-17): the object's init hands over to an update that calls
+KillObject 0x488DA0 (clears 0x8000) when it breaks: CONTWOOD 0x6CD7F0 (update 0x6CD890) and
+0x6FB200 (0x6FB280), CONTIRON 0x6D63F0 (0x6D6490) and 0x6FBBA0 (0x6FBC20), DOORT 0x6E3F60
+(0x6E4090).
+
 Not synced (examples): RING 0x6C0F80 (clears 0x8000 when collected), SPRA/SPRB, SAVEPOINT
-0x6D99A0 (sets 0x10), SWITCH, SCHBOX/SG_SEARCHBOX (hint/search boxes), SOLIDBOX, CONTWOOD/CONTIRON
-(breakable containers; they could be added later the same way), ITEMBOXBAL GEN 0x6DBA70
+0x6D99A0 (sets 0x10), SWITCH, SCHBOX/SG_SEARCHBOX (hint/search boxes), SOLIDBOX (no KillObject in
+it), DOOR 0x613550/0x6B06D0/0x7049E0 (switch doors), CONTCHAO, ITEMBOXBAL GEN 0x6DBA70
 (a balloon generator, see caveats).
 
 ---

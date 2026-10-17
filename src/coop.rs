@@ -1,5 +1,5 @@
-//! Co-op rooms: an enemy or item box destroyed by anyone in the room is gone for everyone in
-//! that stage (same level and mission). See re/stage-objects.md.
+//! Co-op rooms: an enemy, item box or breakable container destroyed by anyone in the room is
+//! gone for everyone in that stage (same level and mission). See re/stage-objects.md.
 //!
 //! Every stage object comes from a record in `SETObjectData[0x600]`, filled in SET-file order,
 //! so a record's index names the same object in every game. Each frame we apply kills from the
@@ -58,12 +58,23 @@ const ENEMIES: [usize; 18] = [
 const GROUND_BOXES: [usize; 2] = [0x006C_7C10, 0x006C_7CE0];
 /// Air, balloon, KD and SG boxes: gone once broken.
 const OTHER_BOXES: [usize; 4] = [0x006C_8EF0, 0x006D_B030, 0x006E_9350, 0x006E_ABC0];
+/// Mech-stage breakables whose update calls KillObject (0x488DA0, clears "alive") when shot:
+/// CONTWOOD (0x6CD7F0, 0x6FB200), CONTIRON (0x6D63F0, 0x6FBBA0) and the breakable door DOORT
+/// (0x6E3F60). Doors opened by switches aren't synced.
+const BREAKABLES: [usize; 5] = [
+    0x006C_D7F0,
+    0x006F_B200,
+    0x006D_63F0,
+    0x006F_BBA0,
+    0x006E_3F60,
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Enemy,
     GroundBox,
     OtherBox,
+    Breakable,
 }
 
 struct Coop {
@@ -137,6 +148,8 @@ fn kind(n: usize) -> Option<Kind> {
         Some(Kind::GroundBox)
     } else if OTHER_BOXES.contains(&main) {
         Some(Kind::OtherBox)
+    } else if BREAKABLES.contains(&main) {
+        Some(Kind::Breakable)
     } else {
         None
     }
@@ -145,7 +158,7 @@ fn kind(n: usize) -> Option<Kind> {
 /// Destroyed in our game (as far as this kind can be).
 fn is_destroyed(kind: Kind, f: u16) -> bool {
     match kind {
-        Kind::Enemy => f & ALIVE == 0,
+        Kind::Enemy | Kind::Breakable => f & ALIVE == 0,
         Kind::GroundBox => f & BROKEN != 0,
         Kind::OtherBox => f & ALIVE == 0 || f & BROKEN != 0,
     }
@@ -155,7 +168,7 @@ fn is_destroyed(kind: Kind, f: u16) -> bool {
 fn destroy(n: usize, kind: Kind) {
     let mut f = flags(n);
     match kind {
-        Kind::Enemy => f &= !ALIVE,
+        Kind::Enemy | Kind::Breakable => f &= !ALIVE,
         // Stays alive: the loader brings it back as the broken shell.
         Kind::GroundBox => f |= BROKEN,
         Kind::OtherBox => f = (f | BROKEN) & !ALIVE,

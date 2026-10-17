@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::game::{self, LEVEL_CHAO_WORLD, POSE_GO, POSE_WAITING};
+use crate::game::{self, LEVEL_CHAO_WORLD, POSE_GO, POSE_PLAYING, POSE_WAITING};
 use crate::hud;
 use crate::log;
 
@@ -199,13 +199,17 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                 .filter(|p| members.contains(&p.id))
                 .filter(|p| {
                     let here = p.level == level && p.mission == mission;
-                    (here && p.flags & (POSE_WAITING | POSE_GO) == 0) || p.level <= 0
+                    (here && p.flags & (POSE_WAITING | POSE_GO | POSE_PLAYING) == 0) || p.level <= 0
                 })
                 .map(|p| p.id)
                 .collect();
-            let we_go = t.want_go.is_some_and(|asked| {
-                loading.is_empty() || force || now.duration_since(asked) >= WAIT_LIMIT
-            });
+            // Everyone else here already started (they loaded first and went): nobody to wait
+            // for or start with, so we go too.
+            let all_playing = !same.is_empty() && same.iter().all(|p| p.flags & POSE_PLAYING != 0);
+            let we_go = all_playing
+                || t.want_go.is_some_and(|asked| {
+                    loading.is_empty() || force || now.duration_since(asked) >= WAIT_LIMIT
+                });
             if we_go {
                 t.go_until = Some(now + GO_FLAG_TIME);
             }
@@ -223,6 +227,8 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                     "together: countdown ({})",
                     if !we_go {
                         "someone started"
+                    } else if all_playing {
+                        "the others already started"
                     } else if loading.is_empty() {
                         "we started"
                     } else {
@@ -272,6 +278,9 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
     }
     if t.go_until.is_some_and(|until| now < until) {
         flags |= POSE_GO;
+    }
+    if matches!(t.phase, Phase::Started { .. }) {
+        flags |= POSE_PLAYING;
     }
     t.flags = flags;
 }

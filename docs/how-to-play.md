@@ -62,7 +62,8 @@ them. From Stage Select you're taken into their stage.
 **Rooms:** one player creates a room in F9 > Room and the others join it. In a room:
 
 - Stages wait at the start until everyone there has loaded, then anyone presses **F8** (or
-  Start) for a 3-2-1 countdown. This works in story mode too, each on your own save.
+  Start) for a 3-2-1 countdown. This works in story mode too, each on your own save. If the
+  others already started before you loaded, your countdown starts by itself.
 - A stage someone picks on Stage Select takes along everyone in the room who's on Stage Select.
 - **Race mode:** everyone has their own enemies. Your position shows at the top right.
 - **Co-op mode:** enemies and item boxes someone destroys are gone for everyone.

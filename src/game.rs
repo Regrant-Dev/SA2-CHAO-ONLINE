@@ -66,6 +66,8 @@ pub const POSE_GO: u8 = 8;
 pub const POSE_RACE_CHAO: u8 = 16;
 /// `PlayerState::flags`: in a live karate fight (can't be challenged).
 pub const POSE_KARATE_BUSY: u8 = 32;
+/// `PlayerState::flags`: playing a stage that started together (past its countdown).
+pub const POSE_PLAYING: u8 = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

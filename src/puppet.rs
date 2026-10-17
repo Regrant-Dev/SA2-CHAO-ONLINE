@@ -366,6 +366,8 @@ extern "C" fn delete(_object: usize) {
 
 extern "C" fn display(_object: usize) {
     let _ = std::panic::catch_unwind(|| {
+        // Asked before taking our lock: the online code takes its lock, then ours.
+        let connected = crate::online::my_id().is_some();
         let mut p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
         let co2 = game::local_char_obj2();
         let Some(me) = game::local_player() else {
@@ -387,7 +389,7 @@ extern "C" fn display(_object: usize) {
         };
         // Visiting Chao: "Mason 1" (their visitor 1), ours "You 1", plus a name if it has one.
         if let Some(tags) = &tags {
-            let ours = if crate::online::my_id().is_some() {
+            let ours = if connected {
                 crate::garden::my_visitors()
             } else {
                 Vec::new()
