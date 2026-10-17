@@ -3,8 +3,7 @@
 Online multiplayer for **Sonic Adventure 2** (Steam PC), up to 8 players, as an
 [SA2 Mod Loader](https://github.com/X-Hax/sa2-mod-loader) mod.
 
-- **See each other** in stages and Chao gardens: every character (including Tails' and
-  Eggman's mechs), with name tags and Sonic's spin ball.
+- **See each other** in stages and Chao gardens: every character.
 - **Rooms:** create or join a room and play together: every stage starts together (story mode
   too, each on your own save), a Stage Select pick or Chao Race takes the room along, and
   anyone can challenge anyone in the room to live karate.
