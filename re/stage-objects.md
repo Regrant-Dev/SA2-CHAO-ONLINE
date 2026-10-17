@@ -240,10 +240,18 @@ Item boxes:
 | 0x6E9350 | KDITEMBOX | 0x8000 cleared (0x488DA0) |
 | 0x6EABC0 | SGITEMBOX / SG_ITEMBOX | 0x4 and 0x8000 cleared |
 
-Breakables (synced since 2026-10-17): the object's init hands over to an update that calls
-KillObject 0x488DA0 (clears 0x8000) when it breaks: CONTWOOD 0x6CD7F0 (update 0x6CD890) and
-0x6FB200 (0x6FB280), CONTIRON 0x6D63F0 (0x6D6490) and 0x6FBBA0 (0x6FBC20), DOORT 0x6E3F60
-(0x6E4090).
+Breakables (synced since 2026-10-17): every object list entry whose update calls KillObject
+0x488DA0 (clears 0x8000, never reloads). Found by mapping the 30 KillObject call sites to the
+function containing them and the init that installs it, then to the entry names: DRMCN 0x4B6A40,
+0x4D9BD0, 0x5BBAB0; PPSHED 0x4B6D60; MITRUCK 0x4D7AB0; SLANE 0x4DF5E0, 0x5AE3E0; SLANE2 0x5AF4A0;
+E EMI 0x4FDD00; BIGSHUTTER 0x5C2B90; BALOON 0x624E10; BOMBE 0x638A60; DLCONT 0x645B30; DYNAMITE
+0x65ADA0, 0x6DA720; CONTWOOD 0x6CD7F0, 0x6FB200; CONTIRON 0x6D63F0, 0x6FBBA0; KDDOOR 0x6E3F80
+(not DOORT 0x6E3F60); WSMMLS 0x6EA1E0; BCOL 0x6F6EA0; POISON 0x777250; SGOLID 0x779FB0; CGWOOD
+0x77A950. Three call sites had no named entry (0x6356F0, 0x6E9DE0, 0x77BA60).
+
+Rings: RING 0x6C0F80 and SGRING 0x6C1470 also end in KillObject. In co-op a ring collected by
+anyone is gone for everyone and gives each player a ring: AddRings **0x44CE10** (EAX = player,
+DX = signed count; rings at 0x174B028 + 2*player, clamped to 999, extra life per 100; 27 callers).
 
 Not synced (examples): RING 0x6C0F80 (clears 0x8000 when collected), SPRA/SPRB, SAVEPOINT
 0x6D99A0 (sets 0x10), SWITCH, SCHBOX/SG_SEARCHBOX (hint/search boxes), SOLIDBOX (no KillObject in

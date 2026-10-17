@@ -448,6 +448,25 @@ pub fn in_garden() -> bool {
     current_level() == LEVEL_CHAO_WORLD && (1..=3).contains(&current_chao_area())
 }
 
+/// Gives player 1 `count` rings the game's way (AddRings 0x44CE10: EAX = player, DX = count;
+/// clamps at 999 and handles the extra lives at every 100).
+pub fn add_rings(count: i16) {
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the game's own usercall, on the game thread; it saves the registers it uses
+    // besides EAX/ECX/EDX.
+    unsafe {
+        std::arch::asm!(
+            "call {f}",
+            f = in(reg) 0x0044_CE10usize,
+            inout("eax") 0 => _,
+            inout("edx") i32::from(count) => _,
+            clobber_abi("C"),
+        );
+    }
+    #[cfg(not(target_arch = "x86"))]
+    let _ = count;
+}
+
 /// Copies one garden slot out of game memory (read-only).
 pub fn read_chao_slot(index: usize) -> Option<ChaoData> {
     if index >= GARDEN_SLOTS {

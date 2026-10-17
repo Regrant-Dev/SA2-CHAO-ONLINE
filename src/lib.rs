@@ -142,6 +142,8 @@ pub extern "C" fn OnFrame() {
             let here: Vec<u8> = peers
                 .iter()
                 .filter(|p| members.contains(&p.id) && p.level == level && p.mission == mission)
+                // Only those who started it with us (a late joiner hunts on their own).
+                .filter(|p| p.flags & (game::POSE_WAITING | game::POSE_PLAYING) != 0)
                 .map(|p| p.id)
                 .collect();
             watch::mark("hunt::on_frame");

@@ -66,7 +66,8 @@ them. From Stage Select you're taken into their stage.
   others already started before you loaded, your countdown starts by itself.
 - A stage someone picks on Stage Select takes along everyone in the room who's on Stage Select.
 - **Race mode:** everyone has their own enemies. Your position shows at the top right.
-- **Co-op mode:** enemies and item boxes someone destroys are gone for everyone.
+- **Co-op mode:** enemies, item boxes and other breakable things someone destroys are gone for
+  everyone. A ring one of you picks up is gone for both, and you both get it.
 
 **Room battles:** while online, the main menu's 2P button becomes **ROOM BATTLES**:
 

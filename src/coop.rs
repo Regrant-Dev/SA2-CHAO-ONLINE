@@ -58,16 +58,41 @@ const ENEMIES: [usize; 18] = [
 const GROUND_BOXES: [usize; 2] = [0x006C_7C10, 0x006C_7CE0];
 /// Air, balloon, KD and SG boxes: gone once broken.
 const OTHER_BOXES: [usize; 4] = [0x006C_8EF0, 0x006D_B030, 0x006E_9350, 0x006E_ABC0];
-/// Mech-stage breakables whose update calls KillObject (0x488DA0, clears "alive") when shot:
-/// CONTWOOD (0x6CD7F0, 0x6FB200), CONTIRON (0x6D63F0, 0x6FBBA0) and the breakable door DOORT
-/// (0x6E3F60). Doors opened by switches aren't synced.
-const BREAKABLES: [usize; 5] = [
-    0x006C_D7F0,
-    0x006F_B200,
-    0x006D_63F0,
-    0x006F_BBA0,
-    0x006E_3F60,
+/// Objects removed for good by KillObject (0x488DA0, clears "alive") when destroyed: every
+/// object list entry whose update calls it (re/stage-objects.md "Breakables"). Rings are
+/// separate (`RINGS`); treasure hunt pieces never go through here.
+const BREAKABLES: [usize; 25] = [
+    0x004B_6A40, // DRMCN
+    0x004B_6D60, // PPSHED
+    0x004D_7AB0, // MITRUCK
+    0x004D_9BD0, // DRMCN
+    0x004D_F5E0, // SLANE
+    0x004F_DD00, // E EMI
+    0x005A_E3E0, // SLANE
+    0x005A_F4A0, // SLANE2
+    0x005B_BAB0, // DRMCN
+    0x005C_2B90, // BIGSHUTTER
+    0x0062_4E10, // BALOON
+    0x0063_8A60, // BOMBE
+    0x0064_5B30, // DLCONT
+    0x0065_ADA0, // DYNAMITE
+    0x006C_D7F0, // CONTWOOD
+    0x006D_63F0, // CONTIRON
+    0x006D_A720, // DYNAMITE
+    0x006E_3F80, // KDDOOR
+    0x006E_A1E0, // WSMMLS
+    0x006F_6EA0, // BCOL
+    0x006F_B200, // CONTWOOD
+    0x006F_BBA0, // CONTIRON
+    0x0077_7250, // POISON
+    0x0077_9FB0, // SGOLID
+    0x0077_A950, // CGWOOD
 ];
+/// RING and SGRING: collected by one player, gone for everyone and a ring for each.
+const RINGS: [usize; 2] = [0x006C_0F80, 0x006C_1470];
+/// A friend's ring pickup only counts once our stage has run this long (someone joining late
+/// gets the whole list of what's gone, but not those rings).
+const RING_REWARD_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -75,6 +100,7 @@ enum Kind {
     GroundBox,
     OtherBox,
     Breakable,
+    Ring,
 }
 
 struct Coop {
@@ -92,6 +118,8 @@ struct Coop {
     send_all: bool,
     /// Room members in this stage last frame.
     here: Vec<u8>,
+    /// When we entered this stage.
+    since: Option<std::time::Instant>,
 }
 
 static COOP: Mutex<Coop> = Mutex::new(Coop {
@@ -102,6 +130,7 @@ static COOP: Mutex<Coop> = Mutex::new(Coop {
     outgoing: Vec::new(),
     send_all: false,
     here: Vec::new(),
+    since: None,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, Coop> {
@@ -150,6 +179,8 @@ fn kind(n: usize) -> Option<Kind> {
         Some(Kind::OtherBox)
     } else if BREAKABLES.contains(&main) {
         Some(Kind::Breakable)
+    } else if RINGS.contains(&main) {
+        Some(Kind::Ring)
     } else {
         None
     }
@@ -158,7 +189,7 @@ fn kind(n: usize) -> Option<Kind> {
 /// Destroyed in our game (as far as this kind can be).
 fn is_destroyed(kind: Kind, f: u16) -> bool {
     match kind {
-        Kind::Enemy | Kind::Breakable => f & ALIVE == 0,
+        Kind::Enemy | Kind::Breakable | Kind::Ring => f & ALIVE == 0,
         Kind::GroundBox => f & BROKEN != 0,
         Kind::OtherBox => f & ALIVE == 0 || f & BROKEN != 0,
     }
@@ -168,7 +199,7 @@ fn is_destroyed(kind: Kind, f: u16) -> bool {
 fn destroy(n: usize, kind: Kind) {
     let mut f = flags(n);
     match kind {
-        Kind::Enemy | Kind::Breakable => f &= !ALIVE,
+        Kind::Enemy | Kind::Breakable | Kind::Ring => f &= !ALIVE,
         // Stays alive: the loader brings it back as the broken shell.
         Kind::GroundBox => f |= BROKEN,
         Kind::OtherBox => f = (f | BROKEN) & !ALIVE,
@@ -231,6 +262,7 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                 outgoing: Vec::new(),
                 send_all: false,
                 here: Vec::new(),
+                since: None,
             };
         }
         return;
@@ -246,6 +278,7 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
             stage.1
         );
         c.stage = Some(stage);
+        c.since = Some(std::time::Instant::now());
         c.dead.clear();
         c.outgoing.clear();
         c.here.clear();
@@ -258,9 +291,13 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
 
     // Kills from the others, and anything a death restart brought back.
     let incoming = std::mem::take(&mut c.incoming);
+    let rewards = c.since.is_some_and(|at| at.elapsed() >= RING_REWARD_AFTER);
     for n in incoming {
-        if usize::from(n) < count {
-            c.dead.insert(n);
+        if usize::from(n) < count && c.dead.insert(n) {
+            // A ring a friend just picked up: one for us too.
+            if rewards && kind(usize::from(n)) == Some(Kind::Ring) {
+                game::add_rings(1);
+            }
         }
     }
     let dead: Vec<u16> = c.dead.iter().copied().collect();

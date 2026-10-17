@@ -211,6 +211,20 @@ fn entry_of(object: usize) -> Option<usize> {
         .map(|(e, _)| e)
 }
 
+/// Animals' MainSub (re/chao-garden-items.md); their update reads `+0x3C` unchecked.
+const ANIMAL_MAIN: usize = 0x0054_8C50;
+
+/// The item is still in the garden's item list (an animal also still has its `+0x3C`; drives
+/// never do). A Chao eating or absorbing it takes it out, and running the item's update after
+/// that crashes (0x548BB2 in the animal update, 2026-10-17). `main` is its original MainSub.
+fn attached(object: usize, main: usize) -> bool {
+    if entry_of(object).is_none() {
+        return false;
+    }
+    // SAFETY: a live object we track.
+    main != ANIMAL_MAIN || unsafe { ((object + OBJ_ENTRY) as *const usize).read() != 0 }
+}
+
 fn category_of(entry: usize) -> usize {
     (entry.wrapping_sub(WORLD)) / WORLD_CATEGORY_SIZE
 }
@@ -602,9 +616,21 @@ fn apply_owners(s: &mut Items, me: u8, area: u8) {
         if owner == me {
             // Our claim won: the copy becomes ours, saved in our save.
             if let Some(c) = s.copies.remove(&id) {
-                // SAFETY: the copy's live object; its original MainSub goes back.
+                // SAFETY: the copy's live object, checked to still be our wrapped copy in the
+                // item list before its original MainSub goes back.
                 unsafe {
-                    ((c.object + OBJ_MAIN) as *mut usize).write(c.main);
+                    let main = (c.object + OBJ_MAIN) as *mut usize;
+                    if main.read() != copy_main as extern "C" fn(usize) as usize
+                        || !attached(c.object, c.main)
+                    {
+                        log!(
+                            "items: item {}:{} was used up before it became ours",
+                            id.origin,
+                            id.serial
+                        );
+                        continue;
+                    }
+                    main.write(c.main);
                     if let Some(entry) = entry_of(c.object) {
                         adopt(entry, c.object, area);
                     }
@@ -688,6 +714,11 @@ extern "C" fn copy_main(object: usize) {
         delete(object);
         return;
     };
+    if !attached(object, main) {
+        // Eaten or absorbed here: its update would crash; the copy just goes.
+        delete(object);
+        return;
+    }
     let in_hands = spot.is_some_and(|(_, held)| held);
     if local || !in_hands {
         // SAFETY: the item's own MainSub, which this object had.
