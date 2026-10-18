@@ -125,6 +125,9 @@ pub struct Pose {
     pub flags: u8,
     /// `CharObj2Base::Upgrades` (mech upgrade parts).
     pub upgrades: u32,
+    /// EntityData1 action and `protocol::STATUS_*` bits (what a skin's animation follows).
+    pub action: u8,
+    pub status: u8,
 }
 
 /// Spin ball centres (newest last) and their texture (0/1).
@@ -134,7 +137,8 @@ struct Puppets {
     /// The game object, or 0. Cleared by our delete callback when the game frees it.
     object: usize,
     /// Remote players' poses and names.
-    remotes: Vec<(Pose, String)>,
+    /// Pose, name, and the skin they wear ("" for none).
+    remotes: Vec<(Pose, String, String)>,
     /// Other characters' assets loaded this stage (and characters that failed to load).
     loaded: Vec<Loaded>,
     failed: Vec<u8>,
@@ -188,6 +192,8 @@ pub fn blend(a: &Pose, b: &Pose, t: f32) -> Pose {
         frame,
         flags: b.flags,
         upgrades: b.upgrades,
+        action: b.action,
+        status: b.status,
     }
 }
 
@@ -199,7 +205,7 @@ pub fn set_name_tags(on: bool) {
     NAME_TAGS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn set_remotes(remotes: Vec<(Pose, String)>) {
+pub fn set_remotes(remotes: Vec<(Pose, String, String)>) {
     PUPPETS.lock().unwrap_or_else(|e| e.into_inner()).remotes = remotes;
 }
 
@@ -210,7 +216,7 @@ pub fn on_frame() {
     if p.object != 0
         && let Some(me) = game::local_player()
     {
-        let wanted: Vec<u8> = p.remotes.iter().map(|(pose, _)| pose.character).collect();
+        let wanted: Vec<u8> = p.remotes.iter().map(|(pose, ..)| pose.character).collect();
         for character in wanted {
             if character == me.character
                 || p.loaded.iter().any(|l| l.character == character)
@@ -377,10 +383,10 @@ extern "C" fn display(_object: usize) {
         if co2.is_null() {
             return;
         }
-        let poses: Vec<(Pose, Option<String>)> = p
+        let poses: Vec<(Pose, Option<String>, String)> = p
             .remotes
             .iter()
-            .map(|(pose, name)| (*pose, Some(name.clone())))
+            .map(|(pose, name, skin)| (*pose, Some(name.clone()), skin.clone()))
             .collect();
         // SAFETY: display callback on the game thread; the matrix stack top is the camera view.
         let tags = if NAME_TAGS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -410,9 +416,16 @@ extern "C" fn display(_object: usize) {
                 tags.draw_scaled(at, CHAO_TAG_HEIGHT, &label, CHAO_TAG_SCALE);
             }
         }
-        for (pose, name) in poses {
+        for (pose, name, skin) in poses {
             if let (Some(tags), Some(name)) = (&tags, &name) {
                 tags.draw(pose.position, name);
+            }
+            // Wearing a skin we have: that instead of the character (skins.rs).
+            if !skin.is_empty()
+                && !crate::kart::in_kart_race()
+                && crate::skins::draw_other(name.as_deref().unwrap_or(""), &skin, &pose)
+            {
+                continue;
             }
             let source = if pose.character == me.character {
                 texlist_slot(pose.character).map(|slot| Source {
@@ -1234,6 +1247,100 @@ mod ffi {
 }
 
 /// Host builds (tests, fakepeer) never run the display callback.
+/// Loads a texture archive by name (no extension) with the game's loader; 0 if not found.
+pub fn load_texlist_named(name: usize) -> usize {
+    // SAFETY: the game's loader, on the game thread, with a NUL-terminated name.
+    unsafe { load_texlist(name) }
+}
+
+/// Releases a texture list `load_texlist_named` gave.
+pub fn release_texlist(texlist: usize) {
+    if texlist != 0 {
+        // SAFETY: a texlist the game's loader made for us, released once.
+        unsafe { free_texlist(texlist) }
+    }
+}
+
+/// How a solid model moves on its own: a flip (`spin`, BAMS about its side axis) and a lean
+/// into turns (`lean`, BAMS about its length), both about the point `lift` above its base.
+#[derive(Clone, Copy, Default)]
+pub struct Tilt {
+    pub spin: i32,
+    pub lean: i32,
+    pub lift: f32,
+}
+
+/// Draws a solid model (a skin) at `position` with a character's `rotation`, `scale`d, with
+/// its own texture list: the same transform a character's display uses (translate, rotate
+/// Z, X, then Y as 0x8000 - y), then the model's own `tilt`. With a `motion` (and its
+/// frame) it's drawn posed by it, the way the game draws a character's animation.
+///
+/// # Safety
+/// Game thread, inside the display pass; `model` is a checked, relocated object tree, and
+/// `motion` a checked, relocated NJS_MOTION for it.
+pub unsafe fn draw_solid(
+    model: usize,
+    texlist: usize,
+    position: [f32; 3],
+    rotation: [i32; 3],
+    s: f32,
+    tilt: Tilt,
+    motion: Option<(usize, f32)>,
+) {
+    unsafe {
+        let top = read::<usize>(MATRIX_TOP);
+        let limit = read::<usize>(MATRIX_LIMIT);
+        let base_ptr = read::<usize>(MATRIX_BASE);
+        let render = read::<usize>(RENDER_STATE);
+        let next = top + MATRIX_SIZE;
+        if render == 0 || top == 0 || top < base_ptr || next > limit {
+            return;
+        }
+        ptr::copy_nonoverlapping(top as *const u8, next as *mut u8, MATRIX_SIZE);
+        write(MATRIX_TOP, next);
+        let old_texlist = read::<usize>(render + RENDER_TEXLIST);
+        write(render + RENDER_TEXLIST, texlist);
+        translate(next, position);
+        let [rx, ry, rz] = rotation;
+        if rz != 0 {
+            rotate(ROTATE_Z, next, rz);
+        }
+        if rx != 0 {
+            rotate(ROTATE_X, next, rx);
+        }
+        let ry = 0x8000i32.wrapping_sub(ry);
+        if ry != 0 {
+            rotate(ROTATE_Y, next, ry);
+        }
+        if tilt.spin != 0 || tilt.lean != 0 {
+            translate(next, [0.0, tilt.lift, 0.0]);
+            if tilt.lean != 0 {
+                rotate(ROTATE_Z, next, tilt.lean);
+            }
+            if tilt.spin != 0 {
+                rotate(ROTATE_X, next, tilt.spin);
+            }
+            translate(next, [0.0, -tilt.lift, 0.0]);
+        }
+        if s != 1.0 {
+            scale(s);
+        }
+        match motion {
+            Some((motion, frame)) => {
+                // No bone callback: the character's display may have left one that records
+                // its body's node positions, and these nodes aren't its body.
+                let old_bone = read::<usize>(BONE_CALLBACK);
+                write(BONE_CALLBACK, 0usize);
+                draw_motion(motion, model, frame);
+                write(BONE_CALLBACK, old_bone);
+            }
+            None => draw_object(model),
+        }
+        write(render + RENDER_TEXLIST, old_texlist);
+        write(MATRIX_TOP, top);
+    }
+}
+
 #[cfg(not(target_arch = "x86"))]
 mod ffi {
     pub unsafe fn load_object(_: u32, _: *const u8, _: usize) -> usize {
@@ -1285,6 +1392,8 @@ mod tests {
             frame,
             flags: 0,
             upgrades: 0,
+            action: 0,
+            status: 0,
         }
     }
 

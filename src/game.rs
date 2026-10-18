@@ -38,6 +38,13 @@ const ENTITY_POSITION: usize = 0x14;
 const ENTITY_ROTATION: usize = 0x08;
 /// `EntityData1::Rotation.y` offset.
 const ENTITY_ROTATION_Y: usize = 0x0C;
+/// EntityData1 status bits (+4) and scale (+0x20).
+const ENTITY_STATUS: usize = 0x04;
+/// EntityData1 status: holding something (re/chao-garden-sync.md).
+const STATUS_HOLDING: u16 = 0x800;
+const ENTITY_SCALE: usize = 0x20;
+/// CharObj2 bits Sonic's display checks (with 0x11) before drawing the spin ball.
+const CO2_BALL_FLAGS: usize = 0x360;
 
 /// CharObj2 offsets, confirmed in the draw and setup code (re/characters.md).
 pub const CO2_CHAR_ID: usize = 0x03;
@@ -589,6 +596,18 @@ pub struct LocalPlayer {
     pub flags: u8,
     /// `CharObj2Base::Upgrades`.
     pub upgrades: u32,
+    /// Curled into a ball, by the same test Sonic's display uses to swap in the ball model
+    /// (0x720090, re/skins.md): status +4 & 0x100, not blending, not the Chao walker, and
+    /// co2+0x360 & 0x11.
+    pub curled: bool,
+    /// The entity's scale (+0x20, normally 1).
+    pub scale: f32,
+    /// Standing on the ground or an object (status +4 & 3).
+    pub grounded: bool,
+    /// EntityData1 action (re/skins.md "Garden actions": 43 pet, 35 shake a tree, ...).
+    pub action: u8,
+    /// Holding something (status +4 & 0x800: a Chao, fruit, ...).
+    pub holding: bool,
 }
 
 /// Player 1's EntityData1 (position, angles, action), or null when no player exists.
@@ -637,6 +656,13 @@ pub fn local_player() -> Option<LocalPlayer> {
         // attack starts (13) (re/spin-ball.md, re/effects.md). Sonic family only.
         let action = entity.read();
         let ball = matches!(character, 0 | 1 | 8 | 9) && matches!(action, 3..=6 | 13 | 69);
+        let curled = (entity.add(ENTITY_STATUS) as *const u16).read_unaligned() & 0x100 != 0
+            && !blending
+            && co2.add(CO2_CHAR_ID).read() != 0x0C
+            && (co2.add(CO2_BALL_FLAGS) as *const u32).read_unaligned() & 0x11 != 0;
+        let scale = (entity.add(ENTITY_SCALE) as *const f32).read_unaligned();
+        let status = (entity.add(ENTITY_STATUS) as *const u16).read_unaligned();
+        let grounded = status & 3 != 0;
         Some(LocalPlayer {
             character,
             position: (entity.add(ENTITY_POSITION) as *const Vector).read_unaligned(),
@@ -649,7 +675,53 @@ pub fn local_player() -> Option<LocalPlayer> {
             frame: (co2.add(CO2_FRAME) as *const f32).read_unaligned(),
             flags: if ball { POSE_BALL } else { 0 } | if blending { POSE_BLENDING } else { 0 },
             upgrades: (co2.add(CO2_UPGRADES) as *const u32).read_unaligned(),
+            curled,
+            scale: if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            },
+            grounded,
+            action,
+            holding: status & STATUS_HOLDING != 0,
         })
+    }
+}
+
+/// How far through its current animation the local player is (0..1), from its animation
+/// table and the motion table (as the display finds the motion; re/skins.md).
+pub fn local_anim_progress() -> Option<f32> {
+    const ANIM_INFO_SIZE: usize = 0x10;
+    const MAX_ANIM: usize = 256;
+    const MOTION_STRIDE: usize = 8;
+    let co2 = local_char_obj2();
+    if co2.is_null() {
+        return None;
+    }
+    // SAFETY: the live CharObj2 and the game's own tables, every index checked first.
+    unsafe {
+        let anim_info = (co2.add(CO2_ANIM_INFO) as *const usize).read_unaligned();
+        let anim = (co2.add(CO2_ANIM) as *const i16).read_unaligned();
+        let frame = (co2.add(CO2_FRAME) as *const f32).read_unaligned();
+        if anim_info == 0 || anim < 0 || anim as usize >= MAX_ANIM || !frame.is_finite() {
+            return None;
+        }
+        let base = ((anim_info + anim as usize * ANIM_INFO_SIZE) as *const i16).read_unaligned();
+        if base < 0 || base as usize >= MAX_ANIM {
+            return None;
+        }
+        let motion_index =
+            ((anim_info + base as usize * ANIM_INFO_SIZE) as *const i16).read_unaligned();
+        if motion_index < 0 || motion_index as usize >= MOTION_COUNT {
+            return None;
+        }
+        let motion =
+            ((MOTION_TABLE + motion_index as usize * MOTION_STRIDE) as *const usize).read();
+        if motion == 0 {
+            return None;
+        }
+        let frames = ((motion + 4) as *const u32).read_unaligned();
+        (frames > 1).then(|| (frame / (frames - 1) as f32).clamp(0.0, 1.0))
     }
 }
 

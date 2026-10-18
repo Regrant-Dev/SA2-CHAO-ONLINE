@@ -53,6 +53,11 @@ const W_YAW: usize = 0x68;
 const W_GATE: usize = 0xBC;
 const W_LAPS: usize = 0xC4;
 const W_WHEEL: usize = 0xD4;
+/// The car's models (+0x34 drawn far, +0x38 near), texture list and wheels flag.
+const W_MODEL_FAR: usize = 0x34;
+const W_MODEL_NEAR: usize = 0x38;
+const W_TEXLIST: usize = 0x3C;
+const W_WHEELS: usize = 0x40;
 /// Body tilt from jumps and bumps: the display adds +0xF0/+0xFC, +0xF4/+0x100, +0xF8/+0x104.
 const W_TILT: usize = 0xF0;
 const W_TILT_2: usize = 0xFC;
@@ -334,6 +339,17 @@ extern "C" fn nothing(_object: usize) {}
 /// Call every frame (game thread). `racing_others`: room players still racing here.
 pub fn on_frame(racing_others: bool) {
     let mine = my_state();
+    // Our kart skin: its model and textures in our car's work, no wheels (they're the
+    // skin's own), every frame of the race (re/skins.md).
+    if in_kart_race()
+        && let Some(w) = our_work()
+        && let Some((model, texlist)) = crate::skins::kart()
+    {
+        write(w + W_MODEL_FAR, model);
+        write(w + W_MODEL_NEAR, model);
+        write(w + W_TEXLIST, texlist);
+        write(w + W_WHEELS, 0u32);
+    }
     with(|k| {
         k.frame = k.frame.wrapping_add(1);
         if let Some(state) = mine {

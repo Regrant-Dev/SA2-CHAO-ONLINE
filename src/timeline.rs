@@ -83,6 +83,8 @@ mod tests {
             frame: 0.0,
             flags: 0,
             upgrades: 0,
+            action: 0,
+            status: 0,
         }
     }
 

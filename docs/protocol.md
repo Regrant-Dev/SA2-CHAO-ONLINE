@@ -1,4 +1,4 @@
-# Network protocol (v18)
+# Network protocol (v19)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -49,7 +49,7 @@ Game bodies:
 
 | tag | body | sent | fields |
 |---|---|---|---|
-| 1 | PlayerState | 30 Hz, unreliable | time u32 (sender frame), level i16, mission u8, chao_area i8, character u8, position f32×3 (finite, \|v\| ≤ 1e6), rotation i32×3 (BAMS), anim u16, frame f32 (finite, \|v\| ≤ 1e5), flags u8, room (owner u8, kind u8), upgrades u32 (`CharObj2Base::Upgrades`, for mech upgrade parts) |
+| 1 | PlayerState | 30 Hz, unreliable | time u32 (sender frame), level i16, mission u8, chao_area i8, character u8, position f32×3 (finite, \|v\| ≤ 1e6), rotation i32×3 (BAMS), anim u16, frame f32 (finite, \|v\| ≤ 1e5), flags u8, room (owner u8, kind u8), upgrades u32 (`CharObj2Base::Upgrades`, for mech upgrade parts), action u8 (EntityData1 action), status u8 (1 on the ground, 2 holding something): the last two drive skins' animations |
 | 2 | Chao | reliable | index u8 (0..=1 garden Chao, 2 = My Chao), 0x800 bytes `ChaoData` (must pass `ChaoData::validate`) |
 | 4 | RoomPick | reliable | level i16 (1..=100), mission u8 (0..=4), character u8 (0..=15): a room player's Stage Select pick |
 | 5 | RacePick | reliable | category u8 (0..=4), course u8 (0..=12), level u8 (0..=11): a room player's race |
@@ -78,6 +78,29 @@ Game bodies:
 | 28 | Checkpoint | reliable | level i16, mission u8, record u16 (< 0x600), position f32×3, rotation i32×3: co-op room, the sender passed this checkpoint standing there; the others light it and restart there if they have no checkpoint yet or it's further along the stage's route |
 | 29 | Ball | 10 Hz unreliable | area u8 (1..=3), claim u16, position f32×3, velocity f32×3: shared garden, the ball as whoever kicked or held it last has it (a higher claim takes over; equal claims go to the lower id) |
 | 30 | BossHp | reliable | level i16, mission u8, hp f32, full f32: co-op room, the sender's boss is down to `hp`; the others' boss with the same `full` drops to it (never below a sliver: the last hit is each player's own) |
+| 31 | SkinWorn | reliable, on change and every 10 s | skin str ≤ 24 (a skin id: `[a-z0-9_]`, or "" for none): what the sender wears; nothing shows on screen |
+| 32 | SkinListGet | reliable, to the host | page u16 |
+| 33 | SkinList | reliable, from the host | page u16, pages u16, count u8 (≤ 48), then count × (path str ≤ 96, size u32 (≤ 16 MB), hash [u8;8] FNV-1a 64): the host's shared skin files (file index = page × 48 + position) |
+| 34 | SkinGet | unreliable, to the host | file u16 (< 1024), offset u32 |
+| 35 | SkinChunk | unreliable, from the host | file u16, offset u32, len u16 (1..=1024), data |
+
+## Skins (`net/files.rs`, `skin_sync.rs`)
+
+A host shares a folder of skins: the dedicated server its `SA2CO_SKINS` folder (`/skins` in
+Docker, looked at again every minute), a player hosting their own `skins/`. Skin requests are
+answered straight to the asker, never relayed or refereed, and a client gets at most 2048
+chunks a second. On joining, a client asks for the list page by page, keeps the files it
+already has the same of (size and hash), and fetches the rest a file at a time with up to 64
+chunk requests out (lost ones asked again after 400 ms). A finished file is checked against
+its hash and written whole (side file, then renamed) under `skins/`; the skins are then read
+again, and every model, motion and sound file is still checked when it's loaded. A path is
+`<skin id>/<parts>` with plain names only (no `..`, no leading `.`, no backslashes). While it
+downloads, the menus show a progress bar. A new skin's textures are found by the mod loader
+only at start, so new skins (not changed ones) need a restart; the menus say so.
+
+Players announce their skin with SkinWorn. A player wearing an animated or solid skin we have
+is drawn with it, animated from their PlayerState (position, action, status, spin ball);
+skins built on a character's skeleton (rigged) show the character to others.
 
 `PlayerState.flags` (`game::POSE_*`): 1 spin ball (jump), 2 blending into `anim`, 4 waiting at
 a synced start, 8 "start now", 16 in a Chao Race the state is the player's racing Chao (position

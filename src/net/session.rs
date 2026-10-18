@@ -9,7 +9,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use super::files::SkinStore;
 
 use super::protocol::{Body, GameBuild, MAX_PLAYERS, Message, PROTOCOL_VERSION};
 use super::referee::{Out, Referee, To};
@@ -98,7 +101,12 @@ struct Remote {
     addr: SocketAddr,
     name: String,
     last_heard: Instant,
+    /// Shared-skin chunks sent this second (and when the second started).
+    chunks: (Instant, u32),
 }
+
+/// Shared-skin chunks a client may get a second (about 2 MB/s each).
+const CHUNKS_PER_SECOND: u32 = 2048;
 
 pub struct Host {
     ep: Endpoint,
@@ -111,6 +119,8 @@ pub struct Host {
     referee: Box<Referee>,
     /// Referee answers for the hosting player, handed out by the next poll.
     pending: Vec<Event>,
+    /// Skins this host shares (files.rs), if any.
+    files: Option<Arc<SkinStore>>,
 }
 
 impl Host {
@@ -124,7 +134,48 @@ impl Host {
             last_heartbeat: now,
             referee: Box::new(Referee::new()),
             pending: Vec::new(),
+            files: None,
         }
+    }
+
+    /// Shares these skins with clients (or stops, with `None`).
+    pub fn set_files(&mut self, files: Option<Arc<SkinStore>>) {
+        self.files = files;
+    }
+
+    /// A client's shared-skin request, answered straight to it (never relayed). Returns whether
+    /// `body` was one (skin lists and chunks only ever come from the host).
+    fn serve_files(&mut self, id: u8, body: &Body, now: Instant) -> bool {
+        let reply = match body {
+            Body::SkinListGet { page } => self.files.as_ref().and_then(|f| f.page(*page)),
+            Body::SkinGet { file, offset } => {
+                let Some(r) = self.clients.get_mut(&id) else {
+                    return true;
+                };
+                if now.duration_since(r.chunks.0) >= Duration::from_secs(1) {
+                    r.chunks = (now, 0);
+                }
+                r.chunks.1 += 1;
+                if r.chunks.1 > CHUNKS_PER_SECOND {
+                    return true;
+                }
+                self.files.as_ref().and_then(|f| f.chunk(*file, *offset))
+            }
+            Body::SkinList { .. } | Body::SkinChunk { .. } => None,
+            _ => return false,
+        };
+        if let (Some(body), Some(addr)) = (reply, self.clients.get(&id).map(|r| r.addr)) {
+            // Not from the client itself (it ignores those), and not from anyone else either.
+            let from = (id + 1) % MAX_PLAYERS as u8;
+            let list = matches!(body, Body::SkinList { .. });
+            let data = Message::Game { from, body }.encode();
+            if list {
+                self.ep.send_reliable(addr, &data, now);
+            } else {
+                self.ep.send_unreliable(addr, &data);
+            }
+        }
+        true
     }
 
     /// The hosting player's own game message: through the referee, then to everyone.
@@ -279,6 +330,7 @@ impl Host {
                         r.last_heard = now;
                     }
                     match msg {
+                        Message::Game { body, .. } if self.serve_files(id, &body, now) => {}
                         Message::Game { body, .. } => {
                             let mut out = Vec::new();
                             if self.referee.observe(id, &body, &mut out) {
@@ -372,6 +424,7 @@ impl Host {
                 addr,
                 name: name.clone(),
                 last_heard: now,
+                chunks: (now, 0),
             },
         );
         self.by_addr.insert(addr, id);
@@ -604,6 +657,8 @@ mod tests {
             flags: 0,
             room: (0xFF, 0),
             upgrades: 0,
+            action: 0,
+            status: 0,
         })
     }
 

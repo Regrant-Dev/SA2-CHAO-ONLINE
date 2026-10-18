@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 19;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -39,6 +39,16 @@ pub const MAX_STAGE_OBJECTS: u16 = 0x600;
 pub const MAX_BOSS_HP: f32 = 1000.0;
 /// Animation frames; real motions are a few hundred frames long.
 const MAX_FRAME: f32 = 1.0e5;
+/// Skins: an id (a folder name), files per list page, a file path, a file's size, a chunk.
+pub const MAX_SKIN_ID: usize = 24;
+pub const SKIN_LIST_PAGE: usize = 48;
+pub const MAX_SKIN_PATH: usize = 96;
+pub const MAX_SKIN_FILE: u32 = 16 << 20;
+pub const MAX_SKIN_FILES: usize = 1024;
+pub const SKIN_CHUNK: usize = 1024;
+/// `PlayerState::status` bits.
+pub const STATUS_GROUNDED: u8 = 1;
+pub const STATUS_HOLDING: u8 = 2;
 
 /// Identifies the exact game build (PE TimeDateStamp + SizeOfImage).
 pub type GameBuild = [u8; 8];
@@ -261,6 +271,33 @@ pub enum Body {
         hp: f32,
         full: f32,
     },
+    /// The skin the sender wears (a skin id), or "" for none. Sent when it changes and now
+    /// and then; nothing shows on screen.
+    SkinWorn {
+        skin: String,
+    },
+    /// To the server: a page of its shared skin files, please.
+    SkinListGet {
+        page: u16,
+    },
+    /// From the server: page `page` of `pages` of its shared skin files (index = page *
+    /// SKIN_LIST_PAGE + position here).
+    SkinList {
+        page: u16,
+        pages: u16,
+        files: Vec<SkinFile>,
+    },
+    /// To the server: a chunk of shared file `file` from `offset`.
+    SkinGet {
+        file: u16,
+        offset: u32,
+    },
+    /// From the server: that chunk (at most SKIN_CHUNK bytes).
+    SkinChunk {
+        file: u16,
+        offset: u32,
+        data: Vec<u8>,
+    },
 }
 
 /// A short signature of a treasure hunt's 3 pieces (kind, id): claims name the hunt they're for.
@@ -389,6 +426,50 @@ pub struct PlayerState {
     pub room: (u8, u8),
     /// `CharObj2Base::Upgrades` (mechs draw their upgrade parts from it).
     pub upgrades: u32,
+    /// EntityData1 action (what a skin's animation follows: re/skins.md "Garden actions").
+    pub action: u8,
+    /// `STATUS_*` bits: on the ground, holding something.
+    pub status: u8,
+}
+
+/// One file the server shares in its `skins/` folder: `<skin id>/<path inside it>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkinFile {
+    pub path: String,
+    pub size: u32,
+    /// FNV-1a 64 of its bytes (`skin_hash`).
+    pub hash: u64,
+}
+
+/// FNV-1a 64: a shared skin file's checksum (finds changed files; the files are checked
+/// again when loaded).
+pub fn skin_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xCBF2_9CE4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    })
+}
+
+/// A skin id: a folder name of lowercase letters, digits and `_`.
+pub fn skin_id_ok(id: &str) -> bool {
+    (1..=MAX_SKIN_ID).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A shared file's path: `<skin id>/<parts>`, plain names only (nothing like `..`).
+pub fn skin_path_ok(path: &str) -> bool {
+    let mut parts = path.split('/');
+    let ok_part = |p: &str| {
+        !p.is_empty()
+            && !p.starts_with('.')
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b" _-.()!?',&+".contains(&b))
+    };
+    path.len() <= MAX_SKIN_PATH && parts.next().is_some_and(skin_id_ok) && {
+        let rest: Vec<&str> = parts.collect();
+        !rest.is_empty() && rest.iter().all(|p| ok_part(p))
+    }
 }
 
 mod tag {
@@ -431,6 +512,11 @@ mod tag {
     pub const CHECKPOINT: u8 = 28;
     pub const BALL: u8 = 29;
     pub const BOSS_HP: u8 = 30;
+    pub const SKIN_WORN: u8 = 31;
+    pub const SKIN_LIST_GET: u8 = 32;
+    pub const SKIN_LIST: u8 = 33;
+    pub const SKIN_GET: u8 = 34;
+    pub const SKIN_CHUNK: u8 = 35;
 }
 
 fn item_id(r: &mut Reader) -> Result<ItemId> {
@@ -567,7 +653,9 @@ impl Body {
                     .u8(s.flags)
                     .u8(s.room.0)
                     .u8(s.room.1)
-                    .u32(s.upgrades);
+                    .u32(s.upgrades)
+                    .u8(s.action)
+                    .u8(s.status);
             }
             Self::Chao { index, data } => {
                 w.u8(tag::CHAO).u8(*index).bytes(&data.bytes);
@@ -866,6 +954,31 @@ impl Body {
                     .f32(*hp)
                     .f32(*full);
             }
+            Self::SkinWorn { skin } => {
+                w.u8(tag::SKIN_WORN).str(skin);
+            }
+            Self::SkinListGet { page } => {
+                w.u8(tag::SKIN_LIST_GET).u16(*page);
+            }
+            Self::SkinList { page, pages, files } => {
+                w.u8(tag::SKIN_LIST)
+                    .u16(*page)
+                    .u16(*pages)
+                    .u8(files.len() as u8);
+                for f in files {
+                    w.str(&f.path).u32(f.size).bytes(&f.hash.to_le_bytes());
+                }
+            }
+            Self::SkinGet { file, offset } => {
+                w.u8(tag::SKIN_GET).u16(*file).u32(*offset);
+            }
+            Self::SkinChunk { file, offset, data } => {
+                w.u8(tag::SKIN_CHUNK)
+                    .u16(*file)
+                    .u32(*offset)
+                    .u16(data.len() as u16)
+                    .bytes(data);
+            }
         }
     }
 
@@ -885,6 +998,8 @@ impl Body {
                 flags: r.u8()?,
                 room: (r.u8()?, r.u8()?),
                 upgrades: r.u32()?,
+                action: r.u8()?,
+                status: r.u8()?,
             }),
             tag::CHAO => {
                 let index = r.u8()?;
@@ -1273,6 +1388,55 @@ impl Body {
                     full,
                 }
             }
+            tag::SKIN_WORN => {
+                let skin = r.str(MAX_SKIN_ID)?;
+                if !skin.is_empty() && !skin_id_ok(&skin) {
+                    return Err(WireError::BadValue("skin id"));
+                }
+                Self::SkinWorn { skin }
+            }
+            tag::SKIN_LIST_GET => Self::SkinListGet { page: r.u16()? },
+            tag::SKIN_LIST => {
+                let (page, pages, count) = (r.u16()?, r.u16()?, usize::from(r.u8()?));
+                let max_pages = MAX_SKIN_FILES.div_ceil(SKIN_LIST_PAGE) as u16;
+                if count > SKIN_LIST_PAGE || pages > max_pages || (pages > 0 && page >= pages) {
+                    return Err(WireError::BadValue("skin list"));
+                }
+                let files = (0..count)
+                    .map(|_| {
+                        let path = r.str(MAX_SKIN_PATH)?;
+                        let size = r.u32()?;
+                        let hash = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
+                        if !skin_path_ok(&path) || size > MAX_SKIN_FILE {
+                            return Err(WireError::BadValue("skin file"));
+                        }
+                        Ok(SkinFile { path, size, hash })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::SkinList { page, pages, files }
+            }
+            tag::SKIN_GET => {
+                let (file, offset) = (r.u16()?, r.u32()?);
+                if usize::from(file) >= MAX_SKIN_FILES || offset >= MAX_SKIN_FILE {
+                    return Err(WireError::BadValue("skin get"));
+                }
+                Self::SkinGet { file, offset }
+            }
+            tag::SKIN_CHUNK => {
+                let (file, offset, len) = (r.u16()?, r.u32()?, usize::from(r.u16()?));
+                if usize::from(file) >= MAX_SKIN_FILES
+                    || len == 0
+                    || len > SKIN_CHUNK
+                    || offset.saturating_add(len as u32) > MAX_SKIN_FILE
+                {
+                    return Err(WireError::BadValue("skin chunk"));
+                }
+                Self::SkinChunk {
+                    file,
+                    offset,
+                    data: r.take(len)?.to_vec(),
+                }
+            }
             _ => return Err(WireError::BadTag("body", t)),
         })
     }
@@ -1328,6 +1492,8 @@ mod tests {
                     flags: 1,
                     room: (0, 2),
                     upgrades: 0x40_0000,
+                    action: 0,
+                    status: 0,
                 }),
             },
             Message::Game {
@@ -1585,6 +1751,47 @@ mod tests {
                 },
             },
             Message::Game {
+                from: 2,
+                body: Body::SkinWorn {
+                    skin: "master_chief".into(),
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::SkinWorn { skin: "".into() },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::SkinListGet { page: 1 },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::SkinList {
+                    page: 0,
+                    pages: 2,
+                    files: vec![SkinFile {
+                        path: "big_anim/sounds/jump/0747 - Whoa.wav".into(),
+                        size: 12345,
+                        hash: 0xDEAD_BEEF_0123_4567,
+                    }],
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::SkinGet {
+                    file: 3,
+                    offset: 2048,
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::SkinChunk {
+                    file: 3,
+                    offset: 2048,
+                    data: vec![7; 1000],
+                },
+            },
+            Message::Game {
                 from: 1,
                 body: Body::KarateState(KarateState {
                     clock: 42,
@@ -1652,6 +1859,8 @@ mod tests {
                 flags: 0,
                 room: (0xFF, 0),
                 upgrades: 0,
+                action: 0,
+                status: 0,
             }),
         }
         .encode();
@@ -1718,5 +1927,44 @@ mod tests {
             let data: Vec<u8> = (0..len).map(|_| next()).collect();
             let _ = Message::decode(&data);
         }
+    }
+
+    #[test]
+    fn skin_paths_stay_inside_the_skins_folder() {
+        assert!(skin_path_ok(
+            "mint/sounds/happy/05 shijou saikyou - strongest ever.wav"
+        ));
+        assert!(skin_path_ok("big_anim/model.sa2mdl"));
+        for bad in [
+            "../evil",
+            "big/../../evil",
+            "big/./x",
+            "/etc/passwd",
+            "big",
+            "big/",
+            "Big/x",
+            "big//x",
+            "big/.hidden",
+            "big\\x",
+            "big/x:y",
+        ] {
+            assert!(!skin_path_ok(bad), "{bad}");
+        }
+        assert!(skin_id_ok("lightning_mcqueen"));
+        assert!(!skin_id_ok("") && !skin_id_ok("Mint") && !skin_id_ok("a b"));
+        // A list naming a bad path is refused whole.
+        let bad = Message::Game {
+            from: 0,
+            body: Body::SkinList {
+                page: 0,
+                pages: 1,
+                files: vec![SkinFile {
+                    path: "../x".into(),
+                    size: 1,
+                    hash: 0,
+                }],
+            },
+        };
+        assert!(Message::decode(&bad.encode()).is_err());
     }
 }

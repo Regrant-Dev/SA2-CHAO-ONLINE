@@ -50,6 +50,12 @@ A server keeps the lobby up so nobody has to host. Everyone joins it with its ad
 
 Update the server whenever you update the mod.
 
+**Skins for everyone:** put skin folders (as in `mods/sa2-chao-online/skins/`) in a folder on the
+server and mount it at `/skins` (Docker: add `-v /path/to/skins:/skins:ro`). Everyone who joins
+gets them in the background, with a progress bar on the main menu; brand-new skins show after a
+restart. Others then see you wearing your skin. Only share skins with your own group: they're
+other people's characters.
+
 ## Playing together
 
 You see everyone who's in the same stage or garden as you.

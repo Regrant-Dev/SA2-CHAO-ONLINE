@@ -29,4 +29,23 @@ cp target/i686-pc-windows-gnu/release/sa2_chao_online.dll "$DEST/sa2-chao-online
 # SA Mod Manager offers a GitHub release as an update when it's newer than this: a local build
 # counts as current until something newer is published.
 date -u +%Y-%m-%dT%H:%M:%SZ > "$DEST/mod.version"
+# Your own skins (made with tools/skinconv.py into skins/, which git ignores).
+if [ -d skins ] && [ -n "$(ls -A skins)" ]; then
+    mkdir -p "$DEST/skins"
+    for skin in skins/*/; do
+        rm -rf "$DEST/skins/$(basename "$skin")"
+    done
+    cp -a skins/. "$DEST/skins/"
+    # Their textures where the mod loader finds texture packs (the mod also does this at start).
+    for skin in skins/*/; do
+        id=$(basename "$skin")
+        if [ -d "$skin/textures" ]; then
+            pack="$DEST/textures/SKIN_${id^^}"
+            rm -rf "$pack"
+            mkdir -p "$pack"
+            cp -a "$skin/textures/." "$pack/"
+        fi
+    done
+    echo "Copied skins: $(ls skins | tr '\n' ' ')"
+fi
 echo "Installed to $DEST"

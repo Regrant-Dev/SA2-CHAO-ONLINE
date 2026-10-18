@@ -15,3 +15,8 @@ re/bin/
 .mcp.json
 .claude/
 docs/re-tools.md
+
+# Skin sources and converted skins (third-party models): never in the public repo.
+/skins-src/
+/skins/
+__pycache__/

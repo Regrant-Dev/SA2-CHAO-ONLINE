@@ -26,11 +26,14 @@ mod puppet;
 mod race;
 mod room;
 mod shots;
+mod skin_sync;
+mod skins;
 mod stage_race;
 mod timeline;
 mod together;
 mod toys;
 mod visitors;
+mod voice;
 mod watch;
 
 use std::ffi::{CStr, c_char};
@@ -99,8 +102,10 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     }
     game::install_freeze();
     karate::install();
+    voice::install();
     race::install();
     guarded("online init", || online::init(&path));
+    guarded("skins init", || skins::init(&path));
     watch::start();
 }
 
@@ -126,6 +131,8 @@ pub extern "C" fn OnFrame() {
         visitors::on_frame();
         watch::mark("garden::on_frame");
         garden::on_frame();
+        watch::mark("skins::on_frame");
+        skins::on_frame();
         watch::mark("let ");
         let (peers, connected) = online::peers();
         game::track_run();
@@ -203,6 +210,21 @@ pub extern "C" fn OnFrame() {
         chat::on_frame(connected, menu::is_open());
         watch::mark("hud::on_frame");
         hud::on_frame();
+        // Shared skins coming down: a bar on the menus (never over play).
+        if game::local_entity().is_null() {
+            if let Some((done, total)) = skin_sync::progress() {
+                hud::progress(
+                    &format!(
+                        "Downloading skins... {:.1} / {:.1} MB",
+                        done as f64 / 1e6,
+                        total as f64 / 1e6
+                    ),
+                    done as f32 / total as f32,
+                );
+            } else if skins::restart_hint() {
+                hud::progress("New skins downloaded: restart the game to use them", 1.0);
+            }
+        }
 
         if state.menu_key.pressed() {
             menu::toggle();

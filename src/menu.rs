@@ -41,6 +41,8 @@ enum Row {
     Port,
     RoomInfo,
     NameTags,
+    /// Our skin (a model drawn in place of our character or kart).
+    Skin,
     Room,
     RoomMode,
     GoTo,
@@ -71,7 +73,7 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
         "Join" => rows.push(Row::Host),
         _ => {}
     }
-    rows.extend([Row::NameTags, Row::Room]);
+    rows.extend([Row::NameTags, Row::Skin, Row::Room]);
     if room::summary().is_some() {
         rows.extend([Row::RoomInfo, Row::RoomMode]);
     }
@@ -118,6 +120,8 @@ pub struct Settings {
     pub visitors: [i32; 2],
     /// Mode of rooms we create.
     pub room_mode: room::Mode,
+    /// Our skin's id (`skins::list`), empty for none.
+    pub skin: String,
 }
 
 impl Settings {
@@ -134,6 +138,7 @@ impl Settings {
             visits: 1,
             visitors: [online::VISITOR_AUTO; 2],
             room_mode: room::Mode::Race,
+            skin: String::new(),
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -157,6 +162,7 @@ impl Settings {
                 "visitor1" => s.visitors[0] = online::parse_visitor(&v),
                 "visitor2" => s.visitors[1] = online::parse_visitor(&v),
                 "roommode" => s.room_mode = room::Mode::parse(&v),
+                "skin" => s.skin = v.to_ascii_lowercase(),
                 "chaorace" => {
                     s.chao_race = !matches!(
                         v.to_ascii_lowercase().as_str(),
@@ -179,7 +185,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\nVisitor1={}\nVisitor2={}\nRoomMode={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\nVisitor1={}\nVisitor2={}\nRoomMode={}\nSkin={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -190,7 +196,8 @@ impl Settings {
             ["Off", "On"][self.visits.min(1)],
             self.visitors[0],
             self.visitors[1],
-            self.room_mode.ini()
+            self.room_mode.ini(),
+            self.skin,
         )
     }
 }
@@ -246,6 +253,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         visits: 1,
         visitors: [-1; 2],
         room_mode: crate::room::Mode::Race,
+        skin: String::new(),
     },
     message: String::new(),
     keys: Vec::new(),
@@ -429,6 +437,24 @@ pub fn on_frame() {
             let n = choices.len() + 1;
             let next = (at + if left { n - 1 } else { 1 }) % n;
             karate::set_opponent(next.checked_sub(1).map(|i| choices[i].clone()));
+        }
+        Row::Skin if left || right => {
+            // None, then each skin found in <mod>/skins.
+            let list = crate::skins::list();
+            let at = list
+                .iter()
+                .position(|(id, _)| *id == m.settings.skin)
+                .map_or(0, |i| i + 1);
+            let n = list.len() + 1;
+            let next = (at + if left { n - 1 } else { 1 }) % n;
+            m.settings.skin = next
+                .checked_sub(1)
+                .map_or_else(String::new, |i| list[i].0.clone());
+            crate::skins::set_mine((!m.settings.skin.is_empty()).then(|| m.settings.skin.clone()));
+            let _ = fs::write(
+                Path::new(online::mod_path()).join("config.ini"),
+                m.settings.to_ini(),
+            );
         }
         Row::NameTags if left || right => {
             m.settings.name_tags = !m.settings.name_tags;
@@ -655,6 +681,13 @@ fn draw(m: &Menu, rows: &[Row]) {
                 karate::opponent_label().map_or_else(|| "CPU".into(), |l| format!("{l} (copy)"))
             ),
             Row::NameTags => format!("Name tags:    < {} >", on_off(m.settings.name_tags)),
+            Row::Skin if crate::skins::list().is_empty() => {
+                "Skin:         (none in skins folder)".into()
+            }
+            Row::Skin => format!(
+                "Skin:         < {} >",
+                crate::skins::mine_name().unwrap_or_else(|| "None".into())
+            ),
             Row::Apply => "[ Apply settings & reconnect ]".into(),
             Row::StartStop if status.is_some() => "[ Stop multiplayer ]".into(),
             Row::StartStop => "[ Save & Start ]".into(),
@@ -716,6 +749,7 @@ mod tests {
             visits: 1,
             visitors: [3, -2],
             room_mode: crate::room::Mode::Coop,
+            skin: "mcqueen".into(),
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.

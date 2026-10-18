@@ -478,6 +478,8 @@ fn main() {
                     _ => (0xFF, 0),
                 },
                 upgrades: 0,
+                action: 0,
+                status: 0,
             };
             session.send(Body::PlayerState(state), false, now);
         }

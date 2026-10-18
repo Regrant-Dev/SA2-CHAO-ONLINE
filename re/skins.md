@@ -1,0 +1,376 @@
+# Kart skins: where kart models and textures come from (2026-10-17, objdump + Data_DLL)
+
+Read from the objdump listing of `re/bin/sonic2app.dumped.exe` and the game's
+`resource/gd_PC/DLL/Win32/Data_DLL_orig.dll` (the mod loader renames the real one), with the key
+functions decompiled in REA (Ghidra, raw-binary slices at each function's address):
+- the table copy 0x61FFE0;
+- the texture setup 0x6200A0, decompiled only up to its first out-of-slice call;
+- the loader 0x44C350;
+- the kart display 0x61C6C0.
+
+Not run in game yet.
+
+## The kart type table (KART_TYPES 0x1D96F70, 8 entries x 0x1C)
+Filled at kart race setup by **0x61FFE0**: it copies the Data_DLL export `specialInfo` (8 x 0x1C)
+into 0x1D96F70. 0x6200A0 then overrides some entries with character karts from the export
+`exModels` (far = near = exModel[i], texlist = `texlist_kartExModel_cartSpecial`, wheels = 0).
+
+| Off | Meaning |
+|---|---|
+| +0 | kind |
+| +4 | model A (NJS_OBJECT*); copied to car work +0x34 |
+| +8 | model B (NJS_OBJECT*); work +0x38. The display draws +0x38 when 0x61EFE0 returns non-zero and +0x34 otherwise (REA). Only +0x34's wheel nodes are posed. |
+| +0xC | NJS_TEXLIST*; work +0x3C |
+| +0x18 | "wheels": 1 for kinds 2..7, 0 for character karts; work +0x40 |
+
+Data_DLL exports are looked up by name with **0x77DEF0** (cdecl, push name -> pointer;
+GetProcAddress on the handle at 0x1AF0220).
+
+Texture setup 0x6200A0 (REA) picks the texlist by 0x1D970FC:
+- 0: `texlist_tailsBig`, the story kart, file name `sBig`/`tailsBig`;
+- 1: `texlist_rougeBig`;
+- otherwise: `texlist_cartData_cartSpecial` with the archive "cartData".
+
+## Textures
+- Kinds 2..7 share `texlist_cartData_cartSpecial`, loaded from **cartData** (`gd_PC/cartData.prs`).
+  Character karts use **kartExModel** (`gd_PC/kartExModel.prs`).
+- **LoadTextureList 0x44C350**: usercall, ECX = archive name (no extension), EDX = NJS_TEXLIST*.
+  It first tries the PC texture archive loader 0x430B10, which builds "./resource/" + gd_PC
+  path for `PRS/<name>.pak`. The dumped exe has the mod loader's hook at its first byte, so mod
+  texture packs and PAK replacements go through there. If that fails it falls back to 0x44C620
+  ("%s.PRS", a GVM). Then it copies texaddr/attr into the texlist's entries, **only up to the
+  texlist's own count** (+4). So the texlist must already have the right number of NJS_TEXNAME
+  (12 bytes: name*, attr, texaddr). Confirmed in REA: entries are filled **by archive order**
+  (attr into +4, texaddr into +8), and names are never compared. A skin's texture order must
+  match its model's texture ids.
+- **Release: 0x77F9F0**, cdecl (NJS_TEXLIST*).
+- New file names: the HelperFunctions slot `ReplaceFile(src, dst)` (already a placeholder in
+  src/modloader.rs) can map `resource\gd_PC\PRS\<SKIN>.pak` to a file in our skins folder. Then
+  `LoadTextureList("<SKIN>")` finds it. Unconfirmed: whether ReplaceFile accepts a source path
+  that doesn't exist in the game. If it doesn't, put the .pak in a mod's own gd_PC/PRS/ folder.
+
+## Model format: Ninja chunk models
+Kart models are NJS_OBJECT trees whose models are **NJS_CNK_MODEL** (0x18 bytes: vlist*,
+plist*, center f32[3], radius). The vlist starts with chunk type 0x29 and the plist with
+0x22511 (material/tiny chunks). So a skin model must be a chunk model, an SA Tools `.sa2mdl`, not
+a GC/`.sa2bmdl` one. Drawn by 0x42EB30(object, 0x42D650) after 0x42D340.
+
+Node layout (kind 2, model A): root (no model) -> children: 3 small nodes, then the body node
+with its own children. With wheels = 1 and kind 2..7, the display (0x61CAA6) writes the wheel
+angle (work +0xD4) into ang.x (+0x14) of model A's first three child nodes. It reaches them as
+root+0x2C, then +0x30 siblings, and clears eval flag 2 on each. It also draws the exhaust
+(0x61ECF0). **With wheels = 0, nothing in the model is touched:** safe for any node layout, but
+no exhaust.
+
+## .sa2mdl (SA Tools ModelFile), from memory: verify before coding
+- u64 header: "SA2MDL" in the low 6 bytes (0x4C444D324153), version in the top byte (3 current).
+- u32 +8: root NJS_OBJECT offset. u32 +0xC: metadata offset (labels/author/etc, ignore).
+- Pointers inside are file offsets (written with image base 0); 0 = null.
+- Relocate by adding the buffer base to:
+  - NJS_OBJECT (0x34): +4 model, +0x2C child, +0x30 sibling. Everything else is inline:
+    +0 flags, +8 pos, +0x14 ang, +0x20 scale.
+  - NJS_CNK_MODEL (0x18): +0 vlist, +4 plist. The vlist and plist are self-contained chunk
+    streams with no pointers. Texture ids in the plist index the current texlist, so the
+    skin's archive order must match the model's texture ids.
+- Walk the tree once and relocate each node and model only once (guard with a visited set,
+  because models can be shared).
+
+## Recipe
+1. Init: for each `skins/<name>/` with `kart.sa2mdl` + `<name>.pak` (+ texture count), register
+   ReplaceFile(`resource\gd_PC\PRS\SKIN_<NAME>.pak` -> that file).
+2. Kart race start (game thread, first frame of in_kart_race):
+   - read the .sa2mdl into a leaked/pinned buffer and relocate it;
+   - allocate an NJS_TEXLIST with N entries and LoadTextureList("SKIN_<NAME>", &tl);
+   - build a private entry {kind, far = root, near = root, &tl, 0, 0, wheels 0}.
+3. Drawing:
+   - remote karts with that skin: src/kart.rs writes the private entry's fields into its fake
+     work (+0x34/+0x38/+0x3C/+0x40 = 0);
+   - our own kart: write the same into our car's work each frame.
+   - Never write into KART_TYPES itself; the CPU karts use it.
+4. Race end (in_kart_race false): FreeTexList(&tl) (0x77F9F0), then free the model buffer once
+   nothing draws it.
+
+## Character skeletons (2026-10-17, from the game's `gd_PC/*mdl.prs`, tools/prs.py)
+Character model files are PRS-compressed, **big-endian** model lists: `(i32 model number,
+u32 file offset)` pairs ending at -1; objects and chunk models (NJS_OBJECT 0x34,
+NJS_CNK_MODEL 0x18: vlist, plist, centre, radius) with offsets from the file start. The
+loader 0x459590 swaps them to little-endian on load.
+
+Biggest node trees per file (nodes, model number):
+- 62-node humanoid tree (the same layout, different proportions): Sonic (0/31/48), Shadow
+  (65/104/123), Amy 395, Metal Sonic 418, Knuckles (142/169), Rouge (171/206), Tails
+  (208/528), Tikal (483/503), Chaos 0 (507/525); 60-node variants beside each.
+- Eggman: 46 nodes (230/527). Mechs/walkers: 33 nodes (Tails 293/464, Eggman 248/463,
+  Chao walkers 442/450, 465/473).
+
+So one bone mapping onto the humanoid tree serves nine characters. The converter should read
+the target skeleton from the player's own game files when it converts (no game data in the
+repo).
+
+## Following Sonic exactly (2026-10-17, REA on a slice of 0x720090 + objdump + sonicmtn/plcommtn parsed offline)
+
+### Sonic's display 0x720090 (ObjectMaster +0x14), the body's matrix chain (REA-confirmed)
+e1 = obj+0x34 (EntityData1), co2 = obj+0x40. Before drawing: bone callback 0x1A55834 (0x71EAA0,
+0x71F5E0 if co2+1, Amy 0x71F040, Metal 0x71FBE0), texlist `*(*(0x2670544)+0x20) = co2+0x394`.
+1. push matrix (copy current 0x30 bytes, 0x1A557FC += 0x30, not past 0x2670588).
+2. translate:
+   - normally e1 pos (+0x14,+0x18,+0x1C);
+   - **if e1 Action (byte +0) == 0x33**: hanging from something. Anchor = `*(*(e1+0x2C)+0xC)` (an
+     object/collision record; its position at +8/+0xC/+0x10). Offset = (0, -co2+0x134 * 0.5, 0)
+     rotated by Z(e1+0x10), X(e1+8), Y(-e1+0xC) (0x4273B0 = transform vector by the scratch
+     matrix), translate(anchor + offset).
+3. rotate Z(e1+0x10), X(e1+0x08), Y(0x8000 - e1+0x0C) (each skipped when 0). In 2P split
+   screen of the other viewport only Y.
+4. **anim 11 and (e1+4 & 3)** (on the ground): extra tilt 0x428A30 (push), translate(0, 5, 0),
+   rotZ(0x2000 = 45°), translate(0, -5, 0), 0x429740 (pop/merge): Sonic's top-speed lean, about
+   his middle (5 units up).
+5. scale(e1+0x20, +0x24, +0x28) (normally 1).
+6. Body: if e1 Action == 0x36 and co2+0xBC != 0: model AnimInfo[0] with frame *(0x1DEB070)
+   (a held/attached state). Else model = ModelTable[AnimInfo[anim].ModelNum] (low-detail swap
+   0x1DE97A4/0x1DE971C when far), **spin ball**: unless co2+0x174 == 2, when (e1+4 & 0x100) and
+   co2+3 != 0xC and (co2+0x360 & 0x11): model AnimInfo[30] (ModelNum 6, the ball) and anim = 30.
+   DrawMotion 0x780870(model, co2+0x184) with ECX = motion (the double AnimInfo lookup).
+7. pop; shoes/upgrades after (co2+0x24 & 0x40008 bits, models 0x1DE96EC / 0x1DE9944).
+So the skin's chain is right as is (translate, Z, X, 0x8000 - Y), apart from action 0x33, the
+anim-11 lean and e1's scale.
+
+### DrawMotion 0x780870 and the motion format
+- 0x780870: 0x7819A0(frame) with ECX = motion, then 0x782420(model) walks the tree.
+- 0x42C240 (set motion, ECX = NJS_MOTION, 0 = a default): NJS_MOTION = { +0 mdata*, +4 nbFrame u32,
+  +8 type u16 (1 POS, 2 ANG, 4 SCL, 0x2000 = quaternion-style rotation via 0x7828E0),
+  +0xA inp_fn u16: low 6 bits = key arrays per node (n), bits 6..7 = interpolation }.
+- mdata: one entry per node in depth-first order (object, its child tree, then sibling),
+  n*8 bytes: n key pointers, then n u32 key counts (POS, ANG, SCL in that order, only those
+  present in `type`). The node counter (state +0x1C) advances once per node.
+- Keys are 16 bytes: u32 frame + 3 values: POS/SCL f32[3], ANG i32[3] (BAMS).
+- Interpolation 0 (linear, tables 0x174B294 / 0x174B2F8): key search 0x42C2C0 truncates the
+  frame, k0 = last key with frame <= f (binary search), k1 = next key, or key 0 after the last
+  (wrap; then t = f - k0.frame unscaled). t = (f - k0.frame) / (k1.frame - k0.frame).
+  POS: k0 + (k1 - k0) * t. ANG: per axis `k0 + (i16)(k1 - k0) * t` (shortest way, 16-bit wrap),
+  then truncated to int. (The angle interpolator 0x42DF60 starts with a jmp into a hook at
+  0x774896C0 in this dump; the body after it is the original.)
+- Missing keys leave the node's own NJS_OBJECT pos/ang.
+
+### What Sonic's motions do (sonicmtn.prs / plcommtn.prs, PRS-decompressed; big-endian files)
+File: entries {i16 id, u16 nodes (62 for Sonic), u32 offset} until id -1; motion data
+big-endian, pointers file-relative (the loader swaps and relocates). AnimInfo 0xA17C18 maps
+anim n -> motion n for 0..202 (except 100 -> 66, 131/132 and 155/156 swapped); 203.. use
+model 65 (the alternate body).
+- **Node 0 (root) has no keys in any motion**; node 2 (the body) carries a small position bob
+  (pos only); limb nodes carry the rotations. So there is no whole-body root rotation to sample
+  for runs, grinds or board tricks: they're limb poses.
+- **Anim 30 (spin ball, model 6)**: 8 frames, node 1 rotates a full turn about **Z** (span
+  57343 BAMS): the ball rolls about the model's Z axis, so character models face along X (Z is
+  their side axis). A car facing +Z needs the 90° turn, and a flip about its own X (its side
+  axis) matches the ball's roll.
+- Full turns elsewhere: motion 117 (64 frames) node 4 ±X full turn; 102/103 node 4; plcom 51/52
+  (10 frames, node 4, large spans): likely tricks. Anims 104-111 (8 x 17 frames, mode 13),
+  121-124 / 145-148 (mode 13) and 157-168 (mode 9, return to 129) are Sonic-only sets: likely
+  the board/grind lean directions and board tricks (not confirmed by name).
+
+## Big the Cat cameo (2026-10-17, objdump + REA slices `re/bin/big_4f5ef0.bin`, `bigdisp_4f6040.bin`)
+
+**The object.** SET object "BIG THE CAT", main **0x4F61E0** (state table 0x4F62C4). It is in
+about 50 stage object lists, so most stages have it.
+- Init **0x4F5EF0** (REA): Data2 +0x1F8 = motion table **0x1521D70**, +0x1FC = model
+  **0x14E0EAC**, +0x1F3 = pose kind (from the SET's rot), display 0x4F6040, delete 0x7A11C0.
+- The first Big in a stage loads the textures with `LoadTextureList("E_BIGTEX", 0x1521D38)`
+  (0x44C350; static texlist **0x1521D38**). It then makes a helper object (0x46F680, main
+  0x6FE430) whose delete 0x4F5ED0 frees them. The object pointer is kept at 0x1A5A79C.
+
+**Display 0x4F6040 (REA):**
+1. Set texlist 0x1521D38, push the matrix.
+2. Translate to the position, then rotate Z, X, and **Y(rot.y + 0x4000)**, not
+   0x8000 − y as the characters do.
+3. `DrawMotion(model 0x14E0EAC, Data2+0x1E0 frame)` with ECX = `*(0x1521D70 + 16 * Data2[0x1F2])`.
+   In mode 2 (Data2+0x1F0) it uses the shape-motion draw 0x782320 instead.
+- Pose kind 0x17 draws nothing.
+
+**The model is static exe data, little-endian chunk models.**
+- At runtime the root is simply 0x14E0EAC. It is always there (the exe's .data), whatever the
+  stage.
+- Offline, read it from the decrypted exe with `tools/bigmodel.py <exe>`.
+- 73 nodes, meshes on 36 of them, 566 vertices.
+- All vertex blocks are plain unweighted `CnkV_VN` (0x29): each node's mesh sits rigidly in
+  that node's frame.
+- Polygon chunks are materials **0x13 and 0x17** (diffuse + ambient (+ specular): a size of 4
+  or 6 u16), tiny texture ids (0x08) and strips 0x41.
+- skins.rs's checker only accepts material 0x11, so either rewrite these or extend the checker.
+
+**Motions.** The table at 0x1521D70 is 15 entries × 16 bytes; +0 is an NJS_MOTION* with type 3
+(position + angle), 17 to 120 frames. These are the cameo poses: normal, fishing, dancing and
+so on.
+
+**Node tree in bind pose** (world coordinates: Y up, legs at ∓Z, tail along +X; arms hang
+straight down):
+
+| Nodes | Part |
+|---|---|
+| 0 / 1 | root / hips (no mesh) |
+| 3–10, 11–18 | legs at z −2.98 / +2.98: thigh 4/12 (y −1.84), knee 5/13 (y −4.39), ankle/foot mesh 7/16 (y −6.34), toes 8/17, shin mesh 9/15, thigh mesh 10/18 |
+| 19–22 | tail (towards +X) |
+| 23 | pelvis mesh |
+| 24–26 | chest group (25 is turned by 0x8000) |
+| 27–37, 38–51 | arms at z −3.93 / +3.93: shoulder 28/39 (y 5.15), elbow 29/40 (y 1.45), wrist 30/41 (y −2.30); hand meshes 33–35 / 43–45; fishing rod 46–48 on the +z hand |
+| 52–57 | meshless chains below the hands (y −10 to −14): IK or line points |
+| 58–69 | head: neck 59 (y 6.14), head mesh 62, eyes 63–66, ears 67/68 |
+| 70–72 | torso mesh, belt |
+
+So it is a humanoid that maps cleanly onto the 62-node tree: hips, two 3-segment legs, two
+3-segment arms, chest, head.
+
+**Textures: E_BIGTEX.** `gd_PC/e_bigtex.prs` is a PRS-compressed **GVM** (GameCube) holding 6
+GVRTs, in texlist order:
+- b_beruto3 32²;
+- b_ring3 32²;
+- big 128²;
+- btx_hada0 64²;
+- btx_sims 64²;
+- b_sao00 32².
+
+`tools/gvm.py <prs> <dir>` exports them as PNGs (CMPR/DXT1, RGB5A3, RGB565, I4/I8/IA8,
+ARGB8888). Or load the archive in game by name with 0x44C510("E_BIGTEX").
+
+**Recipe for a Big-over-Knuckles skin:**
+1. The converter reads Big's 73 nodes from the player's exe and the Knuckles tree from
+   `knuckmdl.prs` (big-endian, model 142 or 169).
+2. Map Big's mesh nodes to Knuckles' nodes by the labels above.
+3. Move each mesh's vertices from Big's bind frame (world) into the mapped Knuckles node's bind
+   frame. Big's arms hang down, so align each limb segment's direction first.
+4. Rewrite materials 0x13/0x17 as 0x11.
+5. Write the result as a model on Knuckles' tree, with the 6 textures as a PNG pack
+   (`tools/gvm.py`).
+6. At runtime, alternatively, take the textures straight from the game with
+   `0x44C510("E_BIGTEX")` and skip the PNGs.
+
+## Rigged skins: the humanoid tree, body slots, and what a replacement must keep (2026-10-17)
+From the game files (tools/charskel.py, tools/prs.py) and the objdump listing; not run in game.
+
+**Node evaluation** (object draw 0x42EBDD; rotation dispatch 0x4277B0): child = parent x T x R x S.
+Unless flag 1, translate by pos; unless flag 2, rotate (flag 0x20 clear: Z(ang.z), then
+Y(ang.y), then X(ang.x); set: Y, X, Z); unless flag 4, scale; flag 8 hides the node's mesh.
+Computed this way, Sonic's bind pose is upright (Y up), **facing -X** (shoe tips and the nose
+marker at -X, the tail at +X), with his **right side at -Z**.
+
+**The 62-node humanoid tree** (depth-first order = motion node order; the same parents and the
+same mesh nodes for Sonic model 0 and Knuckles 142, except Knuckles' 7/17 carry no mesh).
+Sonic's world bind positions (x, y, z), feet at y = 0:
+| Nodes | Role |
+|---|---|
+| 0 | root (hidden, no mesh) |
+| 1 (0, 5.15, 0) mesh, 2 (0, 5.24, 0) mesh | hips / lower torso, waist |
+| 3, 4 (0.03, 5.09, 0) mesh | pelvis |
+| 5 (0.27, 4.62, 0) | leg and tail branch |
+| 6-15 (z -0.28) | **right leg**: 7 thigh (4.69, mesh), 8 knee (3.93, mesh), 9 shin (3.28, mesh), 10 ankle (1.92), 11 foot (mesh), 12-13 shoe (mesh), 14 sole/toe (0.27, mesh), 15 toe end |
+| 16-25 (z +0.32) | **left leg**, the same |
+| 26-30 (+X, y 4.58 to 3.96) | tail: 27-29 meshes, 30 end |
+| 31, 32 (0, 5.24) mesh | chest |
+| 33 (5.85) mesh | upper chest |
+| 34 (6.63) | neck / shoulder branch |
+| 35-42 (z +0.82 to +1.74) | **left arm**: 35 shoulder (6.22, mesh), 37 upper arm (mesh), 38 elbow / forearm (5.53, mesh), 39 wrist (4.71, mesh), 40-41 hand joints, 42 hand (4.22, mesh) |
+| 43, 44 (6.48) | head joint (44 hidden) |
+| 45 | head end marker (-2.7 along X: the facing) |
+| 46/47, 48/49 (8.19) mesh | head meshes (two variants; 49 is swapped for mouths, below) |
+| 50/51, 52/53 (8.21, z +/-0.15) mesh | eyes (Knuckles: dreadlock/ear parts at z +/-0.7) |
+| 54-61 (z negative) | **right arm**, as 35-42 |
+Knuckles' proportions differ (head joint at 6.78, hands at y ~4.1, z +/-2.5), with the same tree.
+
+**Body slots.**
+- **Sonic** (AnimInfo 0xA17C18): every anim draws **model 0**, except anim 30 (the ball, model 6).
+  The display 0x720090 swaps model 0 by camera distance (0x77FBD0): above 150 it draws
+  **model 48**, below 100 (or with 0x174AFDE set) **model 31**. It only swaps when slots 48 and 31
+  are loaded and the body pointer equals ModelTable[0] (0x7205A3). Shadow uses 65, 104 and 123
+  the same way. Textures: co2+0x394.
+- **Knuckles** (AnimInfo 0xA13320): all 141 anims draw **model 142**; there's no distance swap in
+  0x72EF20. Textures: co2+0x3F0. Rouge, Tikal and Chaos share the display and slot.
+- **Slots pointing inside the body.** Many other model-table slots point at nodes *inside* the
+  body tree. Bone callbacks (Sonic 0x71EAA0 and others, Knuckles 0x72EAA0) find hands, feet and
+  head by comparing each drawn node's pointer with those slots. They then write world positions
+  into co2 (+0x230, +0x2CC, ...: gameplay data such as held objects and effects).
+  - Sonic body 0: slot 1 is node 2, then 2:31, 3:43, 4:50, 5:52, 8:44, 9:14, 10:24, 11:13, 12:23,
+    15:60, 16:41, 17:55, 18:36, 21:48, 22:46, 23:60, 24:41 (bodies 31 and 48 have their own: 32-47
+    and 49-64).
+  - Knuckles 142: 143:2, 144:31, 145:43, 146:50, 147:52, 149:44, 150:14, 151:24, 152:61, 153:42,
+    154:55, 155:36, 156:48, 157:46, 158:60, 159:41, 160:48, 167:33.
+- **Generic rule for the mod.** When it replaces a body, every slot that pointed at node *i* of the
+  old tree must point at node *i* of the new one. The mod can find these at run time by matching
+  pointers, so no per-character list is needed.
+- **Mouths.** Sonic's display temporarily replaces the mesh of slot 21's child (node 49) for mouth
+  shapes (0x7204C8: slot 21, or slot 86 for Shadow). Knuckles' does the same through slot 156,
+  node 48 (0x72F3D0, co2+0x3E4). So a skin should leave nodes 47 and 49 without a mesh and put the
+  head mesh on node 44 (clearing its hide flag in our copy).
+
+**Meshes and weights.**
+- Every node's mesh is drawn in that node's space after its transform; the chunk vertices go into
+  one shared buffer at each block's index offset.
+- **Knuckles uses only rigid `0x29` (VN) blocks, with no weights**, and stitches joints by giving
+  each node's vertices their own offset in the buffer (e.g. 334 x4, 86 x51, 324 x9). A later
+  node's strips then use vertices an earlier node transformed. So unweighted, rigid meshes are
+  fully supported.
+- Sonic also uses `0x2C` (VN_NF) blocks with weight status in flag bits 0-1 (0 start, 1 middle,
+  2 end) for smooth skinning. Flag 0x80 appears on most non-first blocks; its meaning wasn't
+  checked, and flag 0 with an offset also occurs.
+- Buffer offsets seen go up to 421 (Knuckles: 370 + 51).
+- Polygon chunks: 0x11/0x13/0x17 materials, tiny texture ids, 0x40/0x41 strips.
+- **Converter recipe:** one `0x29` block per node, flags 0, each node's vertices at a distinct
+  offset (total under ~500). Each node's strips may use its own vertices and those of earlier nodes
+  in depth-first order (put a joint's bridging triangles on the child).
+
+### Garden actions (for animated skins' extra animations)
+Player actions are `EntityData1+0` (Sonic's switch: 0x719B19, table 0x71E1A0, 0x58 entries; a
+per-frame switch at 0x717C81, table 0x7197B4, same numbering). Animation = CharObj2 +0x176 (next)
+/ +0x178 (current). The action button: CharObj2 +4..+0xB is this frame's list of possible
+actions (count +0xC), +0xD the one the object in front offers; on B the switch at 0x723182
+(context code = action number) starts it through small shared setters (0x475F00..0x4762A0).
+The garden list is built by **0x475AF0** from the flags **0x45A0C0** gives the object in front,
+by its `Data1+2` kind: 0xA/0xC holdable (0x200), 0xB pushable (0x400), 0xD tree (0x800), 0xE
+(0x1000).
+
+| Action | Animation | What |
+|---|---|---|
+| 19 (0x13) | 31 | pick up (object at hand height) |
+| 41 (0x29) | 69 | pick up from the ground (bend down) |
+| 49 (0x31) | 69 → 79 | pick up a kind-0xE object (voice 0x3004 Sonic / 0x3016 Shadow) |
+| 43 (0x2B) | 78 | **pet a Chao**: spawns `ChaonadeExec` (0x477100) at the hand (CharObj2 +0x1E8) while the action lasts (max 60 frames, facing the Chao); pet voice at its frame 30 (0x5EC, 0x5ED, ... by character, 0x476FD0) |
+| 20 (0x14) | 53 | put down (holding, slow) |
+| 26 (0x1A) | 49 / 50 | throw (holding, moving; 0x46E5B0 also sets it when made to pick something up) |
+| 33 (0x21) | 51 / 52 | throw in the air |
+| 23 (0x17) | 43 | reach for a tree → 34 |
+| 34 (0x22) | 41 | hold the tree (voice 0x6C0 / 0x6C3 by character, 0x4754F0) |
+| 35 (0x23) | 42 | **shake the tree**: pushes the tree's Data2 +0xC..+0x14 by the animation frame (0x718BA1) |
+| 42 (0x2A) | 72 | **whistle** (Chao check 0x5637B0; sound 0x2005/0x2006 by character) |
+| 22 (0x16) → 32 (0x20) | 43 → 40 | push a box / wall |
+| 45, 46/47, 48 | 82, 83, 84 | Mystic Melody (by each character's upgrade bit, 0x475A40) |
+Holding anything: EntityData1 status +4 & 0x800, CharObj2 +0x94 the object.
+Voices: 0x443130 (EAX = voice id, EDX = 2) and 0x4372E0 (EDI = id); sounds 0x437260 (ESI = id).
+The game's own voice banks are in `resource/gd_PC/MLT`.
+
+### Voices
+- **0x4372E0**: play a sound at a position (EDI = sound id, ESI = position, cdecl stack args;
+  returns AL = 0xFF when it couldn't). 322 callers. It starts `51 53 8A 5C 24 14` (push ecx,
+  push ebx, mov bl,[esp+0x14]), so a 6-byte jump there is safe to put back exactly.
+- Sound ids: 0x20xx the player's sound effects; **0x30xx the character voice bank** (Sonic
+  0x3000..0x3011, Shadow +0x12, Amy/Metal 0x3021..0x3028). Known: 0x3004 / 0x3016 picking up
+  (0x725582), 0x3005 / 0x3017 putting down or throwing (0x725640, 0x725970), 0x3008 / 0x301A
+  light dash, 0x3009 / 0x301B homing attack (action 13). 0x300B, 0x300C (several sites), 0x3000,
+  0x3006, 0x3007, 0x300A not pinned down.
+- **0x443130** (EAX = voice number, EDX = 2): numbered voice lines, e.g. the pet line (0x5EC,
+  0x5ED...) and grabbing a tree (0x6C0 / 0x6C3); not hooked.
+- Rings: i16 at **0x174B028** (+2 per player); lives: i16 at **0x174B024** (AddRings 0x44CE10,
+  extra life 0x44CB10).
+- The mod (src/voice.rs) drops 0x30xx while a skin with sounds is on and plays the skin's
+  clips with winmm `PlaySoundA` (memory, async).
+- **0x443130 takes the voice id as its stack argument** (`push id; mov edx, 2; call`), not EAX;
+  it returns -1 when it doesn't play, and callers then use EDX (`lea eax, [edx-1]`). Its first
+  bytes are already a `jmp` at run time (the mod loader hooks it), so it can't be hooked there.
+- Garden voices through it (the mod redirects exactly these sites while a voiced skin is on):
+  - pet (ChaonadeExec 0x476FD0, frame 30, `jmp` table 0x4770DC by CharObj2 +3): Sonic 0x5ED
+    (0x47705B), Shadow 0x5EC (0x477071), Tails 0x6C1 (0x477087), Eggman 0x6BE (0x47709D),
+    Knuckles 0x4DA (0x4770B3), Rouge 0x4DB (0x4770C9);
+  - tree: grabbing it (0x4754F0, by CharObj2 +0 = 3 / 2) 0x6C0 (call 0x47553D) / 0x6C3
+    (0x475557); starting to shake it (action 35 in two other characters' code) 0x6C0
+    (0x73DAB1) / 0x6C3 (0x74EEB3).
+- Not garden, left alone: action 11 (hurt, 0x47530C) plays 0x3002 / 0x3014 / 0x3013 / 0x300C /
+  0x3022 through 0x4372E0 and 0x65E / 0x65F / 0xA72 through 0x443130 by character; per-character
+  sets at 0x473FFB.. (0x61C, 0x515, 0x68C, 0x68D, 0xA6B, 0xA9D) and 0x474794.. (0x6B7, 0x6B4,
+  0xA69) not identified.

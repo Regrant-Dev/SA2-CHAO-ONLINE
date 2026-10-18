@@ -13,7 +13,7 @@ use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,11 +21,15 @@ use crate::chao::{self, ChaoData};
 use crate::game;
 use crate::hud;
 use crate::log;
-use crate::net::protocol::{Body, CHAO_SLOTS, MAX_CARRIED_CHAO, MY_CHAO_INDEX, PlayerState};
+use crate::net::files::SkinStore;
+use crate::net::protocol::{
+    Body, CHAO_SLOTS, MAX_CARRIED_CHAO, MY_CHAO_INDEX, PlayerState, STATUS_GROUNDED, STATUS_HOLDING,
+};
 use crate::net::session::{Client, Event, Host, Identity, Session};
 use crate::net::udp::Endpoint;
 use crate::puppet;
 use crate::room;
+use crate::skin_sync::SkinSync;
 use crate::timeline::Timeline;
 use crate::together;
 use crate::visitors;
@@ -146,6 +150,8 @@ struct Remote {
     /// Chao this player brought to their current garden (they never change our save).
     /// Their garden Chao (visitors), then their chosen Chao (`MY_CHAO_INDEX`).
     chao: [Option<Box<ChaoData>>; CHAO_SLOTS],
+    /// The skin they wear ("" for none).
+    skin: String,
 }
 
 fn to_pose(s: &PlayerState) -> puppet::Pose {
@@ -157,6 +163,8 @@ fn to_pose(s: &PlayerState) -> puppet::Pose {
         frame: s.frame,
         flags: s.flags,
         upgrades: s.upgrades,
+        action: s.action,
+        status: s.status,
     }
 }
 
@@ -183,7 +191,14 @@ struct Online {
     race_chao: Option<ChaoData>,
     /// Client mode: where to rejoin, and when (set after a disconnect).
     rejoin: Option<(SocketAddr, Identity, Option<Instant>)>,
+    /// The host's shared skins, coming down in the background.
+    skins: SkinSync,
+    /// Our skin as last told to the others, and when.
+    skin_sent: Option<(String, Instant)>,
 }
+
+/// Our skin goes out again this often (for players who joined since).
+const SKIN_WORN_EVERY: Duration = Duration::from_secs(10);
 
 static ONLINE: Mutex<Option<Online>> = Mutex::new(None);
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -257,7 +272,14 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
                 .map_err(|e| format!("can't listen on port {port}: {e}"))?;
             log!("online: hosting on port {port} as '{}'", me.name);
             hud::toast(format!("Hosting on port {port} as {}", me.name));
-            (Session::Host(Host::new(ep, me, now)), None)
+            let mut host = Host::new(ep, me, now);
+            // Our skins go to whoever joins.
+            let store = SkinStore::scan(&skins_dir());
+            if !store.is_empty() {
+                log!("online: sharing {} skin file(s)", store.len());
+                host.set_files(Some(Arc::new(store)));
+            }
+            (Session::Host(host), None)
         }
         Mode::Client { host } => {
             let ep = Endpoint::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
@@ -279,6 +301,8 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
         my_chao: None,
         race_chao: None,
         rejoin,
+        skins: SkinSync::new(skins_dir()),
+        skin_sent: None,
     }))
 }
 
@@ -449,12 +473,17 @@ fn pump(online: &mut Online, now: Instant) {
             Event::Connected { my_id } => {
                 log!("online: connected, I am player {my_id}");
                 hud::toast("Connected");
+                for b in online.skins.start(now) {
+                    online.session.send(b, true, now);
+                }
+                online.skin_sent = None;
                 online.resend_chao = true;
                 RESEND_MY_CHAO.store(true, Ordering::Relaxed);
             }
             Event::Disconnected { reason } => {
                 log!("online: disconnected: {reason}");
                 online.remote.clear();
+                online.skins.stop();
                 crate::garden::player_left(None);
                 // A different version won't get any better by retrying.
                 if reason.starts_with("rejected: protocol") || reason.starts_with("rejected: mod") {
@@ -477,6 +506,7 @@ fn pump(online: &mut Online, now: Instant) {
                         latest: None,
                         timeline: Timeline::default(),
                         chao: Default::default(),
+                        skin: String::new(),
                     },
                 );
                 online.resend_chao = true;
@@ -842,8 +872,53 @@ fn pump(online: &mut Online, now: Instant) {
                     crate::bosses::received(level, mission, hp, full);
                 }
             }
+            Event::Game {
+                from,
+                body: Body::SkinWorn { skin },
+            } => {
+                if let Some(r) = online.remote.get_mut(&from) {
+                    r.skin = skin;
+                }
+            }
+            Event::Game {
+                body: body @ (Body::SkinList { .. } | Body::SkinChunk { .. }),
+                ..
+            } => {
+                for b in online.skins.on_body(&body, now) {
+                    let list = matches!(b, Body::SkinListGet { .. });
+                    online.session.send(b, list, now);
+                }
+            }
+            // Only a host answers these (session.rs).
+            Event::Game {
+                body: Body::SkinListGet { .. } | Body::SkinGet { .. },
+                ..
+            } => {}
         }
     }
+    for b in online.skins.tick(now) {
+        let list = matches!(b, Body::SkinListGet { .. });
+        online.session.send(b, list, now);
+    }
+    // Our skin, now and then and when it changes (silently: nobody sees this).
+    if online.session.my_id().is_some() {
+        let mine = crate::skins::worn().unwrap_or_default();
+        let due = online
+            .skin_sent
+            .as_ref()
+            .is_none_or(|(s, at)| *s != mine || now.duration_since(*at) >= SKIN_WORN_EVERY);
+        if due {
+            online.skin_sent = Some((mine.clone(), now));
+            online
+                .session
+                .send(Body::SkinWorn { skin: mine }, true, now);
+        }
+    }
+}
+
+/// `<mod>/skins`, where skins live (and shared ones come down to).
+fn skins_dir() -> std::path::PathBuf {
+    std::path::Path::new(mod_path()).join("skins")
 }
 
 /// Player `id` is in the garden we're in.
@@ -906,7 +981,11 @@ pub fn on_frame() {
                     }
             })
         })
-        .filter_map(|r| r.timeline.sample(clock).map(|pose| (pose, r.name.clone())))
+        .filter_map(|r| {
+            r.timeline
+                .sample(clock)
+                .map(|pose| (pose, r.name.clone(), r.skin.clone()))
+        })
         .collect();
     // Nobody is drawn into a local two-player (split screen) game.
     puppet::set_remotes(if game::two_player() {
@@ -1327,6 +1406,11 @@ pub fn on_frame() {
                 | crate::karate_live::flags(),
             room: room::wire(),
             upgrades: me.map_or(0, |m| m.upgrades),
+            action: me.map_or(0, |m| m.action),
+            status: me.map_or(0, |m| {
+                (if m.grounded { STATUS_GROUNDED } else { 0 })
+                    | if m.holding { STATUS_HOLDING } else { 0 }
+            }),
         };
         // In a room race, our racing Chao goes out instead of our (absent) character.
         let mut state = state;

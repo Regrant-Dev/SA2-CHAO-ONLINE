@@ -285,6 +285,29 @@ pub fn chat_line(line: &str) {
     draw(&hud, x, y, size, TOAST_COLOR, line);
 }
 
+const BAR_FILL: u32 = 0xFFF0_C030;
+
+/// A line and a progress bar (`fraction` 0..1) centred near the bottom of the screen
+/// (shared skins coming down, on the menus).
+pub fn progress(line: &str, fraction: f32) {
+    let (w, h) = screen_size();
+    let size = (h / 50.0).round().max(10.0);
+    let cols = line.chars().count().max(28) + 2;
+    let width = cols as f32 * size;
+    let (x, y) = ((w - width) / 2.0, h * 0.84);
+    panel(x, y, size, cols, 3);
+    let rect = |x1: f32, y1: f32, x2: f32, y2: f32| [x1, y1, x2, y2].map(|v| v.round() as i32);
+    let (bx1, bx2) = (x + size, x + width - size);
+    let (by1, by2) = (y + size * 1.7, y + size * 2.4);
+    rects::push(rect(bx1, by1, bx2, by2), PANEL_BORDER);
+    let filled = bx1 + (bx2 - bx1) * fraction.clamp(0.0, 1.0);
+    if filled > bx1 {
+        rects::push(rect(bx1, by1, filled, by2), BAR_FILL);
+    }
+    let hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
+    draw(&hud, x + size, y + size * 0.4, size, TOAST_COLOR, line);
+}
+
 /// A line of text centred near the bottom of the screen (hints on Stage Select).
 pub fn banner(line: &str) {
     let (w, h) = screen_size();
