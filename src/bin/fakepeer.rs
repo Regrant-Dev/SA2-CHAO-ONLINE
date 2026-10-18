@@ -209,11 +209,12 @@ fn main() {
                     body: body @ (Body::RoomPick { .. } | Body::RacePick { .. }),
                 } => println!("player {from} picked: {body:?}"),
                 // Our visiting Chao copy the real player's live garden Chao (40 units to the
-                // side like our character; held ones stay in our character's hands).
+                // side like our character; held ones stay in our character's hands). Only their
+                // own: we never keep the garden, so their game does (and sends ours back to us).
                 Event::Game {
-                    body: Body::GardenChao(list),
-                    ..
-                } if !chao.is_empty() => {
+                    from,
+                    body: Body::GardenChao { owner, list },
+                } if !chao.is_empty() && owner == from => {
                     let list = list
                         .into_iter()
                         .filter(|c| usize::from(c.index) < chao.len())
@@ -222,7 +223,8 @@ fn main() {
                             ..c
                         })
                         .collect();
-                    session.send(Body::GardenChao(list), false, now);
+                    let owner = session.my_id().unwrap_or(0);
+                    session.send(Body::GardenChao { owner, list }, false, now);
                 }
                 // Own a copy of each of the real player's garden items: same place (40 units
                 // to the side on the ground), our own ids. Claim them from us (we host, so our

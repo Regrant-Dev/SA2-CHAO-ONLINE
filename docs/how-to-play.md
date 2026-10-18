@@ -91,8 +91,8 @@ connected. Pausing during a room stage doesn't stop it for the others.
 
 ## Chao
 
-**Visiting:** when you're in a garden with friends, up to 2 of your Chao from that garden visit
-theirs. Pick them in F9 > Visitor 1 and Visitor 2, or leave them on Auto (your My Chao first).
+**Visiting:** when you're in a garden with friends, up to 4 of your Chao from that garden visit
+theirs. Pick them in F9 > Visitor 1 to Visitor 4, or leave them on Auto (your My Chao first).
 A Chao only visits while you're in the garden it lives in, and the same Chao can't fill both
 rows. Visiting Chao show who they belong to over their heads, like "Mason 1" (Mason's visitor 1)
 or "You 2", with the Chao's name if it has one. Eggs and Chao without a tag stay in your game
@@ -102,6 +102,15 @@ You can pet, hold and feed each other's Chao, and that affects the real Chao in 
 save. Garden items are shared too: pick up a friend's fruit and it's yours. The garden ball is
 shared: kick it and it rolls the same way for everyone. Trees drop ripe fruit by themselves for
 only one of you, so fruit doesn't pile up twice as fast; shaking a tree works for everyone.
+With friends in a garden, one player's game runs it (whoever was keeping it already, else the
+lowest player number): every Chao there, the trees and the toys. So everyone's Chao meet, play,
+fight and even have babies together, and whatever happens to your Chao lands in your save. A
+baby made there is laid in that player's garden. If they leave or tab out, someone else takes
+over after a moment.
+
+Everyone sees that player's trees, and planting a seed plants it for everyone. The TV, the radio
+and the jack-in-the-box are shared too: switch one on and it's on for everyone. Whistle and your
+friends' Chao come to you. Visiting eggs show up for everyone (only the owner's egg hatches).
 
 Set **Visit friends** to Off and your Chao go home within a few seconds.
 

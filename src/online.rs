@@ -39,6 +39,8 @@ pub const DEFAULT_PORT: u16 = 43_902;
 const STATE_EVERY_FRAMES: u32 = 2;
 /// How often our visitors' looks are checked for changes.
 const LOOK_EVERY_FRAMES: u32 = 60;
+/// A friend counts for keeping the garden while their updates are this fresh.
+const KEEPER_FRESH: Duration = Duration::from_millis(1500);
 /// Network thread poll interval.
 const POLL_EVERY: Duration = Duration::from_millis(10);
 /// Wait before rejoining after a disconnect (client mode).
@@ -66,8 +68,8 @@ pub struct Config {
     pub my_chao: i32,
     /// Visit friends: 0 off, 1 on (index into `VISIT_MODES`).
     pub visits: usize,
-    /// Visitor 1 and 2: a save slot, `VISITOR_AUTO` or `VISITOR_NONE`.
-    pub visitors: [i32; 2],
+    /// Visitors 1..=4: a save slot, `VISITOR_AUTO` or `VISITOR_NONE`.
+    pub visitors: [i32; MAX_CARRIED_CHAO],
     /// Mode of rooms we create.
     pub room_mode: crate::room::Mode,
 }
@@ -130,10 +132,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         name_tags,
         my_chao: get("mychao").trim().parse().unwrap_or(-1),
         visits: parse_visits(get("visitwith")),
-        visitors: [
-            parse_visitor(get("visitor1")),
-            parse_visitor(get("visitor2")),
-        ],
+        visitors: std::array::from_fn(|i| parse_visitor(get(&format!("visitor{}", i + 1)))),
         room_mode: crate::room::Mode::parse(get("roommode")),
         chao_race: !matches!(
             get("chaorace").to_ascii_lowercase().as_str(),
@@ -146,6 +145,8 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
 struct Remote {
     name: String,
     latest: Option<PlayerState>,
+    /// When `latest` came.
+    heard: Instant,
     timeline: Timeline,
     /// Chao this player brought to their current garden (they never change our save).
     /// Their garden Chao (visitors), then their chosen Chao (`MY_CHAO_INDEX`).
@@ -504,6 +505,7 @@ fn pump(online: &mut Online, now: Instant) {
                     Remote {
                         name,
                         latest: None,
+                        heard: Instant::now(),
                         timeline: Timeline::default(),
                         chao: Default::default(),
                         skin: String::new(),
@@ -548,6 +550,7 @@ fn pump(online: &mut Online, now: Instant) {
                     let clock = frames_since(online.started, now);
                     remote.timeline.push(state.time, to_pose(&state), clock);
                     remote.latest = Some(state);
+                    remote.heard = now;
                 }
             }
             Event::Game {
@@ -629,7 +632,15 @@ fn pump(online: &mut Online, now: Instant) {
             } => crate::karate_live::received_cheer(from, count),
             Event::Game {
                 from,
-                body: Body::GardenChao(list),
+                body: Body::GardenKeeper { area, term },
+            } => {
+                if in_my_garden(online, from) {
+                    crate::keeper::received(from, area, term);
+                }
+            }
+            Event::Game {
+                from,
+                body: Body::GardenChao { owner, list },
             } => {
                 // Only from a friend in our garden: elsewhere their Chao aren't visiting us (and
                 // ours of theirs go home).
@@ -642,13 +653,56 @@ fn pump(online: &mut Online, now: Instant) {
                             && i32::from(s.chao_area) == game::current_chao_area()
                     });
                 if here {
-                    crate::garden::received(from, list);
+                    crate::garden::received(from, owner, list);
                 }
             }
             Event::Game {
                 from,
                 body: Body::GardenItems { area, items },
             } => crate::items::received(from, area, items),
+            Event::Game {
+                from,
+                body: Body::GardenTrees { area, trees },
+            } => crate::trees::received_trees(from, area, trees),
+            Event::Game {
+                from,
+                body: Body::ToyMode { area, toy, mode },
+            } => {
+                let keeper = crate::keeper::current() == Some(from);
+                crate::garden_toys::received(keeper, area, toy, mode);
+            }
+            Event::Game {
+                from,
+                body: Body::GardenEggs { area, eggs },
+            } => {
+                if i32::from(area) == game::current_chao_area() {
+                    crate::eggs::received(from, eggs);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::EggHeld {
+                        owner,
+                        index,
+                        held,
+                        position,
+                    },
+            } => {
+                if Some(owner) == online.session.my_id() {
+                    crate::eggs::received_held(from, index, held, position);
+                }
+            }
+            Event::Game {
+                body:
+                    Body::TreeAction {
+                        area,
+                        slot,
+                        action,
+                        kind,
+                    },
+                ..
+            } => crate::trees::received_action(area, slot, action, kind),
             Event::Game {
                 from,
                 body:
@@ -756,9 +810,12 @@ fn pump(online: &mut Online, now: Instant) {
                         changes,
                     },
             } => {
-                // Only from someone in our garden: our Chao are only there.
-                if Some(owner) == online.session.my_id() && in_my_garden(online, from) {
-                    crate::garden::received_changes(index, changes);
+                // Only from someone in our garden: our Chao (and the ones we run) are only there.
+                // Ours go to our save; a visitor's to our copy when we keep the garden.
+                let me = online.session.my_id();
+                let keeping = me.is_some() && crate::keeper::current() == me;
+                if (Some(owner) == me || keeping) && in_my_garden(online, from) {
+                    crate::garden::received_changes(owner, index, changes);
                 }
             }
             Event::Game {
@@ -770,8 +827,9 @@ fn pump(online: &mut Online, now: Instant) {
                         offset,
                     },
             } => {
-                if Some(owner) == online.session.my_id() && in_my_garden(online, from) {
-                    crate::garden::received_held(from, index, offset);
+                // To whoever's game runs that Chao.
+                if crate::garden::brain_here(owner) && in_my_garden(online, from) {
+                    crate::garden::received_held(from, owner, index, offset);
                 }
             }
             Event::Game {
@@ -1025,7 +1083,7 @@ pub fn on_frame() {
         online.sent_looks.clear();
         // Each visitor keeps its row number as its index (friends see "Regrant 2").
         let rows = match VISITS.load(Ordering::Relaxed) {
-            VISITS_OFF => [None, None],
+            VISITS_OFF => [const { None }; MAX_CARRIED_CHAO],
             _ => carried_chao(garden),
         };
         let mine: Vec<(usize, (usize, ChaoData))> = rows
@@ -1034,11 +1092,12 @@ pub fn on_frame() {
             .filter_map(|(row, c)| c.map(|c| (row, c)))
             .collect();
         log!("online: bringing {} chao to garden {garden}", mine.len());
-        crate::garden::set_mine(
-            mine.iter()
-                .map(|(index, (slot, _))| (*index as u8, *slot))
-                .collect(),
-        );
+        let slots: Vec<(u8, usize)> = mine
+            .iter()
+            .map(|(index, (slot, _))| (*index as u8, *slot))
+            .collect();
+        crate::garden::set_mine(slots.clone());
+        crate::eggs::set_mine(slots);
         for (index, (_, chao)) in mine {
             let body = Body::Chao {
                 index: index as u8,
@@ -1111,7 +1170,10 @@ pub fn on_frame() {
             .send(Body::KaratePick { opponent }, true, now);
     }
 
-    for (id, index) in crate::garden::take_left() {
+    for (id, index) in crate::garden::take_left()
+        .into_iter()
+        .chain(crate::eggs::take_left())
+    {
         visitors::forget(id, index);
     }
     if garden > 0 {
@@ -1124,7 +1186,8 @@ pub fn on_frame() {
             for (index, chao) in remote.chao.iter().take(MAX_CARRIED_CHAO).enumerate() {
                 // Only while their game sends it (they can take it home any time).
                 if let Some(chao) = chao
-                    && crate::garden::visiting(id, index as u8)
+                    && (crate::garden::visiting(id, index as u8)
+                        || crate::eggs::visiting(id, index as u8))
                 {
                     visitors::spawn_remote(
                         id,
@@ -1198,9 +1261,10 @@ pub fn on_frame() {
                 };
                 online.session.send(body, false, now);
             }
-            let list = crate::garden::my_chao();
-            if !list.is_empty() {
-                online.session.send(Body::GardenChao(list), false, now);
+            for (owner, list) in crate::garden::streams() {
+                online
+                    .session
+                    .send(Body::GardenChao { owner, list }, false, now);
             }
             // A visitor's look changed (it took an animal, evolved): send it again.
             if online.frame.is_multiple_of(LOOK_EVERY_FRAMES) {
@@ -1239,6 +1303,21 @@ pub fn on_frame() {
         })
         .map(|(&id, _)| id)
         .collect();
+    // Who keeps the garden (runs its Chao, trees and toys): among the friends whose updates
+    // are coming (a paused game sends none).
+    let fresh: Vec<u8> = friends
+        .iter()
+        .copied()
+        .filter(|id| {
+            online
+                .remote
+                .get(id)
+                .is_some_and(|r| now.duration_since(r.heard) < KEEPER_FRESH)
+        })
+        .collect();
+    if let Some(body) = crate::keeper::on_frame(online.session.my_id(), area, &fresh) {
+        online.session.send(body, false, now);
+    }
     if let Some((area, claim, position, velocity)) =
         crate::toys::on_frame(online.session.my_id(), area, &friends)
     {
@@ -1254,6 +1333,36 @@ pub fn on_frame() {
         online
             .session
             .send(Body::GardenItems { area, items }, false, now);
+    }
+    // Friends' whistles reach our Chao.
+    let whistlers: Vec<(u8, game::Vector, u8)> = online
+        .remote
+        .iter()
+        .filter(|(id, _)| friends.contains(id))
+        .filter_map(|(&id, r)| {
+            let s = r.latest?;
+            let [x, y, z] = s.position;
+            Some((id, game::Vector { x, y, z }, s.action))
+        })
+        .collect();
+    crate::whistle::on_frame(&whistlers);
+    // Visiting eggs: ours to everyone; the friends' we hold, to them.
+    if area != 0 {
+        let where_friends = whistlers.iter().map(|&(id, p, _)| (id, p)).collect();
+        for body in crate::eggs::on_frame(area, &where_friends) {
+            let reliable = matches!(body, Body::EggHeld { .. });
+            online.session.send(body, reliable, now);
+        }
+    }
+    // Shared trees: the keeper's to everyone (again each second), what we did to copies of them
+    // to the keeper.
+    for body in crate::trees::on_frame(online.session.my_id(), area) {
+        let reliable = matches!(body, Body::TreeAction { .. });
+        online.session.send(body, reliable, now);
+    }
+    // Shared toys: jumps go with the garden's keeper.
+    for body in crate::garden_toys::on_frame(area, crate::keeper::keeping()) {
+        online.session.send(body, true, now);
     }
     if let Some(course) = crate::kart::take_pick() {
         online.session.send(Body::KartPick { course }, true, now);
@@ -1455,6 +1564,14 @@ fn chosen_chao(r: &Remote) -> Option<&ChaoData> {
 }
 
 /// Our hatched, valid Chao: (save slot, record) (read-only).
+/// Our valid Chao, eggs too (they visit as well).
+pub fn garden_chao() -> Vec<(usize, ChaoData)> {
+    (0..game::GARDEN_SLOTS)
+        .filter_map(|slot| game::read_chao_slot(slot).map(|c| (slot, c)))
+        .filter(|(_, c)| c.validate().is_ok())
+        .collect()
+}
+
 pub fn hatched_chao() -> Vec<(usize, ChaoData)> {
     (0..game::GARDEN_SLOTS)
         .filter_map(|slot| game::read_chao_slot(slot).map(|c| (slot, c)))
@@ -1486,8 +1603,8 @@ pub fn set_my_chao(slot: i32) {
     RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
 }
 
-/// Visit friends: whether our Chao (up to 2 from the garden we're in) visit the others in it.
-pub const VISIT_MODES: [&str; 2] = ["Off (they stay home)", "On (up to 2 Chao from this garden)"];
+/// Visit friends: whether our Chao (up to 4 from the garden we're in) visit the others in it.
+pub const VISIT_MODES: [&str; 2] = ["Off (they stay home)", "On (up to 4 Chao from this garden)"];
 const VISITS_OFF: u8 = 0;
 const VISITS_ON: u8 = 1;
 static VISITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(VISITS_ON);
@@ -1509,10 +1626,8 @@ pub fn refresh_visitors() {
 /// A visitor row: pick Chao automatically, or send nobody.
 pub const VISITOR_AUTO: i32 = -1;
 pub const VISITOR_NONE: i32 = -2;
-static VISITORS: [std::sync::atomic::AtomicI32; 2] = [
-    std::sync::atomic::AtomicI32::new(VISITOR_AUTO),
-    std::sync::atomic::AtomicI32::new(VISITOR_AUTO),
-];
+static VISITORS: [std::sync::atomic::AtomicI32; MAX_CARRIED_CHAO] =
+    [const { std::sync::atomic::AtomicI32::new(VISITOR_AUTO) }; MAX_CARRIED_CHAO];
 
 /// F9 / config: which Chao is visitor `i` (a save slot, auto or none). Applies right away.
 pub fn set_visitor(i: usize, slot: i32) {
@@ -1522,15 +1637,17 @@ pub fn set_visitor(i: usize, slot: i32) {
     }
 }
 
-/// Both visitor rows on the same Chao: the second goes back to Auto.
-pub fn tidy_visitors(mut rows: [i32; 2]) -> [i32; 2] {
-    if rows[0] >= 0 && rows[0] == rows[1] {
-        rows[1] = VISITOR_AUTO;
+/// Visitor rows on a Chao an earlier row has: those go back to Auto.
+pub fn tidy_visitors(mut rows: [i32; MAX_CARRIED_CHAO]) -> [i32; MAX_CARRIED_CHAO] {
+    for i in 1..rows.len() {
+        if rows[i] >= 0 && rows[..i].contains(&rows[i]) {
+            rows[i] = VISITOR_AUTO;
+        }
     }
     rows
 }
 
-/// Parses a `Visitor1`/`Visitor2` value: a save slot, "Auto" (-1, the default) or "None" (-2).
+/// Parses a `Visitor1`..`Visitor4` value: a save slot, "Auto" (-1, the default) or "None" (-2).
 pub fn parse_visitor(text: &str) -> i32 {
     match text.trim().to_ascii_lowercase().as_str() {
         "none" | "off" => VISITOR_NONE,
@@ -1581,14 +1698,12 @@ pub fn karate_opponents() -> Vec<(Option<u8>, String)> {
     out
 }
 
-/// Up to `MAX_CARRIED_CHAO` hatched, valid Chao living in `garden`, with their save slots
-/// (read-only).
-/// Our visitors from `garden`, by visitor row: `[visitor 1, visitor 2]` (save slot and Chao).
-fn carried_chao(garden: i32) -> [Option<(usize, ChaoData)>; 2] {
+/// Our visitors from `garden` (hatched Chao and eggs), by visitor row (save slot and Chao).
+fn carried_chao(garden: i32) -> [Option<(usize, ChaoData)>; MAX_CARRIED_CHAO] {
     // Only Chao living in this garden can visit from it (their real ones are here to follow).
     // Auto picks My Chao first, then the others in save order.
     let mine = my_chosen_slot().map(|(slot, _)| slot);
-    let mut here: Vec<(usize, ChaoData)> = hatched_chao()
+    let mut here: Vec<(usize, ChaoData)> = garden_chao()
         .into_iter()
         .filter(|(_, c)| i32::from(c.garden()) == garden)
         .collect();
@@ -1599,15 +1714,18 @@ fn carried_chao(garden: i32) -> [Option<(usize, ChaoData)>; 2] {
         .map(|slot| slot.and_then(|slot| here.iter().find(|(s, _)| *s == slot).cloned()))
 }
 
-/// What the two visitor rows come to in the garden we're in (None outside a garden).
-pub fn visitor_preview() -> Option<[Option<(usize, ChaoData)>; 2]> {
+/// What the visitor rows come to in the garden we're in (None outside a garden).
+pub fn visitor_preview() -> Option<[Option<(usize, ChaoData)>; MAX_CARRIED_CHAO]> {
     game::in_garden().then(|| carried_chao(game::current_chao_area()))
 }
 
-/// The two visitor rows over `here` (save slots in this garden, in Auto order): a chosen Chao
+/// The visitor rows over `here` (save slots in this garden, in Auto order): a chosen Chao
 /// that lives here keeps its row; Auto rows take the next ones nobody chose. No Chao twice.
-fn pick_visitors(here: &[usize], picks: [i32; 2]) -> [Option<usize>; 2] {
-    let mut out = [None; 2];
+fn pick_visitors(
+    here: &[usize],
+    picks: [i32; MAX_CARRIED_CHAO],
+) -> [Option<usize>; MAX_CARRIED_CHAO] {
+    let mut out = [None; MAX_CARRIED_CHAO];
     for (row, &pick) in picks.iter().enumerate() {
         out[row] = here
             .iter()
@@ -1642,22 +1760,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn visitors_follow_the_two_rows() {
+    fn visitors_follow_their_rows() {
         let (auto, none) = (VISITOR_AUTO, VISITOR_NONE);
         // Slots living in this garden, My Chao (3) first.
         let here = [3, 0, 1];
-        assert_eq!(pick_visitors(&here, [auto, auto]), [Some(3), Some(0)]);
-        assert_eq!(pick_visitors(&here, [1, auto]), [Some(1), Some(3)]);
-        assert_eq!(pick_visitors(&here, [auto, 1]), [Some(3), Some(1)]);
-        assert_eq!(pick_visitors(&here, [0, none]), [Some(0), None]);
-        assert_eq!(pick_visitors(&here, [none, none]), [None, None]);
+        assert_eq!(
+            pick_visitors(&here, [auto, auto, none, none]),
+            [Some(3), Some(0), None, None]
+        );
+        assert_eq!(
+            pick_visitors(&here, [1, auto, none, none]),
+            [Some(1), Some(3), None, None]
+        );
+        assert_eq!(
+            pick_visitors(&here, [auto, 1, none, none]),
+            [Some(3), Some(1), None, None]
+        );
+        assert_eq!(
+            pick_visitors(&here, [0, none, none, none]),
+            [Some(0), None, None, None]
+        );
+        assert_eq!(
+            pick_visitors(&here, [none, none, none, none]),
+            [None, None, None, None]
+        );
         // A pick living in another garden doesn't come; it isn't replaced either.
-        assert_eq!(pick_visitors(&here, [7, auto]), [None, Some(3)]);
+        assert_eq!(
+            pick_visitors(&here, [7, auto, none, none]),
+            [None, Some(3), None, None]
+        );
         // The same Chao twice comes once.
-        assert_eq!(pick_visitors(&here, [0, 0]), [Some(0), None]);
+        assert_eq!(
+            pick_visitors(&here, [0, 0, none, none]),
+            [Some(0), None, None, None]
+        );
         // One Chao: row 1 has it, row 2 is empty. None: both empty.
-        assert_eq!(pick_visitors(&[5], [auto, auto]), [Some(5), None]);
-        assert_eq!(pick_visitors(&[], [auto, auto]), [None, None]);
+        assert_eq!(
+            pick_visitors(&[5], [auto, auto, none, none]),
+            [Some(5), None, None, None]
+        );
+        assert_eq!(
+            pick_visitors(&[], [auto, auto, none, none]),
+            [None, None, None, None]
+        );
+        // Four rows, all Auto: the first four here.
+        assert_eq!(
+            pick_visitors(&[3, 0, 1, 6, 2], [auto; 4]),
+            [Some(3), Some(0), Some(1), Some(6)]
+        );
+        assert_eq!(tidy_visitors([2, 2, 5, 2]), [2, auto, 5, auto]);
         assert_eq!(parse_visitor("None"), none);
         assert_eq!(parse_visitor(" 4 "), 4);
         assert_eq!(parse_visitor("99"), auto);
@@ -1674,7 +1825,7 @@ mod tests {
                 chao_race: true,
                 my_chao: -1,
                 visits: 1,
-                visitors: [VISITOR_AUTO; 2],
+                visitors: [VISITOR_AUTO; MAX_CARRIED_CHAO],
                 room_mode: crate::room::Mode::Race,
             }
         );
@@ -1692,7 +1843,7 @@ mod tests {
                 chao_race: true,
                 my_chao: -1,
                 visits: 1,
-                visitors: [VISITOR_AUTO; 2],
+                visitors: [VISITOR_AUTO; MAX_CARRIED_CHAO],
                 room_mode: crate::room::Mode::Race,
             }
         );

@@ -342,3 +342,93 @@ counts down while shaking. A ripe slot also drops on its own (frame % 10 == 1 an
 Drop (0x5470C0): position 0x546670, record 0x52F9E0(ECX=3), then **0x546180(kind, &pos, ang,
 NULL, record)**; kind = garden-1 (0/1/2) for state-5 trees, else tree kind+2. So a dropped fruit
 is an ordinary saved fruit and already syncs as an item.
+
+**Shared trees (2026-10-18, REA; src/trees.rs).**
+- Garden load 0x52EB70 makes all 7 spots' GrowTrees, empty ones too: `0x548210(position, record)`
+  with positions `0x1366B30 + (garden-1)*0x78 + slot*0xC` and records at
+  `0x52E440() + 0x20 + (garden-1)*0x38 + slot*8`. Nothing else makes trees: planting changes an
+  empty spot's tree.
+- The constructor takes the record: +0 kind (Data1+0x30), +1 state (+0x31; 0 empty, 1 seed,
+  2 growing, 3 grown, 5 the garden's own; 4 is read as 0; kind 8 means state 5), +2 growth,
+  +3 life x100 (+0x3C), +4..+6 fruit ripeness (x100, or x50 for the garden's own), +7 facing
+  (high nibble). It keeps the record pointer at Data1+0xEC.
+- The main 0x546810 writes it back every frame (0x548660), as does the garden's save on exit
+  (0x52E6B0 over registry categories 4 and 5). The delete sub 0x5481E0 only frees the model and
+  the registry entry.
+- Modes (Data1 byte 0): 0 empty (planting: 0x530710 reads and clears the entry's +0x34; when it's
+  5, kind = entry +0x36 + 1, mode 1), 1 seed (watering: 0x54B1F0(0xAD); +100 a tick to 10000),
+  2/3 sprouting, 4 growing (life +0x3C, scale +0x34), 5/6 grown up, 7 grown with fruit, 8..10
+  dying, withering, back to 0.
+- Fruit slots (Data1+0x44, 3 x 0x20): ripeness f32, its target f32, drop timer i32 (+8). In mode
+  7, a frame with Data1+0xD0 set (shaken) counts each ripe (> 0.9) fruit's timer down; at < 1 it
+  drops: position 0x546670(out, data1, slot), record 0x52F9E0(ECX=3), then
+  `0x546180(kind, &pos, angle, &vel, record)`; ripeness reset to -rand*0.3, timer 11 + rand*13.
+  Over 1.9 it can also drop on its own (frame % 10 == 1, 0.2%).
+- The mod: the garden's lowest player id keeps the trees and sends its 7 records each second.
+  Everyone else frees their own trees (save untouched) and makes copies with GrowTree from records
+  it owns, MainSub wrapped: fruit kept under 1.85 with timers at 100 (never drops), an entry +0x34
+  of 5 (a seed planting) and Data1+0xD0 (shaken) sent to the keeper. The keeper's game marks its
+  empty spot's entry the same way, or runs that shake frame and drops the fruit as above.
+
+## Whistling (2026-10-18, objdump; src/whistle.rs)
+- Each frame a garden Chao's reaction check 0x53DB10 asks 0x5637B0 whether player 1
+  (`*0x1DEA6C0`, EntityData1) has action 42 (whistling) within 100 units (squared distance
+  < 10000); if so it may start behaviour 0x5634D0, which walks to player index 0 (0x796AB0).
+- Only player 1 counts, so a friend's whistle never reaches our Chao. The mod: our Chao (MainSub
+  0x54FE20) within 100 of a whistling friend runs a wrapper for up to 600 frames, which points
+  `*0x1DEA6C0` at a stand-in copy of player 1's first 0x40 bytes, placed where the friend is
+  (whistling for the first 20 frames), only while that Chao's own MainSub runs.
+
+## Eggs (2026-10-18, objdump; src/eggs.rs)
+- Eggs are made by CreateChao 0x5501D0 for type 1 (spawner 0x57B9C0), MainSub 0x57B520, registry
+  category 1; Data1 +0x5C its record, +0x14 position. Mode table 0x57B618; modes 4, 6 and 8
+  hatch (0x57ADD0, 0x57AFD0, 0x57B1D0 call CreateChao and the hat 0x54A540).
+- The mod: eggs visit like Chao (protocol `GardenEggs`); a copy runs the egg MainSub only while
+  held or settling and is put back from the hatching modes, otherwise it sits where its owner's
+  egg is. Picking a copy up (CharObj2 +0x94) sends `EggHeld`; the owner's game holds the real egg
+  there, so only the owner's egg can hatch.
+
+## Toys: TV, radio, jack-in-the-box (2026-10-18, objdump; src/garden_toys.rs)
+- One object each in object list 4, main at +0x10: TV 0x55C540 (made by 0x55CB90,
+  "ALO_TVExecutor", also kept at 0x1AED288), radio 0x57C840 (0x1AED2E0), box 0x5801C0
+  (0x1AED32C).
+- Data1: +0 mode, +1 and +3 counters, +6 u16 timer, +8 picture frame (TV) or spin (radio).
+  Every jump to a mode other than the next clears +1, +3 and +6.
+- Touches: 0x486760(object, kind) (cdecl, read-only) returns the hit from collision kind `kind`
+  (+4 who hit, 0 if none). Kind 0xAF switches an off toy on (TV/radio mode 1, box mode 1 with
+  +6 = 30 less a random bit), 0xB1 switches one that's on over or off.
+- TV modes 1..12 (table 0x55C9AC): odd modes start a channel (frame index +8 = 0, screen texture
+  0x55EA00), the next even one plays it; after switching on it picks a channel at random
+  (rand 0x7A89D8); +6 counts up to 3600 frames, then mode 3 (switching off), then 0.
+- Radio modes 1..6 (table 0x57CA64): songs 4..6 picked at random, 3 off.
+- Box modes 0..4 (table 0x5804F4): 1 counts +6 down, 2..4 pop open (floats +0x20/+0x24/+0x28),
+  back to 0.
+- The mod: the trees' keeper (lowest id) wraps the toys' mains and sends every jump (`ToyMode`);
+  the others' toys jump the same unless already there or one step past. A touch in someone
+  else's game goes to the keeper, which makes the jump and sends it to everyone.
+
+## Keeper: one brain per shared garden (2026-10-18; src/keeper.rs, src/garden.rs)
+- With friends in a garden, one player's game keeps it: it runs every Chao there with its own AI
+  (its own and the visitors' copies), the trees and the toys. The keeper says so with
+  `GardenKeeper` (area, term) 4 times a second. Everyone follows the claim with the higher term,
+  then the lower id. A newcomer follows a keeper already there. With friends and no claim for
+  1 s, the lowest id claims with term = highest seen + 1 (anyone after 3 s). A paused game sends
+  nothing (tabbing out pauses SA2), so its claim lapses after 1.5 s and someone else takes over;
+  coming back it sees the higher term and follows.
+- Keeper: visitor copies run `CHAO_MAIN` with AI on. Every 30 frames their record is diffed
+  (`chao::changes`) and the changes are sent to the owner. All Chao are sent per owner
+  (`GardenChao` owner field). A friend's hold of any Chao it runs wraps it in the hold MainSub.
+- Everyone else: friends' copies follow the keeper's stream; their own visiting Chao do too
+  (wrapped like a copy, AI off, never deleted), and their records stay their save's. The keeper's
+  changes go into the save and the follower's snapshot. A touch still runs the AI locally for 5 s,
+  and its changes go to the owner and the keeper. Holds go to the keeper.
+- Nobody keeping yet (friends just met): each owner's game runs its own Chao, as before.
+- Breeding (checked 2026-10-18): the mating behaviour makes the egg from a free slot in the local
+  save (0x531AA0), genes mixed from both parents (0x551D20), then the egg spawner 0x57B9C0 (call
+  at 0x59C2D7). So a baby made in a shared garden is the keeper's.
+- End of life: when a Chao's lifespan (record +0x8A) is 0, 0x562A20 starts 0x568F60, leading to
+  death or reincarnation: 0x568570 makes an egg from the Chao's own record (+0x8E reincarnations).
+  The keeper keeps its visitor copies' lifespan at 1 or more without sending that, so this only
+  happens in the owner's game.
+- Still open: hats (section 5 of re/chao-garden-items.md, items 1 and 2). A visitor running here
+  all the time can drop its hat into the keeper's save when hit or thrown.

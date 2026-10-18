@@ -4,17 +4,17 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
 
 /// Chao each player brings into a shared garden.
-pub const MAX_CARRIED_CHAO: usize = 2;
+pub const MAX_CARRIED_CHAO: usize = 4;
 /// `Body::Chao` index of the player's chosen Chao for races and karate ("My Chao").
-pub const MY_CHAO_INDEX: u8 = 2;
+pub const MY_CHAO_INDEX: u8 = MAX_CARRIED_CHAO as u8;
 /// Chao slots per player in `Body::Chao`: the garden Chao, then "My Chao".
-pub const CHAO_SLOTS: usize = 3;
+pub const CHAO_SLOTS: usize = MAX_CARRIED_CHAO + 1;
 /// Player names: short enough for a tidy name tag.
 pub const MAX_NAME: usize = 10;
 pub const MAX_REASON: usize = 64;
@@ -122,9 +122,19 @@ pub enum Body {
     KarateCheer {
         count: u8,
     },
-    /// Shared garden: the sender's visiting Chao (their `Body::Chao` indices) as they are in
-    /// the sender's game right now, ~30 per second.
-    GardenChao(Vec<GardenChao>),
+    /// Shared garden: player `owner`'s visiting Chao (their `Body::Chao` indices) as they are in
+    /// the sender's game right now, ~30 per second. Each player sends their own (so the others
+    /// know they're visiting); the garden's keeper also sends everyone else's, which they run.
+    GardenChao {
+        owner: u8,
+        list: Vec<GardenChao>,
+    },
+    /// Shared garden `area`: the sender keeps it (runs its Chao, trees and toys) in term `term`,
+    /// a few times a second (keeper.rs).
+    GardenKeeper {
+        area: u8,
+        term: u32,
+    },
     /// Shared garden: the sender's interaction changed `owner`'s visiting Chao `index`
     /// (`chao::changes::diff` output) for the owner to apply to the real one.
     ChaoChanges {
@@ -263,6 +273,44 @@ pub enum Body {
         position: [f32; 3],
         velocity: [f32; 3],
     },
+    /// Shared garden: the sender keeps garden `area`'s trees (the lowest player id there) and
+    /// these are their 7 tree spots, as their save has them (8 bytes each: kind, state, growth,
+    /// life, fruit ripeness x3, facing; re/chao-garden-sync.md "Trees"). The others show these.
+    GardenTrees {
+        area: u8,
+        trees: [[u8; TREE_RECORD]; TREE_SLOTS],
+    },
+    /// Shared garden: the sender planted a seed of `kind` in tree spot `slot` (`TREE_PLANT`) or
+    /// shook its tree (`TREE_SHAKE`) in their copy of garden `area`'s trees; its keeper does it
+    /// for real.
+    TreeAction {
+        area: u8,
+        slot: u8,
+        action: u8,
+        kind: u8,
+    },
+    /// Shared garden `area`: the sender's visiting eggs (their `Body::Chao` index) where they lie,
+    /// or held by the sender (`held`; the position is then their hands').
+    GardenEggs {
+        area: u8,
+        eggs: Vec<(u8, [f32; 3], bool)>,
+    },
+    /// Shared garden: the sender picked up (`held`) or put down player `owner`'s egg `index` (a
+    /// copy of it in their game), at `position`; the owner's game holds the real one there.
+    EggHeld {
+        owner: u8,
+        index: u8,
+        held: bool,
+        position: [f32; 3],
+    },
+    /// Shared garden `area`: the sender's toy `toy` (`TOY_TV`, `TOY_RADIO`, `TOY_BOX`) jumped to
+    /// `mode` (switched on, off or over, by a touch or by itself). From the toys' keeper, the
+    /// others' toy does the same; to the keeper, it does it for real and tells everyone.
+    ToyMode {
+        area: u8,
+        toy: u8,
+        mode: u8,
+    },
     /// Co-op room: the sender's boss in this stage is down to `hp` (its bar started at `full`);
     /// the others' boss drops to it too.
     BossHp {
@@ -392,6 +440,19 @@ impl GardenItem {
     }
 }
 
+/// A garden's tree spots and the bytes of each one's save record.
+pub const TREE_SLOTS: usize = 7;
+pub const TREE_RECORD: usize = 8;
+/// `TreeAction` actions.
+pub const TREE_PLANT: u8 = 0;
+pub const TREE_SHAKE: u8 = 1;
+
+/// `ToyMode` toys, and the highest mode any of them has.
+pub const TOY_TV: u8 = 0;
+pub const TOY_RADIO: u8 = 1;
+pub const TOY_BOX: u8 = 2;
+pub const TOY_MAX_MODE: u8 = 12;
+
 /// Items per `GardenItems` message.
 pub const MAX_GARDEN_ITEMS: usize = 24;
 
@@ -520,6 +581,12 @@ mod tag {
     pub const SKIN_LIST: u8 = 33;
     pub const SKIN_GET: u8 = 34;
     pub const SKIN_CHUNK: u8 = 35;
+    pub const GARDEN_TREES: u8 = 36;
+    pub const TREE_ACTION: u8 = 37;
+    pub const GARDEN_EGGS: u8 = 38;
+    pub const EGG_HELD: u8 = 39;
+    pub const TOY_MODE: u8 = 40;
+    pub const GARDEN_KEEPER: u8 = 41;
 }
 
 fn item_id(r: &mut Reader) -> Result<ItemId> {
@@ -702,8 +769,11 @@ impl Body {
                     .f32(hp[0])
                     .f32(hp[1]);
             }
-            Self::GardenChao(list) => {
-                w.u8(tag::GARDEN_CHAO).u8(list.len() as u8);
+            Self::GardenKeeper { area, term } => {
+                w.u8(tag::GARDEN_KEEPER).u8(*area).u32(*term);
+            }
+            Self::GardenChao { owner, list } => {
+                w.u8(tag::GARDEN_CHAO).u8(*owner).u8(list.len() as u8);
                 for c in list {
                     w.u8(c.index);
                     for v in c.position {
@@ -945,6 +1015,51 @@ impl Body {
                     w.f32(*v);
                 }
             }
+            Self::GardenTrees { area, trees } => {
+                w.u8(tag::GARDEN_TREES).u8(*area);
+                for b in trees.iter().flatten() {
+                    w.u8(*b);
+                }
+            }
+            Self::TreeAction {
+                area,
+                slot,
+                action,
+                kind,
+            } => {
+                w.u8(tag::TREE_ACTION)
+                    .u8(*area)
+                    .u8(*slot)
+                    .u8(*action)
+                    .u8(*kind);
+            }
+            Self::GardenEggs { area, eggs } => {
+                w.u8(tag::GARDEN_EGGS).u8(*area).u8(eggs.len() as u8);
+                for (index, position, held) in eggs {
+                    w.u8(*index);
+                    for v in position {
+                        w.f32(*v);
+                    }
+                    w.u8(u8::from(*held));
+                }
+            }
+            Self::ToyMode { area, toy, mode } => {
+                w.u8(tag::TOY_MODE).u8(*area).u8(*toy).u8(*mode);
+            }
+            Self::EggHeld {
+                owner,
+                index,
+                held,
+                position,
+            } => {
+                w.u8(tag::EGG_HELD)
+                    .u8(*owner)
+                    .u8(*index)
+                    .u8(u8::from(*held));
+                for v in position {
+                    w.f32(*v);
+                }
+            }
             Self::BossHp {
                 level,
                 mission,
@@ -1069,7 +1184,15 @@ impl Body {
                     hp: [r.f32(MAX_KARATE_HP)?, r.f32(MAX_KARATE_HP)?],
                 }
             }
+            tag::GARDEN_KEEPER => {
+                let (area, term) = (r.u8()?, r.u32()?);
+                if !(1..=3).contains(&area) {
+                    return Err(WireError::BadValue("garden keeper"));
+                }
+                Self::GardenKeeper { area, term }
+            }
             tag::GARDEN_CHAO => {
+                let owner = player_id(r)?;
                 let count = usize::from(r.u8()?);
                 if count > MAX_CARRIED_CHAO {
                     return Err(WireError::BadValue("garden chao count"));
@@ -1111,7 +1234,7 @@ impl Body {
                         cocoon,
                     });
                 }
-                Self::GardenChao(list)
+                Self::GardenChao { owner, list }
             }
             tag::CHAO_CHANGES => {
                 let (owner, index, count) = (player_id(r)?, r.u8()?, usize::from(r.u8()?));
@@ -1378,6 +1501,69 @@ impl Body {
                     velocity,
                 }
             }
+            tag::GARDEN_TREES => {
+                let area = r.u8()?;
+                if !(1..=3).contains(&area) {
+                    return Err(WireError::BadValue("garden trees"));
+                }
+                let mut trees = [[0u8; TREE_RECORD]; TREE_SLOTS];
+                for b in trees.iter_mut().flatten() {
+                    *b = r.u8()?;
+                }
+                Self::GardenTrees { area, trees }
+            }
+            tag::TREE_ACTION => {
+                let (area, slot, action, kind) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
+                if !(1..=3).contains(&area)
+                    || usize::from(slot) >= TREE_SLOTS
+                    || action > TREE_SHAKE
+                {
+                    return Err(WireError::BadValue("tree action"));
+                }
+                Self::TreeAction {
+                    area,
+                    slot,
+                    action,
+                    kind,
+                }
+            }
+            tag::GARDEN_EGGS => {
+                let (area, count) = (r.u8()?, usize::from(r.u8()?));
+                if !(1..=3).contains(&area) || count > MAX_CARRIED_CHAO {
+                    return Err(WireError::BadValue("garden eggs"));
+                }
+                let mut eggs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let index = r.u8()?;
+                    let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                    let held = r.u8()?;
+                    if usize::from(index) >= MAX_CARRIED_CHAO || held > 1 {
+                        return Err(WireError::BadValue("garden egg"));
+                    }
+                    eggs.push((index, position, held == 1));
+                }
+                Self::GardenEggs { area, eggs }
+            }
+            tag::TOY_MODE => {
+                let (area, toy, mode) = (r.u8()?, r.u8()?, r.u8()?);
+                if !(1..=3).contains(&area) || toy > TOY_BOX || mode > TOY_MAX_MODE {
+                    return Err(WireError::BadValue("toy mode"));
+                }
+                Self::ToyMode { area, toy, mode }
+            }
+            tag::EGG_HELD => {
+                let (owner, index, held) = (player_id(r)?, r.u8()?, r.u8()?);
+                let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                if usize::from(index) >= MAX_CARRIED_CHAO || held > 1 {
+                    return Err(WireError::BadValue("egg held"));
+                }
+                Self::EggHeld {
+                    owner,
+                    index,
+                    held: held == 1,
+                    position,
+                }
+            }
             tag::BOSS_HP => {
                 let (level, mission) = (r.i16()?, r.u8()?);
                 let (hp, full) = (r.f32(MAX_BOSS_HP)?, r.f32(MAX_BOSS_HP)?);
@@ -1516,23 +1702,26 @@ mod tests {
             },
             Message::Game {
                 from: 2,
-                body: Body::GardenChao(vec![
-                    GardenChao {
-                        index: 0,
-                        position: [10.0, 0.5, -30.0],
-                        rotation_y: 0x8000,
-                        motion: 0x101,
-                        held: true,
-                        offset: [0.0, 4.0, 1.2],
-                        bubble: (4, 30, 180),
-                        eyes: 9,
-                        mouth: 3,
-                        props: [5, 0, 20],
-                        drum: 200,
-                        cocoon: 2,
-                    },
-                    GardenChao::default(),
-                ]),
+                body: Body::GardenChao {
+                    owner: 3,
+                    list: vec![
+                        GardenChao {
+                            index: 0,
+                            position: [10.0, 0.5, -30.0],
+                            rotation_y: 0x8000,
+                            motion: 0x101,
+                            held: true,
+                            offset: [0.0, 4.0, 1.2],
+                            bubble: (4, 30, 180),
+                            eyes: 9,
+                            mouth: 3,
+                            props: [5, 0, 20],
+                            drum: 200,
+                            cocoon: 2,
+                        },
+                        GardenChao::default(),
+                    ],
+                },
             },
             Message::Game {
                 from: 4,
@@ -1742,6 +1931,50 @@ mod tests {
                     claim: 7,
                     position: [1.5, 0.0, -40.0],
                     velocity: [0.25, -0.5, 1.0],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::GardenTrees {
+                    area: 3,
+                    trees: [[5, 3, 40, 90, 10, 200, 0, 0x70]; TREE_SLOTS],
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::GardenEggs {
+                    area: 2,
+                    eggs: vec![(0, [1.0, 2.0, 3.0], false), (3, [-4.5, 0.0, 9.0], true)],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::GardenKeeper { area: 3, term: 7 },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::ToyMode {
+                    area: 2,
+                    toy: TOY_RADIO,
+                    mode: 5,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::EggHeld {
+                    owner: 3,
+                    index: 3,
+                    held: true,
+                    position: [10.0, 0.5, -2.0],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::TreeAction {
+                    area: 1,
+                    slot: 6,
+                    action: TREE_SHAKE,
+                    kind: 0,
                 },
             },
             Message::Game {

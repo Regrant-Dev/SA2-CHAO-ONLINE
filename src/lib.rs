@@ -1,13 +1,16 @@
 //! SA2 Chao Online: mod DLL loaded by SA2 Mod Loader.
 
+mod audio;
 mod battles;
 mod boot_art;
 mod bosses;
 pub mod chao;
 mod chat;
 mod coop;
+mod eggs;
 pub mod game;
 mod garden;
+mod garden_toys;
 mod goto;
 mod hide;
 mod hud;
@@ -17,6 +20,7 @@ mod items;
 mod karate;
 mod karate_live;
 mod kart;
+mod keeper;
 mod log;
 mod menu;
 mod modloader;
@@ -34,9 +38,11 @@ mod stage_race;
 mod timeline;
 mod together;
 mod toys;
+mod trees;
 mod visitors;
 mod voice;
 mod watch;
+mod whistle;
 
 use std::ffi::{CStr, c_char};
 use std::panic;
@@ -109,6 +115,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     race::install();
     guarded("online init", || online::init(&path));
     guarded("skins init", || skins::init(&path));
+    guarded("audio init", || audio::init(&path));
     guarded("boot art", || boot_art::install(&path));
     watch::start();
 }

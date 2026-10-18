@@ -366,8 +366,16 @@ REA; Knuckles 0x72DCE0) starts its own shadow map (0x495A90(0x80, position, Char
 ...)), sets its texture list, pushes a matrix, applies its place and turn as the display does,
 draws the body with DrawMotion, sets renderer +0x34(1), and lays the shadow on the ground
 (0x495D20(1, 50.0, CharObj2 +0x308, ...)). Under a skin it runs as it is, but its DrawMotion is
-replaced (src/hide.rs `replacing`): the skin is drawn there from the matrix the display began
-with, in the pose it had in the display. A rigged skin's own root goes as it is. Hiding the
+replaced (src/hide.rs `replacing`): the skin is drawn there in the pose it had in the display,
+from the matrix under the character's. 0x495A90 pushes a matrix and builds the light's view
+in it (identity, then 0x427330/0x427180/0x4270E0), and the +0x2C pushes another for its place
+and turn, so the light's view is one below the top at DrawMotion. The stack top as +0x2C
+begins is the camera's: drawn from there, nothing lands in the shadow map.
+- **Culling.** DrawMotion's node draw 0x42E660, when `0x25F02D8` & 0x100, tests the model's
+  sphere (0x42F640, against the current projection: in this pass the light's) unless its radius
+  is 0.0 (compared with 0x8AF004), and skips the draw if it's out. Our converters gave skin
+  models a radius of 10000 ("never culled"), which this test can cull. The mod now sets every
+  skin model's radius to 0 when it loads one. A rigged skin's own root goes as it is. Hiding the
 whole call (the first try) also drops the shadow laid on the ground.
 
 **Separate objects.** The jump ball is a JumpAura object per frame (re/spin-ball.md), drawn by

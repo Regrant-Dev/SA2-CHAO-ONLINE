@@ -39,6 +39,8 @@ const OBJ_MODEL: usize = 0x04;
 const OBJ_CHILD: usize = 0x2C;
 const OBJ_SIBLING: usize = 0x30;
 const MODEL_SIZE: usize = 0x18;
+/// NJS_CNK_MODEL: vertex list, polygon list, centre, radius.
+const MODEL_RADIUS: usize = 0x14;
 
 /// The model table: `{index, NJS_OBJECT*}` x 532; we use the pointer field.
 const MODEL_TABLE: usize = 0x01DE_9624;
@@ -425,6 +427,7 @@ fn load_model(bytes: &[u8], textures: usize) -> Result<Model, String> {
     let mut tex_ids = Vec::new();
     let mut vertices = 0;
     let mut plists = Vec::new();
+    let mut models = Vec::new();
     let mut todo = vec![u32_at(8).unwrap_or(0) as usize];
     while let Some(obj) = todo.pop() {
         if obj == 0 || !seen_objects.insert(obj) {
@@ -455,6 +458,7 @@ fn load_model(bytes: &[u8], textures: usize) -> Result<Model, String> {
         if !in_range(model, MODEL_SIZE) {
             return Err(format!("model at {model:#x}"));
         }
+        models.push(model);
         let (vlist, plist) = (
             u32_at(model).unwrap_or(0) as usize,
             u32_at(model + 4).unwrap_or(0) as usize,
@@ -509,6 +513,12 @@ fn load_model(bytes: &[u8], textures: usize) -> Result<Model, String> {
     for at in pointers {
         let w = &mut words[at / 4];
         *w = (base + *w as usize) as u32;
+    }
+    // Radius 0: never left out. The node draw (0x42E660) tests a model's sphere against the
+    // view unless its radius is 0.0 (0x8AF004); later nodes use earlier ones' vertices, and in
+    // the shadow map's small view a big sphere is left out (re/skins.md "The shadow pass").
+    for model in models {
+        words[(model + MODEL_RADIUS) / 4] = 0;
     }
     Ok(Model {
         words,
@@ -900,6 +910,21 @@ pub fn init(mod_path: &str) {
     if let Some(id) = &mine {
         log!("skins: wearing {id}");
     }
+    // And how loud their voices are (`SkinVoiceVolume=<percent>`).
+    if let Some(percent) = std::fs::read_to_string(Path::new(mod_path).join("config.ini"))
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                k.trim()
+                    .eq_ignore_ascii_case("skinvoicevolume")
+                    .then(|| v.trim().parse::<u32>().ok())
+                    .flatten()
+            })
+        })
+    {
+        crate::voice::set_volume(percent);
+    }
     *SKINS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Skins {
         dir,
         list,
@@ -1170,6 +1195,7 @@ pub fn on_frame() {
     };
     crate::voice::frame(voice.as_deref());
     hide::set_jump_ball_hidden(wanted);
+    log_shadow_pass();
     if object == 0 {
         return;
     }
@@ -1259,10 +1285,48 @@ fn fresh_drawn() -> Option<Drawn> {
         .filter(|d| now.wrapping_sub(d.frame) <= 1 && texlist_ok(d.texlist))
 }
 
-/// The matrix stack's top as our shadow display began, and a rigged skin's root (it goes in
-/// through the character's own drawing).
-static SHADOW_TOP: AtomicUsize = AtomicUsize::new(0);
+/// A rigged skin's root while our shadow display runs (it goes in through the character's own
+/// drawing).
 static SHADOW_RIG: AtomicUsize = AtomicUsize::new(0);
+/// One matrix of the game's stack (12 floats).
+const MATRIX_SIZE: usize = 0x30;
+
+/// Diagnostics of the shadow pass (logged now and then while a skin is on): our shadow display
+/// ran, a body was offered, the skin was drawn for it, there was no pose to draw; and the
+/// matrices it was last drawn between.
+static SHADOW_RUNS: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_OFFERED: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_DRAWN: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_NO_POSE: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_LAST: Mutex<String> = Mutex::new(String::new());
+
+/// Logs the shadow pass diagnostics every few seconds, while there are any.
+fn log_shadow_pass() {
+    if !FRAME.load(Ordering::Relaxed).is_multiple_of(300) {
+        return;
+    }
+    let runs = SHADOW_RUNS.swap(0, Ordering::Relaxed);
+    if runs == 0 {
+        return;
+    }
+    log!(
+        "skins: shadow pass: {runs} runs, {} bodies offered, {} skins drawn, {} without a pose; {}",
+        SHADOW_OFFERED.swap(0, Ordering::Relaxed),
+        SHADOW_DRAWN.swap(0, Ordering::Relaxed),
+        SHADOW_NO_POSE.swap(0, Ordering::Relaxed),
+        SHADOW_LAST.lock().unwrap_or_else(|e| e.into_inner())
+    );
+}
+
+/// The first row and translation of the matrix at `at` (for the diagnostics).
+fn matrix_summary(at: usize) -> String {
+    // SAFETY: a matrix of the game's stack (12 floats).
+    let m = unsafe { std::slice::from_raw_parts(at as *const f32, 12) };
+    format!(
+        "[{:.2} {:.2} {:.2} | {:.1} {:.1} {:.1}]",
+        m[0], m[1], m[2], m[3], m[7], m[11]
+    )
+}
 
 /// The character's shadow display (re/skins.md "The shadow pass"): it starts a shadow map for the
 /// character (0x495A90), draws the body into it with DrawMotion, and lays the shadow on the
@@ -1272,7 +1336,7 @@ extern "C" fn player_shadow(object: usize) {
     if original == 0 {
         return;
     }
-    SHADOW_TOP.store(crate::puppet::matrix_top(), Ordering::Relaxed);
+    SHADOW_RUNS.fetch_add(1, Ordering::Relaxed);
     let rigged = std::panic::catch_unwind(|| {
         let player = game::local_player()?;
         let co2 = game::local_char_obj2() as usize;
@@ -1304,23 +1368,38 @@ extern "C" fn player_shadow(object: usize) {
 /// A body the shadow display draws: a rigged skin's own goes as it is; any other is the
 /// character's, and the skin is drawn instead, as it was in the display. Nonzero: drawn here.
 extern "C" fn shadow_body(model: usize) -> u32 {
+    SHADOW_OFFERED.fetch_add(1, Ordering::Relaxed);
     let rig = SHADOW_RIG.load(Ordering::Relaxed);
     if rig != 0 && model == rig {
         return 0;
     }
     let Some(drawn) = fresh_drawn() else {
+        SHADOW_NO_POSE.fetch_add(1, Ordering::Relaxed);
         // A rigged skin's character's other body: nothing rather than the character.
         return u32::from(rig != 0);
     };
-    // From the matrix the display began with: the skin has its own place, turn and size.
+    // From the matrix under the character's own (its place and turn are pushed on the light's
+    // view that 0x495A90 pushed): the skin has its own place, turn and size.
     let top = crate::puppet::matrix_top();
-    // SAFETY: the shadow pass on the game thread; the stack top as the display began, put
-    // back right after; the pose kept from this or the last frame's display.
+    let Some(under) = top.checked_sub(MATRIX_SIZE) else {
+        return 1;
+    };
+    // SAFETY: the shadow pass on the game thread; the matrix under the current one, the top
+    // put back right after; the pose kept from this or the last frame's display.
+    *SHADOW_LAST.lock().unwrap_or_else(|e| e.into_inner()) = format!(
+        "top {top:#x} {} under {} at {:.1} {:.1} {:.1}",
+        matrix_summary(top),
+        matrix_summary(under),
+        drawn.position[0],
+        drawn.position[1],
+        drawn.position[2]
+    );
     unsafe {
-        crate::puppet::set_matrix_top(SHADOW_TOP.load(Ordering::Relaxed));
+        crate::puppet::set_matrix_top(under);
         draw_drawn(drawn);
         crate::puppet::set_matrix_top(top);
     }
+    SHADOW_DRAWN.fetch_add(1, Ordering::Relaxed);
     1
 }
 

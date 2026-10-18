@@ -242,10 +242,30 @@ static VOICE_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 /// Set while a voiced skin is on: the hook drops character voices and leaves the id here.
 static MUTE: AtomicU8 = AtomicU8::new(0);
+
+/// The player's skin voice volume (F9 menu, config.ini `SkinVoiceVolume`), percent, on top of each
+/// skin's own `voice_volume`.
+static VOLUME: AtomicU32 = AtomicU32::new(100);
+pub const MAX_VOLUME: u32 = 150;
+
+/// Skin voices at `percent` of their own loudness (up to `MAX_VOLUME`).
+pub fn set_volume(percent: u32) {
+    VOLUME.store(percent.min(MAX_VOLUME), Ordering::Relaxed);
+}
+
+/// `samples` (16-bit PCM) at `factor` of their loudness, held within range.
+fn scale(samples: &mut [u8], factor: f32) {
+    for s in samples.as_chunks_mut::<2>().0 {
+        let v = f32::from(i16::from_le_bytes(*s)) * factor;
+        *s = (v.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16).to_le_bytes();
+    }
+}
 static PENDING: AtomicU32 = AtomicU32::new(0);
 
 struct Clip {
     wav: Box<[u8]>,
+    /// Where its samples are in `wav`.
+    samples: std::ops::Range<usize>,
     length: Duration,
 }
 
@@ -657,7 +677,11 @@ fn play(s: &mut State, m: Moment) {
     }
     let (k, n) = choices[next(&mut s.rng) as usize % choices.len()];
     let clip = &v.clips[k][n];
-    let wav = clip.wav.clone();
+    let mut wav = clip.wav.clone();
+    let volume = VOLUME.load(Ordering::Relaxed);
+    if volume != 100 {
+        scale(&mut wav[clip.samples.clone()], volume as f32 / 100.0);
+    }
     let end = now + clip.length;
     start(&wav);
     s.playing = Some((wav, end, m.priority()));
@@ -761,12 +785,11 @@ fn clip(mut wav: Vec<u8>, volume: f32) -> Result<Clip, String> {
     else {
         return Err("not 16-bit PCM".into());
     };
-    for s in wav[from..to].as_chunks_mut::<2>().0 {
-        *s = ((i16::from_le_bytes(*s) as f32 * volume) as i16).to_le_bytes();
-    }
+    scale(&mut wav[from..to], volume);
     let samples = (to - from) / 2 / channels as usize;
     Ok(Clip {
         wav: wav.into_boxed_slice(),
+        samples: from..to,
         length: Duration::from_secs_f32(samples as f32 / rate as f32),
     })
 }

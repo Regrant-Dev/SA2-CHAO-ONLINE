@@ -1,4 +1,4 @@
-# Network protocol (v19)
+# Network protocol (v20)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -58,9 +58,9 @@ Game bodies:
 | 8 | KarateEnd | reliable | code u8 (2 knockout/ring-out, 3 time up), result u8 (0/1 winning side, 2 draw), hp f32×2 |
 | 9 | KarateCheer | reliable | count u8: the member cheered (A) this many times |
 | 10 | StageKills | reliable | level i16 (0..=100), mission u8 (0..=4), count u16 (≤ 0x600), then count × u16 object index (< 0x600): co-op room, these stage objects (`SETObjectData` record indices, re/stage-objects.md) were destroyed. New kills as they happen; the whole list when a room player enters the stage (sent by the room players already in it) |
-| 11 | GardenChao | 30 Hz, unreliable | count u8 (≤ 2), then per Chao: index u8 (< 2), position f32×3, rotation_y i32, motion u16, held u8 (0/1), offset f32×3, mood (current state i16, timer i32, length i32), eyes i16, mouth i16, props u8×3 (per attach point 4/11/35: 0 none, else 1 + index into `garden::PROPS`, ≤ 20), drum u8 (size 0..=255, 0 none), cocoon u8 (0 none, 1 + kind 0..=2): the sender's visiting Chao as they are in their game (re/chao-garden-sync.md); offset = where it is relative to the sender while held, in the sender's frame |
-| 12 | ChaoChanges | reliable | owner u8, index u8 (< 2), count u8 (≤ 128), then count × (offset u16 (< 0x800), value f32): the sender's interaction changed `owner`'s visiting Chao; `chao::changes` deltas (or values for animal parts) for the owner to apply to the real one |
-| 13 | ChaoHeld | 30 Hz, unreliable | owner u8, index u8 (< 2), offset f32×3: the sender is holding `owner`'s Chao `index` |
+| 11 | GardenChao | 30 Hz, unreliable | owner u8, count u8 (≤ 4), then per Chao: index u8 (< 4), position f32×3, rotation_y i32, motion u16, held u8 (0/1), offset f32×3, mood (current state i16, timer i32, length i32), eyes i16, mouth i16, props u8×3 (per attach point 4/11/35: 0 none, else 1 + index into `garden::PROPS`, ≤ 20), drum u8 (size 0..=255, 0 none), cocoon u8 (0 none, 1 + kind 0..=2): player `owner`'s visiting Chao as they are in the sender's game (re/chao-garden-sync.md). Each player sends their own (that's how the others know they visit); the garden's keeper also sends everyone else's, and the others' copies follow the keeper's; offset = where it is relative to the sender while held, in the sender's frame |
+| 12 | ChaoChanges | reliable | owner u8, index u8 (< 4), count u8 (≤ 128), then count × (offset u16 (< 0x800), value f32): the sender's interaction changed `owner`'s visiting Chao; `chao::changes` deltas (or values for animal parts) for the owner to apply to the real one, and for the garden's keeper to apply to the copy it runs. The keeper also sends what its visitors' AI changed, about once a second |
+| 13 | ChaoHeld | 30 Hz, unreliable | owner u8, index u8 (< 4), offset f32×3: the sender is holding `owner`'s Chao `index`; the game running it (the keeper's, or with nobody keeping the owner's) shows it in their hands |
 | 14 | GardenItems | ~10 Hz, unreliable | area u8 (1..=3), count u8 (≤ 24), then per item: id (origin u8, serial u16), category u8 (2/3/7/9), kind u8, bites u8 (≤ 4), place u8 (0 ground, 1 held by the sender, 2 held/eaten by their visiting Chao, 3 in use unseen), chao u8 (place 2: Chao index < 2), position f32×3 (ground/unseen: where; held: offset in the holder's frame): items the sender owns in that garden (src/items.rs) |
 | 15 | ItemClaim | reliable, to the host only | id: the sender picked up (or a Chao in their game took) item `id` and asks to own it. The host's referee answers; it is never passed on |
 | 16 | ItemOwner | reliable, from the host | id, owner u8: item `id` belongs to `owner` (to everyone when a claim is granted, to the claimer alone when refused) |
@@ -83,6 +83,12 @@ Game bodies:
 | 33 | SkinList | reliable, from the host | page u16, pages u16, count u8 (≤ 48), then count × (path str ≤ 96, size u32 (≤ 16 MB), hash [u8;8] FNV-1a 64): the host's shared skin files (file index = page × 48 + position) |
 | 34 | SkinGet | unreliable, to the host | file u16 (< 1024), offset u32 |
 | 35 | SkinChunk | unreliable, from the host | file u16, offset u32, len u16 (1..=1024), data |
+| 36 | GardenTrees | 1 Hz unreliable | area u8 (1..=3), 7 × 8 bytes: shared garden, the sender keeps this garden's trees (the lowest player id there) and these are its 7 tree records as their save has them (kind, state, growth, life, fruit ×3, facing); the others show copies of them (`trees.rs`) |
+| 37 | TreeAction | reliable | area u8 (1..=3), slot u8 (< 7), action u8 (0 plant, 1 shake), kind u8 (the seed's): the sender planted in or shook their copy of that tree; its keeper does it for real (a planted seed, or one shake of ripe fruit) |
+| 38 | GardenEggs | ~10 Hz unreliable | area u8 (1..=3), count u8, count × (index u8 (< 4), position f32×3, held u8 (0/1)): the sender's visiting eggs (their Chao index) where they lie, or held by the sender (`eggs.rs`) |
+| 39 | EggHeld | reliable | owner u8, index u8 (< 4), held u8 (0/1), position f32×3: the sender picked up or put down a copy of player `owner`'s egg `index`; the owner's game holds the real one there |
+| 40 | ToyMode | reliable | area u8 (1..=3), toy u8 (0 TV, 1 radio, 2 jack-in-the-box), mode u8 (<= 12): the sender's toy jumped to that mode. From the toys' keeper (the garden's lowest player id), the others' toy jumps too; from anyone else (a touch), the keeper makes the jump and sends it on (`garden_toys.rs`) |
+| 41 | GardenKeeper | 4 Hz unreliable | area u8 (1..=3), term u32: the sender keeps that garden (runs its Chao, trees and toys; `keeper.rs`). The others follow the claim with the higher term (then the lower id); with nobody claiming for a moment the lowest id in the garden claims with a higher term |
 
 ## Skins (`net/files.rs`, `skin_sync.rs`)
 

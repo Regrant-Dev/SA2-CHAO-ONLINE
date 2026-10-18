@@ -18,9 +18,9 @@ use crate::chao::{self, ChaoData, file};
 use crate::game;
 use crate::log;
 
-/// Visitors per garden visit (Chao from files and other players' Chao together). The garden's own
-/// Chao count too, so keep this modest until the garden's object limits are known.
-pub const MAX_VISITORS: usize = 6;
+/// Visitors per garden visit (Chao from files and other players' Chao together): three friends'
+/// four each. With the garden's own (at most 8) that's 20 of the Chao registry's 32 entries.
+pub const MAX_VISITORS: usize = 12;
 
 /// Where a visitor came from, so the same Chao isn't spawned twice in one visit.
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +164,7 @@ pub fn on_frame() {
     if changed {
         // Left the garden, or went straight to another one.
         crate::garden::clear();
+        crate::eggs::clear();
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         if pool
             .buffers
@@ -284,9 +285,10 @@ fn import_visitors(mod_path: &str) {
 /// Spawns another player's Chao next to `near` (their puppet), once per garden visit.
 /// Returns false when it was already spawned or the visitor limit is reached.
 pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -> bool {
-    if !game::in_garden() || chao.validate().is_err() || chao.chao_type() == chao::TYPE_EGG {
+    if !game::in_garden() || chao.validate().is_err() {
         return false;
     }
+    let egg = chao.chao_type() == chao::TYPE_EGG;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let source = Source::Player { id: player, index };
     if pool.has(&source) || pool.count() >= MAX_VISITORS {
@@ -298,7 +300,12 @@ pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -
         z: near.z + 6.0,
     };
     let object = spawn(&mut pool, source, chao, position, 0);
-    crate::garden::spawned(player, index, object);
+    // An egg is an egg object, not a Chao: eggs.rs looks after it.
+    if egg {
+        crate::eggs::spawned(player, index, object);
+    } else {
+        crate::garden::spawned(player, index, object);
+    }
     true
 }
 

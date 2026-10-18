@@ -21,7 +21,7 @@
         <HelpText>The Chao you race and fight with. Easier to pick in game: F9 > My Chao.</HelpText>
       </Property>
       <Property name="VisitWith" display="Visit friends" type="VisitWith" defaultvalue="On" alwaysinclude="true">
-        <HelpText>On: up to 2 Chao from the garden you're in visit friends in the same garden. Off: they stay home.</HelpText>
+        <HelpText>On: up to 4 Chao from the garden you're in visit friends in the same garden. Off: they stay home.</HelpText>
       </Property>
       <Property name="Visitor1" display="Visitor 1 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
         <HelpText>Which Chao visits first. Easier to pick in game: F9 > Visitor 1.</HelpText>
@@ -29,8 +29,20 @@
       <Property name="Visitor2" display="Visitor 2 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
         <HelpText>Which Chao visits second. Easier to pick in game: F9 > Visitor 2.</HelpText>
       </Property>
+      <Property name="Visitor3" display="Visitor 3 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Which Chao visits third. Easier to pick in game: F9 > Visitor 3.</HelpText>
+      </Property>
+      <Property name="Visitor4" display="Visitor 4 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Which Chao visits fourth. Easier to pick in game: F9 > Visitor 4.</HelpText>
+      </Property>
       <Property name="RoomMode" display="Room mode (rooms you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
         <HelpText>Race: everyone has their own enemies. Coop: enemies someone destroys are gone for everyone.</HelpText>
+      </Property>
+      <Property name="SkinVoiceVolume" display="Skin voice volume (%)" type="int" defaultvalue="100" minvalue="0" maxvalue="150" alwaysinclude="true">
+        <HelpText>How loud skins' voices are, 0 to 150 (100 = as the skin makes them). Also in game: F9 > Skin voices.</HelpText>
+      </Property>
+      <Property name="GameVolume" display="Game volume (%)" type="int" defaultvalue="100" minvalue="0" maxvalue="100" alwaysinclude="true">
+        <HelpText>The whole game's volume: music, sounds, voices and skins (the game has no volume option of its own). Also in game: F9 > Game volume.</HelpText>
       </Property>
       <Property name="ChaoRace" display="Friends' Chao in races" type="bool" defaultvalue="True" alwaysinclude="true">
         <HelpText>Friends' Chao fill the other lanes in your Chao Races.</HelpText>

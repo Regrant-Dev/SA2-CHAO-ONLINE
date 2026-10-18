@@ -9,14 +9,17 @@ use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::audio;
 use crate::hud;
 use crate::input::{self, Hotkey};
 use crate::karate;
+use crate::net::protocol::MAX_CARRIED_CHAO;
 use crate::online;
 use crate::puppet;
 use crate::race;
 use crate::room;
 use crate::together;
+use crate::voice;
 
 const VK_BACK: i32 = 0x08;
 const VK_RETURN: i32 = 0x0D;
@@ -43,6 +46,10 @@ enum Row {
     NameTags,
     /// Our skin (a model drawn in place of our character or kart).
     Skin,
+    /// How loud skins' voices are.
+    VoiceVolume,
+    /// How loud the whole game is.
+    GameVolume,
     Room,
     RoomMode,
     GoTo,
@@ -73,7 +80,13 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
         "Join" => rows.push(Row::Host),
         _ => {}
     }
-    rows.extend([Row::NameTags, Row::Skin, Row::Room]);
+    rows.extend([
+        Row::NameTags,
+        Row::Skin,
+        Row::VoiceVolume,
+        Row::GameVolume,
+        Row::Room,
+    ]);
     if room::summary().is_some() {
         rows.extend([Row::RoomInfo, Row::RoomMode]);
     }
@@ -86,7 +99,7 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
     rows.extend([Row::MyChao, Row::Visits]);
     if visits != 0 {
-        rows.extend([Row::Visitor(0), Row::Visitor(1)]);
+        rows.extend((0..MAX_CARRIED_CHAO).map(Row::Visitor));
     }
     rows.extend([Row::Race, Row::Karate]);
     if online::status().is_some() {
@@ -97,6 +110,8 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
     rows
 }
 const MAX_NAME: usize = crate::net::protocol::MAX_NAME;
+/// Skin voice and game volume change by this much a press.
+const VOLUME_STEP: u32 = 10;
 const MAX_HOST: usize = 64;
 
 const COLOR_TITLE: i32 = 0xFFFF_E080u32 as i32;
@@ -117,11 +132,15 @@ pub struct Settings {
     /// Visit friends: 0 off, 1 on (index into `online::VISIT_MODES`).
     pub visits: usize,
     /// Visitor 1 and 2: a save slot, `online::VISITOR_AUTO` or `online::VISITOR_NONE`.
-    pub visitors: [i32; 2],
+    pub visitors: [i32; MAX_CARRIED_CHAO],
     /// Mode of rooms we create.
     pub room_mode: room::Mode,
     /// Our skin's id (`skins::list`), empty for none.
     pub skin: String,
+    /// Skin voice volume, percent (`voice::set_volume`).
+    pub voice_volume: u32,
+    /// The game's volume, percent (`audio::set_volume`).
+    pub game_volume: u32,
 }
 
 impl Settings {
@@ -136,9 +155,11 @@ impl Settings {
             chao_race: true,
             my_chao: -1,
             visits: 1,
-            visitors: [online::VISITOR_AUTO; 2],
+            visitors: [online::VISITOR_AUTO; MAX_CARRIED_CHAO],
             room_mode: room::Mode::Race,
             skin: String::new(),
+            voice_volume: 100,
+            game_volume: 100,
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -159,10 +180,22 @@ impl Settings {
                 "port" if !v.is_empty() => s.port = v,
                 "mychao" => s.my_chao = v.parse().unwrap_or(-1),
                 "visitwith" => s.visits = online::parse_visits(&v),
-                "visitor1" => s.visitors[0] = online::parse_visitor(&v),
-                "visitor2" => s.visitors[1] = online::parse_visitor(&v),
+                k if k.starts_with("visitor") => {
+                    if let Some(i) = k["visitor".len()..]
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .filter(|&i| i < MAX_CARRIED_CHAO)
+                    {
+                        s.visitors[i] = online::parse_visitor(&v);
+                    }
+                }
                 "roommode" => s.room_mode = room::Mode::parse(&v),
                 "skin" => s.skin = v.to_ascii_lowercase(),
+                "gamevolume" => s.game_volume = v.parse::<u32>().map_or(100, |p| p.min(100)),
+                "skinvoicevolume" => {
+                    s.voice_volume = v.parse::<u32>().map_or(100, |p| p.min(voice::MAX_VOLUME))
+                }
                 "chaorace" => {
                     s.chao_race = !matches!(
                         v.to_ascii_lowercase().as_str(),
@@ -185,7 +218,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\nVisitor1={}\nVisitor2={}\nRoomMode={}\nSkin={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n{}RoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -194,10 +227,15 @@ impl Settings {
             if self.chao_race { "On" } else { "Off" },
             self.my_chao,
             ["Off", "On"][self.visits.min(1)],
-            self.visitors[0],
-            self.visitors[1],
+            self.visitors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("Visitor{}={v}\n", i + 1))
+                .collect::<String>(),
             self.room_mode.ini(),
             self.skin,
+            self.voice_volume,
+            self.game_volume,
         )
     }
 }
@@ -251,9 +289,11 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         chao_race: true,
         my_chao: -1,
         visits: 1,
-        visitors: [-1; 2],
+        visitors: [-1; MAX_CARRIED_CHAO],
         room_mode: crate::room::Mode::Race,
         skin: String::new(),
+        voice_volume: 100,
+        game_volume: 100,
     },
     message: String::new(),
     keys: Vec::new(),
@@ -360,14 +400,17 @@ pub fn on_frame() {
             );
         }
         Row::Visitor(i) if left || right => {
-            // Auto, then each hatched Chao the other row hasn't picked, then None.
-            let other = m.settings.visitors[1 - i];
+            // Auto, then each hatched Chao no other row has picked, then None.
+            let others: Vec<i32> = (0..MAX_CARRIED_CHAO)
+                .filter(|&j| j != i)
+                .map(|j| m.settings.visitors[j])
+                .collect();
             let mut options = vec![online::VISITOR_AUTO];
             options.extend(
-                online::hatched_chao()
+                online::garden_chao()
                     .iter()
                     .map(|(slot, _)| *slot as i32)
-                    .filter(|&slot| slot != other),
+                    .filter(|slot| !others.contains(slot)),
             );
             options.push(online::VISITOR_NONE);
             let at = options
@@ -451,6 +494,32 @@ pub fn on_frame() {
                 .checked_sub(1)
                 .map_or_else(String::new, |i| list[i].0.clone());
             crate::skins::set_mine((!m.settings.skin.is_empty()).then(|| m.settings.skin.clone()));
+            let _ = fs::write(
+                Path::new(online::mod_path()).join("config.ini"),
+                m.settings.to_ini(),
+            );
+        }
+        Row::VoiceVolume if left || right => {
+            let v = m.settings.voice_volume;
+            m.settings.voice_volume = if left {
+                v.saturating_sub(VOLUME_STEP)
+            } else {
+                (v + VOLUME_STEP).min(voice::MAX_VOLUME)
+            };
+            voice::set_volume(m.settings.voice_volume);
+            let _ = fs::write(
+                Path::new(online::mod_path()).join("config.ini"),
+                m.settings.to_ini(),
+            );
+        }
+        Row::GameVolume if left || right => {
+            let v = m.settings.game_volume;
+            m.settings.game_volume = if left {
+                v.saturating_sub(VOLUME_STEP)
+            } else {
+                (v + VOLUME_STEP).min(100)
+            };
+            audio::set_volume(m.settings.game_volume);
             let _ = fs::write(
                 Path::new(online::mod_path()).join("config.ini"),
                 m.settings.to_ini(),
@@ -554,9 +623,14 @@ fn start_stop(m: &mut Menu) -> String {
 /// A Chao for the menu: "Chao (Neutral garden, slot 2)".
 fn chao_label(slot: usize, chao: &crate::chao::ChaoData) -> String {
     const GARDENS: [&str; 4] = ["?", "Neutral", "Hero", "Dark"];
+    let name = if chao.chao_type() == crate::chao::TYPE_EGG {
+        "Egg".into()
+    } else {
+        karate::chao_name(chao)
+    };
     format!(
         "{} ({} garden, slot {})",
-        karate::chao_name(chao),
+        name,
         GARDENS[usize::from(chao.garden()).min(3)],
         slot + 1
     )
@@ -576,7 +650,7 @@ fn visitor_label(row: usize, slot: i32) -> String {
             None => "Auto".into(),
         },
         slot => {
-            let picked = online::hatched_chao()
+            let picked = online::garden_chao()
                 .into_iter()
                 .find(|(s, _)| *s as i32 == slot)
                 .map_or_else(|| format!("slot {}", slot + 1), |(s, c)| chao_label(s, &c));
@@ -688,6 +762,8 @@ fn draw(m: &Menu, rows: &[Row]) {
                 "Skin:         < {} >",
                 crate::skins::mine_name().unwrap_or_else(|| "None".into())
             ),
+            Row::VoiceVolume => format!("Skin voices:  < {}% >", m.settings.voice_volume),
+            Row::GameVolume => format!("Game volume:  < {}% >", m.settings.game_volume),
             Row::Apply => "[ Apply settings & reconnect ]".into(),
             Row::StartStop if status.is_some() => "[ Stop multiplayer ]".into(),
             Row::StartStop => "[ Save & Start ]".into(),
@@ -747,9 +823,11 @@ mod tests {
             chao_race: false,
             my_chao: 5,
             visits: 1,
-            visitors: [3, -2],
+            visitors: [3, -2, -1, 7],
             room_mode: crate::room::Mode::Coop,
             skin: "race_car".into(),
+            voice_volume: 70,
+            game_volume: 60,
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.
