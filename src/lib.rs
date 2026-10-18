@@ -223,6 +223,11 @@ pub extern "C" fn OnFrame() {
                 );
             } else if skins::restart_hint() {
                 hud::progress("New skins downloaded: restart the game to use them", 1.0);
+            } else if let Some(n) = skin_sync::updated_notice() {
+                hud::progress(
+                    &format!("Skins updated ({n} file{})", if n == 1 { "" } else { "s" }),
+                    1.0,
+                );
             }
         }
 

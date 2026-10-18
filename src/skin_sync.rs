@@ -37,6 +37,24 @@ pub fn take_changed() -> bool {
     CHANGED.swap(false, Ordering::Relaxed)
 }
 
+/// After a download: how many files came, and since when it's been shown (the clock starts
+/// the first time it's drawn, so it isn't over before the menu even shows).
+static UPDATED: std::sync::Mutex<Option<(usize, Option<Instant>)>> = std::sync::Mutex::new(None);
+const UPDATED_FOR: Duration = Duration::from_secs(4);
+
+/// "N files updated", for a few seconds once the menus show it (call only when drawing it).
+pub fn updated_notice() -> Option<usize> {
+    let mut u = UPDATED.lock().unwrap_or_else(|e| e.into_inner());
+    let (count, since) = u.as_mut()?;
+    let since = *since.get_or_insert_with(Instant::now);
+    if since.elapsed() < UPDATED_FOR {
+        Some(*count)
+    } else {
+        *u = None;
+        None
+    }
+}
+
 struct Fetch {
     index: u16,
     file: SkinFile,
@@ -183,6 +201,7 @@ impl SkinSync {
                     log!("skins: {wrote} shared file(s) updated");
                     if *wrote > 0 {
                         CHANGED.store(true, Ordering::Relaxed);
+                        *UPDATED.lock().unwrap_or_else(|e| e.into_inner()) = Some((*wrote, None));
                     }
                     TOTAL.store(0, Ordering::Relaxed);
                     DONE.store(0, Ordering::Relaxed);
