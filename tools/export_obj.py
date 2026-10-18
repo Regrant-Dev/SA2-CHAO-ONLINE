@@ -2,7 +2,7 @@
 """Exports a skin source as an OBJ with its textures (e.g. to upload to Mixamo for animations).
 
     tools/export_obj.py --big "<game>/sonic2app.exe" --game "<game>/resource/gd_PC" <out dir>
-    tools/export_obj.py --gltf skins-src/master_chief_small/scene.gltf <out dir>
+    tools/export_obj.py --gltf skins-src/my_model/scene.gltf <out dir>
 
 The model is turned to face +Z with Y up (what Mixamo expects) and scaled to about 1.7 units
 tall. Reads the player's own game files; the result is for their own use.

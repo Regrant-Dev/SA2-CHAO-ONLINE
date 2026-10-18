@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Animated skins: a model on its own skeleton, with its own animations (re/skins.md).
 
-    tools/skinanim.py <merged.gltf> skins/master_chief --name "Master Chief" [--height 9]
+    tools/skinanim.py <merged.gltf> skins/my_skin --name "My Skin" [--height 9]
 
 The input is a glTF with a skinned mesh and its animations (tools/blender_merge_anims.py makes
-one from Mixamo downloads; SpongeBob's comes that way). The output skin folder holds:
+one from Mixamo downloads; some models come with their animations already). The output skin folder holds:
   model.sa2mdl    the skeleton as a node tree: a hidden root node that turns it to face -X,
                   stand on y = 0 and be --height tall, then one node per bone. Each vertex goes
                   with its strongest bone (small separate pieces, like a rod, whole with their

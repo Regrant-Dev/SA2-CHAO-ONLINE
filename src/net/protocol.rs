@@ -1756,7 +1756,7 @@ mod tests {
             Message::Game {
                 from: 2,
                 body: Body::SkinWorn {
-                    skin: "master_chief".into(),
+                    skin: "space_hero".into(),
                 },
             },
             Message::Game {
@@ -1773,7 +1773,7 @@ mod tests {
                     page: 0,
                     pages: 2,
                     files: vec![SkinFile {
-                        path: "big_anim/sounds/jump/0747 - Whoa.wav".into(),
+                        path: "my_skin/sounds/jump/01 - Whoa.wav".into(),
                         size: 12345,
                         hash: 0xDEAD_BEEF_0123_4567,
                     }],
@@ -1935,9 +1935,9 @@ mod tests {
     #[test]
     fn skin_paths_stay_inside_the_skins_folder() {
         assert!(skin_path_ok(
-            "mint/sounds/happy/05 shijou saikyou - strongest ever.wav"
+            "my_skin/sounds/happy/05 a longer line - and more (2).wav"
         ));
-        assert!(skin_path_ok("big_anim/model.sa2mdl"));
+        assert!(skin_path_ok("my_skin/model.sa2mdl"));
         for bad in [
             "../evil",
             "big/../../evil",
@@ -1956,8 +1956,8 @@ mod tests {
         ] {
             assert!(!skin_path_ok(bad), "{bad}");
         }
-        assert!(skin_id_ok("lightning_mcqueen"));
-        assert!(!skin_id_ok("") && !skin_id_ok("Mint") && !skin_id_ok("a b"));
+        assert!(skin_id_ok("race_car_2"));
+        assert!(!skin_id_ok("") && !skin_id_ok("MySkin") && !skin_id_ok("a b"));
         // A list naming a bad path is refused whole.
         let bad = Message::Game {
             from: 0,

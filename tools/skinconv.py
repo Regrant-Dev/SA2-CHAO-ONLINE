@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turns a glTF model (e.g. a Sketchfab download) into an SA2 Chao Online skin folder.
 
-    tools/skinconv.py <scene.gltf> skins/lightning_mcqueen --name "Lightning McQueen" \
+    tools/skinconv.py <scene.gltf> skins/my_car --name "My Car" \
         --length 16 --characters sonic --kart
 
 Copy the skin folder into the mod's `skins/` folder (the mod puts its textures where the mod

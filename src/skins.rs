@@ -6,7 +6,7 @@
 //! where the mod loader looks for texture packs, and loaded by that name with the game's own
 //! loader.
 //!
-//! A "car" skin (one solid model, like Lightning McQueen) rides on a character: the mod draws
+//! A solid skin (one model, like a car) rides on a character: the mod draws
 //! it at the character's position and angle instead of the character, so the character's moves
 //! (running, grinding, homing) are all still there. In kart races it's drawn as our kart.
 //!
@@ -84,6 +84,7 @@ pub struct Info {
     /// How far each motion's cycle goes (game units at size 1; 0 = in place), so walks and
     /// runs play as fast as the character moves.
     pub strides: Vec<f32>,
+    pub pace: Pace,
 }
 
 /// Animation roles: what an animated skin's character is doing. The garden ones come from the
@@ -148,6 +149,8 @@ pub struct Doing {
     /// How far through its own animation the character is (0..1): one-off actions keep up
     /// with it, so the skin finishes when the character does.
     pub progress: Option<f32>,
+    /// The skin's pacing.
+    pub pace: Pace,
 }
 
 /// A rigged skin's model for one character: its file, the model-table slots the character's
@@ -192,6 +195,7 @@ impl Info {
             animated: false,
             roles: [None; ROLES],
             strides: Vec::new(),
+            pace: Pace::default(),
         };
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else {
@@ -223,6 +227,23 @@ impl Info {
                 "animated" => {
                     info.animated =
                         matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "yes" | "true")
+                }
+                "anim_walk_from" | "anim_run_from" | "anim_walk_speed" | "anim_run_speed"
+                | "anim_max_rate" => {
+                    let set = match k.trim().to_ascii_lowercase().as_str() {
+                        "anim_walk_from" => &mut info.pace.walk_from,
+                        "anim_run_from" => &mut info.pace.run_from,
+                        "anim_walk_speed" => &mut info.pace.walk_speed,
+                        "anim_run_speed" => &mut info.pace.run_speed,
+                        _ => &mut info.pace.max_rate,
+                    };
+                    if let Ok(x) = v.parse::<f32>()
+                        && x.is_finite()
+                        && x > 0.0
+                        && x < 100.0
+                    {
+                        *set = x;
+                    }
                 }
                 "strides" => {
                     info.strides = v
@@ -895,6 +916,7 @@ struct Ready {
     turn: i32,
     height: f32,
     lean: f32,
+    pace: Pace,
 }
 
 /// Our skin, loaded, if it applies to `character` now.
@@ -1026,6 +1048,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
         turn: info.turn,
         height: info.height,
         lean: info.lean,
+        pace: info.pace,
     };
     Some((ready, index))
 }
@@ -1143,18 +1166,40 @@ pub struct Animator {
 
 /// The skins' animations are 30 frames a second; the game draws 60.
 const ANIM_STEP: f32 = 0.5;
-/// Ground speed (units a frame) to start walking; to run, and back to walking, when the
-/// animations don't say how far they go.
-const WALK_FROM: f32 = 0.15;
-const RUN_FROM: f32 = 2.0;
 /// Back to walking below this share of the speed it started running at.
 const RUN_UNTIL: f32 = 0.8;
-/// Speeds in-place walk and run animations look right at (scaled by the skin's size).
-const WALK_SPEED: f32 = 0.8;
-const RUN_SPEED: f32 = 3.0;
-/// How much slower or faster than its own pace an animation may play: fast as Sonic gets,
-/// a run only blurs so much.
-const RATE_RANGE: (f32, f32) = (0.3, 6.0);
+
+/// How an animated skin's walks and runs keep up with the character: `anim_*` lines in its
+/// skin.ini (docs/skins.md), each defaulting to what suits most skins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pace {
+    /// Ground speed (units a frame) to start walking (`anim_walk_from`).
+    pub walk_from: f32,
+    /// To run, when the walk and run don't say how far they go (`anim_run_from`).
+    pub run_from: f32,
+    /// Speeds in-place walk and run animations look right at, at size 1 (`anim_walk_speed`,
+    /// `anim_run_speed`).
+    pub walk_speed: f32,
+    pub run_speed: f32,
+    /// The fastest a walk or run may play, times its own pace (`anim_max_rate`): a run only
+    /// blurs so much.
+    pub max_rate: f32,
+}
+
+impl Default for Pace {
+    fn default() -> Self {
+        Pace {
+            walk_from: 0.15,
+            run_from: 2.0,
+            walk_speed: 0.8,
+            run_speed: 3.0,
+            max_rate: 6.0,
+        }
+    }
+}
+
+/// The slowest a walk or run plays, times its own pace.
+const MIN_RATE: f32 = 0.3;
 
 /// One animation's length (frames; 0 = none) and how far its cycle goes (0 = in place).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1227,7 +1272,7 @@ impl Animator {
         };
         let run_from = match (cycles[walk_role].pace(size), cycles[run_role].pace(size)) {
             (Some(w), Some(r)) if r > w => (w + r) / 2.0,
-            _ => RUN_FROM,
+            _ => doing.pace.run_from,
         };
         let running = self.role == RUN || self.role == CARRY_RUN;
         let moving = if !grounded || curled {
@@ -1238,7 +1283,7 @@ impl Animator {
                 _ if rise > 0.0 || curled => JUMP,
                 _ => FALL,
             }
-        } else if self.speed < WALK_FROM {
+        } else if self.speed < doing.pace.walk_from {
             IDLE
         } else if self.speed > run_from || (running && self.speed > run_from * RUN_UNTIL) {
             RUN
@@ -1287,12 +1332,12 @@ impl Animator {
             WALK | RUN | CARRY_WALK | CARRY_RUN => {
                 let pace = cycles[role].pace(size).unwrap_or(
                     if role == WALK || role == CARRY_WALK {
-                        WALK_SPEED
+                        doing.pace.walk_speed
                     } else {
-                        RUN_SPEED
+                        doing.pace.run_speed
                     } * size,
                 );
-                (self.speed / pace).clamp(RATE_RANGE.0, RATE_RANGE.1)
+                (self.speed / pace).clamp(MIN_RATE, doing.pace.max_rate.max(MIN_RATE))
             }
             _ => 1.0,
         };
@@ -1552,6 +1597,7 @@ pub fn draw_other(key: &str, skin: &str, pose: &crate::puppet::Pose) -> bool {
                 action: pose.action,
                 holding: pose.status & STATUS_HOLDING != 0,
                 progress: None,
+                pace: r.pace,
             };
             let (role, frame) = anim.step(pose.position, doing, r.scale, poses.map(|(_, c)| c));
             if role == JUMP || role == FALL {
@@ -1616,6 +1662,7 @@ extern "C" fn player_display(object: usize) {
             turn,
             height,
             lean,
+            pace,
         } = with(|s| {
             let rigged = s
                 .list
@@ -1645,6 +1692,7 @@ extern "C" fn player_display(object: usize) {
                 action: player.action,
                 holding: player.holding,
                 progress: game::local_anim_progress(),
+                pace,
             };
             let (role, frame) = OUR_ANIM.lock().unwrap_or_else(|e| e.into_inner()).step(
                 [player.position.x, player.position.y, player.position.z],
@@ -2013,7 +2061,7 @@ mod tests {
         }
         let (_, f0) = go(&mut a, 30.0);
         let (_, f1) = go(&mut a, 30.0);
-        assert!(((f1 - f0).rem_euclid(20.0) - RATE_RANGE.1 * ANIM_STEP).abs() < 0.01);
+        assert!(((f1 - f0).rem_euclid(20.0) - Pace::default().max_rate * ANIM_STEP).abs() < 0.01);
     }
 
     #[test]
@@ -2045,8 +2093,8 @@ mod tests {
     #[test]
     fn rigged_skin_ini() {
         let i = Info::parse(
-            "chief",
-            "name=Master Chief\nrigged=on\nrig_sonic=0,31,48;0x394\nrig_knuckles=142;0x3f0\nrig_nobody=1;2\ntextures=3\n",
+            "hero",
+            "name=Space Hero\nrigged=on\nrig_sonic=0,31,48;0x394\nrig_knuckles=142;0x3f0\nrig_nobody=1;2\ntextures=3\n",
         )
         .unwrap();
         assert_eq!(i.characters, vec![0, 4]);
@@ -2062,21 +2110,30 @@ mod tests {
     #[test]
     fn skin_ini() {
         let i = Info::parse(
-            "mcq",
-            "name=Lightning McQueen\ncharacters=sonic, 1\ncharacter_scale=0.6\nturn=90\nkart=on\ntextures=5\n",
+            "car",
+            "name=Race Car\ncharacters=sonic, 1\ncharacter_scale=0.6\nturn=90\nkart=on\ntextures=5\n",
         )
         .unwrap();
         assert_eq!(i.characters, vec![0, 1]);
         assert_eq!(i.turn, 0x4000);
         assert!(i.kart);
-        assert_eq!(i.archive(), "SKIN_MCQ");
+        assert_eq!(i.archive(), "SKIN_CAR");
         let a = Info::parse(
-            "mint",
+            "anim",
             "animated=on\nmotions=Idle:100,Run:22\nstrides=0,15.8,nan,-3\nidle=0\nrun=1\n",
         )
         .unwrap();
         assert!(a.animated);
         assert_eq!(a.roles[RUN], Some(1));
         assert_eq!(a.strides, vec![0.0, 15.8, 0.0, 0.0]);
+        let paced = Info::parse(
+            "x",
+            "anim_walk_from=0.3\nanim_max_rate=3\nanim_run_speed=-1\n",
+        )
+        .unwrap();
+        assert_eq!(paced.pace.walk_from, 0.3);
+        assert_eq!(paced.pace.max_rate, 3.0);
+        // Bad values keep the default.
+        assert_eq!(paced.pace.run_speed, Pace::default().run_speed);
     }
 }

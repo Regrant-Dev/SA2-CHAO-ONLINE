@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rigged skins: rebuilds a model on an SA2 character's own skeleton (re/skins.md "Rigged skins").
 
-    tools/skinrig.py <scene.gltf> skins/master_chief --name "Master Chief" \\
+    tools/skinrig.py <scene.gltf> skins/my_skin --name "My Skin" \\
         --game "<Sonic Adventure 2>/resource/gd_PC" --character sonic,knuckles
 
 The model's vertices are split by body part (each vertex goes with its strongest bone), each

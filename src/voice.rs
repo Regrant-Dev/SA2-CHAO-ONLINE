@@ -34,7 +34,8 @@ pub enum Moment {
     ShakeTree,
     Happy,
     Idle,
-    Kachow,
+    /// The skin's catchphrase: on some jumps, now and then going fast, in idle chatter.
+    Signature,
     /// The game's other voice lines: a short jump, attack or hurt clip (no folder of its own).
     Grunt,
 }
@@ -54,7 +55,7 @@ const MOMENTS: [(Moment, &str); 15] = [
     (Moment::ShakeTree, "shake_tree"),
     (Moment::Happy, "happy"),
     (Moment::Idle, "idle"),
-    (Moment::Kachow, "kachow"),
+    (Moment::Signature, "signature"),
 ];
 
 impl Moment {
@@ -70,7 +71,7 @@ impl Moment {
         match self {
             Moment::Death | Moment::FallDeath => 3,
             Moment::Hurt => 2,
-            Moment::Idle | Moment::Happy | Moment::Kachow => 0,
+            Moment::Idle | Moment::Happy | Moment::Signature => 0,
             _ => 1,
         }
     }
@@ -84,8 +85,8 @@ impl Moment {
             Moment::Death | Moment::FallDeath => 3000,
             Moment::ShakeTree => 8000,
             Moment::Happy => 8000,
-            Moment::Idle => 60_000,
-            Moment::Kachow => 25_000,
+            // The skin's own timing (`Tuning`) decides these.
+            Moment::Idle | Moment::Signature => 0,
             _ => 3000,
         })
     }
@@ -101,26 +102,97 @@ impl Moment {
     }
 }
 
-/// How often a jump gets a voice (1 in N), so it doesn't on every hop.
-const JUMP_ONE_IN: u32 = 3;
-/// Of those, 1 in this many is a Kachow instead (skins with a `kachow` folder).
-const KACHOW_JUMPS: u32 = 4;
-/// Random lines wait this long after any line.
-const QUIET_BEFORE_RANDOM: Duration = Duration::from_secs(10);
-/// Standing still this long starts the idle chatter.
-const IDLE_AFTER: Duration = Duration::from_secs(20);
-/// Ground speed (units a frame) counted as standing still, and as going fast.
+/// Ground speed (units a frame) counted as standing still.
 const STILL: f32 = 0.05;
-const FAST: f32 = 4.0;
 /// A grunt (for the game's other voice lines) is a jump, attack or hurt clip at most this long.
 const GRUNT_MAX: Duration = Duration::from_millis(1000);
 /// Jumps, attacks, hurts and boosts are quick sounds: longer clips (lines) never play for them.
 const QUICK_MAX: Duration = GRUNT_MAX;
-/// The same clip doesn't play again this soon: a skin with few clips speaks less, one with
-/// plenty can talk more (a grunt, then a line).
-const CLIP_REST: (Duration, Duration) = (Duration::from_secs(4), Duration::from_secs(30));
-/// Clips' loudness here (they're normalised when made; the game's sounds are a little quieter).
-const VOLUME: f32 = 0.8;
+
+/// How chatty a skin is: `voice_*` lines in its skin.ini (docs/skins.md "Voice"), each defaulting to
+/// what suits most skins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    /// 1 in this many jumps gets a voice (`voice_jump`; 0 = none).
+    pub jump: u32,
+    /// Of those, 1 in this many is a signature line instead (`voice_signature_jump`; 0 = none).
+    pub signature_jump: u32,
+    /// Going fast: about one signature line this often (`voice_signature_every`, seconds;
+    /// 0 = none), and the speed that counts as fast (`voice_fast`, units a frame).
+    pub signature_every: Duration,
+    pub fast: f32,
+    /// Standing still this long starts idle chatter (`voice_idle_after`), then at most one line
+    /// this often (`voice_idle_every`).
+    pub idle_after: Duration,
+    pub idle_every: Duration,
+    /// Random lines wait this long after any line (`voice_quiet`).
+    pub quiet: Duration,
+    /// The same clip doesn't play again this soon: a grunt, a line (`voice_grunt_rest`,
+    /// `voice_line_rest`). A skin with few clips speaks less; one with plenty can talk more.
+    pub rest: (Duration, Duration),
+    /// Loudness of its clips, 0..1 (`voice_volume`).
+    pub volume: f32,
+    /// Least time between two lines of a moment (`voice_cooldown_<folder>`, seconds), where
+    /// the skin sets one; else the moment's own.
+    pub cooldowns: [Option<Duration>; MOMENTS.len()],
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            jump: 3,
+            signature_jump: 4,
+            signature_every: Duration::from_secs(25),
+            fast: 4.0,
+            idle_after: Duration::from_secs(20),
+            idle_every: Duration::from_secs(60),
+            quiet: Duration::from_secs(10),
+            rest: (Duration::from_secs(4), Duration::from_secs(30)),
+            volume: 0.8,
+            cooldowns: [None; MOMENTS.len()],
+        }
+    }
+}
+
+impl Tuning {
+    /// The `voice_*` lines of a skin.ini (others ignored; bad values keep the default).
+    pub fn parse(ini: &str) -> Self {
+        let mut t = Tuning::default();
+        for line in ini.lines() {
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = v.trim().parse::<f32>() else {
+                continue;
+            };
+            if !v.is_finite() || v < 0.0 {
+                continue;
+            }
+            let secs = |v: f32| Duration::from_secs_f32(v.min(3600.0));
+            let count = |v: f32| v.min(1000.0) as u32;
+            match k.trim().to_ascii_lowercase().as_str() {
+                "voice_jump" => t.jump = count(v),
+                "voice_signature_jump" => t.signature_jump = count(v),
+                "voice_signature_every" => t.signature_every = secs(v),
+                "voice_fast" => t.fast = v.min(100.0),
+                "voice_idle_after" => t.idle_after = secs(v),
+                "voice_idle_every" => t.idle_every = secs(v),
+                "voice_quiet" => t.quiet = secs(v),
+                "voice_grunt_rest" => t.rest.0 = secs(v),
+                "voice_line_rest" => t.rest.1 = secs(v),
+                "voice_volume" => t.volume = v.min(1.0),
+                key => {
+                    if let Some(folder) = key.strip_prefix("voice_cooldown_")
+                        && let Some(i) = MOMENTS.iter().position(|&(_, f)| f == folder)
+                    {
+                        t.cooldowns[i] = Some(secs(v));
+                    }
+                }
+            }
+        }
+        t
+    }
+}
 const MAX_CLIP_BYTES: usize = 4 << 20;
 const MAX_CLIPS: usize = 32;
 
@@ -179,6 +251,7 @@ struct Clip {
 
 struct Voices {
     dir: PathBuf,
+    tuning: Tuning,
     clips: Vec<Vec<Clip>>,
     /// Short jump/attack/hurt clips, for the game's other voice lines.
     grunts: Vec<(usize, usize)>,
@@ -207,10 +280,10 @@ struct State {
     playing: Option<(Box<[u8]>, Instant, u8)>,
     last: Vec<Option<Instant>>,
     last_clip: Option<(usize, usize)>,
-    /// When each clip last played (moment folder, clip), for `CLIP_REST`.
+    /// When each clip last played (moment folder, clip), for `Tuning::rest`.
     played: std::collections::HashMap<(usize, usize), Instant>,
-    /// A Kachow for a jump (not one of the random ones while driving).
-    jump_kachow: bool,
+    /// A signature line for a jump (not a random one while going fast).
+    jump_signature: bool,
     last_line: Option<Instant>,
     watch: Watch,
     rng: u32,
@@ -365,7 +438,7 @@ pub fn frame(skin: Option<&Path>) {
         last: vec![None; MOMENTS.len() + 1],
         last_clip: None,
         played: std::collections::HashMap::new(),
-        jump_kachow: false,
+        jump_signature: false,
         last_line: None,
         watch: Watch::default(),
         rng: 0x9E37_79B9 ^ std::process::id(),
@@ -385,14 +458,19 @@ pub fn frame(skin: Option<&Path>) {
         return;
     };
     for m in events(s, &me, pending) {
-        // McQueen: some of the jumps that get a voice get a Kachow instead.
-        let kachow = m == Moment::Jump
-            && s.voices.as_ref().is_some_and(|v| v.has(Moment::Kachow))
-            && next(&mut s.rng).is_multiple_of(JUMP_ONE_IN * KACHOW_JUMPS);
-        if kachow {
-            s.jump_kachow = true;
-            play(s, Moment::Kachow);
-            s.jump_kachow = false;
+        // Some of the jumps that get a voice get the skin's signature line instead.
+        let signature = m == Moment::Jump
+            && s.voices.as_ref().is_some_and(|v| {
+                let t = v.tuning;
+                v.has(Moment::Signature)
+                    && t.jump > 0
+                    && t.signature_jump > 0
+                    && next(&mut s.rng).is_multiple_of(t.jump * t.signature_jump)
+            });
+        if signature {
+            s.jump_signature = true;
+            play(s, Moment::Signature);
+            s.jump_signature = false;
         } else {
             play(s, m);
         }
@@ -411,6 +489,7 @@ fn events(s: &mut State, me: &game::LocalPlayer, pending: u32) -> Vec<Moment> {
             (LIVES as *const i16).read_volatile(),
         )
     };
+    let tuning = s.voices.as_ref().map(|v| v.tuning).unwrap_or_default();
     let w = &mut s.watch;
     let first = w.position.is_none();
     let (speed, rise) = match w.position {
@@ -461,18 +540,18 @@ fn events(s: &mut State, me: &game::LocalPlayer, pending: u32) -> Vec<Moment> {
                 _ => {}
             }
         }
-        // Standing about: now and then a line (idle, happy, or for McQueen a Kachow).
+        // Standing about: now and then a line (idle, happy or signature).
         if speed < STILL && me.grounded && me.action == 0 {
             let since = *w.still_since.get_or_insert(now);
-            if now.duration_since(since) > IDLE_AFTER {
+            if now.duration_since(since) > tuning.idle_after {
                 out.push(Moment::Idle);
             }
         } else {
             w.still_since = None;
         }
-        // Going fast: the odd Kachow.
-        if speed > FAST && me.grounded {
-            out.push(Moment::Kachow);
+        // Going fast: now and then the signature line.
+        if speed > tuning.fast && me.grounded {
+            out.push(Moment::Signature);
         }
     }
     w.falling = if !me.grounded && rise < -0.5 {
@@ -501,8 +580,17 @@ fn play(s: &mut State, m: Moment) {
     if pool.is_none() && (m != Moment::Grunt || v.grunts.is_empty()) {
         return;
     }
+    let t = v.tuning;
     let i = m.index();
-    if s.last[i].is_some_and(|t| now.duration_since(t) < m.cooldown()) {
+    let cooldown = match t.cooldowns.get(i).copied().flatten() {
+        Some(set) => set,
+        None => match m {
+            Moment::Idle => t.idle_every,
+            Moment::Signature if !s.jump_signature => t.signature_every,
+            _ => m.cooldown(),
+        },
+    };
+    if s.last[i].is_some_and(|at| now.duration_since(at) < cooldown) {
         return;
     }
     let busy = s.playing.as_ref().filter(|(_, end, _)| *end > now);
@@ -513,19 +601,24 @@ fn play(s: &mut State, m: Moment) {
     }
     if m.priority() == 0
         && s.last_line
-            .is_some_and(|t| now.duration_since(t) < QUIET_BEFORE_RANDOM)
+            .is_some_and(|at| now.duration_since(at) < t.quiet)
     {
         return;
     }
-    // Chance: jumps 1 in 3; random lines rarely (they're checked every frame).
+    // Chance: 1 in `voice_jump` jumps; random lines a few seconds after they may (they're
+    // checked every frame).
     let roll = next(&mut s.rng);
     match m {
-        Moment::Jump if !roll.is_multiple_of(JUMP_ONE_IN) => return,
-        Moment::Kachow if !s.jump_kachow && !roll.is_multiple_of(900) => return,
+        Moment::Jump if t.jump == 0 || !roll.is_multiple_of(t.jump) => return,
+        Moment::Signature
+            if !s.jump_signature && (t.signature_every.is_zero() || !roll.is_multiple_of(300)) =>
+        {
+            return;
+        }
         Moment::Idle | Moment::Happy if !roll.is_multiple_of(240) => return,
         _ => {}
     }
-    // Idle chatter mixes in the happy lines and Kachows.
+    // Idle chatter mixes in the happy lines and the signature ones.
     let mut choices: Vec<(usize, usize)> = Vec::new();
     let add = |choices: &mut Vec<(usize, usize)>, c: Moment| {
         let k = c.index();
@@ -537,7 +630,7 @@ fn play(s: &mut State, m: Moment) {
     }
     if m == Moment::Idle {
         add(&mut choices, Moment::Happy);
-        add(&mut choices, Moment::Kachow);
+        add(&mut choices, Moment::Signature);
     }
     let quick = matches!(
         m,
@@ -547,9 +640,9 @@ fn play(s: &mut State, m: Moment) {
     choices.retain(|&(k, n)| {
         let c = &v.clips[k][n];
         let rest = if c.length <= GRUNT_MAX {
-            CLIP_REST.0
+            t.rest.0
         } else {
-            CLIP_REST.1
+            t.rest.1
         };
         (!quick || c.length <= QUICK_MAX)
             && s.played
@@ -583,6 +676,11 @@ fn next(rng: &mut u32) -> u32 {
 
 /// Loads a skin's `sounds/` (none, or nothing usable: `None`).
 fn load(dir: &Path) -> Option<Voices> {
+    // How chatty: the skin's skin.ini (next to `sounds/`).
+    let tuning = dir
+        .parent()
+        .and_then(|skin| std::fs::read_to_string(skin.join("skin.ini")).ok())
+        .map_or_else(Tuning::default, |ini| Tuning::parse(&ini));
     let mut clips: Vec<Vec<Clip>> = (0..MOMENTS.len()).map(|_| Vec::new()).collect();
     for (i, (_, name)) in MOMENTS.iter().enumerate() {
         let Ok(files) = std::fs::read_dir(dir.join(name)) else {
@@ -595,7 +693,10 @@ fn load(dir: &Path) -> Option<Voices> {
             .collect();
         paths.sort();
         for p in paths.into_iter().take(MAX_CLIPS) {
-            match std::fs::read(&p).map_err(|e| e.to_string()).and_then(clip) {
+            match std::fs::read(&p)
+                .map_err(|e| e.to_string())
+                .and_then(|b| clip(b, tuning.volume))
+            {
                 Ok(c) => clips[i].push(c),
                 Err(e) => log!("voice: {} refused: {e}", p.display()),
             }
@@ -619,13 +720,14 @@ fn load(dir: &Path) -> Option<Voices> {
     log!("voice: {} clips from {}", total, dir.display());
     Some(Voices {
         dir: dir.to_path_buf(),
+        tuning,
         clips,
         grunts,
     })
 }
 
-/// Checks a WAV (16-bit PCM, 1 or 2 channels) and turns it down to `VOLUME`.
-fn clip(mut wav: Vec<u8>) -> Result<Clip, String> {
+/// Checks a WAV (16-bit PCM, 1 or 2 channels) and sets its loudness (`volume`, 0..1).
+fn clip(mut wav: Vec<u8>, volume: f32) -> Result<Clip, String> {
     if wav.len() > MAX_CLIP_BYTES
         || wav.len() < 44
         || &wav[..4] != b"RIFF"
@@ -660,7 +762,7 @@ fn clip(mut wav: Vec<u8>) -> Result<Clip, String> {
         return Err("not 16-bit PCM".into());
     };
     for s in wav[from..to].as_chunks_mut::<2>().0 {
-        *s = ((i16::from_le_bytes(*s) as f32 * VOLUME) as i16).to_le_bytes();
+        *s = ((i16::from_le_bytes(*s) as f32 * volume) as i16).to_le_bytes();
     }
     let samples = (to - from) / 2 / channels as usize;
     Ok(Clip {
@@ -712,15 +814,15 @@ mod tests {
 
     #[test]
     fn clips_are_checked_and_turned_down() {
-        let c = clip(wav(16, &[10_000; 44_100])).unwrap();
+        let c = clip(wav(16, &[10_000; 44_100]), 0.8).unwrap();
         assert_eq!(c.length, Duration::from_secs(1));
         assert_eq!(i16::from_le_bytes([c.wav[44], c.wav[45]]), 8000);
-        assert!(clip(wav(8, &[0; 100])).is_err());
-        assert!(clip(b"RIFF....WAVE".to_vec()).is_err());
+        assert!(clip(wav(8, &[0; 100]), 0.8).is_err());
+        assert!(clip(b"RIFF....WAVE".to_vec(), 0.8).is_err());
         // A data chunk claiming more than the file holds.
         let mut bad = wav(16, &[0; 10]);
         bad[40] = 0xFF;
-        assert!(clip(bad).is_err());
+        assert!(clip(bad, 0.8).is_err());
     }
 
     #[test]
@@ -731,5 +833,27 @@ mod tests {
         assert_eq!(Moment::Grunt.index(), MOMENTS.len());
         assert!(Moment::Death.priority() > Moment::Hurt.priority());
         assert_eq!(Moment::Idle.priority(), 0);
+    }
+
+    #[test]
+    fn a_skin_ini_tunes_its_voice() {
+        let t = Tuning::parse(
+            "name=Any Skin\nvoice_jump=2\nvoice_signature_jump=0\nvoice_idle_after=5.5\n\
+             voice_volume=3\nvoice_line_rest=-1\nvoice_fast=nan\n",
+        );
+        assert_eq!(t.jump, 2);
+        assert_eq!(t.signature_jump, 0);
+        assert_eq!(t.idle_after, Duration::from_secs_f32(5.5));
+        assert_eq!(t.volume, 1.0);
+        // Bad values keep the default.
+        assert_eq!(t.rest.1, Tuning::default().rest.1);
+        assert_eq!(t.fast, Tuning::default().fast);
+        assert_eq!(Tuning::parse(""), Tuning::default());
+        let c = Tuning::parse("voice_cooldown_hurt=2\nvoice_cooldown_nothing=1\n");
+        assert_eq!(
+            c.cooldowns[Moment::Hurt.index()],
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(c.cooldowns.iter().flatten().count(), 1);
     }
 }

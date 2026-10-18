@@ -749,7 +749,7 @@ mod tests {
             visits: 1,
             visitors: [3, -2],
             room_mode: crate::room::Mode::Coop,
-            skin: "mcqueen".into(),
+            skin: "race_car".into(),
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.
