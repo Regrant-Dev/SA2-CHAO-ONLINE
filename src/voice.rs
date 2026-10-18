@@ -122,13 +122,17 @@ const RINGS: usize = 0x0174_B028;
 const LIVES: usize = 0x0174_B024;
 
 /// The game's sound-at-a-position call (EDI = sound id, ESI = position) and its first bytes.
+#[cfg(target_arch = "x86")]
 const PLAY_SOUND: usize = 0x0043_72E0;
+#[cfg(target_arch = "x86")]
 const PLAY_SOUND_START: [u8; 6] = [0x51, 0x53, 0x8A, 0x5C, 0x24, 0x14];
 /// The numbered voice call (voice id pushed, EDX = 2; returns -1 when it doesn't play). Its
 /// start is already patched by the mod loader, so the garden's calls to it are redirected
 /// instead: the pet line (ChaonadeExec 0x476FD0 at frame 30, by character, `jmp`) and the
 /// tree-shake line (`call`), each from its own spot so no other voice is touched.
+#[cfg(target_arch = "x86")]
 const PLAY_VOICE: usize = 0x0044_3130;
+#[cfg(target_arch = "x86")]
 const GARDEN_VOICE_JUMPS: [usize; 6] = [
     0x0047_705B, // pet: Sonic 0x5ED
     0x0047_7071, // Shadow 0x5EC
@@ -137,6 +141,7 @@ const GARDEN_VOICE_JUMPS: [usize; 6] = [
     0x0047_70B3, // Knuckles 0x4DA
     0x0047_70C9, // Rouge 0x4DB
 ];
+#[cfg(target_arch = "x86")]
 const GARDEN_VOICE_CALLS: [usize; 4] = [
     0x0047_553D, // grabbing a tree (0x4754F0): 0x6C0
     0x0047_5557, // 0x6C3
@@ -144,6 +149,7 @@ const GARDEN_VOICE_CALLS: [usize; 4] = [
     0x0074_EEB3, // 0x6C3
 ];
 /// The character voice bank's ids (Sonic 0x3000.., Shadow 0x3012.., Amy and Metal 0x3021..).
+#[cfg(target_arch = "x86")]
 const VOICE_IDS: (u32, u32) = (0x3000, 0x3030);
 
 /// Set while a voiced skin is on: the hook drops character voices and leaves the id here.
