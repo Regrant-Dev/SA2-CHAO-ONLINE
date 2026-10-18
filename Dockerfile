@@ -8,6 +8,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY assets ./assets
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl --bin sa2co-server \
     && strip target/x86_64-unknown-linux-musl/release/sa2co-server
 
