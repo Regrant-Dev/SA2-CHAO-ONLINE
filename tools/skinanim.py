@@ -210,6 +210,9 @@ def main():
     ap.add_argument("--soft-face", default="", help="regex of material names to light smoothly")
     ap.add_argument("--stiff", action="append", default=[], metavar="MATERIAL=BONE",
                     help="material (regex) moved whole by one bone, e.g. a cape on the spine")
+    ap.add_argument("--cape", default="", metavar="MATERIAL=BONE",
+                    help="a cape (material regex) hung from BONE that swings back clear of the "
+                         "legs in every animation")
     ap.add_argument("--rigid-islands", type=float, default=0.03, metavar="FRACTION",
                     help="small separate pieces (under this share of the triangles, and of the "
                          "height across) move whole with their main bone instead of bending")
@@ -251,6 +254,47 @@ def main():
         if j is None:
             sys.exit(f"--stiff: no bone {bone!r}")
         stiff.append((pattern, j))
+
+    # A cape: a bone of its own at the cape's top edge, under BONE; its angle per frame comes
+    # later (`cape_angles`), swung back just enough to stay behind the legs.
+    cape = None
+    if args.cape:
+        pattern, bone = args.cape.rsplit("=", 1)
+        pj = next((i for i, n in enumerate(joints) if nodes[n].get("name") == bone), None)
+        if pj is None:
+            sys.exit(f"--cape: no bone {bone!r}")
+        bind = joint_world[pj] @ ibm[pj]
+        pts = []
+        for node in nodes:
+            if "mesh" not in node or "skin" not in node:
+                continue
+            for p in g["meshes"][node["mesh"]]["primitives"]:
+                m_ = p.get("material")
+                mname = g["materials"][m_].get("name", "") if m_ is not None else ""
+                if re.search(pattern, mname):
+                    pos = accessor(p["attributes"]["POSITION"])
+                    pts.extend((bind @ np.c_[pos, np.ones(len(pos))].T).T[:, :3])
+        if not pts:
+            sys.exit(f"--cape: no material matches {pattern!r}")
+        pts = np.array(pts)
+        top = pts[:, 1].max()
+        band = pts[pts[:, 1] > top - (top - pts[:, 1].min()) * 0.05]
+        pivot = np.array([band[:, 0].mean(), top, band[:, 2].mean()])
+        bottom = pts[pts[:, 1] < pts[:, 1].min() + (top - pts[:, 1].min()) * 0.05].mean(axis=0)
+        local = np.linalg.inv(joint_world[pj]) @ np.r_[pivot, 1.0]
+        pn = joints[pj]
+        cn = len(nodes)
+        nodes.append({"name": "cape", "translation": list(map(float, local[:3]))})
+        nodes[pn].setdefault("children", []).append(cn)
+        parent[cn] = pn
+        joints = list(joints) + [cn]
+        jindex[cn] = len(joints) - 1
+        offset = np.eye(4)
+        offset[:3, 3] = local[:3]
+        ibm = np.concatenate([ibm, (np.linalg.inv(offset) @ ibm[pj])[None]])
+        joint_world.append(world(cn))
+        stiff.append((pattern, jindex[cn]))
+        cape = (cn, pn, pivot, bottom)
 
     # The skinned mesh: each vertex on its strongest joint, in that joint's space. Triangles
     # whose corners are on different joints are drawn by the last of them (depth-first), using
@@ -485,6 +529,83 @@ def main():
         n, span = item.rsplit("=", 1)
         a, b = span.split(":")
         trims[n] = (int(a), int(b))
+    def posed(n, tt, tracks, memo):
+        """Node `n`'s world matrix at time `tt` of an animation (its tracks, else its rest)."""
+        if n not in memo:
+            node = dict(nodes[n])
+            if (n, "translation") in tracks:
+                node["translation"] = list(map(float, sample(*tracks[(n, "translation")], tt, False)))
+            if (n, "rotation") in tracks:
+                node["rotation"] = list(map(float, sample(*tracks[(n, "rotation")], tt, True)))
+            m_ = skinconv.node_matrix(node)
+            memo[n] = posed(parent[n], tt, tracks, memo) @ m_ if n in parent else m_
+        return memo[n]
+
+    legs = [n for n in joints if re.search(r"(up)?leg|foot|toe", nodes[n].get("name", ""), re.I)
+            and re.search(r"left|right", nodes[n].get("name", ""), re.I)]
+
+    def cape_angles(tracks, frames, first):
+        """The cape's angles (BAMS, its own bone) per frame: swung back about its top edge just
+        enough to stay behind the knees, feet and toes; at once when a leg comes back, settling
+        slowly after (like cloth)."""
+        cn, _, pivot0, bottom0 = cape
+        up = np.array([0.0, 1.0, 0.0])
+        length = float(np.linalg.norm(bottom0 - pivot0))
+        # Forward: from the feet to the toes at rest, level; the side axis across it.
+        toes = [n for n in legs if re.search(r"toe", nodes[n].get("name", ""), re.I)]
+        foot = [n for n in legs if re.search(r"foot", nodes[n].get("name", ""), re.I)]
+        fwd = sum(world(t)[:3, 3] for t in toes) - sum(world(f)[:3, 3] for f in foot)
+        fwd = fwd - up * (fwd @ up)
+        fwd /= max(np.linalg.norm(fwd), 1e-9)
+        side = np.cross(up, fwd)
+
+        def turn(t):
+            # About `side` by `t` radians (Rodrigues).
+            k = np.array([[0, -side[2], side[1]], [side[2], 0, -side[0]], [-side[1], side[0], 0]])
+            return np.eye(3) + math.sin(t) * k + (1 - math.cos(t)) * (k @ k)
+
+        # Which way round swings the bottom back.
+        back = 1.0 if (turn(0.1) @ -up) @ fwd < 0 else -1.0
+        hang = bottom0 - pivot0
+        rest = math.atan2(-(hang @ fwd), -(hang @ up))
+        # The hang in the cape bone's own space: where the body's lean alone would put it.
+        bind = joint_world[jindex[cn]][:3, :3]
+        hang_local = np.linalg.inv(bind) @ hang
+
+        def tilt(o):
+            h = o @ hang_local
+            return math.atan2(-(h @ fwd), -(h @ up))
+
+        margin = 0.08 * length
+        need = []
+        for f in range(frames):
+            memo = {}
+            tt = (first + f) / FPS
+            top = posed(cn, tt, tracks, memo)[:3, 3]
+            want = rest
+            for n in legs:
+                d = posed(n, tt, tracks, memo)[:3, 3] - top
+                down = -(d @ up)
+                if length * 0.05 < down < length * 1.1:
+                    want = max(want, math.atan((margin - d @ fwd) / down))
+            need.append(min(want, math.radians(70)))
+        # Back at once, forward slowly; twice round so the loop's start matches its end.
+        s_, out = need[-1], list(need)
+        for _ in range(2):
+            for i, v in enumerate(need):
+                s_ = v if v > s_ else s_ + (v - s_) * 0.15
+                out[i] = s_
+        angles, near = [], None
+        for f, phi in enumerate(out):
+            tt = (first + f) / FPS
+            o = posed(cn, tt, tracks, {})[:3, :3]
+            # From where the body's lean leaves it (it hangs, it doesn't lean with the back).
+            swing = phi - tilt(o)
+            o = o / np.linalg.norm(o, axis=0)
+            near = euler_zyx(o.T @ turn(back * swing) @ o, near)
+            angles.append(near)
+        return angles
+
     table, infos = [], []
     for anim in g.get("animations", []):
         name = anim.get("name", f"anim{len(infos)}").split("|")[-1]
@@ -510,12 +631,16 @@ def main():
         airborne = re.search(r"jump|fall", name, re.I) is not None
         stride = 0.0
         entries = []
+        swing = cape_angles(tracks, frames, first) if cape else None
         for item in order:
             if item[0] != "joint":
                 entries.append(([], []))
                 continue
             n = item[1]
             t0, a0 = rest[n]
+            if cape and n == cape[0]:
+                entries.append(([], swing))
+                continue
             angles, positions = [], []
             near, moves = a0, False
             for f in range(frames):
@@ -589,7 +714,12 @@ def main():
     (out / "skin.ini").write_text("\n".join(ini) + "\n")
     # Feet on the ground as it stands idle (the bind pose can stand differently).
     if "idle" in hits:
-        low = min(p[1] for t in skinpreview.Model(out, hits["idle"]).triangles(0) for p in t)
+        # By the feet (a cape or a tail can hang lower); the whole model if it has none.
+        feet = {i + 1 for i, item in enumerate(order)
+                if re.search(r"foot|toe", nodes[item[1]].get("name", ""), re.I)}
+        idle = skinpreview.Model(out, hits["idle"])
+        tris = idle.triangles(0, feet or None) or idle.triangles(0)
+        low = min(p[1] for t in tris for p in t)
         y = struct.unpack_from("<f", w.buf, obj_root + 0xC)[0]
         struct.pack_into("<f", w.buf, obj_root + 0xC, y - low)
         (out / "model.sa2mdl").write_bytes(bytes(w.buf))

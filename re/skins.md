@@ -374,3 +374,9 @@ The game's own voice banks are in `resource/gd_PC/MLT`.
   0x3022 through 0x4372E0 and 0x65E / 0x65F / 0xA72 through 0x443130 by character; per-character
   sets at 0x473FFB.. (0x61C, 0x515, 0x68C, 0x68D, 0xA6B, 0xA9D) and 0x474794.. (0x6B7, 0x6B4,
   0xA69) not identified.
+- The numbered voice call 0x443130 is used by every character's own code with many ids
+  (Sonic/Shadow 0x604..0x609, 0x5F0.., 0xA6B..; Eggman/Tails 0x510..0x513, 0x4F6..0x4F8, ...),
+  so a list of ids can't cover them. The mod chains a hook onto its first instruction (the mod
+  loader's `jmp`, followed on) and drops calls whose return address is in the player code:
+  0x450000..0x478000 (shared player helpers: pick up, pet, tree) and 0x710000..0x760000 (the
+  characters' mains and actions). Cutscene, Omochao and story voices come from elsewhere.

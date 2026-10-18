@@ -103,6 +103,8 @@ impl Moment {
 
 /// How often a jump gets a voice (1 in N), so it doesn't on every hop.
 const JUMP_ONE_IN: u32 = 3;
+/// Of those, 1 in this many is a Kachow instead (skins with a `kachow` folder).
+const KACHOW_JUMPS: u32 = 4;
 /// Random lines wait this long after any line.
 const QUIET_BEFORE_RANDOM: Duration = Duration::from_secs(10);
 /// Standing still this long starts the idle chatter.
@@ -112,6 +114,11 @@ const STILL: f32 = 0.05;
 const FAST: f32 = 4.0;
 /// A grunt (for the game's other voice lines) is a jump, attack or hurt clip at most this long.
 const GRUNT_MAX: Duration = Duration::from_millis(1000);
+/// Jumps, attacks, hurts and boosts are quick sounds: longer clips (lines) never play for them.
+const QUICK_MAX: Duration = GRUNT_MAX;
+/// The same clip doesn't play again this soon: a skin with few clips speaks less, one with
+/// plenty can talk more (a grunt, then a line).
+const CLIP_REST: (Duration, Duration) = (Duration::from_secs(4), Duration::from_secs(30));
 /// Clips' loudness here (they're normalised when made; the game's sounds are a little quieter).
 const VOLUME: f32 = 0.8;
 const MAX_CLIP_BYTES: usize = 4 << 20;
@@ -152,6 +159,15 @@ const GARDEN_VOICE_CALLS: [usize; 4] = [
 #[cfg(target_arch = "x86")]
 const VOICE_IDS: (u32, u32) = (0x3000, 0x3030);
 
+/// Where the player characters' own code is (their mains and actions, and the shared player
+/// helpers: picking up, petting, ...): numbered voices called from here are theirs. Cutscenes,
+/// Omochao and the story call from elsewhere and are left alone.
+#[cfg(target_arch = "x86")]
+const PLAYER_CODE: [(usize, usize); 2] = [(0x0045_0000, 0x0047_8000), (0x0071_0000, 0x0076_0000)];
+/// Where the numbered voice call's first `jmp` (the mod loader's) went, to go on to it.
+#[cfg(target_arch = "x86")]
+static VOICE_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Set while a voiced skin is on: the hook drops character voices and leaves the id here.
 static MUTE: AtomicU8 = AtomicU8::new(0);
 static PENDING: AtomicU32 = AtomicU32::new(0);
@@ -191,6 +207,10 @@ struct State {
     playing: Option<(Box<[u8]>, Instant, u8)>,
     last: Vec<Option<Instant>>,
     last_clip: Option<(usize, usize)>,
+    /// When each clip last played (moment folder, clip), for `CLIP_REST`.
+    played: std::collections::HashMap<(usize, usize), Instant>,
+    /// A Kachow for a jump (not one of the random ones while driving).
+    jump_kachow: bool,
     last_line: Option<Instant>,
     watch: Watch,
     rng: u32,
@@ -227,7 +247,63 @@ pub fn install() {
                 log!("voice: garden voice at {site:#x} not redirected");
             }
         }
+        // Every numbered voice the player's own code plays: through ours first, then on to
+        // whatever the call's first `jmp` went to (the mod loader's hook).
+        // SAFETY: the game's code at a fixed address, read only.
+        let start: [u8; 5] = unsafe { std::ptr::read(PLAY_VOICE as *const [u8; 5]) };
+        if start[0] == 0xE9 {
+            let rel = i32::from_le_bytes([start[1], start[2], start[3], start[4]]);
+            VOICE_NEXT.store(
+                (PLAY_VOICE + 5).wrapping_add(rel as usize),
+                Ordering::Relaxed,
+            );
+            let ours = numbered_voice_thunk as *const () as usize;
+            let mut jump = [0xE9u8, 0, 0, 0, 0];
+            jump[1..].copy_from_slice(&(ours.wrapping_sub(PLAY_VOICE + 5) as u32).to_le_bytes());
+            if !crate::patch::replace_code(PLAY_VOICE, &start, &jump) {
+                log!("voice: couldn't hook the numbered voices");
+            }
+        } else {
+            log!("voice: the numbered voice call isn't as expected; character lines stay");
+        }
     }
+}
+
+/// The numbered voice call's new start: while a voiced skin is on, a voice the player
+/// characters' own code asks for (by where it's called from) is dropped; anything else goes
+/// on as before.
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn numbered_voice_thunk() {
+    std::arch::naked_asm!(
+        "cmp byte ptr [{mute}], 0",
+        "je 3f",
+        "push ecx",
+        "mov ecx, dword ptr [esp + 4]",
+        "cmp ecx, {a0}",
+        "jb 2f",
+        "cmp ecx, {a1}",
+        "jb 1f",
+        "cmp ecx, {b0}",
+        "jb 2f",
+        "cmp ecx, {b1}",
+        "jae 2f",
+        "1:",
+        "pop ecx",
+        // What the voice call returns when it doesn't play.
+        "or eax, -1",
+        "ret",
+        "2:",
+        "pop ecx",
+        "3:",
+        "jmp dword ptr [{next}]",
+        mute = sym MUTE,
+        next = sym VOICE_NEXT,
+        a0 = const PLAYER_CODE[0].0,
+        a1 = const PLAYER_CODE[0].1,
+        b0 = const PLAYER_CODE[1].0,
+        b1 = const PLAYER_CODE[1].1,
+    )
 }
 
 /// The garden's pet and tree lines: dropped while a voiced skin is on (the skin has its own
@@ -288,6 +364,8 @@ pub fn frame(skin: Option<&Path>) {
         playing: None,
         last: vec![None; MOMENTS.len() + 1],
         last_clip: None,
+        played: std::collections::HashMap::new(),
+        jump_kachow: false,
         last_line: None,
         watch: Watch::default(),
         rng: 0x9E37_79B9 ^ std::process::id(),
@@ -307,7 +385,17 @@ pub fn frame(skin: Option<&Path>) {
         return;
     };
     for m in events(s, &me, pending) {
-        play(s, m);
+        // McQueen: some of the jumps that get a voice get a Kachow instead.
+        let kachow = m == Moment::Jump
+            && s.voices.as_ref().is_some_and(|v| v.has(Moment::Kachow))
+            && next(&mut s.rng).is_multiple_of(JUMP_ONE_IN * KACHOW_JUMPS);
+        if kachow {
+            s.jump_kachow = true;
+            play(s, Moment::Kachow);
+            s.jump_kachow = false;
+        } else {
+            play(s, m);
+        }
     }
 }
 
@@ -433,7 +521,7 @@ fn play(s: &mut State, m: Moment) {
     let roll = next(&mut s.rng);
     match m {
         Moment::Jump if !roll.is_multiple_of(JUMP_ONE_IN) => return,
-        Moment::Kachow if !roll.is_multiple_of(900) => return,
+        Moment::Kachow if !s.jump_kachow && !roll.is_multiple_of(900) => return,
         Moment::Idle | Moment::Happy if !roll.is_multiple_of(240) => return,
         _ => {}
     }
@@ -451,11 +539,28 @@ fn play(s: &mut State, m: Moment) {
         add(&mut choices, Moment::Happy);
         add(&mut choices, Moment::Kachow);
     }
-    if choices.is_empty() {
-        return;
-    }
+    let quick = matches!(
+        m,
+        Moment::Jump | Moment::Attack | Moment::Boost | Moment::Hurt | Moment::Grunt
+    );
+    // Quick moments: quick sounds only. Every clip: rested since it last played.
+    choices.retain(|&(k, n)| {
+        let c = &v.clips[k][n];
+        let rest = if c.length <= GRUNT_MAX {
+            CLIP_REST.0
+        } else {
+            CLIP_REST.1
+        };
+        (!quick || c.length <= QUICK_MAX)
+            && s.played
+                .get(&(k, n))
+                .is_none_or(|t| now.duration_since(*t) >= rest)
+    });
     if choices.len() > 1 {
         choices.retain(|&c| Some(c) != s.last_clip);
+    }
+    if choices.is_empty() {
+        return;
     }
     let (k, n) = choices[next(&mut s.rng) as usize % choices.len()];
     let clip = &v.clips[k][n];
@@ -465,6 +570,7 @@ fn play(s: &mut State, m: Moment) {
     s.playing = Some((wav, end, m.priority()));
     s.last[i] = Some(now);
     s.last_clip = Some((k, n));
+    s.played.insert((k, n), now);
     s.last_line = Some(now);
 }
 

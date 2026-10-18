@@ -1669,6 +1669,18 @@ extern "C" fn player_display(object: usize) {
         // Only with its body found and hidden, or the character would show too.
         if !writes.is_empty() {
             writes.push((co2 + CO2_UPGRADES, 0));
+            // The hidden body at the skin's size, so what it holds (a Chao, a fruit) sits up
+            // where the bigger skin's hands are, not at the character's.
+            let entity = game::local_entity() as usize;
+            let grow = scale / player.scale.max(0.01);
+            if entity != 0 && grow.is_finite() && (grow - 1.0).abs() > 0.01 {
+                for axis in 0..3 {
+                    let at = entity + ENTITY_SCALE + axis * 4;
+                    // SAFETY: the player's EntityData1, read like the display reads it.
+                    let now = f32::from_bits(unsafe { (at as *const u32).read() });
+                    writes.push((at, (now * grow).to_bits() as usize));
+                }
+            }
             // SAFETY: live game data, restored in reverse order right after the display.
             unsafe { with_writes(&writes, || call_display(original, object)) };
         }

@@ -51,16 +51,18 @@ class Model:
     def __init__(self, skin, motion=None):
         self.nodes, self.keys = load(skin, motion)
 
-    def triangles(self, frame):
+    def triangles(self, frame, only=None):
         """Every triangle in game coordinates at `frame`, as the game draws them: each node puts
-        its vertices in the buffer, then its strips use it."""
+        its vertices in the buffer, then its strips use it. `only`: just those drawn by these
+        nodes (depth-first indices)."""
         ms = matrices(self.nodes, self.keys, frame)
         buffer, world = {}, []
         for i, nd in enumerate(self.nodes):
             for off, vs in nd["blocks"]:
                 for k, v in enumerate(vs):
                     buffer[off + k] = (ms[i] @ np.r_[v, 1])[:3]
-            world += [[buffer[v] for v in t] for t in nd["tris"]]
+            if only is None or i in only:
+                world += [[buffer[v] for v in t] for t in nd["tris"]]
         return world
 
 
