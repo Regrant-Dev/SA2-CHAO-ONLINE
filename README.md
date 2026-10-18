@@ -1,5 +1,7 @@
 # SA2 Chao Online
 
+![SA2 Chao Online](docs/images/banner.jpg)
+
 Online multiplayer for **Sonic Adventure 2** (Steam PC), for up to 8 players. It's a mod for the
 [SA2 Mod Loader](https://github.com/X-Hax/sa2-mod-loader).
 

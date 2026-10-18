@@ -1,6 +1,7 @@
 //! SA2 Chao Online: mod DLL loaded by SA2 Mod Loader.
 
 mod battles;
+mod boot_art;
 mod bosses;
 pub mod chao;
 mod chat;
@@ -106,6 +107,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     race::install();
     guarded("online init", || online::init(&path));
     guarded("skins init", || skins::init(&path));
+    guarded("boot art", || boot_art::install(&path));
     watch::start();
 }
 
