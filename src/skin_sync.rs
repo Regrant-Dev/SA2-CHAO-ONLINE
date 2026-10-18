@@ -231,6 +231,11 @@ impl SkinSync {
 
     /// The host's list in full: fetch what we don't have the same of.
     fn plan(&mut self, files: Vec<SkinFile>, now: Instant) -> Vec<Body> {
+        let removed = tidy(&self.dir, &files);
+        if removed > 0 {
+            log!("skins: {removed} old file(s) removed");
+            CHANGED.store(true, Ordering::Relaxed);
+        }
         let queue: VecDeque<(u16, SkinFile)> = files
             .into_iter()
             .enumerate()
@@ -262,6 +267,47 @@ fn chunk_request(file: u16, chunk: usize) -> Body {
 }
 
 /// Whether our copy of a shared file is the same (size, then checksum).
+/// The host's skins are kept as it has them: in each skin folder it shares, files it doesn't
+/// list (renamed or dropped there) go. Other skin folders are left alone. Returns how many went.
+fn tidy(dir: &Path, files: &[SkinFile]) -> usize {
+    use std::collections::HashSet;
+    let listed: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let shared: HashSet<&str> = files
+        .iter()
+        .filter_map(|f| f.path.split('/').next())
+        .collect();
+    fn walk(at: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for e in entries.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() && depth < 4 => walk(&e.path(), depth + 1, out),
+                Ok(t) if t.is_file() => out.push(e.path()),
+                _ => {}
+            }
+        }
+    }
+    let mut removed = 0;
+    for id in shared {
+        let mut found = Vec::new();
+        walk(&dir.join(id), 0, &mut found);
+        for path in found {
+            let rel = path
+                .strip_prefix(dir)
+                .ok()
+                .and_then(|r| r.to_str())
+                .map(|r| r.replace('\\', "/"));
+            if rel.is_some_and(|r| !listed.contains(r.as_str()))
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 fn same_here(dir: &Path, f: &SkinFile) -> bool {
     let path = dir.join(&f.path);
     std::fs::metadata(&path).is_ok_and(|m| m.len() == u64::from(f.size))
@@ -300,6 +346,10 @@ mod tests {
         std::fs::write(host.join("big/model.sa2mdl"), &model).unwrap();
         std::fs::write(host.join("big/skin.ini"), b"name=Big").unwrap();
         std::fs::write(host.join("big/sounds/a.wav"), b"RIFFxxxx").unwrap();
+        // A file the host no longer has (in a skin it shares), and a skin it doesn't share.
+        std::fs::write(mine.join("big/old name.wav"), b"x").unwrap();
+        std::fs::create_dir_all(mine.join("my_own")).unwrap();
+        std::fs::write(mine.join("my_own/skin.ini"), b"name=Mine").unwrap();
         // Already have the same skin.ini; an older model.
         std::fs::write(mine.join("big/skin.ini"), b"name=Big").unwrap();
         std::fs::write(mine.join("big/model.sa2mdl"), b"old").unwrap();
@@ -338,6 +388,8 @@ mod tests {
             std::fs::read(mine.join("big/sounds/a.wav")).unwrap(),
             b"RIFFxxxx"
         );
+        assert!(!mine.join("big/old name.wav").exists());
+        assert!(mine.join("my_own/skin.ini").exists());
         // skin.ini was the same: never asked for.
         assert!(!asked.keys().any(|(f, _)| *f == 1));
         assert!(take_changed());

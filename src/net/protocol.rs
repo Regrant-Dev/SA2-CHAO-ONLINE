@@ -460,11 +460,14 @@ pub fn skin_id_ok(id: &str) -> bool {
 /// A shared file's path: `<skin id>/<parts>`, plain names only (nothing like `..`).
 pub fn skin_path_ok(path: &str) -> bool {
     let mut parts = path.split('/');
+    // Names any system can save (Windows refuses `?`, `:` and the like, and changes names
+    // ending in a space or dot).
     let ok_part = |p: &str| {
         !p.is_empty()
             && !p.starts_with('.')
+            && !p.ends_with([' ', '.'])
             && p.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b" _-.()!?',&+".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b" _-.()!',&+".contains(&b))
     };
     path.len() <= MAX_SKIN_PATH && parts.next().is_some_and(skin_id_ok) && {
         let rest: Vec<&str> = parts.collect();
@@ -1947,6 +1950,9 @@ mod tests {
             "big/.hidden",
             "big\\x",
             "big/x:y",
+            "big/what?.wav",
+            "big/name ",
+            "big/name.",
         ] {
             assert!(!skin_path_ok(bad), "{bad}");
         }
