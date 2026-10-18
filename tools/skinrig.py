@@ -31,7 +31,8 @@ import skinconv  # noqa: E402
 
 # The 62-node humanoid tree shared by Sonic, Shadow, Amy, Metal Sonic, Knuckles, Rouge, Tails,
 # Tikal and Chaos: per body part, (node its mesh goes on, node at its start joint, node at its
-# end joint or None). Left is +Z, the character faces -X.
+# end joint or None). Left is +Z, the character faces -X. The torso parts go on together,
+# anchored at the hips' start joint.
 HUMANOID = {
     "hips": (1, 1, 32),
     "chest": (32, 32, 34),
@@ -55,6 +56,30 @@ HUMANOID = {
     "toe_l": (24, 24, None),
     "tail": (27, 26, 30),
 }
+# Eggman's 46-node tree (eggmdl.prs model 230, re/skins.md): no collarbones, so the shoulders
+# go on the shoulder joints (28, 39); legs 7-14 / 16-23, arms 29-33 / 40-45, head 38.
+EGGMAN = {
+    "hips": (1, 1, 25),
+    "chest": (25, 25, 26),
+    "upperchest": (26, 26, 27),
+    "head": (38, 36, None),
+    "shoulder_l": (28, 27, 29),
+    "upperarm_l": (29, 29, 30),
+    "forearm_l": (31, 30, 32),
+    "hand_l": (33, 32, None),
+    "shoulder_r": (39, 27, 40),
+    "upperarm_r": (40, 40, 41),
+    "forearm_r": (42, 41, 43),
+    "hand_r": (44, 43, None),
+    "thigh_r": (7, 7, 8),
+    "shin_r": (9, 8, 10),
+    "foot_r": (12, 12, 14),
+    "toe_r": (13, 13, None),
+    "thigh_l": (16, 16, 17),
+    "shin_l": (18, 17, 19),
+    "foot_l": (21, 21, 23),
+    "toe_l": (22, 22, None),
+}
 # The torso keeps its own shape as one block, anchored at the hips: the characters' torso
 # segments are tiny (hips to waist is 0.1), so fitting each one would crush it.
 TORSO = {"hips", "chest", "upperchest", "head"}
@@ -65,13 +90,21 @@ PARENT_PART = {
     "head": "upperchest", "hand_l": "forearm_l", "hand_r": "forearm_r",
     "toe_l": "foot_l", "toe_r": "foot_r",
 }
-# Nodes a skin must leave empty: the displays swap mouth shapes into these (re/skins.md).
+# Nodes a skin must leave empty on the humanoid tree: the displays swap mouth shapes into these
+# (re/skins.md).
 KEEP_EMPTY = {46, 47, 48, 49}
 
 CHARACTERS = {
-    # name: (model file, body model number, body slots the display draws, texture field)
-    "sonic": ("sonicmdl", 0, [0, 31, 48], 0x394),
-    "knuckles": ("knuckmdl", 142, [142], 0x3F0),
+    # name: (model file, body model number, body slots the display draws (the same tree), the
+    # CharObj2 field of its texture list (its display), its part map)
+    "sonic": ("sonicmdl", 0, [0, 31, 48], 0x394, HUMANOID),
+    "shadow": ("teriosmdl", 65, [65, 104, 123], 0x394, HUMANOID),
+    "amy": ("amymdl", 395, [395], 0x394, HUMANOID),
+    "metalsonic": ("metalsonicmdl", 418, [418], 0x394, HUMANOID),
+    "knuckles": ("knuckmdl", 142, [142, 169], 0x3F0, HUMANOID),
+    "rouge": ("rougemdl", 171, [171, 206], 0x3F0, HUMANOID),
+    "tails": ("milesmdl", 208, [208, 528], 0x3B0, HUMANOID),
+    "eggman": ("eggmdl", 230, [230, 527], 0x360, EGGMAN),
 }
 
 # Unreal-style bone names -> body part (first match wins; _l/_r kept).
@@ -370,7 +403,8 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--name", required=True)
     ap.add_argument("--game", required=True, help="the game's resource/gd_PC folder")
-    ap.add_argument("--character", default="sonic", help="characters to fit it to, e.g. sonic,knuckles")
+    ap.add_argument("--character", default="sonic",
+                    help=f"characters to fit it to, e.g. sonic,knuckles, or all ({','.join(CHARACTERS)})")
     ap.add_argument("--big", type=Path, metavar="EXE", help="use the game's Big the Cat (sonic2app.exe)")
     ap.add_argument("--forward", help="the source model's facing axis (+z for glTF)")
     ap.add_argument("--bulk", type=float, default=1.0, help="widen the parts (not their length)")
@@ -386,7 +420,7 @@ def main():
     forward = args.forward or src.forward
 
     def build(character):
-        file, body, slots, texfield = CHARACTERS[character]
+        file, body, slots, texfield, parts = CHARACTERS[character]
         d, models = charskel.load(args.game, file)
         tree = charskel.nodes(d, models[body])
         world = charskel.world(tree)
@@ -412,20 +446,20 @@ def main():
         for side in "lr":
             foot = f"foot_{side}"
             if foot in src.joints:
-                ankle_height = joint[HUMANOID[foot][1]][1]
+                ankle_height = joint[parts[foot][1]][1]
                 drop[side] = max(0.0, ankle_height - src_point(src.joints[foot][0])[1])
         down = lambda name: np.array([0.0, drop.get(name[-1], 0.0), 0.0])
 
         # Per part: where it starts in each skeleton and how to turn/stretch it.
         fit = {}
-        for name, (mesh_node, start_node, end_node) in HUMANOID.items():
+        for name, (mesh_node, start_node, end_node) in parts.items():
             if name not in src.joints:
                 continue
             a, b = src.joints[name]
             s0, t0 = src_point(a), joint[start_node]
             if name in TORSO and "hips" in src.joints:
                 anchor = src_point(src.joints["hips"][0])
-                fit[name] = [mesh_node, anchor, joint[HUMANOID["hips"][1]], np.eye(3), 1.0, None]
+                fit[name] = [mesh_node, anchor, joint[parts["hips"][1]], np.eye(3), 1.0, None]
                 continue
             if name.startswith("foot_"):
                 t0 = t0 - down(name)
@@ -483,7 +517,7 @@ def main():
             if len(vp) > MAX_NODE_VERTS:
                 sys.exit(f"node {node} has {len(vp)} vertices (at most {MAX_NODE_VERTS}): "
                          f"reduce the model first (tools/blender_reduce.py)")
-            if node in KEEP_EMPTY:
+            if parts is HUMANOID and node in KEEP_EMPTY:
                 sys.exit(f"node {node} must stay empty")
 
         # The character's tree, node for node, with our meshes.
@@ -518,18 +552,23 @@ def main():
         meta = w.put("II", 0x444E45, 0)
         w.patch(0, "QII", skinconv.SA2MDL, obj_at[0], meta)
 
-        return bytes(w.buf), {n: len(v[0]) for n, v in sorted(nodes.items())}, k, slots, texfield, len(tree)
+        height = max(j[1] for j in joint) - min(j[1] for j in joint)
+        return (bytes(w.buf), {n: len(v[0]) for n, v in sorted(nodes.items())}, k, slots, texfield,
+                len(tree), height)
 
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     rigs = []
-    for character in args.character.split(","):
+    heights = []
+    wanted = list(CHARACTERS) if args.character == "all" else args.character.split(",")
+    for character in wanted:
         character = character.strip()
         if character not in CHARACTERS:
             sys.exit(f"no skeleton known for '{character}' (known: {', '.join(sorted(CHARACTERS))})")
-        model, used, k, slots, texfield, count = build(character)
+        model, used, k, slots, texfield, count, height = build(character)
+        heights.append(height)
         (out / f"model_{character}.sa2mdl").write_bytes(model)
-        rigs.append(f"rig_{character}={','.join(map(str, slots))};{texfield:#x}")
+        rigs.append(f"rig_{character}={','.join(map(str, slots))};{texfield:#x};{height:.2f}")
         print(f"{args.name}: on {character}'s {count} nodes, meshes on {used}, scale {k:.4f}")
     tex_dir = out / "textures"
     tex_dir.mkdir(exist_ok=True)
@@ -547,6 +586,8 @@ def main():
         "rigged=on",
         *rigs,
         f"character_scale={args.size}",
+        # Its height (the tallest fit; each rig has its own), for turning over about its middle.
+        f"height={max(heights):.2f}",
         f"keep_nodes={','.join(map(str, sorted(KEEP_EMPTY)))}",
     ]
     if src.credit:

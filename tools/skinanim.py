@@ -6,12 +6,14 @@
 The input is a glTF with a skinned mesh and its animations (tools/blender_merge_anims.py makes
 one from Mixamo downloads; some models come with their animations already). The output skin folder holds:
   model.sa2mdl    the skeleton as a node tree: a hidden root node that turns it to face -X,
-                  stand on y = 0 and be --height tall, then one node per bone. Each vertex goes
-                  with its strongest bone (small separate pieces, like a rod, whole with their
-                  main one); a triangle across bones is drawn by the last of them, using the
-                  others' vertices from the game's shared vertex buffer, so joints bend instead
-                  of tearing (as Knuckles' body does). A bone with many vertices gets extra
-                  pieces: child nodes with no transform of their own, so nothing is reduced;
+                  stand on y = 0 and be --height tall, then one node per bone. A vertex moved
+                  by one bone sits in that bone's space; one moved by several is weighted: each
+                  of its bones adds its share in the game's shared vertex buffer (Ninja weighted
+                  vertices, as Sonic's body has), so joints bend smoothly instead of stretching.
+                  Small separate pieces, like a rod, move whole with their main bone. A triangle
+                  across bones is drawn by the last of them, once its corners are complete. A
+                  bone with many vertices gets extra pieces: child nodes with no transform of
+                  their own, so nothing is reduced;
   motions.sa2mot  every animation as a Ninja motion (positions and angles per node, one key per
                   frame at 30 per second; pointers as file offsets like the model);
   textures/       the texture pack; skin.ini names the animations for idle, walk, run, jump and
@@ -36,8 +38,12 @@ import skinpreview  # noqa: E402
 
 FPS = 30
 MAX_NODE_VERTS = 800
-# The game's chunk vertex buffer (0x25EFE48) holds 8192; we use at most this many slots.
-VERTEX_SLOTS = 4096
+# Weighted vertices: at most this many bones each, each with at least this share (the rest go
+# to the ones kept). Weights are stored in 255ths.
+MAX_BONES = 3
+MIN_WEIGHT = 0.1
+# The game's chunk vertex buffer (0x25EFE48) holds 8192 slots (src/skins.rs VERTEX_SLOTS).
+VERTEX_SLOTS = 8192
 MOTION_MAGIC = b"SA2COMOT"
 BAMS = 65536 / (2 * math.pi)
 # Which animation plays when, by name (first match).
@@ -157,6 +163,26 @@ def rigid_islands(pos, tris, jw, ww, under, across):
     return {v: main[find(v)] for v in range(len(pos)) if find(v) in main}
 
 
+def blend(joints, weights):
+    """A vertex's joints and shares in 255ths (summing to 255): its heaviest few, each at least
+    MIN_WEIGHT."""
+    order = np.argsort(weights)[::-1]
+    kept = [(int(joints[i]), float(weights[i])) for i in order[:MAX_BONES]
+            if weights[i] >= MIN_WEIGHT]
+    if not kept:
+        kept = [(int(joints[order[0]]), 1.0)]
+    # Merge repeats of a joint, then share 255 by the weights (largest remainders round up).
+    merged = {}
+    for j, x in kept:
+        merged[j] = merged.get(j, 0.0) + x
+    total = sum(merged.values())
+    exact = {j: x / total * 255 for j, x in merged.items()}
+    q = {j: int(x) for j, x in exact.items()}
+    for j in sorted(exact, key=lambda j: exact[j] - q[j], reverse=True)[:255 - sum(q.values())]:
+        q[j] += 1
+    return [(j, x) for j, x in sorted(q.items(), key=lambda e: -e[1]) if x > 0]
+
+
 def decompose(m):
     """4x4 of translation, rotation and scale -> (pos, angles BAMS (x, y, z), scale)."""
     s = np.linalg.norm(m[:3, :3], axis=0)
@@ -216,6 +242,8 @@ def main():
     ap.add_argument("--rigid-islands", type=float, default=0.03, metavar="FRACTION",
                     help="small separate pieces (under this share of the triangles, and of the "
                          "height across) move whole with their main bone instead of bending")
+    ap.add_argument("--rigid", action="store_true",
+                    help="every vertex on its strongest bone only (no weighted vertices)")
     ap.add_argument("--role", action="append", default=[], help="role=animation name override")
     ap.add_argument("--only", default="", help="regex: keep only these animations")
     ap.add_argument("--credit", default="")
@@ -296,12 +324,13 @@ def main():
         stiff.append((pattern, jindex[cn]))
         cape = (cn, pn, pivot, bottom)
 
-    # The skinned mesh: each vertex on its strongest joint, in that joint's space. Triangles
-    # whose corners are on different joints are drawn by the last of them (depth-first), using
-    # the others' vertices from the game's shared vertex buffer, so joints bend instead of tearing.
+    # The skinned mesh: each vertex in the space of each of its joints, with that joint's share
+    # (one joint: all of it). Triangles whose corners are on different joints are drawn by the
+    # last of them (depth-first), using the others' vertices from the game's shared vertex
+    # buffer, so joints bend instead of tearing.
     textures, images = {}, []
-    verts = {}  # (joint, position, normal) -> vertex id
-    vert_list = []  # (joint, position, normal)
+    verts = {}  # its parts (rounded) -> vertex id
+    vert_list = []  # [(joint, position, normal, share in 255ths)] per vertex
     tri_list = []  # (texture, [(vertex id, uv)] x 3)
     bind_points = []
     skinned = [p for node in nodes if "mesh" in node and "skin" in node
@@ -334,16 +363,28 @@ def main():
 
             def vertex(v):
                 if v not in ids:
-                    j = island_joint.get(v, int(strongest[v])) if stiff_j is None else stiff_j
-                    lp = (ibm[j] @ np.r_[pos[v], 1.0])[:3]
-                    ln = ibm[j][:3, :3] @ nrm[v]
-                    ln /= max(np.linalg.norm(ln), 1e-9)
-                    key = (j, tuple(np.round(lp, 6)), tuple(np.round(ln, 4)))
+                    if stiff_j is not None:
+                        shares = [(stiff_j, 255)]
+                    elif v in island_joint:
+                        shares = [(island_joint[v], 255)]
+                    elif args.rigid:
+                        shares = [(int(strongest[v]), 255)]
+                    else:
+                        shares = blend(jw[v], ww[v])
+                    parts = []
+                    for j, q in shares:
+                        lp = (ibm[j] @ np.r_[pos[v], 1.0])[:3]
+                        ln = ibm[j][:3, :3] @ nrm[v]
+                        ln /= max(np.linalg.norm(ln), 1e-9)
+                        parts.append((j, lp, ln, q))
+                    key = tuple((j, tuple(np.round(lp, 6)), tuple(np.round(ln, 4)), q)
+                                for j, lp, ln, q in parts)
                     if key not in verts:
                         verts[key] = len(vert_list)
-                        vert_list.append((j, lp, ln))
-                        # Where the skeleton puts it (the joint's world bind matrix).
-                        bind_points.append((joint_world[j] @ np.r_[lp, 1.0])[:3])
+                        vert_list.append(parts)
+                        # Where the skeleton puts it (its joints' world bind matrices).
+                        bind_points.append(sum((joint_world[j] @ np.r_[lp, 1.0])[:3] * q / 255
+                                               for j, lp, _, q in parts))
                     ids[v] = verts[key]
                 return ids[v]
 
@@ -378,9 +419,11 @@ def main():
     for r in roots:
         walk(r)
     jpos = {joints.index(n): i for i, n in enumerate(jorder)}
+    # A vertex is complete once the last of its joints (depth-first) has added its share.
+    done_by = [max((j for j, *_ in parts), key=jpos.get) for parts in vert_list]
     drawn_by = {}  # joint index -> its triangles
     for tri in tri_list:
-        j = max((vert_list[v][0] for v, _ in tri[1]), key=jpos.get)
+        j = max((done_by[v] for v, _ in tri[1]), key=jpos.get)
         drawn_by.setdefault(j, []).append(tri)
 
     # Each joint's triangles in pieces bringing at most MAX_NODE_VERTS of its own vertices.
@@ -388,34 +431,65 @@ def main():
     for j, tris in drawn_by.items():
         out, seen, group = [], set(), []
         for tri in tris:
-            new = {v for v, _ in tri[1] if vert_list[v][0] == j and v not in seen}
+            new = {v for v, _ in tri[1] if done_by[v] == j and v not in seen}
             if group and len(seen) + len(new) > MAX_NODE_VERTS:
                 out.append(group)
                 seen, group = set(), []
-                new = {v for v, _ in tri[1] if vert_list[v][0] == j}
+                new = {v for v, _ in tri[1] if done_by[v] == j}
             seen |= new
             group.append(tri)
         out.append(group)
         pieces[joints[j]] = out
 
+    # Where a weighted vertex's other joints add their shares: not at the joint itself but at a
+    # node of its own (no transform: the joint's space) right before the child whose subtree
+    # completes the vertex, or after all the joint's children when none does. So its buffer
+    # slot is held only from there on, not across every subtree in between.
+    def toward(j, e):
+        """The child of joint node `j` whose subtree holds node `e`, if any."""
+        n = e
+        while n in parent:
+            if parent[n] == j:
+                return n
+            n = parent[n]
+        return None
+
+    share_at = {}  # (vertex, part) -> ("share", joint node, child node or None)
+    for v, parts in enumerate(vert_list):
+        for i, (j, *_) in enumerate(parts):
+            if len(parts) > 1 and j != done_by[v]:
+                share_at[(v, i)] = ("share", joints[j], toward(joints[j], joints[done_by[v]]))
+    shares = set(share_at.values())
+
     # Node order (depth-first, as motions address nodes): our root, then each joint followed by
-    # its children; a joint's extra pieces come right after it as its last children.
-    order = []  # ("joint", gltf node) or ("piece", gltf node, piece index)
+    # its extra pieces (its triangles only use vertices complete by then), then its children
+    # (each after the share node for it, if any), then its share node for none of them.
+    order = []  # ("joint", gltf node), ("share", gltf node, child or None), ("piece", gltf node, i)
+
+    def kids(n):
+        out = [("piece", n, i) for i in range(1, len(pieces.get(n, [])))]
+        for c in nodes[n].get("children", []):
+            if c in jindex:
+                out += [("share", n, c)] if ("share", n, c) in shares else []
+                out.append(("joint", c))
+        out += [("share", n, None)] if ("share", n, None) in shares else []
+        return out
 
     def visit(n):
         order.append(("joint", n))
-        for c in nodes[n].get("children", []):
-            if c in jindex:
-                visit(c)
-        for i in range(1, len(pieces.get(n, []))):
-            order.append(("piece", n, i))
+        for item in kids(n):
+            if item[0] == "joint":
+                visit(item[1])
+            else:
+                order.append(item)
 
     for r in roots:
         visit(r)
     at = {item: i for i, item in enumerate(order)}
 
-    # Which node puts each vertex in the buffer (one of its joint's: the first using it, or the
-    # joint itself when a node before that needs it) and the last node needing it there.
+    # Which nodes put each vertex in the buffer: its last joint's (the first of that joint's
+    # nodes using it, or the joint itself when a node before that needs it) completes it, its
+    # other joints add their shares before (at their own nodes); and the last node needing it.
     users = {}
     for n, plist in pieces.items():
         for i, tris in enumerate(plist):
@@ -423,22 +497,30 @@ def main():
             for _, corners in tris:
                 for v, _ in corners:
                     users.setdefault(v, []).append(at[item])
-    emit, last = {}, {}
+    adds = {}  # node -> [(vertex, its part, weight status)]
+    first, last = {}, {}
     for v, where in users.items():
-        j = joints[vert_list[v][0]]
+        j = joints[done_by[v]]
         own = [p for p in where if order[p][1] == j]
-        emit[v] = min(own) if own and min(own) == min(where) else at[("joint", j)]
-        last[v] = max(where)
+        done = min(own) if own and min(own) == min(where) else at[("joint", j)]
+        nodes_ = sorted((done if j_ == done_by[v] else at[share_at[(v, i)]], i)
+                        for i, (j_, *_) in enumerate(vert_list[v]))
+        for rank, (p, i) in enumerate(nodes_):
+            # One joint: a plain vertex (None); else start, middle or end of its weights.
+            status = None if len(nodes_) == 1 else 0 if rank == 0 else 2 if rank == len(nodes_) - 1 else 1
+            adds.setdefault(p, []).append((v, i, status))
+        first[v] = nodes_[0][0]
+        last[v] = max(max(where), done)
     # Buffer slots: a slot is free again once the last node needing its vertex is drawn.
     slot, free, live, peak = {}, list(range(VERTEX_SLOTS)), [], 0
     heapq.heapify(free)
-    emitted = {}
-    for v in sorted(emit, key=lambda v: (emit[v], v)):
-        emitted.setdefault(emit[v], []).append(v)
+    starting = {}
+    for v in sorted(first, key=lambda v: (first[v], v)):
+        starting.setdefault(first[v], []).append(v)
     for p in range(len(order)):
         while live and live[0][0] < p:
             heapq.heappush(free, heapq.heappop(live)[1])
-        for v in emitted.get(p, []):
+        for v in starting.get(p, []):
             if not free:
                 sys.exit(f"more than {VERTEX_SLOTS} vertices in use at once: fewer triangles")
             slot[v] = heapq.heappop(free)
@@ -451,13 +533,14 @@ def main():
     for item in order:
         p = at[item]
         n = item[1]
-        mine = sorted(emitted.get(p, []), key=slot.get)
-        plist = pieces.get(n, [])
-        i = 0 if item[0] == "joint" else item[2]
+        here = adds.get(p, [])
+        mine = sorted((v for v, _, status in here if status is None), key=slot.get)
+        plist = pieces.get(n, []) if item[0] != "share" else []
+        i = 0 if item[0] == "joint" else item[2] if item[0] == "piece" else 0
         tris = plist[i] if i < len(plist) else []
-        if not mine and not tris:
+        if not here and not tris:
             continue
-        # The vertices in runs of consecutive slots, one block each.
+        # Plain vertices in runs of consecutive slots, one block each.
         w.align()
         vl = w.here()
         runs = []
@@ -470,7 +553,20 @@ def main():
             w.put("I", 0x29 | ((1 + 6 * len(run)) << 16))  # CnkV_VN
             w.put("I", slot[run[0]] | (len(run) << 16))  # buffer offset, count
             for v in run:
-                w.put("6f", *vert_list[v][1], *vert_list[v][2])
+                _, lp, ln, _ = vert_list[v][0]
+                w.put("6f", *lp, *ln)
+        # Shares of weighted vertices, a block per weight status (0 start: the slot is set,
+        # 1 middle: added to, 2 end: added to and complete; re/skins.md "Weighted vertices").
+        for status in (0, 1, 2):
+            group = sorted(((v, part) for v, part, st in here if st == status),
+                           key=lambda e: slot[e[0]])
+            if not group:
+                continue
+            w.put("I", 0x2C | (status << 8) | ((1 + 7 * len(group)) << 16))  # CnkV_VN_NF
+            w.put("I", 0 | (len(group) << 16))  # buffer offset 0 (slots are in each entry), count
+            for v, part in group:
+                _, lp, ln, q = vert_list[v][part]
+                w.put("6fI", *lp, *ln, slot[v] | (q << 16))
         w.put("I", 0xFF)
         groups = {}
         for tex, corners in tris:
@@ -495,14 +591,9 @@ def main():
             model = models.get(item, 0)
             obj[item] = w.put("II3f3i3fII", 0 if model else 0x08, model, *t, *a, *s, 0, 0)
         else:
-            _, n, i = item
-            # No transform of its own (unit position, angles and scale): the bone's space.
+            # A piece or share node: no transform of its own (unit position, angles and
+            # scale), so the bone's space.
             obj[item] = w.put("II3f3i3fII", 0x07, models[item], 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0)
-
-    def kids(n):
-        out = [("joint", c) for c in nodes[n].get("children", []) if c in jindex]
-        out += [("piece", n, i) for i in range(1, len(pieces.get(n, [])))]
-        return out
 
     w.patch(obj_root + 0x2C, "I", obj[("joint", roots[0])])
     top = [("joint", r) for r in roots]
@@ -520,7 +611,7 @@ def main():
     w.patch(0, "QII", skinconv.SA2MDL, obj_root, meta)
 
     # Motions: per joint, an angle key per frame (and positions where it moves). Our root and
-    # the extra pieces have no keys (they keep their own transform).
+    # the piece and share nodes have no keys (they keep their own transform).
     m = skinconv.Writer()
     m.buf = bytearray(MOTION_MAGIC + b"\0" * 8)
     only = re.compile(args.only, re.I) if args.only else None

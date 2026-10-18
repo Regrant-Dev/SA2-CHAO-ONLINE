@@ -19,17 +19,25 @@ built skins in `skins/`, both ignored by git.
 
 - **Animated** (`tools/skinanim.py`): the model on its own skeleton with its own animations
   (Mixamo's, merged with `tools/blender_merge_anims.py`). It plays idle, walk, run, jump and
-  fall from how the character moves, and the garden animations from what it's doing.
+  fall from how the character moves, and the garden animations from what it's doing. Vertices
+  moved by several bones keep their weights (up to 3 bones each), so joints bend smoothly;
+  `--rigid` puts each on its strongest bone instead.
 - **Solid** (`tools/skinconv.py`): one model riding on the character, like a car.
-- **Rigged** (`tools/skinrig.py`): the model on a character's own skeleton, so only that
-  character can wear it.
+- **Rigged** (`tools/skinrig.py`): the model fitted onto the characters' own skeletons and moved
+  by their own animations: one model per character (`--character all`: Sonic, Shadow, Amy,
+  Metal Sonic, Knuckles, Rouge, Tails and Eggman on foot; not the walkers).
+
+Whatever kind, nothing of the character shows while a skin is on: not its body, wings,
+upgrades, effects drawn with it, its jump ball or its shadow (re/skins.md "Hiding the
+character").
 
 `skins-src/build.sh` builds all of ours; each tool's `--help` lists its options.
 
 ## skin.ini
 
 The tools write most of it: `name`, `textures`, `height`, `character_scale` (the size it's drawn
-at), `characters` (who can wear it; empty for anyone), and for animated skins the animations
+at), `characters` (who can wear it; empty for anyone; a rigged skin: whoever it has a
+`rig_<character>=<body slots>;<texture field>;<height>` line for), and for animated skins the animations
 and which one plays when (`idle=`, `walk=`, `run=`, `jump=`, `fall=`, `pickup=`, `carry=`,
 `carry_walk=`, `carry_run=`, `throw=`, `put_down=`, `pet=`, `shake=`, `whistle=`).
 

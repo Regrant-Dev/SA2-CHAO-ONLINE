@@ -9,6 +9,7 @@ mod coop;
 pub mod game;
 mod garden;
 mod goto;
+mod hide;
 mod hud;
 mod hunt;
 mod input;
@@ -104,6 +105,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     game::install_freeze();
     karate::install();
     voice::install();
+    hide::install();
     race::install();
     guarded("online init", || online::init(&path));
     guarded("skins init", || skins::init(&path));

@@ -316,6 +316,82 @@ Knuckles' proportions differ (head joint at 6.78, hands at y ~4.1, z +/-2.5), wi
   offset (total under ~500). Each node's strips may use its own vertices and those of earlier nodes
   in depth-first order (put a joint's bridging triangles on the child).
 
+### Hiding the character (2026-10-18, REA on the dumped exe)
+
+**Everything the game draws ends in two renderer entries.** The renderer is a C++ object at
+`*0x1A557C0` (set by 0x423DBB; its first word is its function table). Of the table's entries,
+two put geometry on screen, both thiscall with the callee popping its arguments:
+- +0x40, 7 arguments: cached buffers. Called only by 0x41BE30 (the GC display-list cache,
+  also via 0x4240A0).
+- +0x54, 6 arguments: plain vertices. Called by 0x41C070, the flush every immediate draw ends
+  in (32 callers: chunk models 0x42D500, display lists 0x41C9B0, sprites and polygons
+  0x77xxxx, ...).
+
+All 306 uses of the renderer pointer were sorted by entry. The others set state: +0x5C/+0x58
+transforms (118 uses), +0xF0..+0xF8 states and textures, +0x3C clear, +0x34 begin/end scene,
++0x30 viewport.
+
+So the mod hides a character by swapping the renderer's table for a copy whose +0x40 and +0x54
+return 0 (src/hide.rs) while the character's displays run. Nothing of it reaches the screen
+(body, wings, gloves, upgrades, mouths, effects drawn there, the shadow-map pass), yet all its
+node matrices and bone callbacks still run, so hands and held things follow. The copy is
+sized with VirtualQuery (up to 256 entries; the game uses up to +0x114).
+
+**Model draws** (for reference):
+- `0x42D500` chunk model draw, cdecl (model), returns 0. It runs the vertex lists through
+  0x42D190, then the strips.
+- DrawMotion `0x780870` (cdecl (model, frame), ECX = motion; starts `51 D9 44 24 0C 51`)
+  walks the nodes with callback 0x42E660, which draws each through 0x42D500.
+- `0x42D790`/`0x42D8E0` queue and flush up to 10 nodes for the GC models' drawer `0x42BED0`
+  (opaque and translucent mesh sets by `0x25EFEE0` & 1 / & 2; display lists 0x41C9B0).
+
+**Rigged skins** go in through the character's own display. A hook on DrawMotion lets only
+the skin's root through with the real table, so none of the character's other models show.
+Rouge's display, for example, draws fixed slots 174 (a separate 30-node model), 186, 190,
+192, 195, 196, 199, 201, 203 and 205. When the display draws another body instead (Sonic's
+family's ball, model AnimInfo[30], a 31-node tree), the skin's own model is drawn turning over
+in its place.
+
+**Every display of the object.** The object list's display loop (0x470010) calls each object's
++0x14, then +0x20 (sorted translucent queue: 0x492F60 / 0x493A90), +0x1C and +0x24, with the
+pass in `0x25EFEE0`. Sonic's +0x1C (0x720B50) draws a model at the player from a distance
+(0x7983F0 culls under 50 units). All of them run hidden while a skin is on.
+
+**Separate objects.** The jump ball is a JumpAura object per frame (re/spin-ball.md), drawn by
+its own display 0x756960 (+0x1C). The hook there skips our player's balls (data +1 == 0)
+while a skin is on.
+
+**Character displays** (the init writes ObjectMaster +0x14). Body slots come from AnimInfo;
+the alternates have the same tree.
+
+| Character | Init | Display | Texture list (CharObj2) | Bodies (nodes) |
+|---|---|---|---|---|
+| Sonic, Shadow, Amy, Metal Sonic | 0x71706C, 0x7175CC, 0x7172E5, 0x7177C7 | 0x720090 | +0x394 | 0/31/48, 65/104/123, 395, 418 (62) |
+| Knuckles | 0x7283DA | 0x72EF20 | +0x3F0 | 142, 169 (62) |
+| Rouge | 0x7287F7 | 0x730970 | +0x3F0 | 171, 206 (62) |
+| Tails on foot | 0x74D152 | 0x7507D0 | +0x3B0 | 208, 528 (62) |
+| Eggman on foot | 0x73C36B | 0x73EF20 | +0x360 | 230, 527 (46) |
+
+Eggman's 46 nodes: hips 1, torso 25/26, neck 27, head joint 36 (mesh 38), legs 7-14
+(right, z -) and 16-23, shoulder joints 28/39, arms 29-33 (left, z +) and 40-45.
+
+### Weighted vertices (2026-10-18, REA: 0x42D190, 0x42ED60, 0x42E440)
+0x42D190 runs a model's vertex list: per block, h1 = type | flags << 8 | words << 16 and
+h2 = offset | count << 16; the slot base is buffer + offset * 32 (`*0x25EFE48`, 0x40000 bytes
+allocated at 0x43502E: 8192 slots). The 0x1000 stored at 0x25EFE4C is never read.
+- **0x29 (VN)**, 0x42E440: per vertex position, normal; the slot gets them through the current
+  matrix, and its word 6 = 0xFFFFFFFF.
+- **0x2C (VN_NF)**, 0x42ED60: per vertex position, normal, u32 flags. The slot is
+  base + (flags & 0xFFFF), the weight (flags >> 16) / 255. The status is h1's flags with 0x80
+  masked off: 0 sets the slot to the weighted vertex, 1 adds to it, 2 adds and marks it
+  complete (word 6 = 0xFFFFFFFF).
+- Others: 0x2A (VN_D8, 0x42F4F0), 0x23 (0x42ECD0).
+
+tools/skinanim.py writes a vertex moved by several bones (up to 3, each at least 10%) as
+0x2C shares. Every share but the last goes in at a share node (no transform: the bone's space)
+right before the child subtree that completes the vertex, so its slot isn't held across other
+subtrees. Triangles are drawn once all their corners are complete.
+
 ### Garden actions (for animated skins' extra animations)
 Player actions are `EntityData1+0` (Sonic's switch: 0x719B19, table 0x71E1A0, 0x58 entries; a
 per-frame switch at 0x717C81, table 0x7197B4, same numbering). Animation = CharObj2 +0x176 (next)

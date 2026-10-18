@@ -20,16 +20,18 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::game;
+use crate::hide;
 use crate::log;
 
 /// SA Tools' "SA2MDL" magic with format version 3 in the top byte.
 const SA2MDL: u64 = 0x4C44_4D32_4153 | (3 << 56);
 const MAX_FILE: usize = 8 << 20;
 const MAX_OBJECTS: usize = 512;
-/// Slots of the game's chunk vertex buffer (0x25EFE48, 8192 of 32 bytes) a model may use:
+/// Slots of the game's chunk vertex buffer (0x25EFE48, allocated 0x40000 bytes at 0x43502E:
+/// 8192 of 32 bytes; the 0x1000 stored beside it at 0x25EFE4C is never read) a model may use:
 /// each block goes in at its offset, and later nodes' strips may use earlier nodes' vertices
 /// (how Knuckles' body joins at the joints; re/skins.md).
-const VERTEX_SLOTS: usize = 4096;
+const VERTEX_SLOTS: usize = 8192;
 const MAX_TEXTURES: usize = 64;
 
 const OBJECT_SIZE: usize = 0x34;
@@ -53,6 +55,9 @@ const ENTITY_SCALE: usize = 0x20;
 /// The player's ObjectMaster (re/characters.md): its display draws the character.
 const PLAYER_OBJECT: usize = 0x01DE_A6E0;
 const OBJ_DISPLAY: usize = 0x14;
+/// The object's later display passes (the object list runs them after every display, 0x470010):
+/// what a character draws there (Sonic's +0x1C draws a model at the player) is hidden too.
+const OBJ_LATER_DISPLAYS: [usize; 3] = [0x1C, 0x20, 0x24];
 
 /// What `skin.ini` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -154,24 +159,33 @@ pub struct Doing {
 }
 
 /// A rigged skin's model for one character: its file, the model-table slots the character's
-/// display draws its body from, and the CharObj2 field holding its texture list.
+/// display draws its body from, the CharObj2 field holding its texture list, and how tall it
+/// stands (0: the skin's `height`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rig {
     pub character: u8,
     pub file: String,
     pub slots: Vec<usize>,
     pub field: usize,
+    pub height: f32,
 }
 
 impl Rig {
-    /// `rig_<character>=<slots>;<field>`, the model in `model_<character>.sa2mdl`.
+    /// `rig_<character>=<slots>;<field>[;<height>]`, the model in `model_<character>.sa2mdl`.
     fn parse(character: &str, v: &str) -> Option<Self> {
-        let (slots, field) = v.split_once(';')?;
+        let mut fields = v.split(';');
+        let (slots, field) = (fields.next()?, fields.next()?);
+        let height = fields
+            .next()
+            .and_then(|h| h.trim().parse::<f32>().ok())
+            .filter(|h| h.is_finite() && (0.0..1000.0).contains(h))
+            .unwrap_or(0.0);
         let rig = Rig {
             character: character_id(character)?,
             file: format!("model_{}.sa2mdl", character.to_ascii_lowercase()),
             slots: numbers(slots).filter(|&n| n < MODEL_COUNT).collect(),
             field: numbers(field).next().filter(|&n| n < 0x1000)?,
+            height,
         };
         (!rig.slots.is_empty() && rig.field != 0).then_some(rig)
     }
@@ -500,7 +514,14 @@ fn load_model(bytes: &[u8], textures: usize) -> Result<Model, String> {
     })
 }
 
-/// A vertex list: only `CnkV_VN` blocks (0x29) within `VERTEX_SLOTS`, then the end marker.
+/// Vertex blocks: plain (`CnkV_VN`, 0x29: position, normal) and weighted (`CnkV_VN_NF`, 0x2C:
+/// position, normal, then slot | weight << 16, the slot counted from the block's offset; the
+/// weight status, 0 start / 1 middle / 2 end, in the header's flags; re/skins.md "Weighted
+/// vertices").
+const VERTICES_PLAIN: u32 = 0x29;
+const VERTICES_WEIGHTED: u32 = 0x2C;
+
+/// A vertex list: only plain and weighted blocks within `VERTEX_SLOTS`, then the end marker.
 /// Returns the end of the highest slot filled.
 fn check_vertices(
     u32_at: &dyn Fn(usize) -> Option<u32>,
@@ -518,24 +539,46 @@ fn check_vertices(
             return Ok(count);
         }
         let h2 = u32_at(at + 4).unwrap_or(0);
-        let (words, offset, n) = (
+        let (kind, status, words, offset, n) = (
+            h1 & 0xFF,
+            (h1 >> 8) & 0x7F,
             (h1 >> 16) as usize,
             (h2 & 0xFFFF) as usize,
             (h2 >> 16) as usize,
         );
-        if h1 & 0xFF != 0x29 || offset + n > VERTEX_SLOTS || words != 1 + 6 * n {
+        let stride = match kind {
+            VERTICES_PLAIN if offset + n <= VERTEX_SLOTS => 6,
+            VERTICES_WEIGHTED if status <= 2 => 7,
+            _ => return Err(format!("vertex block at {at:#x}")),
+        };
+        if words != 1 + stride * n {
             return Err(format!("vertex block at {at:#x}"));
         }
         if !in_range(at, 4 + words * 4) {
             return Err(format!("vertex block at {at:#x} runs off the file"));
         }
-        for i in 0..n * 6 {
-            let v = f32::from_bits(u32_at(at + 8 + i * 4).unwrap_or(0));
-            if !v.is_finite() || v.abs() > 1.0e5 {
-                return Err(format!("vertex block at {at:#x}: bad number"));
+        for v in 0..n {
+            let entry = at + 8 + v * stride * 4;
+            for i in 0..6 {
+                let f = f32::from_bits(u32_at(entry + i * 4).unwrap_or(0));
+                if !f.is_finite() || f.abs() > 1.0e5 {
+                    return Err(format!("vertex block at {at:#x}: bad number"));
+                }
+            }
+            if stride == 7 {
+                let flags = u32_at(entry + 24).unwrap_or(u32::MAX);
+                let slot = offset + (flags & 0xFFFF) as usize;
+                if slot >= VERTEX_SLOTS || flags >> 16 > 255 {
+                    return Err(format!(
+                        "vertex block at {at:#x}: weighted vertex out of range"
+                    ));
+                }
+                count = count.max(slot + 1);
             }
         }
-        count = count.max(offset + n);
+        if stride == 6 {
+            count = count.max(offset + n);
+        }
         at += 4 + words * 4;
     }
     Err(format!("vertices at {vlist:#x}: no end"))
@@ -727,9 +770,9 @@ fn load_motions(bytes: &[u8], nodes: usize) -> Result<Motions, String> {
 struct Loaded {
     id: String,
     model: Model,
-    /// The texture list for this stage, and the level it was loaded in.
+    /// The texture list, and the scene it was loaded in (`scene`).
     texlist: usize,
-    level: i16,
+    level: (i16, u32, i32),
     /// Rigged skins: the character's textures then ours, as one list (entries, then the
     /// NJS_TEXLIST pointing at them), and what it was built from.
     combined: Box<[u8]>,
@@ -935,7 +978,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
     {
         return None;
     }
-    let level = game::current_level();
+    let level = scene();
     // A rigged skin's model for this character; otherwise the one solid model.
     let file = match character {
         Some(c) if info.rigged => info.rig_for(c)?.file.clone(),
@@ -952,7 +995,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
             && let Some(oldest) = (0..s.loaded.len()).min_by_key(|&i| s.loaded[i].used)
         {
             let l = s.loaded.swap_remove(oldest);
-            if l.texlist != 0 {
+            if l.texlist != 0 && texlist_ok(l.texlist) {
                 crate::puppet::release_texlist(l.texlist);
             }
         }
@@ -986,7 +1029,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
                     id: key.clone(),
                     model,
                     texlist: 0,
-                    level: 0,
+                    level: (0, 0, 0),
                     combined: Box::new([]),
                     combined_list: Box::new([0; 2]),
                     combined_from: (0, 0),
@@ -1005,8 +1048,11 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
     let clock = s.clock;
     let loaded = &mut s.loaded[index];
     loaded.used = clock;
-    if loaded.texlist == 0 || loaded.level != level {
-        if loaded.texlist != 0 {
+    // Again for each scene, and whenever the game has freed them since (it frees textures
+    // between Chao World's areas within one level): drawing with freed ones crashes.
+    if loaded.texlist == 0 || loaded.level != level || !texlist_ok(loaded.texlist) {
+        // Ours to release only while they're still there.
+        if loaded.texlist != 0 && texlist_ok(loaded.texlist) {
             crate::puppet::release_texlist(loaded.texlist);
         }
         let name = std::ffi::CString::new(info.archive()).ok()?;
@@ -1022,7 +1068,8 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
             }
         );
     }
-    if loaded.texlist == 0 {
+    if loaded.texlist == 0 || !texlist_ok(loaded.texlist) {
+        loaded.texlist = 0;
         return None;
     }
     let scale = if character.is_some() {
@@ -1053,9 +1100,35 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
     Some((ready, index))
 }
 
+/// Where textures last: the level, the stage run, the Chao World area (game.rs).
+fn scene() -> (i16, u32, i32) {
+    (
+        game::current_level(),
+        game::stage_run(),
+        game::current_chao_area(),
+    )
+}
+
+/// Every texture of an NJS_TEXLIST still loaded (the game hasn't freed it): each entry's
+/// texture (+8) and its surface (+0xC there), as the draw reads them (0x42C4D0).
+fn texlist_ok(texlist: usize) -> bool {
+    // SAFETY: a texture list we loaded; its entries point at the game's texture records.
+    unsafe {
+        let entries = (texlist as *const usize).read();
+        let count = ((texlist + 4) as *const u32).read() as usize;
+        if entries == 0 || count == 0 || count > MAX_CHARACTER_TEXTURES {
+            return false;
+        }
+        (0..count).all(|i| {
+            let texture = ((entries + i * TEXNAME_SIZE + 8) as *const usize).read();
+            texture != 0 && ((texture + 0xC) as *const usize).read() != 0
+        })
+    }
+}
+
 fn release(s: &mut Skins) {
     for l in s.loaded.drain(..) {
-        if l.texlist != 0 {
+        if l.texlist != 0 && texlist_ok(l.texlist) {
             crate::puppet::release_texlist(l.texlist);
         }
     }
@@ -1089,19 +1162,54 @@ pub fn on_frame() {
         None
     };
     crate::voice::frame(voice.as_deref());
+    hide::set_jump_ball_hidden(wanted);
     if object == 0 {
         return;
     }
-    let field = (object + OBJ_DISPLAY) as *mut usize;
-    // SAFETY: the live player object's display field.
-    unsafe {
-        let now = field.read();
-        if wanted && now != ours && now != 0 {
-            PLAYER_DISPLAY.store(now, Ordering::Relaxed);
-            field.write(ours);
-        } else if !wanted && now == ours {
-            field.write(PLAYER_DISPLAY.load(Ordering::Relaxed));
+    let later: [extern "C" fn(usize); 3] = [later_display_0, later_display_1, later_display_2];
+    let fields = std::iter::once((OBJ_DISPLAY, ours, &PLAYER_DISPLAY)).chain(
+        OBJ_LATER_DISPLAYS
+            .iter()
+            .zip(later)
+            .zip(&LATER_DISPLAYS)
+            .map(|((&at, f), saved)| (at, f as usize, saved)),
+    );
+    for (at, ours, saved) in fields {
+        let field = (object + at) as *mut usize;
+        // SAFETY: the live player object's display fields.
+        unsafe {
+            let now = field.read();
+            if wanted && now != ours && now != 0 {
+                saved.store(now, Ordering::Relaxed);
+                field.write(ours);
+            } else if !wanted && now == ours {
+                field.write(saved.load(Ordering::Relaxed));
+            }
         }
+    }
+}
+
+/// The player object's own later displays, while ours stand in for them.
+static LATER_DISPLAYS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+extern "C" fn later_display_0(object: usize) {
+    later_display(0, object);
+}
+
+extern "C" fn later_display_1(object: usize) {
+    later_display(1, object);
+}
+
+extern "C" fn later_display_2(object: usize) {
+    later_display(2, object);
+}
+
+/// A later display of the character's, with nothing of it drawn (the skin is drawn in its
+/// main one).
+fn later_display(i: usize, object: usize) {
+    let original = LATER_DISPLAYS[i].load(Ordering::Relaxed);
+    if original != 0 && hide::hidden(0, || call_display(original, object)).is_none() {
+        call_display(original, object);
     }
 }
 
@@ -1393,8 +1501,16 @@ unsafe fn game_tree(root: usize) -> Vec<usize> {
 }
 
 /// A rigged skin on our character this frame: the writes that put it in place for the
-/// character's own display (address, value), undone right after it draws.
-fn rigged_writes(s: &mut Skins, character: u8, co2: usize) -> Option<Vec<(usize, usize)>> {
+/// character's own display (address, value), undone right after it draws, and its model.
+struct Rigged {
+    writes: Vec<(usize, usize)>,
+    root: usize,
+    texlist: usize,
+    scale: f32,
+    height: f32,
+}
+
+fn rigged_writes(s: &mut Skins, character: u8, co2: usize) -> Option<Rigged> {
     let id = s.mine.clone()?;
     let info = s.list.iter().find(|i| i.id == id)?.clone();
     let rig = info.rig_for(character)?.clone();
@@ -1490,7 +1606,17 @@ fn rigged_writes(s: &mut Skins, character: u8, co2: usize) -> Option<Vec<(usize,
             writes.push((at, (now * scale).to_bits() as usize));
         }
     }
-    Some(writes)
+    Some(Rigged {
+        writes,
+        root: loaded.model.root(),
+        texlist: loaded.combined_list.as_ptr() as usize,
+        scale,
+        height: if rig.height > 0.0 {
+            rig.height
+        } else {
+            info.height
+        },
+    })
 }
 
 /// Extra model-table slots a character's display may draw its body from besides its current
@@ -1641,13 +1767,56 @@ extern "C" fn player_display(object: usize) {
     .ok()
     .flatten();
     let original = PLAYER_DISPLAY.load(Ordering::Relaxed);
-    if let Some(writes) = rigged {
+    if let Some(rig) = rigged {
         if original == 0 {
             return;
         }
+        // Nothing of the character shows but the skin's body: not its other models (wings,
+        // gloves, mouths...), upgrades or effects.
+        let through = if hide::can_let_through() { rig.root } else { 0 };
+        let mut drawn = None;
         // SAFETY: the addresses come from `rigged_writes` (live game data) and are restored in
         // reverse order right after the display.
-        unsafe { with_writes(&writes, || call_display(original, object)) };
+        unsafe {
+            with_writes(&rig.writes, || {
+                drawn = if through != 0 {
+                    hide::hidden(through, || call_display(original, object))
+                } else {
+                    None
+                };
+                if drawn.is_none() {
+                    call_display(original, object);
+                }
+            })
+        };
+        // The display drew another body instead (a spin ball, which is no skeleton of ours):
+        // the skin's own, turning over as it goes.
+        let curled = game::local_player().map(|p| (p.curled, p.position, p.rotation, p.scale));
+        if let Some((curled, p, rotation, size)) = curled {
+            let mut tilt = OUR_MOVES.lock().unwrap_or_else(|e| e.into_inner()).step(
+                curled,
+                rotation[1],
+                rig.height * rig.scale * size,
+            );
+            if drawn == Some(false) {
+                // The characters face -X: rolling forward is about Z.
+                tilt.lean = tilt.spin;
+                tilt.spin = 0;
+                // SAFETY: display pass on the game thread; a checked, relocated model with the
+                // texture list it was drawn with.
+                unsafe {
+                    crate::puppet::draw_solid(
+                        rig.root,
+                        rig.texlist,
+                        [p.x, p.y, p.z],
+                        rotation,
+                        rig.scale * size,
+                        tilt,
+                        None,
+                    )
+                };
+            }
+        }
         return;
     }
     let drawn = std::panic::catch_unwind(|| {
@@ -1709,14 +1878,22 @@ extern "C" fn player_display(object: usize) {
         // The character's own display still runs, with every node of its body hidden: as it
         // draws it works out where the body, hands and feet are, and moves like the light
         // dash use that. Then the skin is drawn in its place.
-        let mut writes = if co2 != 0 && original != 0 {
-            hidden_body(player.character, co2)
-        } else {
+        // Hidden at the renderer, nothing of the character is drawn (body, wings, upgrades,
+        // effects: any character); otherwise its body nodes are, for the characters we know.
+        let hide = hide::available();
+        let mut writes = if co2 == 0 || original == 0 {
             Vec::new()
+        } else if hide {
+            vec![(co2 + CO2_UPGRADES, 0)]
+        } else {
+            let mut body = hidden_body(player.character, co2);
+            if !body.is_empty() {
+                body.push((co2 + CO2_UPGRADES, 0));
+            }
+            body
         };
-        // Only with its body found and hidden, or the character would show too.
+        // Only with the character hidden, or it would show too.
         if !writes.is_empty() {
-            writes.push((co2 + CO2_UPGRADES, 0));
             // The hidden body at the skin's size, so what it holds (a Chao, a fruit) sits up
             // where the bigger skin's hands are, not at the character's.
             let entity = game::local_entity() as usize;
@@ -1730,7 +1907,13 @@ extern "C" fn player_display(object: usize) {
                 }
             }
             // SAFETY: live game data, restored in reverse order right after the display.
-            unsafe { with_writes(&writes, || call_display(original, object)) };
+            unsafe {
+                with_writes(&writes, || {
+                    if !hide || hide::hidden(0, || call_display(original, object)).is_none() {
+                        call_display(original, object);
+                    }
+                })
+            };
         }
         // SAFETY: display pass on the game thread; a checked, relocated model.
         let p = player.position;
@@ -1830,6 +2013,40 @@ mod tests {
         b[..8].copy_from_slice(&SA2MDL.to_le_bytes());
         b[8..12].copy_from_slice(&(root as u32).to_le_bytes());
         b
+    }
+
+    /// A vertex list of one weighted block (status, offset, entries (slot, weight)), checked.
+    fn weighted(status: u32, offset: u32, entries: &[(u32, u32)]) -> Result<usize, String> {
+        let mut b = vec![0u8; 16];
+        let n = entries.len() as u32;
+        b.extend_from_slice(&(0x2C | status << 8 | (1 + 7 * n) << 16).to_le_bytes());
+        b.extend_from_slice(&(offset | n << 16).to_le_bytes());
+        for &(slot, weight) in entries {
+            for f in [1.0f32, 2.0, 3.0, 0.0, 1.0, 0.0] {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+            b.extend_from_slice(&(slot | weight << 16).to_le_bytes());
+        }
+        b.extend_from_slice(&0xFFu32.to_le_bytes());
+        let u32_at = |at: usize| {
+            b.get(at..at + 4)
+                .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        };
+        let in_range =
+            |at: usize, size: usize| at.is_multiple_of(4) && at >= 16 && at + size <= b.len();
+        check_vertices(&u32_at, &in_range, 16)
+    }
+
+    #[test]
+    fn weighted_vertices_are_checked() {
+        // Two shares of slot 10 and one of 8191 (the last there is), counted from offset 0.
+        assert_eq!(weighted(0, 0, &[(10, 128), (8191, 255)]), Ok(8192));
+        assert_eq!(weighted(2, 5, &[(10, 127)]), Ok(16));
+        // A weight status that isn't start, middle or end; a slot past the buffer; a weight
+        // above 255.
+        assert!(weighted(3, 0, &[(1, 255)]).is_err());
+        assert!(weighted(1, 5000, &[(4000, 255)]).is_err());
+        assert!(weighted(1, 0, &[(1, 256)]).is_err());
     }
 
     #[test]
@@ -2094,14 +2311,19 @@ mod tests {
     fn rigged_skin_ini() {
         let i = Info::parse(
             "hero",
-            "name=Space Hero\nrigged=on\nrig_sonic=0,31,48;0x394\nrig_knuckles=142;0x3f0\nrig_nobody=1;2\ntextures=3\n",
+            "name=Space Hero\nrigged=on\nrig_sonic=0,31,48;0x394\nrig_knuckles=142;0x3f0\nrig_nobody=1;2\nrig_eggman=230,527;0x360;14.5\ntextures=3\n",
         )
         .unwrap();
-        assert_eq!(i.characters, vec![0, 4]);
+        assert_eq!(i.characters, vec![0, 4, 3]);
         let k = i.rig_for(4).unwrap();
         assert_eq!(
-            (k.file.as_str(), k.slots.as_slice(), k.field),
-            ("model_knuckles.sa2mdl", &[142][..], 0x3F0)
+            (k.file.as_str(), k.slots.as_slice(), k.field, k.height),
+            ("model_knuckles.sa2mdl", &[142][..], 0x3F0, 0.0)
+        );
+        let e = i.rig_for(3).unwrap();
+        assert_eq!(
+            (e.slots.as_slice(), e.field, e.height),
+            (&[230, 527][..], 0x360, 14.5)
         );
         // Rigged without any usable rig: refused.
         assert!(Info::parse("x", "rigged=on\nrig_sonic=;0x394\n").is_none());
