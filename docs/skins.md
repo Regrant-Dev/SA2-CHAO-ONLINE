@@ -21,14 +21,17 @@ built skins in `skins/`, both ignored by git.
   (Mixamo's, merged with `tools/blender_merge_anims.py`). It plays idle, walk, run, jump and
   fall from how the character moves, and the garden animations from what it's doing. Vertices
   moved by several bones keep their weights (up to 3 bones each), so joints bend smoothly;
-  `--rigid` puts each on its strongest bone instead.
+  `--rigid` puts each on its strongest bone instead. `--clean-sides` takes the other side's
+  leg and arm bones off vertices clearly on one side, for auto-rigged models whose legs nearly
+  touch: the rigging bleeds weights between them and each leg pulls at the other (not for a
+  skirt that joins the legs).
 - **Solid** (`tools/skinconv.py`): one model riding on the character, like a car.
 - **Rigged** (`tools/skinrig.py`): the model fitted onto the characters' own skeletons and moved
   by their own animations: one model per character (`--character all`: Sonic, Shadow, Amy,
   Metal Sonic, Knuckles, Rouge, Tails and Eggman on foot; not the walkers).
 
 Whatever kind, nothing of the character shows while a skin is on: not its body, wings,
-upgrades, effects drawn with it, its jump ball or its shadow (re/skins.md "Hiding the
+upgrades, effects drawn with it or its jump ball, and the shadow is the skin's (re/skins.md "Hiding the
 character").
 
 `skins-src/build.sh` builds all of ours; each tool's `--help` lists its options.

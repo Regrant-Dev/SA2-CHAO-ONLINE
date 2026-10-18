@@ -42,6 +42,8 @@ MAX_NODE_VERTS = 800
 # to the ones kept). Weights are stored in 255ths.
 MAX_BONES = 3
 MIN_WEIGHT = 0.1
+# --clean-sides: vertices further than this share of the height from the middle are on one side.
+SIDE_BAND = 0.01
 # The game's chunk vertex buffer (0x25EFE48) holds 8192 slots (src/skins.rs VERTEX_SLOTS).
 VERTEX_SLOTS = 8192
 MOTION_MAGIC = b"SA2COMOT"
@@ -163,6 +165,28 @@ def rigid_islands(pos, tris, jw, ww, under, across):
     return {v: main[find(v)] for v in range(len(pos)) if find(v) in main}
 
 
+def bone_side(name):
+    """'L' or 'R' for a left or right limb bone, by its name (LeftLeg, thigh_l, Arm.R...)."""
+    m = re.search(r"(?i)(left|right)|[_.]([lr])(?:_\d+)?$", name)
+    if not m:
+        return ""
+    return "L" if (m.group(1) or m.group(2)).lower().startswith("l") else "R"
+
+
+def clean_sides(pos, jw, ww, sides, centre, left, tall):
+    """Weights of the other side's limb bones off the vertices clearly on one side (beyond
+    SIDE_BAND of the height from the middle), the rest scaled back up to the same total."""
+    ww = ww.copy()
+    off = (pos[:, 0] - centre) * left / tall
+    for v in np.where(np.abs(off) >= SIDE_BAND)[0]:
+        other = "R" if off[v] > 0 else "L"
+        keep = np.array([sides[j] != other for j in jw[v]])
+        kept = ww[v] * keep
+        if kept.sum() > 1e-6:
+            ww[v] = kept * (ww[v].sum() / kept.sum())
+    return ww
+
+
 def blend(joints, weights):
     """A vertex's joints and shares in 255ths (summing to 255): its heaviest few, each at least
     MIN_WEIGHT."""
@@ -242,6 +266,10 @@ def main():
     ap.add_argument("--rigid-islands", type=float, default=0.03, metavar="FRACTION",
                     help="small separate pieces (under this share of the triangles, and of the "
                          "height across) move whole with their main bone instead of bending")
+    ap.add_argument("--clean-sides", action="store_true",
+                    help="take the other side's limb bones off vertices clearly on one side: "
+                         "auto-rigging (Mixamo) can bleed weights between legs that nearly touch, "
+                         "pulling each leg toward the other (not for a skirt joining them)")
     ap.add_argument("--rigid", action="store_true",
                     help="every vertex on its strongest bone only (no weighted vertices)")
     ap.add_argument("--role", action="append", default=[], help="role=animation name override")
@@ -338,6 +366,14 @@ def main():
     total = sum(g["accessors"][p["indices"]]["count"] // 3 for p in skinned)
     # The mesh's height (bind pose, its own units): small pieces are a share of it.
     span = max(float(np.ptp(accessor(p["attributes"]["POSITION"]), axis=0).max()) for p in skinned)
+    # Which side each bone is on, and where the middle is (bind pose, mesh space).
+    sides = [bone_side(nodes[j].get("name", "")) for j in joints]
+    bind_x = [np.linalg.inv(m)[0, 3] for m in ibm]
+    middle = [x for x, sd in zip(bind_x, sides) if not sd]
+    lefts = [x for x, sd in zip(bind_x, sides) if sd == "L"]
+    centre = float(np.mean(middle)) if middle else 0.0
+    tall = max(float(np.ptp(accessor(p["attributes"]["POSITION"])[:, 1])) for p in skinned)
+    left = float(np.sign(np.mean(lefts) - centre)) if lefts else 0.0
     for p in skinned:
         if True:
             a = p["attributes"]
@@ -346,6 +382,8 @@ def main():
             uv = accessor(a["TEXCOORD_0"]) if "TEXCOORD_0" in a else np.zeros((len(pos), 2))
             jw = accessor(a["JOINTS_0"]).astype(int)
             ww = accessor(a["WEIGHTS_0"])
+            if left and args.clean_sides:
+                ww = clean_sides(pos, jw, ww, sides, centre, left, tall)
             strongest = jw[np.arange(len(jw)), np.argmax(ww, axis=1)]
             tris = accessor(p["indices"])[:, 0].astype(int).reshape(-1, 3)
             material = p.get("material")

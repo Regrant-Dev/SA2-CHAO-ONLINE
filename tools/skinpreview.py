@@ -61,10 +61,10 @@ class Model:
     def __init__(self, skin, motion=None, file="model.sa2mdl"):
         self.nodes, self.keys = load(skin, motion, file)
 
-    def triangles(self, frame, only=None):
+    def triangles(self, frame, only=None, textures=None):
         """Every triangle in game coordinates at `frame`, as the game draws them: each node puts
         its vertices in the buffer, then its strips use it. `only`: just those drawn by these
-        nodes (depth-first indices)."""
+        nodes (depth-first indices). `textures`: a list that gets each triangle's texture id."""
         ms = matrices(self.nodes, self.keys, frame)
         buffer, world = {}, []
         for i, nd in enumerate(self.nodes):
@@ -80,6 +80,8 @@ class Model:
                     buffer[at] = share if status == 0 else buffer.get(at, 0) + share
             if only is None or i in only:
                 world += [[buffer[v] for v in t] for t in nd["tris"]]
+                if textures is not None:
+                    textures += nd["texes"]
         return world
 
 
@@ -96,7 +98,8 @@ def load(skin, motion, file="model.sa2mdl"):
             pos = struct.unpack_from("<3f", d, o + 8)
             ang = struct.unpack_from("<3i", d, o + 0x14)
             scl = struct.unpack_from("<3f", d, o + 0x20)
-            tris, blocks = [], []
+            tris, blocks, texes = [], [], []
+            tex = 0
             model = u32(o + 4)
             if model:
                 vl, pl = u32(model), u32(model + 4)
@@ -121,6 +124,7 @@ def load(skin, motion, file="model.sa2mdl"):
                     if t == 0xFF:
                         break
                     if t == 8:
+                        tex = struct.unpack_from("<H", d, p + 2)[0] & 0x1FFF
                         p += 4
                         continue
                     size = struct.unpack_from("<H", d, p + 2)[0]
@@ -133,9 +137,10 @@ def load(skin, motion, file="model.sa2mdl"):
                             ids = [struct.unpack_from("<H", d, q + 6 * k)[0] for k in range(abs(ln))]
                             q += 6 * abs(ln)
                             tris.append(ids)
+                            texes.append(tex)
                     p += 4 + size * 2
             nodes.append(dict(parent=parent, flags=fl, pos=pos, ang=ang, scl=scl, tris=tris,
-                              blocks=blocks))
+                              blocks=blocks, texes=texes))
             c = u32(o + 0x2C)
             if c:
                 visit(c, idx)

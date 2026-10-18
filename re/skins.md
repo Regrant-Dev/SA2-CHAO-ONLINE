@@ -357,6 +357,15 @@ in its place.
 pass in `0x25EFEE0`. Sonic's +0x1C (0x720B50) draws a model at the player from a distance
 (0x7983F0 culls under 50 units). All of them run hidden while a skin is on.
 
+**The shadow pass** (0x46FD10, REA 2026-10-19). Shadows are a shadow map. The pass sets the
+shader mode to 4 through 0x41B1F0 (mode -> program: 4 = SonicVS/PS_ShadowGen, program 11 of
+the 13 that 0x4248B0 loads into the shader object `*0x1A557BC` + 0x648; 0x424050 selects
+one). It locks that mode (`0x1A55709` = 1), then for each of the 6 object lists 0x46FB00
+calls every object's **+0x2C** with the object. The characters' +0x2C (Sonic's family 0x71E520,
+Knuckles 0x72DCE0) draw the body again. So that is also wrapped: the character's runs hidden
+and the skin is drawn there with the pose it had in the display (a rigged skin lets its root
+through, as in the display). The skin casts the shadow.
+
 **Separate objects.** The jump ball is a JumpAura object per frame (re/spin-ball.md), drawn by
 its own display 0x756960 (+0x1C). The hook there skips our player's balls (data +1 == 0)
 while a skin is on.

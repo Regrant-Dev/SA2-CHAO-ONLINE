@@ -58,6 +58,10 @@ const OBJ_DISPLAY: usize = 0x14;
 /// The object's later display passes (the object list runs them after every display, 0x470010):
 /// what a character draws there (Sonic's +0x1C draws a model at the player) is hidden too.
 const OBJ_LATER_DISPLAYS: [usize; 3] = [0x1C, 0x20, 0x24];
+/// The object's shadow display: the shadow-map pass (0x46FD10: shader mode 4, ShadowGen, locked)
+/// calls it for every object (0x46FB00). A character draws its body again there; under a skin,
+/// the skin is drawn there instead, so the shadow is the skin's.
+const OBJ_SHADOW_DISPLAY: usize = 0x2C;
 
 /// What `skin.ini` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -995,6 +999,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
             && let Some(oldest) = (0..s.loaded.len()).min_by_key(|&i| s.loaded[i].used)
         {
             let l = s.loaded.swap_remove(oldest);
+            forget_drawn();
             if l.texlist != 0 && texlist_ok(l.texlist) {
                 crate::puppet::release_texlist(l.texlist);
             }
@@ -1127,6 +1132,7 @@ fn texlist_ok(texlist: usize) -> bool {
 }
 
 fn release(s: &mut Skins) {
+    forget_drawn();
     for l in s.loaded.drain(..) {
         if l.texlist != 0 && texlist_ok(l.texlist) {
             crate::puppet::release_texlist(l.texlist);
@@ -1136,6 +1142,7 @@ fn release(s: &mut Skins) {
 
 /// Call every frame (game thread): puts our skin's display on the player while it applies.
 pub fn on_frame() {
+    FRAME.fetch_add(1, Ordering::Relaxed);
     // Shared skins came down: look again (skin_sync.rs).
     if crate::skin_sync::take_changed() {
         rescan();
@@ -1167,7 +1174,13 @@ pub fn on_frame() {
         return;
     }
     let later: [extern "C" fn(usize); 3] = [later_display_0, later_display_1, later_display_2];
-    let fields = std::iter::once((OBJ_DISPLAY, ours, &PLAYER_DISPLAY)).chain(
+    let shadow = player_shadow as extern "C" fn(usize) as usize;
+    let fields = [
+        (OBJ_DISPLAY, ours, &PLAYER_DISPLAY),
+        (OBJ_SHADOW_DISPLAY, shadow, &SHADOW_DISPLAY),
+    ]
+    .into_iter()
+    .chain(
         OBJ_LATER_DISPLAYS
             .iter()
             .zip(later)
@@ -1189,8 +1202,99 @@ pub fn on_frame() {
     }
 }
 
-/// The player object's own later displays, while ours stand in for them.
+/// The player object's own later displays and shadow display, while ours stand in for them.
 static LATER_DISPLAYS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+static SHADOW_DISPLAY: AtomicUsize = AtomicUsize::new(0);
+
+/// Frames so far (`on_frame`).
+static FRAME: AtomicUsize = AtomicUsize::new(0);
+
+/// How the skin was last drawn in place of our character (the shadow pass draws it again so),
+/// and in which frame.
+#[derive(Clone, Copy)]
+struct Drawn {
+    frame: usize,
+    root: usize,
+    texlist: usize,
+    position: [f32; 3],
+    rotation: [i32; 3],
+    scale: f32,
+    tilt: crate::puppet::Tilt,
+    motion: Option<(usize, f32)>,
+}
+
+static LAST_DRAWN: Mutex<Option<Drawn>> = Mutex::new(None);
+
+/// Draws the skin as `drawn` says, and keeps it for the shadow pass.
+fn draw_skin(mut drawn: Drawn) {
+    drawn.frame = FRAME.load(Ordering::Relaxed);
+    *LAST_DRAWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(drawn);
+    // SAFETY: display pass on the game thread; a checked, relocated model (and motion).
+    unsafe { draw_drawn(drawn) };
+}
+
+/// Its model is about to go: nothing kept may point at it.
+fn forget_drawn() {
+    *LAST_DRAWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// # Safety
+/// Game thread, in a display pass; `drawn` came from this frame's or the last frame's display.
+unsafe fn draw_drawn(d: Drawn) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        crate::puppet::draw_solid(
+            d.root, d.texlist, d.position, d.rotation, d.scale, d.tilt, d.motion,
+        )
+    };
+}
+
+/// The character's shadow display: under a skin, the skin's shape instead of the character's.
+/// A rigged skin goes in through the character's own one, as in its display; any other is
+/// drawn as it was in the display.
+extern "C" fn player_shadow(object: usize) {
+    let original = SHADOW_DISPLAY.load(Ordering::Relaxed);
+    if original == 0 {
+        return;
+    }
+    let rigged = std::panic::catch_unwind(|| {
+        let player = game::local_player()?;
+        let co2 = game::local_char_obj2() as usize;
+        if co2 == 0 {
+            return None;
+        }
+        with(|s| rigged_writes(s, player.character, co2)).flatten()
+    })
+    .ok()
+    .flatten();
+    if let Some(rig) = rigged
+        && hide::can_let_through()
+    {
+        // SAFETY: as in `player_display`.
+        unsafe {
+            with_writes(&rig.writes, || {
+                if hide::hidden(rig.root, || call_display(original, object)).is_none() {
+                    call_display(original, object);
+                }
+            })
+        };
+        return;
+    }
+    // Only a pose from this frame or the last: the skin may have stopped being drawn since.
+    let now = FRAME.load(Ordering::Relaxed);
+    let drawn = LAST_DRAWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|d| now.wrapping_sub(d.frame) <= 1 && texlist_ok(d.texlist));
+    match drawn {
+        Some(drawn) if hide::available() => {
+            hide::hidden(0, || call_display(original, object));
+            // SAFETY: the shadow pass, on the game thread; kept from the display.
+            unsafe { draw_drawn(drawn) };
+        }
+        _ => call_display(original, object),
+    }
+}
 
 extern "C" fn later_display_0(object: usize) {
     later_display(0, object);
@@ -1802,19 +1906,16 @@ extern "C" fn player_display(object: usize) {
                 // The characters face -X: rolling forward is about Z.
                 tilt.lean = tilt.spin;
                 tilt.spin = 0;
-                // SAFETY: display pass on the game thread; a checked, relocated model with the
-                // texture list it was drawn with.
-                unsafe {
-                    crate::puppet::draw_solid(
-                        rig.root,
-                        rig.texlist,
-                        [p.x, p.y, p.z],
-                        rotation,
-                        rig.scale * size,
-                        tilt,
-                        None,
-                    )
-                };
+                draw_skin(Drawn {
+                    frame: 0,
+                    root: rig.root,
+                    texlist: rig.texlist,
+                    position: [p.x, p.y, p.z],
+                    rotation,
+                    scale: rig.scale * size,
+                    tilt,
+                    motion: None,
+                });
             }
         }
         return;
@@ -1915,19 +2016,17 @@ extern "C" fn player_display(object: usize) {
                 })
             };
         }
-        // SAFETY: display pass on the game thread; a checked, relocated model.
         let p = player.position;
-        unsafe {
-            crate::puppet::draw_solid(
-                root,
-                texlist,
-                [p.x, p.y, p.z],
-                rotation,
-                scale,
-                tilt,
-                motion,
-            )
-        };
+        draw_skin(Drawn {
+            frame: 0,
+            root,
+            texlist,
+            position: [p.x, p.y, p.z],
+            rotation,
+            scale,
+            tilt,
+            motion,
+        });
         Some(())
     });
     if !matches!(drawn, Ok(Some(()))) {
