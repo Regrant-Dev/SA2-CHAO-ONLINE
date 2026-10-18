@@ -1270,6 +1270,20 @@ pub struct Tilt {
     pub lift: f32,
 }
 
+/// The matrix stack's top (the current matrix), and putting it elsewhere on the stack: a draw
+/// made from an earlier matrix (game thread, display pass; `top` within the stack).
+pub fn matrix_top() -> usize {
+    // SAFETY: the game's matrix stack pointer.
+    unsafe { read::<usize>(MATRIX_TOP) }
+}
+
+/// # Safety
+/// `top` is a matrix of the game's stack (as `matrix_top` gave), put back after.
+pub unsafe fn set_matrix_top(top: usize) {
+    // SAFETY: as the caller promises.
+    unsafe { write(MATRIX_TOP, top) };
+}
+
 /// Draws a solid model (a skin) at `position` with a character's `rotation`, `scale`d, with
 /// its own texture list: the same transform a character's display uses (translate, rotate
 /// Z, X, then Y as 0x8000 - y), then the model's own `tilt`. With a `motion` (and its

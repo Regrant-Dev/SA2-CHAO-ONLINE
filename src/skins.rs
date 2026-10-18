@@ -1249,14 +1249,30 @@ unsafe fn draw_drawn(d: Drawn) {
     };
 }
 
-/// The character's shadow display: under a skin, the skin's shape instead of the character's.
-/// A rigged skin goes in through the character's own one, as in its display; any other is
-/// drawn as it was in the display.
+/// The skin's latest pose, if it's from this frame or the last (the skin may have stopped being
+/// drawn since) and its textures are still there.
+fn fresh_drawn() -> Option<Drawn> {
+    let now = FRAME.load(Ordering::Relaxed);
+    LAST_DRAWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|d| now.wrapping_sub(d.frame) <= 1 && texlist_ok(d.texlist))
+}
+
+/// The matrix stack's top as our shadow display began, and a rigged skin's root (it goes in
+/// through the character's own drawing).
+static SHADOW_TOP: AtomicUsize = AtomicUsize::new(0);
+static SHADOW_RIG: AtomicUsize = AtomicUsize::new(0);
+
+/// The character's shadow display (re/skins.md "The shadow pass"): it starts a shadow map for the
+/// character (0x495A90), draws the body into it with DrawMotion, and lays the shadow on the
+/// ground (0x495D20). Under a skin all of that runs, with the body swapped for the skin.
 extern "C" fn player_shadow(object: usize) {
     let original = SHADOW_DISPLAY.load(Ordering::Relaxed);
     if original == 0 {
         return;
     }
+    SHADOW_TOP.store(crate::puppet::matrix_top(), Ordering::Relaxed);
     let rigged = std::panic::catch_unwind(|| {
         let player = game::local_player()?;
         let co2 = game::local_char_obj2() as usize;
@@ -1267,33 +1283,45 @@ extern "C" fn player_shadow(object: usize) {
     })
     .ok()
     .flatten();
-    if let Some(rig) = rigged
-        && hide::can_let_through()
-    {
+    if let Some(rig) = rigged {
+        SHADOW_RIG.store(rig.root, Ordering::Relaxed);
         // SAFETY: as in `player_display`.
         unsafe {
             with_writes(&rig.writes, || {
-                if hide::hidden(rig.root, || call_display(original, object)).is_none() {
+                if !hide::replacing(shadow_body, || call_display(original, object)) {
                     call_display(original, object);
                 }
             })
         };
+        SHADOW_RIG.store(0, Ordering::Relaxed);
         return;
     }
-    // Only a pose from this frame or the last: the skin may have stopped being drawn since.
-    let now = FRAME.load(Ordering::Relaxed);
-    let drawn = LAST_DRAWN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .filter(|d| now.wrapping_sub(d.frame) <= 1 && texlist_ok(d.texlist));
-    match drawn {
-        Some(drawn) if hide::available() => {
-            hide::hidden(0, || call_display(original, object));
-            // SAFETY: the shadow pass, on the game thread; kept from the display.
-            unsafe { draw_drawn(drawn) };
-        }
-        _ => call_display(original, object),
+    if fresh_drawn().is_none() || !hide::replacing(shadow_body, || call_display(original, object)) {
+        call_display(original, object);
     }
+}
+
+/// A body the shadow display draws: a rigged skin's own goes as it is; any other is the
+/// character's, and the skin is drawn instead, as it was in the display. Nonzero: drawn here.
+extern "C" fn shadow_body(model: usize) -> u32 {
+    let rig = SHADOW_RIG.load(Ordering::Relaxed);
+    if rig != 0 && model == rig {
+        return 0;
+    }
+    let Some(drawn) = fresh_drawn() else {
+        // A rigged skin's character's other body: nothing rather than the character.
+        return u32::from(rig != 0);
+    };
+    // From the matrix the display began with: the skin has its own place, turn and size.
+    let top = crate::puppet::matrix_top();
+    // SAFETY: the shadow pass on the game thread; the stack top as the display began, put
+    // back right after; the pose kept from this or the last frame's display.
+    unsafe {
+        crate::puppet::set_matrix_top(SHADOW_TOP.load(Ordering::Relaxed));
+        draw_drawn(drawn);
+        crate::puppet::set_matrix_top(top);
+    }
+    1
 }
 
 extern "C" fn later_display_0(object: usize) {

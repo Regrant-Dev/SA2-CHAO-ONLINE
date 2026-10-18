@@ -42,8 +42,10 @@ MAX_NODE_VERTS = 800
 # to the ones kept). Weights are stored in 255ths.
 MAX_BONES = 3
 MIN_WEIGHT = 0.1
-# --clean-sides: vertices further than this share of the height from the middle are on one side.
+# --clean-sides: vertices further than this share of the height from the middle are on one side;
+# a separate piece of the mesh is one side's when that side has this share of its limb weights.
 SIDE_BAND = 0.01
+SIDE_PIECE = 0.75
 # The game's chunk vertex buffer (0x25EFE48) holds 8192 slots (src/skins.rs VERTEX_SLOTS).
 VERTEX_SLOTS = 8192
 MOTION_MAGIC = b"SA2COMOT"
@@ -173,18 +175,81 @@ def bone_side(name):
     return "L" if (m.group(1) or m.group(2)).lower().startswith("l") else "R"
 
 
-def clean_sides(pos, jw, ww, sides, centre, left, tall):
-    """Weights of the other side's limb bones off the vertices clearly on one side (beyond
-    SIDE_BAND of the height from the middle), the rest scaled back up to the same total."""
-    ww = ww.copy()
+def vertex_sides(prims, sides, centre, left, tall):
+    """Per primitive, the side each vertex is on ('L', 'R' or '' in the middle). A separate piece
+    of the mesh (joined by shared corners or positions, across primitives) with nearly all its
+    limb weights on one side is that side's, every vertex of it (a trouser leg's inner face
+    crosses the middle); otherwise each vertex by where it is, beyond SIDE_BAND of the height
+    from the middle. `prims`: [(positions, joints, weights, triangles)]."""
+    pos = np.concatenate([p for p, _, _, _ in prims])
+    starts = np.cumsum([0] + [len(p) for p, _, _, _ in prims])
+    parent = list(range(len(pos)))
+
+    def find(v):
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+
+    keys = {}
+    for v, p in enumerate(np.round(pos / tall, 4)):
+        parent[find(v)] = find(keys.setdefault(tuple(p), v))
+    for (_, _, _, tris), at in zip(prims, starts):
+        for a, b, c in tris + at:
+            parent[find(b)] = find(a)
+            parent[find(c)] = find(a)
+    weight = {}
+    for (_, jw, ww, _), at in zip(prims, starts):
+        for v in range(len(jw)):
+            got = weight.setdefault(find(at + v), {"L": 0.0, "R": 0.0})
+            for j, x in zip(jw[v], ww[v]):
+                if sides[j]:
+                    got[sides[j]] += float(x)
+    piece_side = {}
+    for r, got in weight.items():
+        total = got["L"] + got["R"]
+        piece_side[r] = next((sd for sd in "LR" if total and got[sd] / total >= SIDE_PIECE), "")
     off = (pos[:, 0] - centre) * left / tall
-    for v in np.where(np.abs(off) >= SIDE_BAND)[0]:
-        other = "R" if off[v] > 0 else "L"
-        keep = np.array([sides[j] != other for j in jw[v]])
-        kept = ww[v] * keep
+    by_place = np.where(off >= SIDE_BAND, "L", np.where(off <= -SIDE_BAND, "R", ""))
+    out = [piece_side[find(v)] or by_place[v] for v in range(len(pos))]
+    return [out[a:b] for a, b in zip(starts, starts[1:])]
+
+
+def mirror_bones(names):
+    """Each bone's counterpart on the other side, by name (LeftLeg <-> RightLeg, thigh_l <->
+    thigh_r), or itself."""
+    swaps = [(r"(?i)left", "Right"), (r"(?i)right", "Left"), (r"([_.])l((?:_\d+)?)$", r"\1r\2"),
+             (r"([_.])r((?:_\d+)?)$", r"\1l\2"), (r"([_.])L((?:_\d+)?)$", r"\1R\2"),
+             (r"([_.])R((?:_\d+)?)$", r"\1L\2")]
+    index = {n.lower(): i for i, n in enumerate(names)}
+    out = []
+    for i, n in enumerate(names):
+        twin = i
+        for pattern, to in swaps:
+            m = re.sub(pattern, to, n, count=1)
+            if m != n and m.lower() in index:
+                twin = index[m.lower()]
+                break
+        out.append(twin)
+    return out
+
+
+def clean_sides(jw, ww, sides, vside, mirror):
+    """Weights of the other side's limb bones off the vertices on one side (`vside`), the rest
+    scaled back up to the same total; a vertex weighted only to the other side has its weights
+    moved to the same bones on its own side (`mirror`)."""
+    jw, ww = jw.copy(), ww.copy()
+    for v, here in enumerate(vside):
+        if not here:
+            continue
+        other = "R" if here == "L" else "L"
+        wrong = np.array([sides[j] == other for j in jw[v]])
+        kept = ww[v] * ~wrong
         if kept.sum() > 1e-6:
             ww[v] = kept * (ww[v].sum() / kept.sum())
-    return ww
+        elif wrong.any():
+            jw[v] = [mirror[j] if w else j for j, w in zip(jw[v], wrong)]
+    return jw, ww
 
 
 def blend(joints, weights):
@@ -372,9 +437,17 @@ def main():
     middle = [x for x, sd in zip(bind_x, sides) if not sd]
     lefts = [x for x, sd in zip(bind_x, sides) if sd == "L"]
     centre = float(np.mean(middle)) if middle else 0.0
-    tall = max(float(np.ptp(accessor(p["attributes"]["POSITION"])[:, 1])) for p in skinned)
     left = float(np.sign(np.mean(lefts) - centre)) if lefts else 0.0
-    for p in skinned:
+    tall = max(float(np.ptp(accessor(p["attributes"]["POSITION"])[:, 1])) for p in skinned)
+    vsides = [[]] * len(skinned)
+    mirror = mirror_bones([nodes[j].get("name", "") for j in joints])
+    if left and args.clean_sides:
+        vsides = vertex_sides([(accessor(p["attributes"]["POSITION"]),
+                                accessor(p["attributes"]["JOINTS_0"]).astype(int),
+                                accessor(p["attributes"]["WEIGHTS_0"]),
+                                accessor(p["indices"])[:, 0].astype(int).reshape(-1, 3))
+                               for p in skinned], sides, centre, left, tall)
+    for p, vside in zip(skinned, vsides):
         if True:
             a = p["attributes"]
             pos = accessor(a["POSITION"])
@@ -383,7 +456,7 @@ def main():
             jw = accessor(a["JOINTS_0"]).astype(int)
             ww = accessor(a["WEIGHTS_0"])
             if left and args.clean_sides:
-                ww = clean_sides(pos, jw, ww, sides, centre, left, tall)
+                jw, ww = clean_sides(jw, ww, sides, vside, mirror)
             strongest = jw[np.arange(len(jw)), np.argmax(ww, axis=1)]
             tris = accessor(p["indices"])[:, 0].astype(int).reshape(-1, 3)
             material = p.get("material")

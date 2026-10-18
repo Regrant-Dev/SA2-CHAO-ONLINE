@@ -22,7 +22,9 @@ built skins in `skins/`, both ignored by git.
   fall from how the character moves, and the garden animations from what it's doing. Vertices
   moved by several bones keep their weights (up to 3 bones each), so joints bend smoothly;
   `--rigid` puts each on its strongest bone instead. `--clean-sides` takes the other side's
-  leg and arm bones off vertices clearly on one side, for auto-rigged models whose legs nearly
+  leg and arm bones off vertices on one side (a separate piece of the mesh mostly on one side's
+  bones is all that side's; otherwise by where the vertex is), and moves a vertex weighted only
+  to the other side onto the same bones of its own. For auto-rigged models whose legs nearly
   touch: the rigging bleeds weights between them and each leg pulls at the other (not for a
   skirt that joins the legs).
 - **Solid** (`tools/skinconv.py`): one model riding on the character, like a car.

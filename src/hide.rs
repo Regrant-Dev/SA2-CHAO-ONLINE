@@ -15,6 +15,9 @@
 //! One model can be let through: DrawMotion (0x780870, cdecl (model, frame), ECX = motion)
 //! draws it with the real table. A rigged skin's body goes in through the character's own
 //! display; this lets only that body show.
+//!
+//! And DrawMotion's models can be replaced (`replacing`): the shadow pass (re/skins.md) must
+//! run as the game does, with only the body it draws swapped for the skin.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -51,6 +54,8 @@ static QUIET_TABLE: AtomicUsize = AtomicUsize::new(0);
 static LET_THROUGH: AtomicUsize = AtomicUsize::new(0);
 static LET_THROUGH_DRAWN: AtomicBool = AtomicBool::new(false);
 static MOTION_HOOK: AtomicBool = AtomicBool::new(false);
+/// While `replacing`: asked first for each DrawMotion model.
+static REPLACE: AtomicUsize = AtomicUsize::new(0);
 /// The quiet copy, for the table it was made from.
 #[cfg(target_arch = "x86")]
 static QUIET: std::sync::Mutex<Option<(usize, Box<[usize]>)>> = std::sync::Mutex::new(None);
@@ -87,6 +92,34 @@ pub fn set_jump_ball_hidden(hidden: bool) {
 /// Whether one model can be let through `hidden`.
 pub fn can_let_through() -> bool {
     MOTION_HOOK.load(Ordering::Relaxed)
+}
+
+/// Runs `f` with every DrawMotion's model offered to `replace` first (game thread): when it
+/// returns nonzero it drew what goes in the model's place (or nothing should), and DrawMotion
+/// draws nothing itself. False if it can't (and `f` didn't run). DrawMotion calls `replace`
+/// makes itself aren't offered.
+pub fn replacing(replace: extern "C" fn(usize) -> u32, f: impl FnOnce()) -> bool {
+    if !can_let_through() || REPLACE.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    REPLACE.store(replace as usize, Ordering::Relaxed);
+    f();
+    REPLACE.store(0, Ordering::Relaxed);
+    true
+}
+
+/// `REPLACE` for one model, with nothing offered while it runs.
+#[cfg(target_arch = "x86")]
+extern "C" fn offer(model: usize) -> u32 {
+    let replace = REPLACE.swap(0, Ordering::Relaxed);
+    if replace == 0 {
+        return 0;
+    }
+    // SAFETY: stored by `replacing` from a function of this type.
+    let replace = unsafe { std::mem::transmute::<usize, extern "C" fn(usize) -> u32>(replace) };
+    let done = replace(model);
+    REPLACE.store(replace as usize, Ordering::Relaxed);
+    done
 }
 
 /// Whether the renderer is there to hide with.
@@ -221,12 +254,23 @@ unsafe extern "C" fn skip_draw_vertices() {
     std::arch::naked_asm!("xor eax, eax", "ret 0x18")
 }
 
-/// DrawMotion: the model let through is drawn for real (`draw_motion_visible`), anything else
-/// as usual (the moved prologue, then on at +6).
+/// DrawMotion: offered for replacing first, if that's on; the model let through is drawn for
+/// real (`draw_motion_visible`), anything else as usual (the moved prologue, then on at +6).
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
 unsafe extern "C" fn draw_motion_thunk() {
     std::arch::naked_asm!(
+        "cmp dword ptr [{replace}], 0",
+        "je 3f",
+        "push ecx",
+        "push dword ptr [esp+8]",
+        "call {offer}",
+        "add esp, 4",
+        "pop ecx",
+        "test eax, eax",
+        "je 3f",
+        "ret",
+        "3:",
         "cmp dword ptr [{now}], 0",
         "je 2f",
         "mov eax, dword ptr [esp+4]",
@@ -241,6 +285,8 @@ unsafe extern "C" fn draw_motion_thunk() {
         "push ecx",
         "push {resume}",
         "ret",
+        replace = sym REPLACE,
+        offer = sym offer,
         now = sym RENDERER_NOW,
         through = sym LET_THROUGH,
         visible = sym draw_motion_visible,
