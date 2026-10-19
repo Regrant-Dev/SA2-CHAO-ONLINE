@@ -25,11 +25,21 @@ pub const VK_F9: i32 = 0x78;
 pub struct Hotkey {
     key: i32,
     down: bool,
+    /// Frames it has been held, as of the last `pressed()`.
+    held: u32,
 }
+
+/// Held this many frames, a key repeats (`repeating`) every `REPEAT_EVERY` frames.
+const REPEAT_AFTER: u32 = 20;
+const REPEAT_EVERY: u32 = 3;
 
 impl Hotkey {
     pub const fn new(key: i32) -> Self {
-        Self { key, down: false }
+        Self {
+            key,
+            down: false,
+            held: 0,
+        }
     }
 
     pub fn key(&self) -> i32 {
@@ -40,7 +50,13 @@ impl Hotkey {
         let now = key_down(self.key);
         let pressed = now && !self.down;
         self.down = now;
+        self.held = if now { self.held.saturating_add(1) } else { 0 };
         pressed
+    }
+
+    /// Held long enough to repeat, and repeating this frame (as of the last `pressed()`).
+    pub fn repeating(&self) -> bool {
+        self.held > REPEAT_AFTER && (self.held - REPEAT_AFTER).is_multiple_of(REPEAT_EVERY)
     }
 }
 

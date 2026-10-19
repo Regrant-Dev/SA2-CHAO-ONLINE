@@ -110,8 +110,8 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
     rows
 }
 const MAX_NAME: usize = crate::net::protocol::MAX_NAME;
-/// Skin voice and game volume change by this much a press.
-const VOLUME_STEP: u32 = 10;
+/// Skin voice and game volume change by this much a press (and keep going while held).
+const VOLUME_STEP: u32 = 1;
 const MAX_HOST: usize = 64;
 
 const COLOR_TITLE: i32 = 0xFFFF_E080u32 as i32;
@@ -273,6 +273,14 @@ impl Menu {
             }
         }
     }
+
+    /// `key` is held down and repeating this frame (after `pressed(key)` this frame).
+    fn repeating(&self, key: i32) -> bool {
+        self.keys
+            .iter()
+            .find(|k| k.key() == key)
+            .is_some_and(Hotkey::repeating)
+    }
 }
 
 static MENU: Mutex<Menu> = Mutex::new(Menu {
@@ -370,7 +378,12 @@ pub fn on_frame() {
         m.row = (m.row + 1) % rows.len();
     }
     let row = rows[m.row];
-    let (left, right) = (m.pressed(VK_LEFT), m.pressed(VK_RIGHT));
+    let (mut left, mut right) = (m.pressed(VK_LEFT), m.pressed(VK_RIGHT));
+    // The volumes go a step at a time: holding the key keeps them going.
+    if matches!(row, Row::VoiceVolume | Row::GameVolume) {
+        left |= m.repeating(VK_LEFT);
+        right |= m.repeating(VK_RIGHT);
+    }
     match row {
         Row::Mode if left => m.settings.mode = (m.settings.mode + MODES.len() - 1) % MODES.len(),
         Row::Mode if right => m.settings.mode = (m.settings.mode + 1) % MODES.len(),
