@@ -189,10 +189,9 @@ pub fn freeze_world_after(frames: u32) {
 // switches, so `prepare_loader_profile` keeps it on. Forcing `WindowActive` (0x174F5AC) from the
 // mod froze the game too (2026-10-17/18).
 
-/// At start: makes the Mod Loader's current profile fit for online play, from its next launch
-/// (`mods/.modloader/profiles`: `Profiles.json` names it). Fullscreen (`ScreenMode` 1; 0 is
-/// windowed, 2 borderless, 3 custom) becomes borderless, which looks the same. "Pause when
-/// inactive" is kept on (an earlier build turned it off: that's undone), because the loader's
+/// At start: reads the Mod Loader's current display mode without changing it
+/// (`mods/.modloader/profiles`: `Profiles.json` names it). "Pause when inactive" is kept on
+/// from the next launch (an earlier build turned it off: that's undone), because the loader's
 /// handling of the window coming back depends on it (above).
 pub fn prepare_loader_profile(mod_path: &str) {
     let profiles = std::path::Path::new(mod_path)
@@ -222,9 +221,6 @@ pub fn prepare_loader_profile(mod_path: &str) {
     );
     crate::log!("game: Mod Loader screen mode {mode:?}, pause when inactive {pauses:?}");
     let mut changed = profile.clone();
-    if mode == Some("1") {
-        changed = set_json_value(&changed, "ScreenMode", "2").unwrap_or(changed);
-    }
     if pauses == Some("false") {
         changed = set_json_value(&changed, "EnablePauseOnInactive", "true").unwrap_or(changed);
     }
@@ -233,9 +229,9 @@ pub fn prepare_loader_profile(mod_path: &str) {
     }
     match std::fs::write(&path, changed) {
         Ok(()) => {
-            crate::log!("game: Mod Loader profile set to borderless, pause when inactive on");
+            crate::log!("game: Mod Loader profile set to pause when inactive on");
             crate::hud::toast(
-                "From your next launch the game runs borderless and pauses while tabbed out \
+                "From your next launch the game pauses while tabbed out \
                  (the others keep playing)",
             );
         }
