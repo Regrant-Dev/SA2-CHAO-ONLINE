@@ -13,6 +13,7 @@ cargo clippy --release                              # the game DLL (i686)
 cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer
 cargo test --target x86_64-unknown-linux-gnu --features launcher --bin sa2co-launcher
 python3 scripts/test-steam-launch.py
+cargo test --target i686-pc-windows-msvc --lib menu_textures  # Windows: native x86 hook ABI
 ```
 
 The updater tests exercise archive validation, DLL checksums, preserving player files, and
@@ -22,6 +23,14 @@ they also cover Steam library/preload isolation, older updaters and failed updat
 never launch the game. The Unix updater test runs a child process to verify host downloads
 do not inherit Steam's library overrides. For a real update check without launching, run the installed
 `sa2co-launcher` (or `.exe`) with `--update-only` while the game is closed.
+
+The menu recovery tests validate GVM bounds and repeated header restoration. Set `SA2_DIR`
+to the game folder to include the two locally installed menu archives. Windows also runs
+the actual naked x86 shims with controlled codec/parser callees and every stack alignment;
+this uses no game process or saves. For gameplay verification, leave the main menu idle,
+switch focus away and back, and enter/leave Stage Select repeatedly. The log should show
+`menu textures: checked PRS fallback installed`; `recovered stageMap`/`stageMapBG` means
+the guarded fallback was actually exercised. See [native evidence](../re/menu-textures.md).
 
 ## The fake player (one PC)
 

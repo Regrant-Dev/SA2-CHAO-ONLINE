@@ -29,6 +29,7 @@ mod keeper;
 mod lockon;
 mod log;
 mod menu;
+mod menu_textures;
 mod modloader;
 pub mod net;
 mod online;
@@ -114,6 +115,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
         dump_text(&path);
     });
     hud::init(helpers);
+    guarded("menu textures", || menu_textures::install(&path));
     // SAFETY: the loader's helper returns a NUL-terminated path (or null).
     let chao_save = unsafe { (helpers.get_chao_save_path)() };
     if !chao_save.is_null() {

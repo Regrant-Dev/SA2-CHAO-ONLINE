@@ -53,6 +53,8 @@ jobs:
         run: rustup target add i686-pc-windows-msvc
       - name: Test updater on Windows
         run: cargo test --target i686-pc-windows-msvc --features launcher --bin sa2co-launcher
+      - name: Test menu archive recovery and native x86 calling conventions
+        run: cargo test --target i686-pc-windows-msvc --lib menu_textures
 
   release:
     needs: [build, updater-windows]
