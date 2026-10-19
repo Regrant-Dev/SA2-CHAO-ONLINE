@@ -66,6 +66,8 @@ struct Eggs {
     mine: Vec<(u8, usize)>,
     /// Our eggs a friend holds: index -> friend.
     held_by: HashMap<u8, u8>,
+    /// Network hold updates, applied only on the game thread (latest per sender and egg).
+    held_in: HashMap<(u8, u8), (bool, [f32; 3])>,
     /// Where friends are (for the eggs they hold).
     friends: HashMap<u8, Vector>,
     copies: HashMap<(u8, u8), Copy>,
@@ -130,28 +132,9 @@ pub fn received(owner: u8, eggs: Vec<(u8, [f32; 3], bool)>) {
 }
 
 /// Network: friend `from` picked up or put down our egg `index`.
-pub fn received_held(from: u8, index: u8, held: bool, [x, y, z]: [f32; 3]) {
+pub fn received_held(from: u8, index: u8, held: bool, position: [f32; 3]) {
     with(|e| {
-        let Some(&(_, slot)) = e.mine.iter().find(|&&(i, _)| i == index) else {
-            return;
-        };
-        let Some(object) = real_egg(slot) else {
-            return;
-        };
-        if held {
-            e.held_by.insert(index, from);
-            // SAFETY: our live egg: held where the friend is, by our MainSub, until let go.
-            unsafe {
-                ((object + OBJ_MAIN) as *mut usize).write(friend_held_main as *const () as usize)
-            };
-        } else if e.held_by.get(&index) == Some(&from) {
-            e.held_by.remove(&index);
-            // SAFETY: our live egg, back to its own update, where they put it down.
-            unsafe {
-                set_position(object, Vector { x, y, z });
-                ((object + OBJ_MAIN) as *mut usize).write(EGG_MAIN);
-            }
-        }
+        e.held_in.insert((from, index), (held, position));
     });
 }
 
@@ -166,6 +149,7 @@ pub fn clear() {
     with(|e| {
         e.copies.clear();
         e.held_by.clear();
+        e.held_in.clear();
         e.reports.clear();
     });
 }
@@ -177,6 +161,29 @@ pub fn on_frame(area: u8, friends: &HashMap<u8, Vector>) -> Vec<Body> {
     with(|e| {
         e.frame = e.frame.wrapping_add(1);
         e.friends = friends.clone();
+        for ((from, index), (held, [x, y, z])) in std::mem::take(&mut e.held_in) {
+            if !friends.contains_key(&from) {
+                continue;
+            }
+            let Some(&(_, slot)) = e.mine.iter().find(|&&(i, _)| i == index) else {
+                continue;
+            };
+            let Some(object) = real_egg(slot) else {
+                continue;
+            };
+            // SAFETY: the live egg was found in the registry on this game-thread frame.
+            unsafe {
+                if held {
+                    e.held_by.insert(index, from);
+                    ((object + OBJ_MAIN) as *mut usize)
+                        .write(friend_held_main as *const () as usize);
+                } else if e.held_by.get(&index) == Some(&from) {
+                    e.held_by.remove(&index);
+                    set_position(object, Vector { x, y, z });
+                    ((object + OBJ_MAIN) as *mut usize).write(EGG_MAIN);
+                }
+            }
+        }
         // Friends who left drop what they held of ours where they were.
         let gone: Vec<u8> = e
             .held_by
@@ -369,5 +376,22 @@ fn real_egg_is(slot: usize, object: usize) -> bool {
     unsafe {
         let data1 = ((object + OBJ_DATA1) as *const usize).read();
         data1 != 0 && ((data1 + D_RECORD) as *const usize).read() == CHAO_SLOTS + slot * CHAO_SIZE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_hold_is_queued_without_reading_the_games_save_or_objects() {
+        with(|e| e.mine.push((0, 0)));
+        received_held(3, 0, true, [1.0, 2.0, 3.0]);
+        with(|e| {
+            assert_eq!(e.held_in[&(3, 0)], (true, [1.0, 2.0, 3.0]));
+            assert!(!e.held_by.contains_key(&0));
+            e.mine.clear();
+            e.held_in.clear();
+        });
     }
 }

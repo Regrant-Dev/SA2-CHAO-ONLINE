@@ -661,6 +661,32 @@ pub fn in_garden() -> bool {
     current_level() == LEVEL_CHAO_WORLD && (1..=3).contains(&current_chao_area())
 }
 
+/// Saves the active Chao file through AL_Save (0x52E630, cdecl file index). It runs the
+/// game's item write-back/checksum and file writer, respecting the loader's save redirection.
+pub fn save_chao() -> Result<(), String> {
+    if !in_garden() || !matches!(game_state(), 16 | 17) || local_entity().is_null() {
+        return Err("enter a Chao garden and finish loading first".into());
+    }
+    if !chao_in_memory() {
+        return Err("Chao data hasn't loaded yet".into());
+    }
+    #[cfg(all(windows, target_arch = "x86"))]
+    // SAFETY: the game's synchronous save wrapper (REA: calls 0x52F090, then 0x532360).
+    // The selector picks one of the two save copies, as the game's own readers do.
+    unsafe {
+        let file = i32::from((0x0173_D06C as *const u32).read_volatile() == 1);
+        let result =
+            std::mem::transmute::<usize, unsafe extern "C" fn(i32) -> i32>(0x0052_E630)(file);
+        if result != 0 {
+            Ok(())
+        } else {
+            Err("the game couldn't write the Chao save file".into())
+        }
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    Err("saving is only available in the game".into())
+}
+
 /// Gives player 1 `count` rings the game's way (AddRings 0x44CE10: EAX = player, DX = count;
 /// clamps at 999 and handles the extra lives at every 100).
 pub fn add_rings(count: i16) {

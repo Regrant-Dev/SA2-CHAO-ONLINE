@@ -57,6 +57,7 @@ enum Row {
     KarateOpponent,
     Race,
     MyChao,
+    SaveChao,
     Visits,
     /// Visitor 1 or 2: which Chao visits (Auto, a save slot, or None).
     Visitor(usize),
@@ -97,7 +98,7 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([Row::MyChao, Row::Visits]);
+    rows.extend([Row::MyChao, Row::SaveChao, Row::Visits]);
     if visits != 0 {
         rows.extend((0..MAX_CARRIED_CHAO).map(Row::Visitor));
     }
@@ -569,6 +570,7 @@ pub fn on_frame() {
                 .get(m.room_choice)
                 .map(|(choice, _)| room::choose(*choice)),
             Row::StartStop => Some(start_stop(&mut m)),
+            Row::SaveChao => Some(crate::saving::save_now()),
             Row::GoTo => {
                 let others = online::others();
                 others
@@ -756,6 +758,7 @@ fn draw(m: &Menu, rows: &[Row]) {
                 "My Chao (races, karate): < {} >",
                 my_chao_label(m.settings.my_chao)
             ),
+            Row::SaveChao => "[ Save Chao garden now ] (autosaves every 5 min)".into(),
             Row::Visits => format!(
                 "Visit friends: < {} >",
                 online::VISIT_MODES[m.settings.visits.min(1)]

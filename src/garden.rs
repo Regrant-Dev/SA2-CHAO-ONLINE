@@ -180,6 +180,8 @@ type Outgoing = (Vec<(u8, u8, Changes)>, Vec<(u8, u8, [f32; 3])>);
 
 struct Mirror {
     object: usize,
+    /// The record belonging to this object when it was registered (guards address reuse).
+    record: usize,
     /// One of our own Chao following the keeper (never deleted by us; its record is our save's).
     own: bool,
     /// Latest state from the Chao's brain (the keeper, or its owner), when it came and who sent it.
@@ -284,6 +286,13 @@ fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
 /// Visitors: we created `object` for player `owner`'s Chao `index`.
 pub fn spawned(owner: u8, index: u8, object: usize) {
     if object != 0 {
+        let record = crate::registry::entries(crate::registry::CHAO)
+            .into_iter()
+            .find(|&(_, live)| live == object)
+            // SAFETY: a live registry entry's Chao record.
+            .map_or(0, |(entry, _)| unsafe {
+                ((entry + 8) as *const usize).read()
+            });
         with(|g| {
             let mut owner_runs = None;
             if let Some(((at, rotation, motion), runs, when)) = g.rebuilt.remove(&(owner, index))
@@ -310,6 +319,7 @@ pub fn spawned(owner: u8, index: u8, object: usize) {
                 (owner, index),
                 Mirror {
                     object,
+                    record,
                     own: false,
                     target: None,
                     motion: None,
@@ -1340,12 +1350,54 @@ pub fn on_frame() {
     let now = Instant::now();
     with(|g| {
         g.frame = g.frame.wrapping_add(1);
+        prune_mirrors(g);
         own_frame(g);
         mirrors_frame(g, now);
         looks_frame(g);
         mine_frame(g);
         sounds_frame(g);
     });
+}
+
+/// A transition or native behaviour can remove an object before the mod sees the area change.
+/// Forget it without writing to freed memory, even if that address has already been reused.
+fn prune_mirrors(g: &mut Garden) {
+    let live = crate::registry::entries(crate::registry::CHAO);
+    let gone: Vec<(u8, u8)> = g
+        .mirrors
+        .iter()
+        .filter_map(|(&key, m)| {
+            let valid = live.iter().any(|&(entry, object)| {
+                if object != m.object {
+                    return false;
+                }
+                // SAFETY: the current registry still names this object, on the game thread.
+                unsafe {
+                    let d = data1(object);
+                    m.record != 0
+                        && ((entry + 8) as *const usize).read() == m.record
+                        && d != 0
+                        && ((d + D_RECORD) as *const usize).read() == m.record
+                }
+            });
+            (!valid).then_some(key)
+        })
+        .collect();
+    for key in gone {
+        if let Some(m) = g.mirrors.remove(&key) {
+            g.wrapped.remove(&m.object);
+            g.held.remove(&key);
+            g.heard.remove(&key);
+            if !m.own {
+                g.left.push(key);
+            }
+            log!(
+                "garden: forgot removed Chao {}:{} without touching its old object",
+                key.0,
+                key.1
+            );
+        }
+    }
 }
 
 /// Our own visiting Chao follow the keeper while a friend keeps the garden (wrapped like a
@@ -1390,6 +1442,7 @@ fn own_frame(g: &mut Garden) {
             (me, index),
             Mirror {
                 object,
+                record: record_of(slot),
                 own: true,
                 target: None,
                 motion: None,
@@ -2752,7 +2805,11 @@ fn update_at(object: usize, d: usize, spot: Option<(Vector, i32, bool)>) {
     }
     // SAFETY: the Chao's original MainSub, which this object had.
     unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(CHAO_MAIN)(object) };
-    if let Some(spot) = spot {
+    if let Some(spot) = spot
+        && live_pose(object).is_some()
+        // SAFETY: live_pose just verified the object; don't write the old data after a rebuild.
+        && unsafe { data1(object) } == d
+    {
         // SAFETY: as above; Data2's first three floats are the velocity.
         unsafe {
             put(d, spot);

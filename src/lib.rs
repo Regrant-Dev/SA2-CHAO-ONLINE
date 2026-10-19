@@ -36,6 +36,7 @@ mod puppet;
 mod race;
 mod registry;
 mod room;
+mod saving;
 mod shots;
 mod skin_sync;
 mod skins;
@@ -270,6 +271,8 @@ pub extern "C" fn OnFrame() {
         online::on_frame();
         watch::mark("puppet::on_frame");
         puppet::on_frame();
+        watch::mark("saving::on_frame");
+        saving::on_frame();
         watch::mark("menu::on_frame");
         menu::on_frame();
         watch::mark("chat::on_frame");
