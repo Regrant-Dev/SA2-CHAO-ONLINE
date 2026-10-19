@@ -1,4 +1,4 @@
-# Optional jewel eggs in the native Black Market
+# Built-in jewel eggs in the native Black Market
 
 2026-10-18/19: Steam decrypted `sonic2app.exe`, base 0x400000. Code slices were staged
 into the REA VM and inspected with its Ghidra provider. Reference: Exant64/CWE's
@@ -32,7 +32,7 @@ contain 99 strings. Each has big-endian offsets terminated by FFFFFFFF. Native s
 uses **0x57A5D0**, walks the terminator rather than assuming 99, and stores separate dialog
 and item tables in its work. Extending the item table is therefore possible.
 
-On opt-in startup we resolve each source through Mod Loader's GetReplaceablePath, decode
+On startup we resolve each source through Mod Loader's GetReplaceablePath, decode
 bounded PRS, append names 99..110 and descriptions 111..122, then generate replacements in
 the mod's `cache/jewel-eggs/` directory. All original message IDs and payload bytes are
 preserved. The files are registered with ReplaceFile; **the native loader allocates and
@@ -41,8 +41,10 @@ Only new English strings and code are shipped; no game messages or textures are 
 
 ## Activation and limits
 
-Off by default (`JewelEggs=Off/False`). F9 persists the option; restart applies it before
-the shop loads. Each unlock tier from 120 to 180 emblems has a price from 10000 to 40000.
+Always initialized before the shop loads. The user clarified that jewel eggs should be
+built into normal progression, so the original F9/Mod Manager opt-in was removed. Old
+`JewelEggs=Off` configuration entries are ignored and omitted on the next settings save.
+Each unlock tier from 120 to 180 emblems has a price from 10000 to 40000.
 These are our balance choices, not original-game unlock rules. At restock, choose one
 unlocked, absent jewel egg with a private RNG; do not advance the game's RNG, overwrite
 normal offers, or exceed 32 slots. Full stock gets no extra egg.
@@ -50,7 +52,7 @@ normal offers, or exceed 32 slots. Full stock gets no extra egg.
 Before changing anything, verify the native catalog pointer/count, the stock function's
 first eight bytes, the original restock CALL, and every modified attribute byte. Refuse
 activation on a conflict rather than overwrite another shop mod. Reject message tables
-with a different string count, invalid offsets or truncated/oversized PRS. Disabling never
+with a different string count, invalid offsets or truncated/oversized PRS. Activation never
 edits existing Chao or eggs. Runtime restock also verifies the descriptor still matches.
 
 Tests cover exact thresholds, duplicate/capacity handling, attribute/message indices,

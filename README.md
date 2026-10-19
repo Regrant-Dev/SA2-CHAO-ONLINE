@@ -11,7 +11,7 @@ Online multiplayer for **Sonic Adventure 2** (Steam PC), for up to 8 players. It
 - Kart races and treasure hunts against each other.
 - Your Chao can visit friends' gardens, run in their Chao Races and fight them in karate.
 - Inspect your Chao's hidden stats, temperament, emotions, alignment and bonds in F9.
-- Optionally unlock jewel eggs in the Black Market by collecting 120-180 emblems.
+- Unlock jewel eggs in the Black Market by collecting 120-180 emblems.
 - Text chat, and a "go to friend" option to jump to where someone is.
 
 Press **F9** in game for the menu. Multiplayer stays off until you turn it on. There's also an

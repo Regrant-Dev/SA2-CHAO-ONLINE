@@ -61,7 +61,6 @@ enum Row {
     Race,
     MyChao,
     ChaoDetails,
-    JewelEggs,
     SaveChao,
     Visits,
     /// Visitor 1 or 2: which Chao visits (Auto, a save slot, or None).
@@ -103,13 +102,7 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([
-        Row::MyChao,
-        Row::ChaoDetails,
-        Row::JewelEggs,
-        Row::SaveChao,
-        Row::Visits,
-    ]);
+    rows.extend([Row::MyChao, Row::ChaoDetails, Row::SaveChao, Row::Visits]);
     if visits != 0 {
         rows.extend((0..MAX_CARRIED_CHAO).map(Row::Visitor));
     }
@@ -139,8 +132,6 @@ pub struct Settings {
     pub port: String,
     pub name_tags: bool,
     pub chao_race: bool,
-    /// Opt-in native Black Market jewel egg offers; applied on the next game launch.
-    pub jewel_eggs: bool,
     /// Save slot of "My Chao" (-1 = the first hatched one).
     pub my_chao: i32,
     /// Visit friends: 0 off, 1 on (index into `online::VISIT_MODES`).
@@ -170,7 +161,6 @@ impl Settings {
             port: online::DEFAULT_PORT.to_string(),
             name_tags: true,
             chao_race: true,
-            jewel_eggs: false,
             my_chao: -1,
             visits: 1,
             visitors: [online::VISITOR_AUTO; MAX_CARRIED_CHAO],
@@ -198,10 +188,6 @@ impl Settings {
                 "host" if !v.is_empty() => s.host = v,
                 "port" if !v.is_empty() => s.port = v,
                 "mychao" => s.my_chao = v.parse().unwrap_or(-1),
-                "jeweleggs" => {
-                    s.jewel_eggs =
-                        matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")
-                }
                 "visitwith" => s.visits = online::parse_visits(&v),
                 k if k.starts_with("visitor") => {
                     if let Some(i) = k["visitor".len()..]
@@ -247,7 +233,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n{}RoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nJewelEggs={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n{}RoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -266,12 +252,11 @@ impl Settings {
             self.voice_volume,
             self.game_volume,
             if self.stage_sync { "On" } else { "Off" },
-            if self.jewel_eggs { "On" } else { "Off" },
         )
     }
 }
 
-pub(crate) fn load(mod_path: &str) -> Settings {
+fn load(mod_path: &str) -> Settings {
     let dir = Path::new(mod_path);
     ["config.ini", "online.ini"]
         .iter()
@@ -328,7 +313,6 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         port: String::new(),
         name_tags: true,
         chao_race: true,
-        jewel_eggs: false,
         my_chao: -1,
         visits: 1,
         visitors: [-1; MAX_CARRIED_CHAO],
@@ -520,19 +504,6 @@ pub fn on_frame() {
                 Path::new(online::mod_path()).join("config.ini"),
                 m.settings.to_ini(),
             );
-        }
-        Row::JewelEggs if left || right => {
-            m.settings.jewel_eggs = !m.settings.jewel_eggs;
-            match fs::write(
-                Path::new(online::mod_path()).join("config.ini"),
-                m.settings.to_ini(),
-            ) {
-                Ok(()) => hud::toast("Jewel eggs setting saved; restart the game to apply"),
-                Err(e) => {
-                    m.settings.jewel_eggs = !m.settings.jewel_eggs;
-                    hud::toast(format!("Couldn't save jewel egg setting: {e}"));
-                }
-            }
         }
         Row::Karate if (left || right) && !karate::available() => {}
         Row::Karate if left || right => {
@@ -964,17 +935,6 @@ fn draw(m: &Menu, rows: &[Row]) {
                 my_chao_label(m.settings.my_chao)
             ),
             Row::ChaoDetails => "[ Chao details: stats, personality, bonds & more ]".into(),
-            Row::JewelEggs => format!(
-                "Jewel eggs: < {} > (120+ emblems{})",
-                on_off(m.settings.jewel_eggs),
-                if crate::jewel_eggs::unavailable() {
-                    "; unavailable: see log"
-                } else if m.settings.jewel_eggs != crate::jewel_eggs::active() {
-                    "; restart to apply"
-                } else {
-                    ""
-                }
-            ),
             Row::SaveChao => "[ Save Chao garden now ] (autosaves every 5 min)".into(),
             Row::Visits => format!(
                 "Visit friends: < {} >",
@@ -1066,7 +1026,6 @@ mod tests {
             port: "27015".into(),
             name_tags: false,
             chao_race: false,
-            jewel_eggs: true,
             my_chao: 5,
             visits: 1,
             visitors: [3, -2, -1, 7],
@@ -1090,14 +1049,6 @@ mod tests {
             (s.mode, s.name.as_str(), s.host.as_str()),
             (2, "Bob", "1.2.3.4:5")
         );
-    }
-
-    #[test]
-    fn jewel_eggs_require_an_explicit_opt_in() {
-        assert!(!Settings::parse("").jewel_eggs);
-        assert!(!Settings::parse("JewelEggs=maybe").jewel_eggs);
-        assert!(!Settings::parse("JewelEggs=Off").jewel_eggs);
-        assert!(Settings::parse("JewelEggs=True").jewel_eggs);
     }
 
     #[test]

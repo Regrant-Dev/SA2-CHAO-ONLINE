@@ -30,7 +30,6 @@ Pause the game before typing, since letter keys also move your character.
 | Go to | Jump to a friend |
 | My Chao | The Chao you race and fight with |
 | Chao details | Read your Chao's hidden stats, personality, emotions, alignment and bonds |
-| Jewel eggs | Enable emblem-gated jewel eggs in the Black Market; restart to apply |
 | Save Chao garden now | Save your Chao World data immediately while in a garden |
 | Visit friends | Whether your Chao visit friends' gardens |
 | Visitor 1 / 2 | Which Chao visit: Auto, a Chao you pick, or None |
@@ -108,9 +107,9 @@ menu instead of continuing to update a dead character.
 
 ## Chao
 
-**Jewel eggs (optional):** switch **F9 > Jewel eggs** to On, then restart the game. You can
-also enable it in SA Mod Manager's mod settings. It is Off by default. Normal Black Market
-restocks add one randomly chosen jewel egg you have unlocked, when the shop has space.
+**Jewel eggs:** built into the mod's Black Market progression. Normal restocks add one
+randomly chosen jewel egg you have unlocked by collecting emblems, when the shop has space.
+No F9 or Mod Manager setting is required.
 Existing stock stays available; offers rotate with the game's usual restock timing.
 
 | Egg | Emblems | Rings |
@@ -128,8 +127,7 @@ Existing stock stays available; offers rotate with the game's usual restock timi
 | Topaz | 170 | 35,000 |
 | Pearl | 180 | 40,000 |
 
-Buying, delivery, hatching and saving use the game's normal egg system. Turning the option
-off removes future offers after a restart; it does not remove eggs or Chao you already own.
+Buying, delivery, hatching and saving use the game's normal egg system.
 The added names/descriptions use English in every language. A conflicting shop or message
 mod can prevent activation; the reason appears in `sa2-chao-online.log`.
 

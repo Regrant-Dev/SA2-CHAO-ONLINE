@@ -1,4 +1,4 @@
-//! Opt-in native Black Market jewel eggs. Native evidence: re/jewel-eggs.md.
+//! Built-in native Black Market jewel eggs. Native evidence: re/jewel-eggs.md.
 //! The original shop charges rings, delivers eggs, initializes genes and handles hatching.
 
 use std::ffi::{CStr, CString};
@@ -20,7 +20,6 @@ const CAPACITY: usize = 32;
 const FIRST_MESSAGE: usize = 99;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-static FAILED: AtomicBool = AtomicBool::new(false);
 static RNG: AtomicU32 = AtomicU32::new(0x83AD_61C7);
 // Retain the path strings for the entire process, including helpers that retain pointers.
 static REPLACEMENTS: OnceLock<Vec<(CString, CString)>> = OnceLock::new();
@@ -108,11 +107,8 @@ const EGGS: [Egg; 12] = [
     },
 ];
 
-pub fn active() -> bool {
+fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
-}
-pub fn unavailable() -> bool {
-    FAILED.load(Ordering::Relaxed)
 }
 
 fn pick_offer(stock: &[u16], emblems: u8, roll: u32) -> Option<Egg> {
@@ -314,10 +310,6 @@ pub fn init(mod_path: &str, helpers: &HelperFunctions) {
     if active() {
         return;
     }
-    if !crate::menu::load(mod_path).jewel_eggs {
-        log!("jewel eggs: off (opt in through F9 or Mod Manager)");
-        return;
-    }
     let result = (|| -> Result<(), String> {
         verify_native()?;
         let replacements = prepare_messages(mod_path, helpers)?;
@@ -350,7 +342,6 @@ pub fn init(mod_path: &str, helpers: &HelperFunctions) {
             "jewel eggs: enabled; 120-180 emblems, 10000-40000 rings; one extra offer per restock"
         ),
         Err(error) => {
-            FAILED.store(true, Ordering::Relaxed);
             log!("jewel eggs: unavailable: {error}");
             hud::toast("Jewel eggs couldn't be enabled; see the mod log");
         }
