@@ -1,5 +1,30 @@
 # Stage objects: SET loader, kill flags, enemies and item boxes (for co-op kill sync)
 
+## Progression crate correction (2026-10-19)
+
+An in-game report showed Hidden Base's stepping stone missing after a death. Matched
+the live log's position (-3990, 840, -4678) against the unmodified big-endian
+`set0023_s.bin` and native object list **0xA2DCC0** (89 entries at **0xA2D730**):
+
+- record 268: SOLIDBOX (-3989.7,820,-4677.6), main **0x6FC330**;
+- records 270/271: SOLIDBOX (-3969.7,820/860,-4677.6);
+- record **273**: **CONTWOOD**, (-3969.7,840,-4677.6), main **0x6FB200**;
+- record **308** is another CONTWOOD step at (-3969.7,840,-4852.6).
+
+This identifies the breakable step between solid boxes, rather than an item/reward box.
+REA VM/Ghidra inspected the 0x6FB200 initializer: display 0x6FB8A0, update 0x6FB280,
+delete 0x6E7140, collision initialization 0x47E620. The existing Breakables evidence above
+establishes its persistent kill flag; our replay loop deliberately re-deleted it every
+restart. The user confirmed the missing crate persisted after restarting.
+
+Standard wooden/iron crates (**0x6CD7F0,0x6D63F0,0x6FB200,0x6FBBA0**) are now per
+player, excluded from both outgoing detection and incoming destruction history. Incoming
+events are classified before insertion, so older peers' snapshots cannot reintroduce
+crate kills or relay them onwards. Each player keeps the native break/respawn behavior,
+and a faster friend cannot destroy a step they still need. Enemy/item/ring/Chao-reward
+box sharing remains active. Regression tests cover those categories and the exact
+Hidden Base crate. In-game return after death and mixed-version play still need retesting.
+
 Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
 of `re/bin/sonic2app.dumped.exe` (none of it run in game yet). Object names come from the
 per-level object lists in the exe (each entry carries its name string).

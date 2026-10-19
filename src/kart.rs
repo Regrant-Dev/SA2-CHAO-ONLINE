@@ -77,6 +77,7 @@ const GOAL_WAIT: Duration = Duration::from_secs(60);
 const KART_TYPES: usize = 0x01D9_6F70;
 const KART_TYPE_SIZE: usize = 0x1C;
 const KART_DISPLAY: usize = 0x0061_C6C0;
+const RENDER_STATE: usize = 0x0267_0544;
 const ENTITY_SIZE: usize = 0x30;
 const WORK_SIZE: usize = 0x2F8;
 /// Others' karts count this long after their last state.
@@ -200,6 +201,84 @@ fn write<T>(address: usize, value: T) {
 /// In a Kart Race (the room battle level).
 pub fn in_kart_race() -> bool {
     game::current_level() == KART_LEVEL && !game::two_player()
+}
+
+/// Rendering applies to both Route 101/280 and the minigame. Party race rules stay 71-only.
+pub fn in_kart_stage() -> bool {
+    is_kart_level(game::current_level()) && !game::two_player()
+}
+
+fn is_kart_level(level: i16) -> bool {
+    matches!(level, STORY_KART_LEVEL | KART_LEVEL)
+}
+
+/// Restore the native model/texture/wheel fields even if a Rust draw panics. Car work must
+/// never retain a pointer into an evictable skin allocation between display calls.
+struct NativeModels {
+    address: usize,
+    original: [u32; 4],
+}
+
+impl NativeModels {
+    fn replace(work: usize, skin: crate::skins::KartSkin) -> Self {
+        let address = work + W_MODEL_FAR;
+        let original = read::<[u32; 4]>(address);
+        write(
+            address,
+            [skin.root as u32, skin.root as u32, skin.texlist as u32, 0],
+        );
+        Self { address, original }
+    }
+}
+
+impl Drop for NativeModels {
+    fn drop(&mut self) {
+        write(self.address, self.original);
+    }
+}
+
+struct NativeTexture {
+    address: usize,
+    original: u32,
+}
+
+impl Drop for NativeTexture {
+    fn drop(&mut self) {
+        write(self.address, self.original);
+    }
+}
+
+fn draw_car(object: usize, skin: Option<&str>) {
+    let work = read::<usize>(object + OBJ_WORK);
+    if work == 0 {
+        return;
+    }
+    let native = || {
+        // SAFETY: native display for this live car or our private remote buffers.
+        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(KART_DISPLAY)(object) };
+    };
+    if !crate::skins::with_kart(skin, |skin| {
+        let _restore = NativeModels::replace(work, skin);
+        // Native kart display leaves its texlist in the renderer. Do not leave a borrowed
+        // skin list there for the next cache eviction, either.
+        let render = read::<usize>(RENDER_STATE);
+        let _texture = (render != 0).then(|| NativeTexture {
+            address: render + 0x20,
+            original: read(render + 0x20),
+        });
+        native();
+    }) {
+        native();
+    }
+}
+
+extern "C" fn player_display(object: usize) {
+    crate::watch::mark("kart skin display");
+    let result = std::panic::catch_unwind(|| draw_car(object, None));
+    if result.is_err() {
+        // The scoped model replacement has already restored the native fields.
+        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(KART_DISPLAY)(object) };
+    }
 }
 
 /// Kart `i` (0 = ours), only while the stage runs (in game or paused): the table keeps
@@ -339,16 +418,20 @@ extern "C" fn nothing(_object: usize) {}
 /// Call every frame (game thread). `racing_others`: room players still racing here.
 pub fn on_frame(racing_others: bool) {
     let mine = my_state();
-    // Our kart skin: its model and textures in our car's work, no wheels (they're the
-    // skin's own), every frame of the race (re/skins.md).
-    if in_kart_race()
-        && let Some(w) = our_work()
-        && let Some((model, texlist)) = crate::skins::kart()
-    {
-        write(w + W_MODEL_FAR, model);
-        write(w + W_MODEL_NEAR, model);
-        write(w + W_TEXLIST, texlist);
-        write(w + W_WHEELS, 0u32);
+    // Both story driving and races use this native car display. Change only our live car's
+    // callback; model and texture replacements are scoped to each display call.
+    if in_kart_stage() {
+        let c = car(0);
+        if c != 0 && read::<usize>(c + OBJ_DISPLAY) == KART_DISPLAY {
+            write(
+                c + OBJ_DISPLAY,
+                player_display as extern "C" fn(usize) as usize,
+            );
+            log!(
+                "kart: skin display installed for level {}",
+                game::current_level()
+            );
+        }
     }
     with(|k| {
         k.frame = k.frame.wrapping_add(1);
@@ -478,10 +561,10 @@ static mut FAKE: Fake = Fake {
 extern "C" fn display(_object: usize) {
     crate::watch::mark("kart display");
     let _ = std::panic::catch_unwind(|| {
-        let karts: Vec<(KartState, [f32; 3])> = with(|k| {
+        let karts: Vec<(u8, KartState, [f32; 3])> = with(|k| {
             k.others
-                .values_mut()
-                .filter_map(|o| {
+                .iter_mut()
+                .filter_map(|(&id, o)| {
                     // Their frame now, as far as we know, minus the delay; our clock runs at
                     // 60 frames a second and eases toward it.
                     let now = Instant::now();
@@ -506,11 +589,12 @@ extern "C" fn display(_object: usize) {
                         .rposition(|(f, _)| *f <= clock)
                         .unwrap_or(0);
                     let state = o.states.get(i).copied().unwrap_or(o.latest);
-                    Some((state, sample_at(&o.samples, clock)?))
+                    Some((id, state, sample_at(&o.samples, clock)?))
                 })
                 .collect()
         });
-        for (s, at) in karts {
+        for (id, s, at) in karts {
+            let skin = crate::online::worn_skin(id).unwrap_or_default();
             let entry = KART_TYPES + usize::from(s.kind) * KART_TYPE_SIZE;
             let (far, near, texlist, wheels) = (
                 read::<usize>(entry + 4),
@@ -537,10 +621,10 @@ extern "C" fn display(_object: usize) {
                 write(o + OBJ_WORK, w);
                 write(e + E_POSITION, at);
                 write(w + W_ROTATION, s.rotation);
-                write(w + 0x34, far);
-                write(w + 0x38, near);
-                write(w + 0x3C, texlist);
-                write(w + 0x40, wheels);
+                write(w + W_MODEL_FAR, far);
+                write(w + W_MODEL_NEAR, near);
+                write(w + W_TEXLIST, texlist);
+                write(w + W_WHEELS, wheels);
                 write(w + W_PLAYER, 0i32);
                 write(w + W_KIND, i32::from(s.kind));
                 write(w + W_YAW, s.yaw);
@@ -548,7 +632,7 @@ extern "C" fn display(_object: usize) {
                 write(w + W_WHEEL, s.wheel);
                 write(w + W_TILT, s.tilt);
                 write(w + W_ACCEL, i32::from(s.accel));
-                std::mem::transmute::<usize, extern "C" fn(usize)>(KART_DISPLAY)(o);
+                draw_car(o, Some(&skin));
             }
         }
     });
@@ -557,6 +641,45 @@ extern "C" fn display(_object: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skins_apply_to_story_driving_and_races() {
+        assert!(is_kart_level(70));
+        assert!(is_kart_level(71));
+        assert!(!is_kart_level(69));
+        assert!(!is_kart_level(90));
+    }
+
+    #[test]
+    fn borrowed_models_and_textures_are_restored_on_unwind() {
+        let mut work = [0u32; WORK_SIZE / 4];
+        work[W_MODEL_FAR / 4..W_MODEL_FAR / 4 + 4].copy_from_slice(&[11, 12, 13, 1]);
+        let before = work;
+        let mut renderer_texlist = 99u32;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _models = NativeModels::replace(
+                work.as_mut_ptr() as usize,
+                crate::skins::KartSkin {
+                    root: 21,
+                    texlist: 23,
+                },
+            );
+            assert_eq!(
+                &work[W_MODEL_FAR / 4..W_MODEL_FAR / 4 + 4],
+                &[21, 21, 23, 0]
+            );
+            let _texture = NativeTexture {
+                address: &mut renderer_texlist as *mut u32 as usize,
+                original: renderer_texlist,
+            };
+            renderer_texlist = 23;
+            assert_eq!(renderer_texlist, 23);
+            panic!("interrupted skin draw");
+        }));
+        assert!(result.is_err());
+        assert_eq!(work, before);
+        assert_eq!(renderer_texlist, 99);
+    }
 
     #[test]
     fn karts_are_drawn_between_their_states() {

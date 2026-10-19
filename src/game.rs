@@ -158,7 +158,8 @@ const DRAW_ONLY: usize = 0x0043_D4B0;
 
 /// Pause screen state (17): its `call` to draw the stage without updating it.
 const PAUSE_DRAW_CALL: usize = 0x0043_D311;
-/// Requests a state change from the frame update (1 = Start pressed: open the pause screen).
+/// Requests a stage transition (2 = death, 5 = time-limit restart, 7 = full restart).
+/// Start/pause is instead the frame update's return value (REA: re/addresses.md).
 const STATE_REQUEST: usize = 0x01A5_58A4;
 
 static FROZEN: AtomicBool = AtomicBool::new(false);
@@ -167,6 +168,41 @@ static GRACE: AtomicU32 = AtomicU32::new(0);
 static LIVE_PAUSE: AtomicBool = AtomicBool::new(false);
 static INGAME_UPDATE: AtomicUsize = AtomicUsize::new(0);
 static PAUSE_DRAW: AtomicUsize = AtomicUsize::new(0);
+
+/// A transition raised by objects while live-paused must reach the native state-16
+/// dispatcher after Resume. Running more object updates can consume a one-shot death event.
+#[derive(Default)]
+struct PauseTransition {
+    pending: Option<((i16, u8), u16)>,
+}
+
+impl PauseTransition {
+    fn queue(&mut self, stage: (i16, u8), request: u16) -> bool {
+        if matches!(request, 1..=5 | 7 | 8) && self.pending.is_none() {
+            self.pending = Some((stage, request));
+            return true;
+        }
+        false
+    }
+
+    fn retain(&mut self, stage: (i16, u8), state: i16) {
+        if !matches!(state, GAME_STATE_INGAME | GAME_STATE_PAUSED)
+            || self.pending.is_some_and(|(of, _)| of != stage)
+        {
+            self.pending = None;
+        }
+    }
+
+    fn take(&mut self, stage: (i16, u8)) -> Option<u16> {
+        self.pending
+            .take()
+            .filter(|(of, _)| *of == stage)
+            .map(|(_, request)| request)
+    }
+}
+
+static PAUSE_TRANSITION: std::sync::Mutex<PauseTransition> =
+    std::sync::Mutex::new(PauseTransition { pending: None });
 
 /// Freezes (or unfreezes) the whole stage like the pause screen does, without its menu:
 /// nothing moves and the timer stops, but the stage (and other players) keep being drawn.
@@ -429,6 +465,10 @@ const RESTORE_SOUNDS: usize = 0x0043_5FD0;
 /// the stage keeps running behind the menu, only our player ignores the controller.
 pub fn set_live_pause(live: bool) {
     LIVE_PAUSE.store(live, Ordering::Relaxed);
+    PAUSE_TRANSITION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain((current_level(), mission()), game_state());
 }
 
 /// Hooks the in-stage frame update (for `freeze_world`) and the pause screen's drawing (for
@@ -449,15 +489,38 @@ pub fn install_freeze() {
 extern "C" fn pause_draw() {
     crate::watch::mark("pause draw");
     let update = INGAME_UPDATE.load(Ordering::SeqCst);
-    if LIVE_PAUSE.load(Ordering::Relaxed) && !FROZEN.load(Ordering::Relaxed) && update != 0 {
+    let stage = (current_level(), mission());
+    let pending = {
+        let mut transition = PAUSE_TRANSITION.lock().unwrap_or_else(|e| e.into_inner());
+        transition.retain(stage, game_state());
+        // A request can already exist when the pause menu opens on the death frame.
+        let request = unsafe { (STATE_REQUEST as *const u16).read_volatile() };
+        transition.queue(stage, request);
+        transition.pending.is_some()
+    };
+    if LIVE_PAUSE.load(Ordering::Relaxed)
+        && !FROZEN.load(Ordering::Relaxed)
+        && update != 0
+        && !pending
+    {
         // SAFETY: static game variables, and the game's own cdecl frame update without
-        // arguments. The player ignores the pad (it drives the menu now), and a Start press
-        // seen by the update must not ask for the pause screen again.
+        // arguments. The player ignores the pad (it drives the menu now). Ignore only the
+        // returned Start press; preserve actual stage-transition requests for Resume.
         unsafe {
             let controller = (CONTROLLER_ENABLED as *mut u8).read_volatile();
             let request = (STATE_REQUEST as *mut u16).read_volatile();
             (CONTROLLER_ENABLED as *mut u8).write_volatile(0);
             std::mem::transmute::<usize, extern "C" fn() -> i32>(update)();
+            let next = (STATE_REQUEST as *const u16).read_volatile();
+            if PAUSE_TRANSITION
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .queue(stage, next)
+            {
+                crate::log!(
+                    "game: queued stage request {next} during pause; Resume will finish it"
+                );
+            }
             (CONTROLLER_ENABLED as *mut u8).write_volatile(controller);
             (STATE_REQUEST as *mut u16).write_volatile(request);
         }
@@ -471,6 +534,18 @@ extern "C" fn pause_draw() {
 
 extern "C" fn ingame_update() -> i32 {
     crate::watch::mark("stage update");
+    if let Some(request) = PAUSE_TRANSITION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take((current_level(), mission()))
+    {
+        // Resume already ran the native pause cleanup. Skip one object update, letting the
+        // native state-16 dispatcher consume this request exactly once (including lives,
+        // game-over, fade and checkpoint handling). Do not manufacture a GameState here.
+        unsafe { (STATE_REQUEST as *mut u16).write_volatile(request) };
+        crate::log!("game: resumed with pending stage request {request}");
+        return 0;
+    }
     let grace = GRACE.load(Ordering::Relaxed);
     if grace > 0 {
         GRACE.store(grace - 1, Ordering::Relaxed);
@@ -1026,6 +1101,37 @@ pub const KNOWN_GAME_BUILD: [u8; 8] = [0xE8, 0x1A, 0x60, 0x50, 0x00, 0xC0, 0x3F,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_pause_keeps_a_death_until_resume_and_delivers_it_once() {
+        let stage = (23, 0);
+        let mut transition = PauseTransition::default();
+        assert!(!transition.queue(stage, 0));
+        assert!(transition.queue(stage, 2));
+        for _ in 0..30 {
+            transition.retain(stage, GAME_STATE_PAUSED);
+            assert!(!transition.queue(stage, 0));
+        }
+        assert!(!transition.queue(stage, 7)); // the first native transition wins
+        transition.retain(stage, GAME_STATE_INGAME);
+        assert_eq!(transition.take(stage), Some(2));
+        assert_eq!(transition.take(stage), None);
+    }
+
+    #[test]
+    fn queued_pause_transitions_cannot_follow_a_restart_or_level_change() {
+        let mut transition = PauseTransition::default();
+        for state in [5, 7, 9, 13, 15] {
+            assert!(transition.queue((23, 0), 2));
+            transition.retain((23, 0), state);
+            assert_eq!(transition.take((23, 0)), None);
+        }
+        assert!(transition.queue((23, 0), 5));
+        transition.retain((24, 0), GAME_STATE_INGAME);
+        assert_eq!(transition.take((24, 0)), None);
+        assert!(transition.queue((23, 0), 7));
+        assert_eq!(transition.take((23, 1)), None);
+    }
 
     #[test]
     fn reads_the_loader_profile() {

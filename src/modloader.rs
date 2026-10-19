@@ -61,8 +61,9 @@ pub struct HelperFunctions {
     _register_mission23_end_position: Fn0,
     _clear_mission23_end_position_list: Fn0,
     _hook_export: Fn0,
-    _get_replaceable_path: Fn0,
-    _replace_file: Fn0,
+    pub get_replaceable_path:
+        unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_char,
+    pub replace_file: unsafe extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char),
     _set_window_title: Fn0,
     /// Font size in pixels (default 12).
     pub set_debug_font_size: unsafe extern "C" fn(f32),

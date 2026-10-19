@@ -1,5 +1,29 @@
 # Kart racing: entry, start hold, progress, finish and kart drawing (for room races)
 
+## Skin rendering correction (2026-10-19, REA VM/Ghidra)
+
+Rechecked 0x61C6C0 in REA from `kart_61c6c0.bin`: native cdecl ObjectMaster display,
+model pointers in work +0x34/+0x38, texture list +0x3C, wheel/effect flag +0x40. Wheel
+node writes at 0x61CA99..0x61CAEB must be disabled for custom models. The body call
+at 0x61CB2F is `0x42EB30(model, 0x42D650)` with two stack arguments. The same display
+handles story courses (0/1) and minigame courses; its story branches update native effect
+state, so keep the full native display rather than redraw only the body ourselves.
+
+The mod previously replaced only level-71 car work, left borrowed skin pointers there,
+advertised no skin while driving, and ignored remote skin selections. It now distinguishes
+rendering (levels 70 and 71) from party-race rules (71 only). A wrapper on the local car's
+original display borrows only supported solid `kart=on` skin models, calls the native
+display, then restores all four fields and the renderer texture-list pointer with Drop
+guards. The skin cache remains locked for that call, preventing eviction. Switching Off or
+an unavailable texture list immediately draws the original car. No native type table,
+physics or CPU model is changed. Shared SkinWorn messages remain active in driving;
+remote kart display borrows the skin for that peer and falls back to the native kart.
+
+The character-display hook exits early in kart stages, before reading former character
+objects/CharObj2. Restarts recreate car objects; each new original display is wrapped once.
+Tests cover stage eligibility and restoration on unwind. Unit/lint/build checks do not
+replace an in-game Route 101/280, race, skin switch and remote-view retest.
+
 Steam `sonic2app.exe`, image base 0x400000. Everything was read from the objdump listing of
 `re/bin/sonic2app.dumped.exe` (no runtime tests yet). The kart code is `..\..\src\Cart\ModeMain\*.c`,
 at **0x619000..0x626FFF**. Most of its data (models, kart tables, per-type parameters) comes from

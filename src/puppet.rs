@@ -447,7 +447,7 @@ extern "C" fn display(_object: usize) {
         // frames (their own timer stays in their game; this keeps the same beat).
         let blink =
             game::blinks_out(BLINK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let in_kart_race = crate::kart::in_kart_race();
+        let in_kart_race = crate::kart::in_kart_stage();
         for (pose, name, skin, source) in poses {
             if let Some(tags) = &tags {
                 tags.draw(pose.position, &name);

@@ -427,6 +427,12 @@ pub fn others() -> Vec<(u8, String, Option<PlayerState>)> {
     })
 }
 
+/// A remote kart's selected skin; read outside the kart/cache locks.
+pub fn worn_skin(id: u8) -> Option<String> {
+    let guard = ONLINE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.remote.get(&id).map(|r| r.skin.clone())
+}
+
 pub fn peers() -> (Vec<together::Peer>, bool) {
     let guard = ONLINE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(online) = guard.as_ref() else {

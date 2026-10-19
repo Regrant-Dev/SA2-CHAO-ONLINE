@@ -1353,15 +1353,26 @@ pub fn on_frame() {
     if crate::skin_sync::take_changed() {
         rescan();
     }
+    // Driving has no character display/CharObj2 to replace. Advertise the skin used by
+    // the kart renderer and never touch the stale character object from the last stage.
+    if crate::kart::in_kart_stage() {
+        *WORN.lock().unwrap_or_else(|e| e.into_inner()) = with(|s| {
+            let id = s.mine.clone()?;
+            kart_ready(s, &id)?;
+            Some(id)
+        })
+        .flatten();
+        crate::voice::frame(None);
+        hide::set_jump_ball_hidden(false);
+        return;
+    }
     // SAFETY: the static player object pointer, and its display field, on the game thread.
     let object = unsafe { (PLAYER_OBJECT as *const usize).read_volatile() };
     let in_stage = game::current_level() > 0 && !game::two_player();
     let character = game::local_player().map(|p| p.character);
     let ours = player_display as extern "C" fn(usize) as usize;
-    let wanted = in_stage
-        && object != 0
-        && !crate::kart::in_kart_race()
-        && with(|s| ready_for(s, character).is_some()).unwrap_or(false);
+    let wanted =
+        in_stage && object != 0 && with(|s| ready_for(s, character).is_some()).unwrap_or(false);
     // What the others see us wearing.
     *WORN.lock().unwrap_or_else(|e| e.into_inner()) = if wanted {
         with(|s| s.mine.clone()).flatten()
@@ -2402,16 +2413,39 @@ extern "C" fn player_display(object: usize) {
     }
 }
 
-/// Our kart skin for this race, if any: (root object, texlist).
-pub fn kart() -> Option<(usize, usize)> {
+/// Borrowed only during one native kart display, while the skin cache stays locked.
+#[derive(Clone, Copy)]
+pub struct KartSkin {
+    pub root: usize,
+    pub texlist: usize,
+}
+
+fn kart_ready(s: &mut Skins, id: &str) -> Option<KartSkin> {
+    if !s
+        .list
+        .iter()
+        .any(|i| i.id == id && i.kart && !i.rigged && !i.animated)
+    {
+        return None;
+    }
+    let (r, _) = ready(s, id, None)?;
+    Some(KartSkin {
+        root: r.root,
+        texlist: r.texlist,
+    })
+}
+
+/// Draw our selection (`None`) or a specific remote skin. Pointers cannot escape the draw:
+/// holding the cache lock prevents another skin load from evicting their allocations.
+pub fn with_kart(skin: Option<&str>, draw: impl FnOnce(KartSkin)) -> bool {
     with(|s| {
-        let id = s.mine.clone()?;
-        if !s.list.iter().any(|i| i.id == id && i.kart) {
-            return None;
-        }
-        ready_for(s, None).map(|r| (r.root, r.texlist))
+        let id = skin.map(str::to_owned).or_else(|| s.mine.clone())?;
+        let ready = kart_ready(s, &id)?;
+        draw(ready);
+        Some(())
     })
     .flatten()
+    .is_some()
 }
 
 #[cfg(test)]

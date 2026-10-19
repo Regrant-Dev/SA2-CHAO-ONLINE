@@ -38,6 +38,11 @@ character").
 
 `skins-src/build.sh` builds all of ours; each tool's `--help` lists its options.
 
+Solid skins with `kart=on`, including Lightning McQueen, also replace your vehicle in
+Route 101, Route 280 and the single-player Kart Race minigame. Friends in a room kart race
+see your selected kart skin once their copy has downloaded. Other skins use the normal kart.
+Skin switching and turning the skin off apply to the next draw without restarting the race.
+
 ## skin.ini
 
 The tools write most of it: `name`, `textures`, `height`, `character_scale` (the size it's drawn

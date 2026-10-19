@@ -30,6 +30,7 @@ Pause the game before typing, since letter keys also move your character.
 | Go to | Jump to a friend |
 | My Chao | The Chao you race and fight with |
 | Chao details | Read your Chao's hidden stats, personality, emotions, alignment and bonds |
+| Jewel eggs | Enable emblem-gated jewel eggs in the Black Market; restart to apply |
 | Save Chao garden now | Save your Chao World data immediately while in a garden |
 | Visit friends | Whether your Chao visit friends' gardens |
 | Visitor 1 / 2 | Which Chao visit: Auto, a Chao you pick, or None |
@@ -77,13 +78,16 @@ them. From Stage Select you're taken into their stage.
   others already started before you loaded, your countdown starts by itself.
 - A stage someone picks on Stage Select takes along everyone in the party who's on Stage Select.
 - **Race mode:** everyone has their own enemies. Your position shows at the top right.
-- **Co-op mode:** enemies, item boxes and other breakable things someone destroys are gone for
+- **Co-op mode:** enemies, item boxes and supported breakable things someone destroys are gone for
   everyone. A ring one of you picks up is gone for both, and you both get it. Keys and
   switches open everyone's doors and gates, and you see each other's mech shots. A checkpoint
   one of you passes counts for everyone: if you fall behind and die, you restart there, unless
   you passed a checkpoint further along yourself.
   Bosses share one health bar: every hit anyone lands counts, and each of you lands your own
   final hit.
+  Standard wooden and iron crates stay per player: they can be stepping stones, so a friend
+  breaking one cannot remove your route. They respawn normally when you die or restart.
+  Solid kart skins such as Lightning McQueen also work in Route 101/280 and Kart Race.
 
 **Party battles:** while online, the main menu's 2P button becomes **PARTY BATTLES**:
 
@@ -98,7 +102,36 @@ build left you in a small custom window, select Fullscreen or Borderless again i
 Manager before launching with the updated mod. Pausing during a party stage, or in Chao World
 with others around, doesn't stop the game for anyone.
 
+If you die while the online pause menu is open, choose **Resume** to finish the normal death
+and respawn transition. Once a death/restart is pending, the local scene waits behind the
+menu instead of continuing to update a dead character.
+
 ## Chao
+
+**Jewel eggs (optional):** switch **F9 > Jewel eggs** to On, then restart the game. You can
+also enable it in SA Mod Manager's mod settings. It is Off by default. Normal Black Market
+restocks add one randomly chosen jewel egg you have unlocked, when the shop has space.
+Existing stock stays available; offers rotate with the game's usual restock timing.
+
+| Egg | Emblems | Rings |
+|---|---:|---:|
+| Gold | 120 | 10,000 |
+| Silver | 125 | 12,000 |
+| Ruby | 130 | 15,000 |
+| Sapphire | 135 | 18,000 |
+| Emerald | 140 | 20,000 |
+| Amethyst | 145 | 22,000 |
+| Aquamarine | 150 | 24,000 |
+| Garnet | 155 | 26,000 |
+| Onyx | 160 | 28,000 |
+| Peridot | 165 | 30,000 |
+| Topaz | 170 | 35,000 |
+| Pearl | 180 | 40,000 |
+
+Buying, delivery, hatching and saving use the game's normal egg system. Turning the option
+off removes future offers after a restart; it does not remove eggs or Chao you already own.
+The added names/descriptions use English in every language. A conflicting shop or message
+mod can prevent activation; the reason appears in `sa2-chao-online.log`.
 
 **Saving:** F9 > Save Chao garden now updates your active Chao save file, including when save
 redirection is enabled. Gardens also autosave every five minutes spent in them, with a confirmation

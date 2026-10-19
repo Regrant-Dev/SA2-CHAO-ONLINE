@@ -50,6 +50,9 @@
       <Property name="ChaoRace" display="Friends' Chao in races" type="bool" defaultvalue="True" alwaysinclude="true">
         <HelpText>Friends' Chao fill the other lanes in your Chao Races.</HelpText>
       </Property>
+      <Property name="JewelEggs" display="Jewel eggs in the Black Market" type="bool" defaultvalue="False" alwaysinclude="true">
+        <HelpText>Add one eligible jewel egg to normal Black Market restocks, space permitting. Unlocks at 120-180 emblems; costs 10000-40000 rings. Restart the game after changing this option. Also in F9.</HelpText>
+      </Property>
     </Group>
   </Groups>
   <Enums>

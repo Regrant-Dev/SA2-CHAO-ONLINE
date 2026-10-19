@@ -1,4 +1,4 @@
-//! Co-op rooms: an enemy, item box or breakable container destroyed by anyone in the room is
+//! Co-op rooms: an enemy, item box or supported breakable destroyed by anyone in the room is
 //! gone for everyone in that stage (same level and mission). See re/stage-objects.md.
 //!
 //! Every stage object comes from a record in `SETObjectData[0x600]`, filled in SET-file order,
@@ -58,11 +58,14 @@ const ENEMIES: [usize; 18] = [
 const GROUND_BOXES: [usize; 2] = [0x006C_7C10, 0x006C_7CE0];
 /// Air, balloon, KD and SG boxes: gone once broken.
 const OTHER_BOXES: [usize; 4] = [0x006C_8EF0, 0x006D_B030, 0x006E_9350, 0x006E_ABC0];
-/// Objects removed for good when destroyed: every object list entry whose update calls
+/// Objects removed for good when destroyed: object list entries whose update calls
 /// KillObject (0x488DA0, clears "alive"), and those that clear it themselves where they give
 /// the destroy score (re/stage-objects.md "Breakables", "Stage sync audit"). Rings are separate
 /// (`RINGS`, `RING_GROUPS`); treasure hunt pieces never go through here.
-const BREAKABLES: [usize; 36] = [
+/// Standard CONTWOOD/CONTIRON (0x6CD7F0, 0x6D63F0, 0x6FB200, 0x6FBBA0) stay per player:
+/// crates can be steps needed to progress, notably Hidden Base records 273/308. Sharing their
+/// destruction removes those steps for slower players and re-deletes them after every death.
+const BREAKABLES: [usize; 32] = [
     0x004B_6A40, // DRMCN
     0x004B_6D60, // PPSHED
     0x004D_7AB0, // MITRUCK
@@ -77,14 +80,10 @@ const BREAKABLES: [usize; 36] = [
     0x0063_8A60, // BOMBE
     0x0064_5B30, // DLCONT
     0x0065_ADA0, // DYNAMITE
-    0x006C_D7F0, // CONTWOOD
-    0x006D_63F0, // CONTIRON
     0x006D_A720, // DYNAMITE
     0x006E_3F80, // KDDOOR
     0x006E_A1E0, // WSMMLS
     0x006F_6EA0, // BCOL
-    0x006F_B200, // CONTWOOD
-    0x006F_BBA0, // CONTIRON
     0x0077_7250, // POISON
     0x0077_9FB0, // SGOLID
     0x0077_A950, // CGWOOD
@@ -126,7 +125,7 @@ const OBJ_DATA2: usize = 0x38;
 /// A ring a group spawned: its slot (Data2), which it marks when it goes.
 const RING_SLOT: usize = 0x38;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
     Enemy,
     GroundBox,
@@ -308,6 +307,10 @@ fn main_of(n: usize) -> Option<usize> {
 
 fn kind(n: usize) -> Option<Kind> {
     let main = main_of(n)?;
+    kind_for_main(main)
+}
+
+fn kind_for_main(main: usize) -> Option<Kind> {
     if ENEMIES.contains(&main) {
         Some(Kind::Enemy)
     } else if GROUND_BOXES.contains(&main) {
@@ -1161,7 +1164,12 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
         match what {
             Inbound::Kills(objects) => {
                 for n in objects {
-                    if usize::from(n) < count && c.dead.insert(n) {
+                    if usize::from(n) < count
+                        // Older peers can still send platform crates or unknown records.
+                        // Never retain/rebroadcast those events, including late-join history.
+                        && kind(usize::from(n)).is_some()
+                        && c.dead.insert(n)
+                    {
                         // A ring a friend just picked up: one for us too, unless we took it
                         // ourselves at the same moment (it's gone here already, and that one
                         // paid).
@@ -1304,4 +1312,23 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
         c.group_rings_out = c.group_rings.iter().copied().collect();
     }
     c.here = here;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_crates_cannot_enter_shared_destruction_history() {
+        // Hidden Base's step at (-3969.7, 840, -4677.6) is CONTWOOD 0x6FB200.
+        // Both native sizes of wooden and iron crates must survive friends' kill snapshots.
+        for main in [0x6CD7F0, 0x6D63F0, 0x6FB200, 0x6FBBA0] {
+            assert_eq!(kind_for_main(main), None);
+        }
+        assert_eq!(kind_for_main(0x6FC330), None); // adjacent SOLIDBOX
+        assert_eq!(kind_for_main(0x4FC700), Some(Kind::Enemy));
+        assert_eq!(kind_for_main(0x6C7C10), Some(Kind::GroundBox));
+        assert_eq!(kind_for_main(0x6DE3B0), Some(Kind::Breakable)); // Chao reward box
+        assert_eq!(kind_for_main(0x6C0F80), Some(Kind::Ring));
+    }
 }

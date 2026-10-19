@@ -48,6 +48,31 @@ uses was checked against the game's code, and most of it in game.
 | 0x5586A0 | 0x596140 CPU racers | friends' Chao in race lanes (`race.rs`) |
 
 ## Pausing (2026-10-18, REA/objdump)
+
+### Death during live pause (2026-10-19, REA VM/Ghidra)
+
+Rechecked raw native slices at **0x43CE20**, **0x43AAF8**, **0x43AF52** and
+**0x43D310**. The native stage update returns 1/2 for a Start press; that return value,
+held in EDI by state 16, opens the pause menu. **0x1A558A4 is a separate u16 stage
+transition request**, not the pause return value. Objects set it to 2 for death, 5 for a
+time-limit restart, 7 for a full restart and other native transitions. State 16 checks
+these requests before the Start return, handling lives/game-over, fades and level-specific
+rules. State 17 draws/updates its menu and handles Resume; it does not dispatch that table.
+
+Our live-pause draw hook ran the full stage update with controls disabled, then blindly
+restored the previous request. A death raised behind the menu was discarded, potentially
+leaving a dead player with no remaining one-shot transition to respawn. We now retain the
+first request for this level/mission and stop further object updates behind the menu once
+one is pending (native draw-only and pause menu input still run). On Resume, skip exactly
+one native stage update and replay the request to the native state-16 dispatcher. Resume's
+normal cleanup still runs; no forced GameState, pad injection or manual life subtraction.
+
+Also capture an already pending request when pause opens on the death frame. Clear queued
+requests on level/mission changes or any state outside 16/17, so choosing Restart/Quit
+cannot inject a stale death into a new attempt. Unit tests exercise a death surviving many
+pause frames, delivery once, first-event priority, restart and stage/mission changes.
+The user's exact pause/death reproduction still needs an in-game retest.
+
 - **What runs each frame:** WinMain's loop (0x401DFE) calls the game loop **0x433EE0** every
   frame. That function reads input and pads, then:
   1. checks the system dialog (0x40AD30; while it's open, the game update is skipped);
