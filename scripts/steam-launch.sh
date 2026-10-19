@@ -13,7 +13,11 @@ for i in "${!steam_command[@]}"; do
                 chmod +x "$updater"
                 steam_command[$i]="$game_dir/sonic2app.exe"
                 cd -- "$game_dir"
-                exec "$updater" "${steam_command[@]}"
+                # Older launchers invoke host curl with Steam's pinned libcurl, which can
+                # fail before updating themselves. Clean only this update subprocess, then
+                # start Proton with the original Steam environment (overlay/controllers).
+                env -u LD_LIBRARY_PATH -u LD_PRELOAD "$updater" --update-only
+                exec "${steam_command[@]}"
             fi
             # One-time bootstrap for installations predating the automatic launcher.
             manager="$game_dir/SAModManager.exe"

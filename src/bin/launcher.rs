@@ -80,8 +80,14 @@ fn fetch(url: &str, to: &Path, limit: u64) -> Result<()> {
         }
     };
     #[cfg(not(windows))]
-    let curl = PathBuf::from("curl");
+    let curl = if Path::new("/usr/bin/curl").is_file() {
+        PathBuf::from("/usr/bin/curl")
+    } else {
+        PathBuf::from("curl")
+    };
     let mut command = Command::new(curl);
+    #[cfg(not(windows))]
+    prepare_curl_environment(&mut command);
     command.args([
         "--fail",
         "--location",
@@ -127,6 +133,15 @@ fn fetch(url: &str, to: &Path, limit: u64) -> Result<()> {
         return Err("download is larger than expected".into());
     }
     Ok(())
+}
+
+/// Steam prepends old runtime libraries and its overlay to the launch environment. Host
+/// curl must use its own libraries; the Proton/game command still inherits Steam unchanged.
+#[cfg(not(windows))]
+fn prepare_curl_environment(command: &mut Command) {
+    command
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD");
 }
 
 fn unpack(archive: &Path, stage: &Path, release: &Release) -> Result<Vec<String>> {
@@ -424,6 +439,26 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     const BUILD: &str = "1234567890abcdef1234567890abcdef12345678";
+
+    #[cfg(unix)]
+    #[test]
+    fn host_download_ignores_steam_libraries_without_changing_game_environment() {
+        let mut curl = Command::new("/bin/sh");
+        curl.env("LD_LIBRARY_PATH", "/steam/pinned_libraries")
+            .env("LD_PRELOAD", "/steam/gameoverlayrenderer.so")
+            .env("SteamAppId", "213610");
+        prepare_curl_environment(&mut curl);
+        let output = curl.args(["-c", "printf '%s\\n%s\\n%s\\n' \"${LD_LIBRARY_PATH-unset}\" \"${LD_PRELOAD-unset}\" \"$SteamAppId\""]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "unset\nunset\n213610\n"
+        );
+        let mut game = Command::new("proton");
+        game.env("LD_LIBRARY_PATH", "/steam/pinned_libraries");
+        assert!(game.get_envs().any(|(key, value)| key == "LD_LIBRARY_PATH"
+            && value == Some(std::ffi::OsStr::new("/steam/pinned_libraries"))));
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {

@@ -58,6 +58,10 @@ must be installed. Keep this script at the configured path; clear the launch opt
 restore the normal Steam launch. An older installation without `sa2co-launcher` opens Mod
 Manager once so you can accept the update that installs it.
 
+On Linux, the update subprocess uses the host's libraries, avoiding Steam runtime
+`libcurl` conflicts. Proton and the game keep Steam's original environment for Steam
+Input and the overlay. The script also applies this fix when bootstrapping an older updater.
+
 ### Automatic updates when launching from Steam (Windows)
 
 Install the current mod once through SA Mod Manager and enable it. In Steam's Launch Options:

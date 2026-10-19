@@ -18,7 +18,9 @@ python3 scripts/test-steam-launch.py
 The updater tests exercise archive validation, DLL checksums, preserving player files, and
 rolling back an interrupted installation. CI runs them on Windows too. The Steam wrapper
 tests capture arguments, working directory and Steam's environment using a fake executable;
-they never launch the game. For a real update check without launching, run the installed
+they also cover Steam library/preload isolation, older updaters and failed updates. They
+never launch the game. The Unix updater test runs a child process to verify host downloads
+do not inherit Steam's library overrides. For a real update check without launching, run the installed
 `sa2co-launcher` (or `.exe`) with `--update-only` while the game is closed.
 
 ## The fake player (one PC)
