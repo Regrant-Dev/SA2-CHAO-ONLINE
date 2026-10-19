@@ -436,7 +436,16 @@ pub enum Body {
         character: u8,
         mask: u32,
     },
+    /// Party: the sender's Chao World has these gardens open (`GARDEN_HERO`, `GARDEN_DARK`).
+    /// The others open them in their own save too (unlocks.rs).
+    GardenUnlocks {
+        gardens: u8,
+    },
 }
+
+/// `Body::GardenUnlocks` bits: the Hero and Dark Gardens (their bits in the Chao save's flags).
+pub const GARDEN_HERO: u8 = 0x10;
+pub const GARDEN_DARK: u8 = 0x40;
 
 /// At most this many enemies in one `EnemyStates`.
 pub const MAX_ENEMY_STATES: usize = 32;
@@ -775,6 +784,7 @@ mod tag {
     pub const BOSS_ATTACKS: u8 = 55;
     pub const ENEMY_STATES: u8 = 56;
     pub const UPGRADE_GOT: u8 = 57;
+    pub const GARDEN_UNLOCKS: u8 = 58;
 }
 
 /// Garden items as `GardenItems` and `ServerItems` carry them.
@@ -1422,6 +1432,9 @@ impl Body {
                 for a in attacks {
                     w.u16(a.serial).u8(a.kind).u8(a.target).bytes(&a.data);
                 }
+            }
+            Self::GardenUnlocks { gardens } => {
+                w.u8(tag::GARDEN_UNLOCKS).u8(*gardens);
             }
             Self::UpgradeGot {
                 level,
@@ -2097,6 +2110,13 @@ impl Body {
                     attacks,
                 }
             }
+            tag::GARDEN_UNLOCKS => {
+                let gardens = r.u8()?;
+                if gardens & !(GARDEN_HERO | GARDEN_DARK) != 0 {
+                    return Err(WireError::BadValue("garden unlocks"));
+                }
+                Self::GardenUnlocks { gardens }
+            }
             tag::UPGRADE_GOT => {
                 let (level, mission) = (r.i16()?, r.u8()?);
                 let (index, character, mask) = (r.u8()?, r.u8()?, r.u32()?);
@@ -2705,6 +2725,12 @@ mod tests {
                     index: 4,
                     character: 0,
                     mask: 0x40,
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::GardenUnlocks {
+                    gardens: GARDEN_HERO | GARDEN_DARK,
                 },
             },
             Message::Game {

@@ -64,3 +64,23 @@ so they match the community header exactly. They are **not yet verified** agains
   copy, never in the owner's file or ChaoSlots.
 - `flag != 0` → FUN_00536550() extra init (unknown); we pass 0.
 - `data[0xDD] == 3` → extra setup (FUN_00548CF0, FUN_00793880(work+0x144)) — unknown field.
+
+## Garden unlocks (2026-10-18, REA/objdump; src/unlocks.rs)
+- **Where they live:** the Chao save's flags dword at **0x19F646C** (+0xCA6C for the second Chao
+  save; `0x173D06C` says which is in use; each reader picks it with `cmp eax,1`).
+  - Bit 0x2 is set on first entering the Chao World and 0x4 the kindergarten (both at
+    0x54C9EA/0x54CA22, in the lobby setup).
+  - **0x10 = Hero Garden** and **0x40 = Dark Garden** are set in 0x568630, a Chao's
+    evolution: a Hero or Dark evolution opens that garden (0x5687BC / 0x56882D). With both
+    open, it also unlocks Steam achievement 7 (0x40E850, ECX = 7).
+- **Who reads them:** the lobby makes the Hero gate only with 0x10 (0x54C162 → 0x57FCE0,
+  "ALO_LobbyGateHeroExecutor", main 0x57F940) and the Dark gate only with 0x40 (0x54C1B2 →
+  0x580140). 0x531A75/0x531A90 and 0x591536/0x59158E test them too.
+- **It isn't a stage key.** The Chao Key in stages ("ObjectChaoKeyExec", main 0x6E9DE0, let out
+  of Chao boxes, 0x6E9D10) only sets "got the key this stage" (`0x174B004`, `0x1AEFF64` =
+  "ChaoKeyTask"). The stage's end then sends the player into Chao World (0x43C6BB: state 0xB,
+  level 0x5A) and marks `0x1DEF829[character]` (0x444014). The Hero/Dark gardens come from a
+  Chao's evolution.
+- **Co-op:** party players share them (`Body::GardenUnlocks`, tag 58). Ours are sent when they
+  change and every 10 s while in a party. A party player's open gardens are ORed into our save's
+  flags (kept the next time the game saves the Chao World), with a toast.

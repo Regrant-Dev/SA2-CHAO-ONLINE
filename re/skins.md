@@ -521,3 +521,24 @@ switches on the action (0..0x57) through 0x7197B4, its action step through 0x71E
   action. Not checked: 0x45/0x46/0x49 (next to the rail ones; ground/air movement handlers) and
   the other "carried along" moves (pulleys, rockets, swing poles, light dash): in the air they
   play jump/fall as before.
+
+## Texture records (2026-10-18, REA)
+
+Live test: the garden's walls and floor were drawn with the worn skin's (Master Chief's)
+textures after moving through Chao World and switching skins there.
+- A texture list's entries point (+8) at the game's texture records (`NJS_TEXMEMLIST`), shared
+  by global index and counted: 0x44C510 (the loader, through the mod loader's texture pack hook)
+  fills a list; 0x77F9F0 releases one: per entry it lowers the record's count (+0x10) and its
+  texture info's (+0xC, count +0x24); at 0 it releases the D3D texture and clears the info (+0
+  = -1) and the record (+0 = 0, +8 = -1, +0xC = 0), which the next load can then take.
+- The game frees its textures between scenes (Chao World's areas too) and the next scene's take
+  the records. The skins code then released its old list if its records looked loaded
+  (`texlist_ok`: record and texture info set), which by then they were: with the new area's
+  textures. That release counted down and freed the garden's own textures; Chief's, loaded
+  next, took their records, and the garden's lists still pointed there.
+- Fix: a list's records are remembered as loaded (`texlist_signature`: record, +0, +8, +0xC),
+  and the list is only drawn with or released while they still match (`texlist_ours`). A list
+  whose records went to other textures is dropped without releasing anything. Switching skins
+  mid-scene keeps the old list until it's dropped the same safe way.
+- Also: in the same scene, textures that look gone aren't loaded again for 300 frames
+  (`RELOAD_AFTER`); a guard, not the cause here (the log showed no reload after the tab-outs).

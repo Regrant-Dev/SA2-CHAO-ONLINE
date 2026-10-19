@@ -902,6 +902,14 @@ fn pump(online: &mut Online, now: Instant) {
             }
             Event::Game {
                 from,
+                body: Body::GardenUnlocks { gardens },
+            } => {
+                if room::shares_room(from) {
+                    crate::unlocks::received(gardens);
+                }
+            }
+            Event::Game {
+                from,
                 body:
                     Body::UpgradeGot {
                         level,
@@ -1610,6 +1618,11 @@ pub fn on_frame() {
             };
             online.session.send(body, true, now);
         }
+    }
+    if let Some(gardens) = crate::unlocks::on_frame(room::in_room()) {
+        online
+            .session
+            .send(Body::GardenUnlocks { gardens }, true, now);
     }
     for (level, mission, (index, character, mask)) in crate::coop::take_upgrades() {
         let body = Body::UpgradeGot {

@@ -44,6 +44,7 @@ mod timeline;
 mod together;
 mod toys;
 mod trees;
+mod unlocks;
 mod visitors;
 mod voice;
 mod watch;

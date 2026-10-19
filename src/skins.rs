@@ -845,7 +845,17 @@ struct Loaded {
     motions: Option<Motions>,
     /// When it was last used (`Skins::clock`), to drop the longest unused first.
     used: u64,
+    /// The frame (`FRAME`) since which its textures have looked gone in the same scene.
+    gone_since: Option<usize>,
+    /// Its texture records as they were loaded (`texlist_signature`): while they still match,
+    /// they're ours to draw with and release.
+    signature: Vec<[usize; 4]>,
 }
+
+/// Textures that look gone in the same scene are only loaded again after this many frames
+/// (re/skins.md "Texture records"): a guard against reloading while the game rebuilds its
+/// textures (on coming back to the game, say), when the records aren't settled.
+const RELOAD_AFTER: usize = 300;
 
 /// Skins kept loaded at once (ours and other players').
 const MAX_LOADED: usize = 6;
@@ -1074,7 +1084,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
         {
             let l = s.loaded.swap_remove(oldest);
             forget_drawn();
-            if l.texlist != 0 && texlist_ok(l.texlist) {
+            if texlist_ours(&l) {
                 crate::puppet::release_texlist(l.texlist);
             }
         }
@@ -1114,6 +1124,8 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
                     combined_from: (0, 0),
                     motions,
                     used: 0,
+                    gone_since: None,
+                    signature: Vec::new(),
                 });
             }
             Err(e) => {
@@ -1128,14 +1140,38 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
     let loaded = &mut s.loaded[index];
     loaded.used = clock;
     // Again for each scene, and whenever the game has freed them since (it frees textures
-    // between Chao World's areas within one level): drawing with freed ones crashes.
-    if loaded.texlist == 0 || loaded.level != level || !texlist_ok(loaded.texlist) {
-        // Ours to release only while they're still there.
-        if loaded.texlist != 0 && texlist_ok(loaded.texlist) {
+    // between Chao World's areas within one level): drawing with freed ones crashes. Gone in
+    // the same scene: not drawn for now, and only loaded again if that lasts (`RELOAD_AFTER`).
+    let new_scene = loaded.texlist == 0 || loaded.level != level;
+    let ok = !new_scene && texlist_ours(loaded);
+    if ok {
+        loaded.gone_since = None;
+    } else if !new_scene {
+        let now = FRAME.load(Ordering::Relaxed);
+        let since = *loaded.gone_since.get_or_insert(now);
+        if now.wrapping_sub(since) < RELOAD_AFTER {
+            return None;
+        }
+        log!(
+            "skins: textures {} still gone; loading them again",
+            info.archive()
+        );
+    }
+    if !ok {
+        loaded.gone_since = None;
+        // Ours to release only while they're still ours: the game frees every texture between
+        // scenes (Chao World's areas too) and gives the records to the next scene's textures;
+        // releasing ours then would free those (re/skins.md "Texture records").
+        if texlist_ours(loaded) {
             crate::puppet::release_texlist(loaded.texlist);
         }
         let name = std::ffi::CString::new(info.archive()).ok()?;
         loaded.texlist = crate::puppet::load_texlist_named(name.as_ptr() as usize);
+        loaded.signature = if loaded.texlist != 0 && texlist_ok(loaded.texlist) {
+            texlist_signature(loaded.texlist)
+        } else {
+            Vec::new()
+        };
         loaded.level = level;
         log!(
             "skins: textures {} {}",
@@ -1205,10 +1241,44 @@ fn texlist_ok(texlist: usize) -> bool {
     }
 }
 
+/// Each texture record of a texture list (entry +8, the game's `NJS_TEXMEMLIST`) and what
+/// identifies its texture there: its +0 and +8 (set to 0 and -1 when it's freed, 0x77F9F0) and
+/// its texture info (+0xC, set to 0).
+fn texlist_signature(texlist: usize) -> Vec<[usize; 4]> {
+    // SAFETY: a texture list we loaded (checked by `texlist_ok`); its records are the game's.
+    unsafe {
+        let entries = (texlist as *const usize).read();
+        let count = ((texlist + 4) as *const u32).read() as usize;
+        (0..count.min(MAX_CHARACTER_TEXTURES))
+            .map(|i| {
+                let record = ((entries + i * TEXNAME_SIZE + 8) as *const usize).read();
+                if record == 0 {
+                    return [0; 4];
+                }
+                [
+                    record,
+                    (record as *const usize).read(),
+                    ((record + 8) as *const usize).read(),
+                    ((record + 0xC) as *const usize).read(),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// A skin's textures are still the ones it loaded: loaded, and no record freed or handed to
+/// another texture since.
+fn texlist_ours(l: &Loaded) -> bool {
+    l.texlist != 0
+        && !l.signature.is_empty()
+        && texlist_ok(l.texlist)
+        && texlist_signature(l.texlist) == l.signature
+}
+
 fn release(s: &mut Skins) {
     forget_drawn();
     for l in s.loaded.drain(..) {
-        if l.texlist != 0 && texlist_ok(l.texlist) {
+        if texlist_ours(&l) {
             crate::puppet::release_texlist(l.texlist);
         }
     }
@@ -1835,21 +1905,24 @@ fn rigged_writes(s: &mut Skins, character: u8, co2: usize) -> Option<Rigged> {
     if their_entries == 0 || our_entries == 0 || their_count > MAX_CHARACTER_TEXTURES {
         return None;
     }
-    if loaded.combined_from != (theirs, loaded.texlist) {
-        let mut entries = vec![0u8; (their_count + our_count.min(MAX_TEXTURES)) * TEXNAME_SIZE];
-        // SAFETY: both lists have `count` 12-byte entries.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                their_entries as *const u8,
-                entries.as_mut_ptr(),
-                their_count * TEXNAME_SIZE,
-            );
-            std::ptr::copy_nonoverlapping(
-                our_entries as *const u8,
-                entries.as_mut_ptr().add(their_count * TEXNAME_SIZE),
-                our_count.min(MAX_TEXTURES) * TEXNAME_SIZE,
-            );
-        }
+    // Copied again whenever either list's entries change (the game rebuilt its textures), not
+    // only when the lists themselves do: a stale copy draws with texture slots that are now
+    // someone else's.
+    let mut entries = vec![0u8; (their_count + our_count.min(MAX_TEXTURES)) * TEXNAME_SIZE];
+    // SAFETY: both lists have `count` 12-byte entries.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            their_entries as *const u8,
+            entries.as_mut_ptr(),
+            their_count * TEXNAME_SIZE,
+        );
+        std::ptr::copy_nonoverlapping(
+            our_entries as *const u8,
+            entries.as_mut_ptr().add(their_count * TEXNAME_SIZE),
+            our_count.min(MAX_TEXTURES) * TEXNAME_SIZE,
+        );
+    }
+    if loaded.combined_from != (theirs, loaded.texlist) || *loaded.combined != *entries {
         loaded.combined = entries.into_boxed_slice();
         loaded.combined_list[0] = loaded.combined.as_ptr() as usize as u32;
         loaded.combined_list[1] = (their_count + our_count.min(MAX_TEXTURES)) as u32;
