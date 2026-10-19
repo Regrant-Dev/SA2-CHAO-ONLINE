@@ -42,6 +42,20 @@ cd "$SA2_DIR" && protontricks-launch --appid 213610 SAModManager.exe
 
 Start the game from Steam. The mod writes `mods/sa2-chao-online/sa2-chao-online.log`.
 
+### Open SA Mod Manager from Steam (Linux)
+
+To check for mod updates when you press Play in Steam, put `SAModManager.exe` in the game
+folder. In Steam, open Sonic Adventure 2 > Properties > General > Launch Options and enter:
+
+```sh
+bash "/absolute/path/to/sa2-chao-online/scripts/steam-launch.sh" %command%
+```
+
+Replace the script path with your checkout's absolute path. The script opens SA Mod Manager
+using Steam's selected Proton version and game prefix. Keep mod update checks enabled in the
+manager, accept any updates, then click **Save & Play**. Keep the script at this path while
+the launch option is set; clear the launch option to restore the normal Steam launch.
+
 ## Tests and tools
 
 ```sh
