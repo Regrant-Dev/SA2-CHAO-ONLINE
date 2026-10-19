@@ -25,15 +25,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-i686
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup target add i686-pc-windows-gnu x86_64-unknown-linux-gnu
+          rustup target add i686-pc-windows-gnu x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
       - name: Format
         run: cargo fmt --check
       - name: Lint
         run: |
-          cargo clippy --release -- -D warnings
-          cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer -- -D warnings
+          cargo clippy --release --features launcher -- -D warnings
+          cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer,launcher -- -D warnings
       - name: Test
-        run: cargo test --target x86_64-unknown-linux-gnu
+        run: |
+          cargo test --target x86_64-unknown-linux-gnu --features launcher
+          python3 scripts/test-steam-launch.py
       - name: Package
         run: scripts/package.sh
       - uses: actions/upload-artifact@v4
@@ -43,8 +45,17 @@ jobs:
             dist/sa2-chao-online.zip
             dist/sa2co-server.exe
 
+  updater-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup target add i686-pc-windows-msvc
+      - name: Test updater on Windows
+        run: cargo test --target i686-pc-windows-msvc --features launcher --bin sa2co-launcher
+
   release:
-    needs: build
+    needs: [build, updater-windows]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:

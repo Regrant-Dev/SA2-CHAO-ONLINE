@@ -30,7 +30,7 @@ $Dll = "target\$Target\release\sa2_chao_online.dll"
 
 function Build {
     rustup target add $Target | Out-Null
-    cargo build --release --target $Target
+    cargo build --release --target $Target --features launcher
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 }
 
@@ -57,6 +57,9 @@ if ($Install) {
     New-Item -ItemType Directory -Force "$Mod\chao\import" | Out-Null
     Copy-Item mod\mod.ini, mod\configschema.xml $Mod
     Copy-Item $Dll "$Mod\sa2-chao-online.dll"
+    (Get-FileHash "$Mod\sa2-chao-online.dll").Hash.ToLowerInvariant() | Set-Content "$Mod\mod.sha256"
+    Copy-Item "target\$Target\release\sa2co-launcher.exe" $Mod
+    git rev-parse HEAD | Set-Content "$Mod\mod.build"
     # SA Mod Manager offers a GitHub release as an update when it's newer than this.
     (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") | Set-Content "$Mod\mod.version"
     Write-Host "Installed to $Mod"
@@ -68,6 +71,9 @@ if ($Package) {
     Remove-Item -Recurse -Force $out, "dist\sa2-chao-online.zip", "dist\sa2co-server.exe" -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force "$out\chao\import", "$out\chao\export" | Out-Null
     Copy-Item $Dll "$out\sa2-chao-online.dll"
+    (Get-FileHash "$out\sa2-chao-online.dll").Hash.ToLowerInvariant() | Set-Content "$out\mod.sha256"
+    Copy-Item "target\$Target\release\sa2co-launcher.exe" $out
+    git rev-parse HEAD | Set-Content "$out\mod.build"
     (Get-Content mod\mod.ini) -replace '^Version=.*', "Version=$version" | Set-Content "$out\mod.ini"
     Copy-Item mod\configschema.xml $out
     Copy-Item docs\how-to-play.md $out

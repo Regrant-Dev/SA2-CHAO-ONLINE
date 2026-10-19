@@ -27,7 +27,7 @@ Needs `rustup` and the MinGW cross compiler (Arch: `mingw-w64-gcc`; Debian/Ubunt
 `gcc-mingw-w64-i686`). `.cargo/config.toml` builds for `i686-pc-windows-gnu` by default.
 
 ```sh
-rustup target add i686-pc-windows-gnu x86_64-unknown-linux-gnu
+rustup target add i686-pc-windows-gnu x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
 export SA2_DIR="$HOME/.local/share/Steam/steamapps/common/Sonic Adventure 2"  # your game folder
 scripts/install.sh     # back up saves, build, install into $SA2_DIR/mods/sa2-chao-online
 scripts/package.sh     # release zip in dist/
@@ -42,30 +42,40 @@ cd "$SA2_DIR" && protontricks-launch --appid 213610 SAModManager.exe
 
 Start the game from Steam. The mod writes `mods/sa2-chao-online/sa2-chao-online.log`.
 
-### Open SA Mod Manager from Steam (Linux)
+### Automatic updates when launching from Steam (Linux)
 
-To check for mod updates when you press Play in Steam, put `SAModManager.exe` in the game
-folder. In Steam, open Sonic Adventure 2 > Properties > General > Launch Options and enter:
+Install the current mod once using SA Mod Manager, and enable it. In Steam, open Sonic
+Adventure 2 > Properties > General > Launch Options and enter:
 
 ```sh
 bash "/absolute/path/to/sa2-chao-online/scripts/steam-launch.sh" %command%
 ```
 
-Replace the script path with your checkout's absolute path. The script opens SA Mod Manager
-using Steam's selected Proton version and game prefix. Keep mod update checks enabled in the
-manager, accept any updates, then click **Save & Play**. Keep the script at this path while
-the launch option is set; clear the launch option to restore the normal Steam launch.
+Replace the script path with your checkout's absolute path. Each launch checks GitHub and
+installs a newer mod automatically before starting the game with Steam's original Proton
+command and environment. There is no update confirmation or **Save & Play** step. `curl`
+must be installed. Keep this script at the configured path; clear the launch option to
+restore the normal Steam launch. An older installation without `sa2co-launcher` opens Mod
+Manager once so you can accept the update that installs it.
 
-### Open SA Mod Manager from Steam (Windows)
+### Automatic updates when launching from Steam (Windows)
 
-Put `SAModManager.exe` in the game folder. In Steam's Launch Options, use its full path:
+Install the current mod once through SA Mod Manager and enable it. In Steam's Launch Options:
 
 ```text
-"C:\Program Files (x86)\Steam\steamapps\common\Sonic Adventure 2\SAModManager.exe" %command%
+"C:\Program Files (x86)\Steam\steamapps\common\Sonic Adventure 2\mods\sa2-chao-online\sa2co-launcher.exe" %command%
 ```
 
-Adjust the path to your Steam library. Windows launches the executable directly; it doesn't
-use the Linux Bash script. Accept mod updates in the manager, then click **Save & Play**.
+Adjust the path to your Steam library. The launcher installs new mod releases automatically,
+then starts the game in Steam's session. No Bash or PowerShell command is needed. It uses
+the system `curl.exe` included with current Windows 10/11. Continue opening Mod Manager
+manually when changing mods or game settings.
+
+The launcher updates only this mod's program files and itself. Settings, skins, exports and
+game saves are preserved. An installation error restores the previous mod and prevents
+starting a partially updated game. A connection/update error is shown on Windows and logged
+to `mods/sa2-chao-online/auto-update.log`; retry the launch after resolving it. Close the game
+before updating. The in-game log's `build:` line identifies the DLL actually loaded.
 
 ## Tests and tools
 

@@ -9,9 +9,18 @@ out=dist/sa2-chao-online
 rm -rf "$out" dist/sa2-chao-online.zip dist/sa2co-server.exe
 mkdir -p "$out/chao/import" "$out/chao/export"
 
-cargo build --release
+cargo build --release --features launcher
 cp target/i686-pc-windows-gnu/release/sa2_chao_online.dll "$out/sa2-chao-online.dll"
 i686-w64-mingw32-strip "$out/sa2-chao-online.dll"
+sha256sum "$out/sa2-chao-online.dll" | cut -d ' ' -f1 > "$out/mod.sha256"
+cp target/i686-pc-windows-gnu/release/sa2co-launcher.exe "$out/"
+i686-w64-mingw32-strip "$out/sa2co-launcher.exe"
+# A static Linux launcher has no dependency on the player's distribution/glibc version.
+cargo build --release --target x86_64-unknown-linux-musl --features launcher --bin sa2co-launcher
+cp target/x86_64-unknown-linux-musl/release/sa2co-launcher "$out/"
+strip "$out/sa2co-launcher"
+chmod +x "$out/sa2co-launcher"
+printf '%s\n' "${GITHUB_SHA:-$(git rev-parse HEAD)}" > "$out/mod.build"
 # The dedicated server for Windows, a separate download (not part of the mod folder).
 cp target/i686-pc-windows-gnu/release/sa2co-server.exe dist/sa2co-server.exe
 i686-w64-mingw32-strip dist/sa2co-server.exe

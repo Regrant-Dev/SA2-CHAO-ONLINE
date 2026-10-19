@@ -15,9 +15,20 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Builds the fake second player used for testing (src/bin/fakepeer.rs); off by default.
 fakepeer = []
+launcher = ["dep:serde_json", "dep:sha2", "dep:zip"]
 # Dev only: at start, saves the game's decrypted code section to `sonic2app.text.bin` in the
 # mod folder, for reverse engineering (tools/rebuild_exe.py turns it back into an exe).
 dumpexe = []
+
+[dependencies]
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+zip = { version = "2.4", default-features = false, features = ["deflate"], optional = true }
+
+[[bin]]
+name = "sa2co-launcher"
+path = "src/bin/launcher.rs"
+required-features = ["launcher"]
 
 # Dedicated server: relays a lobby without anyone's game hosting it (also as a Docker image).
 [[bin]]

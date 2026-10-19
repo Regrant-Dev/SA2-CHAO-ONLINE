@@ -22,6 +22,10 @@ folder and enable "SA2 Chao Online" in SA Mod Manager. Then read
 **[how to play](docs/how-to-play.md)**. It works on Windows and on Linux through Proton. You need
 your own Steam copy of the game.
 
+For automatic updates before each Steam launch, set up the optional
+[launcher](docs/setup.md#automatic-updates-when-launching-from-steam-windows) once. It installs
+new mod releases without update prompts and keeps your settings and saves.
+
 Karate needs the game's Battle DLC.
 
 ## Developers
@@ -36,7 +40,7 @@ Karate needs the game's Battle DLC.
 
 ```
 src/          the mod (Rust)
-src/bin/      sa2co-server (dedicated server) and fakepeer (a test player)
+src/bin/      dedicated server, automatic-update launcher, and fakepeer (a test player)
 mod/          mod.ini and the SA Mod Manager settings page
 scripts/      build, install and package scripts
 tools/        small analysis scripts

@@ -11,7 +11,15 @@ Crash dumps: `CrashDump/` in the game folder (`tools/mdmp.py <dump>`).
 cargo test --target x86_64-unknown-linux-gnu        # unit + localhost network tests
 cargo clippy --release                              # the game DLL (i686)
 cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer
+cargo test --target x86_64-unknown-linux-gnu --features launcher --bin sa2co-launcher
+python3 scripts/test-steam-launch.py
 ```
+
+The updater tests exercise archive validation, DLL checksums, preserving player files, and
+rolling back an interrupted installation. CI runs them on Windows too. The Steam wrapper
+tests capture arguments, working directory and Steam's environment using a fake executable;
+they never launch the game. For a real update check without launching, run the installed
+`sa2co-launcher` (or `.exe`) with `--update-only` while the game is closed.
 
 ## The fake player (one PC)
 

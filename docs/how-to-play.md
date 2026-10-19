@@ -7,8 +7,11 @@
    Mod Manager.
 3. Start the game. Multiplayer is off until you turn it on.
 
-Everyone playing together needs the same version of the mod. SA Mod Manager checks for a new
-version when it starts and asks before installing it; your settings are kept.
+Everyone playing together needs the same version of the mod. The optional Steam launcher
+checks and installs new releases automatically before the game starts; configure it once
+using [the setup instructions](https://github.com/Regrant-Dev/SA2-CHAO-ONLINE/blob/main/docs/setup.md#automatic-updates-when-launching-from-steam-windows).
+Otherwise SA Mod Manager checks when it starts and asks before installing. Settings and
+saves are kept. Updates take effect on the next game launch.
 
 ## The F9 menu
 
