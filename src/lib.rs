@@ -98,6 +98,11 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
 
     guarded("Init", || {
         log!("sa2-chao-online {MOD_VERSION} loaded");
+        log!(
+            "build: {} (protocol {})",
+            option_env!("GITHUB_SHA").unwrap_or("local"),
+            net::protocol::PROTOCOL_VERSION
+        );
         log!("mod path: {path}");
         log!("mod loader helper version: {}", helpers.version);
         log!("F9 opens the menu (multiplayer, start together, Chao tools)");

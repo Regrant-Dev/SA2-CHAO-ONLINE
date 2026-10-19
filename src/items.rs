@@ -36,7 +36,6 @@ const ENTRY_PARTNER: usize = 0x40;
 const OBJ_MAIN: usize = 0x10;
 const OBJ_DATA1: usize = 0x34;
 const OBJ_ENTRY: usize = 0x3C;
-const D_ROTATION_Y: usize = 0x0C;
 const D_POSITION: usize = 0x14;
 /// Fruit: Data1 byte 0 is its mode (4 = being eaten); +8 kind; +0x10 bites left.
 const FRUIT: usize = 3;
@@ -205,11 +204,6 @@ fn position(object: usize) -> Vector {
     unsafe { ((data1(object) + D_POSITION) as *const Vector).read_unaligned() }
 }
 
-fn facing(object: usize) -> i32 {
-    // SAFETY: as above.
-    unsafe { ((data1(object) + D_ROTATION_Y) as *const i32).read() }
-}
-
 /// The registry entry of a live item: found in the registry (the entry pointing at it), not
 /// through the object's own back-pointer, which some items (Chaos Drives) don't set.
 fn entry_of(object: usize) -> Option<usize> {
@@ -273,13 +267,17 @@ fn category_of(entry: usize) -> usize {
     crate::registry::category_of(entry)
 }
 
-/// Some garden item is within `distance` of `at`.
-pub fn near(at: Vector, distance: f32) -> bool {
-    live_items().into_iter().any(|(_, o)| {
-        let p = position(o);
-        let (dx, dy, dz) = (p.x - at.x, p.y - at.y, p.z - at.z);
-        dx * dx + dy * dy + dz * dz < distance * distance
-    })
+/// This Chao is actually holding or eating an item, by the item's registry partner.
+pub fn chao_busy(chao: usize) -> bool {
+    let Some((chao_entry, _)) = crate::registry::entries(CHAO_CATEGORY)
+        .into_iter()
+        .find(|&(_, object)| object == chao)
+    else {
+        return false;
+    };
+    live_items()
+        .into_iter()
+        .any(|(entry, object)| chao_with(entry, object) == Some(chao_entry))
 }
 
 /// (category, kind, bites) of an item.
@@ -470,11 +468,8 @@ fn place(owner: u8, item: &GardenItem) -> Option<(Vector, bool)> {
             owner: chao_owner,
             index,
         } => {
-            let chao = garden::following_copy(chao_owner, index)?;
-            Some((
-                garden::in_hands(position(chao), facing(chao), item.position),
-                true,
-            ))
+            let (at, angle) = garden::following_pose(chao_owner, index)?;
+            Some((garden::in_hands(at, angle, item.position), true))
         }
     }
 }
@@ -628,17 +623,15 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
                 garden::rotate([p.x - at.x, p.y - at.y, p.z - at.z], angle.wrapping_neg()),
             )
         } else if let Some(partner) = chao_with(entry, object) {
-            match chao.iter().find(|(_, _, e, _)| *e == partner) {
-                Some(&(owner, index, _, chao)) => {
-                    let c = position(chao);
-                    (
-                        ItemPlace::Chao { owner, index },
-                        garden::rotate(
-                            [p.x - c.x, p.y - c.y, p.z - c.z],
-                            facing(chao).wrapping_neg(),
-                        ),
-                    )
-                }
+            match chao.iter().find_map(|&(owner, index, entry, object)| {
+                (entry == partner)
+                    .then(|| garden::live_pose(object).map(|pose| (owner, index, pose)))
+                    .flatten()
+            }) {
+                Some((owner, index, (c, angle))) => (
+                    ItemPlace::Chao { owner, index },
+                    garden::rotate([p.x - c.x, p.y - c.y, p.z - c.z], angle.wrapping_neg()),
+                ),
                 None => (ItemPlace::Busy, [p.x, p.y, p.z]),
             }
         } else {

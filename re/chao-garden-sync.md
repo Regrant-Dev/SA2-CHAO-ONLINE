@@ -421,7 +421,21 @@ is an ordinary saved fruit and already syncs as an item.
 - Everyone else: friends' copies follow the keeper's stream; their own visiting Chao do too
   (wrapped like a copy, AI off, never deleted), and their records stay their save's. The keeper's
   changes go into the save and the follower's snapshot. A touch still runs the AI locally for 5 s,
-  and its changes go to the owner and the keeper. Holds go to the keeper.
+  and its changes go to the owner and the keeper. Holds go to the keeper. Petting requires
+  player action 43 within reach: proximity alone used to enable a second AI indefinitely,
+  causing different positions and activities (reported with drumming, 2026-10-18). Only an
+  item this Chao actually holds/eats (registry partner and held/eaten state) extends a touch;
+  fruit lying nearby no longer prevents it from following the keeper again.
+- Handoffs keep an existing follower frozen through the election's `Wait`, instead of
+  restarting its own AI. A newly responsible game adopts the last received position/facing
+  and clears old velocity before running the Chao. A gap over 30 units snaps to the shared
+  position; ordinary movement is still smoothed.
+- Held-item crash, 2026-10-18 21:45:21: `items::place` called `following_copy` for a Chao
+  whose Data1 was already null during a transition (GameState 5). Dump: DLL RVA `0x7A77E`,
+  null read at `0xC`; inline symbols lead through `in_hands` to `items::place`/`on_frame`.
+  `following_pose` now verifies that the registry still names the object, that it isn't queued
+  for deletion and that Data1 exists before returning position/facing. Outgoing held-item
+  reports use the same `live_pose` check. Regression test covers cleared Data1 and deletion.
 - Nobody keeping yet (friends just met): each owner's game runs its own Chao, as before.
 - Breeding (checked 2026-10-18): the mating behaviour makes the egg from a free slot in the local
   save (0x531AA0), genes mixed from both parents (0x551D20), then the egg spawner 0x57B9C0 (call
