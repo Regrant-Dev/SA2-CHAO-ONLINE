@@ -408,6 +408,25 @@ is an ordinary saved fruit and already syncs as an item.
   else's game goes to the keeper, which makes the jump and sends it to everyone.
 
 ## Keeper: one brain per shared garden (2026-10-18; src/keeper.rs, src/garden.rs)
+
+### Area transitions and saving (2026-10-18)
+
+- Carrying a Chao into another garden caused shared crashes at `0x8355C2` and `0x835022`
+  (invalid native audio-object pointers). A concrete unsafe path: `carried::received`, called
+  on the network thread, deleted a cached object after an area unload could free/reuse it.
+  Carry reports now coalesce in a queue and are applied on the game thread. Before touching
+  a cached object, the live Chao registry, record identity and copy callback must match.
+  Egg hold reports use the same game-thread queue rule. Garden mirrors are pruned when their
+  registry/record identity disappears, and post-update position writes check the object again.
+  These guards address the invalid-memory paths; the shared-crash reproduction still needs
+  an in-game check on the updated build.
+- Native Chao save wrapper `0x52E630` is cdecl `(file_index) -> int`: REA confirms it calls
+  item/checksum write-back `0x52F090`, then `0x532360(index, save_base)`. The latter builds the
+  file buffer and completes the write; nonzero means success. Index is 1 only when selector
+  `0x173D06C` is 1, else 0. `saving.rs` uses this on the game thread from F9 and after five
+  minutes in gardens. Saving requires a loaded garden, game state 16/17 and a player; autosave
+  waits two safe seconds after loading and retries failures no faster than every 30 seconds.
+
 - With friends in a garden, one player's game keeps it: it runs every Chao there with its own AI
   (its own and the visitors' copies), the trees and the toys. The keeper says so with
   `GardenKeeper` (area, term) 4 times a second. Everyone follows the claim with the higher term,

@@ -26,6 +26,7 @@ Pause the game before typing, since letter keys also move your character.
 | Mode | Race or Co-op (set by whoever made the party) |
 | Go to | Jump to a friend |
 | My Chao | The Chao you race and fight with |
+| Save Chao garden now | Save your Chao World data immediately while in a garden |
 | Visit friends | Whether your Chao visit friends' gardens |
 | Visitor 1 / 2 | Which Chao visit: Auto, a Chao you pick, or None |
 | Friends' Chao in races | Friends' Chao fill the other lanes in your Chao Races |
@@ -94,6 +95,10 @@ with the updated mod. Pausing during a party stage, or in Chao World with others
 doesn't stop the game for anyone.
 
 ## Chao
+
+**Saving:** F9 > Save Chao garden now saves your Chao World data through the game's normal
+save system. Gardens also autosave every five minutes spent in them, with a confirmation
+toast. Autosaving waits until loading finishes; a manual save resets the five-minute timer.
 
 **Visiting:** when you're in a garden with friends, up to 4 of your Chao from that garden visit
 theirs. Pick them in F9 > Visitor 1 to Visitor 4, or leave them on Auto (your My Chao first).

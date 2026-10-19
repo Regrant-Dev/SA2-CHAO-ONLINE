@@ -56,6 +56,17 @@ using Steam's selected Proton version and game prefix. Keep mod update checks en
 manager, accept any updates, then click **Save & Play**. Keep the script at this path while
 the launch option is set; clear the launch option to restore the normal Steam launch.
 
+### Open SA Mod Manager from Steam (Windows)
+
+Put `SAModManager.exe` in the game folder. In Steam's Launch Options, use its full path:
+
+```text
+"C:\Program Files (x86)\Steam\steamapps\common\Sonic Adventure 2\SAModManager.exe" %command%
+```
+
+Adjust the path to your Steam library. Windows launches the executable directly; it doesn't
+use the Linux Bash script. Accept mod updates in the manager, then click **Save & Play**.
+
 ## Tests and tools
 
 ```sh
