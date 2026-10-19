@@ -11,7 +11,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Publishing replaces the release/tag. Let an active run finish so another push can't
+  # interrupt it between removing the old release and creating the new one.
+  cancel-in-progress: false
 
 jobs:
   build:
