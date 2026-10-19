@@ -7,6 +7,7 @@ mod boss_follow;
 mod bosses;
 mod carried;
 pub mod chao;
+mod chao_details;
 mod chat;
 mod coop;
 mod eggs;

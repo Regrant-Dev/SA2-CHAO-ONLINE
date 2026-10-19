@@ -1186,6 +1186,19 @@ fn live_object(slot: usize) -> Option<usize> {
     live_entry(slot).map(|e| unsafe { ((e + OBJ_ENTRY) as *const usize).read() })
 }
 
+/// The held Chao's own save slot, if it is a live Chao from our save. Never dereference the
+/// held pointer: compare it with the registry's current objects instead.
+pub fn held_save_slot() -> Option<usize> {
+    if !crate::game::in_garden() {
+        return None;
+    }
+    let object = player_held();
+    if object == 0 {
+        return None;
+    }
+    (0..SAVE_CHAO_SLOTS).find(|&slot| live_object(slot) == Some(object))
+}
+
 /// # Safety
 /// `object` is a live object.
 unsafe fn data1(object: usize) -> usize {

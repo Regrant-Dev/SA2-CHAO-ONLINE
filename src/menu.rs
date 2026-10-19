@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::audio;
+use crate::chao_details::{self, View as ChaoView};
 use crate::hud;
 use crate::input::{self, Hotkey};
 use crate::karate;
@@ -30,6 +31,8 @@ const VK_LEFT: i32 = 0x25;
 const VK_UP: i32 = 0x26;
 const VK_RIGHT: i32 = 0x27;
 const VK_DOWN: i32 = 0x28;
+const VK_PRIOR: i32 = 0x21;
+const VK_NEXT: i32 = 0x22;
 const VK_DECIMAL: i32 = 0x6E;
 const VK_OEM_1: i32 = 0xBA; // ;:
 const VK_OEM_MINUS: i32 = 0xBD; // -_
@@ -57,6 +60,7 @@ enum Row {
     KarateOpponent,
     Race,
     MyChao,
+    ChaoDetails,
     SaveChao,
     Visits,
     /// Visitor 1 or 2: which Chao visits (Auto, a save slot, or None).
@@ -98,7 +102,7 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([Row::MyChao, Row::SaveChao, Row::Visits]);
+    rows.extend([Row::MyChao, Row::ChaoDetails, Row::SaveChao, Row::Visits]);
     if visits != 0 {
         rows.extend((0..MAX_CARRIED_CHAO).map(Row::Visitor));
     }
@@ -268,6 +272,7 @@ struct Menu {
     room_choice: usize,
     /// Which player the Go to row shows.
     goto_choice: usize,
+    details: Option<ChaoView>,
     settings: Settings,
     message: String,
     keys: Vec<Hotkey>,
@@ -300,6 +305,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
     row: 0,
     room_choice: 0,
     goto_choice: 0,
+    details: None,
     settings: Settings {
         mode: 0,
         name: String::new(),
@@ -330,6 +336,7 @@ pub fn toggle() {
     let mut m = MENU.lock().unwrap_or_else(|e| e.into_inner());
     m.open = !m.open;
     if m.open {
+        m.details = None;
         m.settings = load(online::mod_path());
         m.row = 0;
         m.message.clear();
@@ -341,8 +348,8 @@ pub fn toggle() {
     }
 }
 
-const KEYS_TO_PRIME: [i32; 8] = [
-    VK_RETURN, VK_ESCAPE, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_BACK, VK_SPACE,
+const KEYS_TO_PRIME: [i32; 10] = [
+    VK_RETURN, VK_ESCAPE, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_BACK, VK_SPACE, VK_PRIOR, VK_NEXT,
 ];
 
 /// The character a key types (with Shift state), for the text rows.
@@ -376,6 +383,10 @@ const TYPING_KEYS: [i32; 6] = [
 pub fn on_frame() {
     let mut m = MENU.lock().unwrap_or_else(|e| e.into_inner());
     if !m.open {
+        return;
+    }
+    if m.details.is_some() {
+        details_frame(&mut m);
         return;
     }
     if m.pressed(VK_ESCAPE) {
@@ -565,6 +576,25 @@ pub fn on_frame() {
         edit_text(&mut m, row);
     }
     if m.pressed(VK_RETURN) {
+        if row == Row::ChaoDetails {
+            let choices = online::garden_chao();
+            let preferred = crate::garden::held_save_slot()
+                .or_else(|| usize::try_from(m.settings.my_chao).ok())
+                .or_else(|| {
+                    choices
+                        .iter()
+                        .find(|(_, c)| i32::from(c.garden()) == crate::game::current_chao_area())
+                        .map(|(s, _)| *s)
+                });
+            let mut view = ChaoView {
+                slot: preferred,
+                ..Default::default()
+            };
+            view.retain_slot(&choices.iter().map(|(s, _)| *s).collect::<Vec<_>>());
+            draw_details(&mut view, &choices);
+            m.details = Some(view);
+            return;
+        }
         let message = match row {
             Row::Room => room::choices()
                 .get(m.room_choice)
@@ -598,6 +628,152 @@ pub fn on_frame() {
         }
     }
     draw(&m, &rows);
+}
+
+fn details_frame(m: &mut Menu) {
+    let Some(mut view) = m.details.take() else {
+        return;
+    };
+    if m.pressed(VK_ESCAPE) || m.pressed(VK_BACK) {
+        return;
+    }
+    let choices = online::garden_chao();
+    let slots: Vec<usize> = choices.iter().map(|(slot, _)| *slot).collect();
+    view.retain_slot(&slots);
+    if m.pressed(VK_UP) {
+        view.row = (view.row + 2) % 3;
+    }
+    if m.pressed(VK_DOWN) {
+        view.row = (view.row + 1) % 3;
+    }
+    let (left, right) = (m.pressed(VK_LEFT), m.pressed(VK_RIGHT));
+    if left || right {
+        match view.row {
+            0 => view.select(&slots, left),
+            1 => {
+                view.page = view.page.next(left);
+                view.scroll = 0;
+            }
+            _ => {}
+        }
+    }
+    if m.pressed(VK_RETURN) {
+        match view.row {
+            0 => view.row = 1,
+            1 => {
+                view.page = view.page.next(false);
+                view.scroll = 0;
+            }
+            _ => return,
+        }
+    }
+    let (w, h) = hud::screen_size();
+    let (_, visible) = chao_details::layout(w, h);
+    let up = m.pressed(VK_PRIOR) || m.repeating(VK_PRIOR);
+    let down = m.pressed(VK_NEXT) || m.repeating(VK_NEXT);
+    if up {
+        view.scroll = view.scroll.saturating_sub(visible);
+    }
+    if down {
+        view.scroll = view.scroll.saturating_add(visible);
+    }
+    draw_details(&mut view, &choices);
+    m.details = Some(view);
+}
+
+fn draw_details(view: &mut ChaoView, choices: &[(usize, crate::chao::ChaoData)]) {
+    let (w, h) = hud::screen_size();
+    let (size, visible) = chao_details::layout(w, h);
+    let chosen = choices.iter().find(|(slot, _)| Some(*slot) == view.slot);
+    let label = chosen.map_or_else(
+        || "No Chao in your save".into(),
+        |(slot, c)| chao_label(*slot, c),
+    );
+    let mut rows = vec![("== Chao details ==".to_owned(), COLOR_TITLE, None)];
+    for (i, text) in [
+        format!("Your Chao: < {label} >"),
+        format!(
+            "Page: < {} > ({}/{})",
+            view.page.title(),
+            view.page.index() + 1,
+            chao_details::Page::ALL.len()
+        ),
+        "[ Back to F9 menu ]".into(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows.push((
+            format!("{} {text}", if i == view.row { ">" } else { " " }),
+            if i == view.row {
+                COLOR_SELECTED
+            } else {
+                COLOR_TEXT
+            },
+            None,
+        ));
+    }
+    rows.push((String::new(), COLOR_TEXT, None));
+    let content = chosen.map_or_else(
+        || {
+            vec![chao_details::Line {
+                text: "Enter Chao World or load a Chao save first.".into(),
+                gauge: None,
+            }]
+        },
+        |(_, c)| chao_details::lines(c, view.page),
+    );
+    view.scroll = view.scroll.min(content.len().saturating_sub(visible));
+    for line in content.iter().skip(view.scroll).take(visible) {
+        rows.push((line.text.clone(), COLOR_TEXT, line.gauge));
+    }
+    if content.len() > visible {
+        rows.push((
+            format!(
+                "Showing {}-{} of {}",
+                view.scroll + 1,
+                (view.scroll + visible).min(content.len()),
+                content.len()
+            ),
+            COLOR_HINT,
+            None,
+        ));
+    }
+    rows.extend([
+        (
+            "View only. Exact values; gauges show their normal ranges.".into(),
+            COLOR_HINT,
+            None,
+        ),
+        (
+            "Up/Down select, Left/Right change, Enter next page/back.".into(),
+            COLOR_HINT,
+            None,
+        ),
+        (
+            "PgUp/PgDn scroll. Esc/Backspace back. F9 closes.".into(),
+            COLOR_HINT,
+            None,
+        ),
+    ]);
+    let x = ((w - 64.0 * size) / 2.0).max(0.0);
+    let y = size;
+    hud::panel(x, y, size, 64, rows.len() + 2);
+    for (i, (text, color, gauge)) in rows.iter().enumerate() {
+        let line_y = y + (i + 1) as f32 * size;
+        let max = if gauge.is_some() { 49 } else { 62 };
+        let clipped: String = text.chars().take(max).collect();
+        hud::text(x + size, line_y, size, *color, &clipped);
+        if let Some(fraction) = gauge {
+            hud::stat_gauge(
+                x + 52.0 * size,
+                line_y + size * 0.25,
+                10.0 * size,
+                size * 0.5,
+                *fraction,
+            );
+        }
+    }
 }
 
 fn edit_text(m: &mut Menu, row: Row) {
@@ -758,6 +934,7 @@ fn draw(m: &Menu, rows: &[Row]) {
                 "My Chao (races, karate): < {} >",
                 my_chao_label(m.settings.my_chao)
             ),
+            Row::ChaoDetails => "[ Chao details: stats, personality, bonds & more ]".into(),
             Row::SaveChao => "[ Save Chao garden now ] (autosaves every 5 min)".into(),
             Row::Visits => format!(
                 "Visit friends: < {} >",
