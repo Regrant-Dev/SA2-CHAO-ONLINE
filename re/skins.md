@@ -542,3 +542,22 @@ textures after moving through Chao World and switching skins there.
   mid-scene keeps the old list until it's dropped the same safe way.
 - Also: in the same scene, textures that look gone aren't loaded again for 300 frames
   (`RELOAD_AFTER`); a guard, not the cause here (the log showed no reload after the tab-outs).
+
+### Switching skins after garden changes (2026-10-19)
+
+- Live report: Ganondorf's cape showed SpongeBob textures; all clients crashed while switching
+  skins. The local dump at 05:31:43 UTC faults at `0x835022` while traversing the native audio
+  object list (invalid vtable `0x3B8CB26F`). The log ends loading Master Chief, the seventh
+  different model after the six-entry cache filled. This points at eviction/lifetime handling,
+  but does not prove the texture issue and audio corruption share a cause.
+- A record signature alone does not establish ownership across scenes: addresses and texture
+  records can be reused when returning to the same garden. `texlist_ours` now requires the
+  original level/run/area as well; old references are never released against the new scene.
+- Skin lists/entries now live in Rust-owned stable boxes. REA verifies `0x44C350` takes
+  ECX = archive and EDX = caller-owned NJS_TEXLIST, copying exactly the requested entries.
+  Validate the pack count against `skin.ini` before that call. This avoids retaining and later
+  freeing a game-heap list through `0x44C510`/the native allocator. Current-scene record releases
+  still use `0x77F9F0`, which clears the references but does not free the caller's list.
+- Replacing a list also clears `LAST_DRAWN` before dropping its storage. Previously a shadow
+  pose from the last frame could still point at that allocation. The updated build needs the
+  original garden-change / seven-skin switching reproduction before calling this crash solved.

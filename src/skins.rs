@@ -835,6 +835,9 @@ struct Loaded {
     model: Model,
     /// The texture list, and the scene it was loaded in (`scene`).
     texlist: usize,
+    /// Own the list and entries in Rust. Only texture records belong to the game; a scene
+    /// change must never turn an old game-heap list into a different allocation we free.
+    texture_words: Box<[u32]>,
     level: (i16, u32, i32),
     /// Rigged skins: the character's textures then ours, as one list (entries, then the
     /// NJS_TEXLIST pointing at them), and what it was built from.
@@ -850,6 +853,41 @@ struct Loaded {
     /// Its texture records as they were loaded (`texlist_signature`): while they still match,
     /// they're ours to draw with and release.
     signature: Vec<[usize; 4]>,
+}
+
+/// Fill our stable NJS_TEXLIST through the game's texture-pack-aware loader. REA: 0x44C350,
+/// ECX = archive, EDX = caller-owned list; it fills exactly the supplied number of entries.
+unsafe fn load_skin_textures(name: usize, list: usize) -> bool {
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        let result: i32;
+        std::arch::asm!(
+            "call eax",
+            inout("eax") 0x0044_C350usize => result,
+            inout("ecx") name => _,
+            inout("edx") list => _,
+            clobber_abi("C"),
+        );
+        result != 0
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        let _ = (name, list);
+        false
+    }
+}
+
+fn release_skin_textures(loaded: &Loaded) {
+    if texlist_ours(loaded) {
+        log!("skins: releasing current-scene textures for {}", loaded.id);
+        // SAFETY: our own list and entries remain allocated through the call, and both the
+        // scene and every referenced texture record still match. Only release references;
+        // the list itself is Rust-owned and must not go through the game's heap allocator.
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            std::mem::transmute::<usize, extern "C" fn(usize)>(0x0077_F9F0)(loaded.texlist);
+        }
+    }
 }
 
 /// Textures that look gone in the same scene are only loaded again after this many frames
@@ -1084,9 +1122,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
         {
             let l = s.loaded.swap_remove(oldest);
             forget_drawn();
-            if texlist_ours(&l) {
-                crate::puppet::release_texlist(l.texlist);
-            }
+            release_skin_textures(&l);
         }
         let path = s.dir.join(&id).join(&file);
         let animated = info.animated;
@@ -1118,6 +1154,7 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
                     id: key.clone(),
                     model,
                     texlist: 0,
+                    texture_words: Box::new([]),
                     level: (0, 0, 0),
                     combined: Box::new([]),
                     combined_list: Box::new([0; 2]),
@@ -1159,14 +1196,37 @@ fn ready(s: &mut Skins, id: &str, character: Option<u8>) -> Option<(Ready, usize
     }
     if !ok {
         loaded.gone_since = None;
+        // The shadow pass may still remember the previous frame's list. Invalidate that
+        // pose before replacing its backing allocation, even when the model is unchanged.
+        forget_drawn();
         // Ours to release only while they're still ours: the game frees every texture between
         // scenes (Chao World's areas too) and gives the records to the next scene's textures;
         // releasing ours then would free those (re/skins.md "Texture records").
-        if texlist_ours(loaded) {
-            crate::puppet::release_texlist(loaded.texlist);
-        }
+        release_skin_textures(loaded);
+        loaded.texlist = 0;
+        loaded.signature.clear();
         let name = std::ffi::CString::new(info.archive()).ok()?;
-        loaded.texlist = crate::puppet::load_texlist_named(name.as_ptr() as usize);
+        // The fixed-list loader copies the requested number of entries. Refuse inconsistent
+        // packs rather than copying leftover entries belonging to the previously loaded skin.
+        let index = std::fs::read_to_string(s.dir.join(&id).join("textures/index.txt")).ok()?;
+        let count = index.lines().filter(|line| !line.trim().is_empty()).count();
+        if count != info.textures || count == 0 {
+            loaded.texlist = 0;
+            log!(
+                "skins: {} texture count differs from its pack; skipped",
+                info.id
+            );
+            return None;
+        }
+        loaded.texture_words = vec![0u32; 2 + count * 3].into_boxed_slice();
+        loaded.texlist = loaded.texture_words.as_ptr() as usize;
+        loaded.texture_words[0] = (loaded.texlist + 8) as u32;
+        loaded.texture_words[1] = count as u32;
+        // SAFETY: a stable, correctly sized list and a NUL-terminated archive name, on the
+        // game thread. The list's allocation outlives all model and shadow draws using it.
+        if !unsafe { load_skin_textures(name.as_ptr() as usize, loaded.texlist) } {
+            loaded.texlist = 0;
+        }
         loaded.signature = if loaded.texlist != 0 && texlist_ok(loaded.texlist) {
             texlist_signature(loaded.texlist)
         } else {
@@ -1270,6 +1330,10 @@ fn texlist_signature(texlist: usize) -> Vec<[usize; 4]> {
 /// another texture since.
 fn texlist_ours(l: &Loaded) -> bool {
     l.texlist != 0
+        // A matching record can have been freed/reused across scenes, including a return
+        // to the same garden. Its old reference must never release the new scene's texture.
+        && l.level == scene()
+        && l.texlist == l.texture_words.as_ptr() as usize
         && !l.signature.is_empty()
         && texlist_ok(l.texlist)
         && texlist_signature(l.texlist) == l.signature
@@ -1278,9 +1342,7 @@ fn texlist_ours(l: &Loaded) -> bool {
 fn release(s: &mut Skins) {
     forget_drawn();
     for l in s.loaded.drain(..) {
-        if texlist_ours(&l) {
-            crate::puppet::release_texlist(l.texlist);
-        }
+        release_skin_textures(&l);
     }
 }
 

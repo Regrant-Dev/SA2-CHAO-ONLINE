@@ -432,7 +432,9 @@ is an ordinary saved fruit and already syncs as an item.
   Unexpected file/snapshot sizes are rejected without changing the save. Saving requires a
   loaded garden, game state 16/17 and a player; autosave waits two safe seconds after loading
   and retries failures no faster than every 30 seconds. Disk-format tests cover preservation
-  and rejected writes; native checksum/load compatibility still needs an in-game check.
+  and rejected writes. Live build `94add07` logged a successful five-minute save at 05:38:27
+  UTC on 2026-10-19; the 65536-byte file's modification time confirms the write. Loading that
+  saved file on the next launch still needs verification.
 - Owner `GardenChao` reports are cached per remote player even while we're in another area.
   Entering a garden can seed visitors at their reported position without waiting for another
   packet from a paused owner (observed 44-second delay). Active snapshots expire after 8 s;
