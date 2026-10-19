@@ -90,9 +90,9 @@ them. From Stage Select you're taken into their stage.
 Tabbing out pauses your game like normal SA2: you stay connected and the others see you
 stand still (the garden's keeper passes to someone else meanwhile). Choose Fullscreen,
 Borderless or Windowed in SA Mod Manager; the mod keeps your display choice. If an earlier
-build switched you to Borderless, select Fullscreen again in SA Mod Manager before launching
-with the updated mod. Pausing during a party stage, or in Chao World with others around,
-doesn't stop the game for anyone.
+build left you in a small custom window, select Fullscreen or Borderless again in SA Mod
+Manager before launching with the updated mod. Pausing during a party stage, or in Chao World
+with others around, doesn't stop the game for anyone.
 
 ## Chao
 

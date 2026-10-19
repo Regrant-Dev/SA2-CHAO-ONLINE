@@ -212,11 +212,12 @@ pub fn prepare_loader_profile(mod_path: &str) {
     };
     let mode = json_value(&profile, "ScreenMode");
     let pauses = json_value(&profile, "EnablePauseOnInactive");
+    // SA2 Mod Manager: 0 windowed, 1 borderless, 2 custom window, 3 fullscreen.
     // `run_unfocused` may keep the game going without focus only when this launch isn't
     // fullscreen and the loader's own pause is off (with it on, the loader handles inactivity
     // its own way and we stay out of it).
     WINDOWED.store(
-        matches!(mode, Some("0" | "2" | "3")) && pauses == Some("false"),
+        matches!(mode, Some("0" | "1" | "2")) && pauses == Some("false"),
         Ordering::Relaxed,
     );
     crate::log!("game: Mod Loader screen mode {mode:?}, pause when inactive {pauses:?}");

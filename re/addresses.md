@@ -96,7 +96,7 @@ uses was checked against the game's code, and most of it in game.
 - **The Mod Loader's part:** with its "pause when inactive" off, it doesn't hold the game. What
   was left is this check.
 - **What the mod does (`game::run_unfocused` + `frame_skip`, the call at 0x401DE0 redirected):**
-  online, and only when the launch isn't fullscreen (Mod Loader `ScreenMode` 0/2/3, read at
+  online, and only when the launch isn't fullscreen (Mod Loader `ScreenMode` 0/1/2, read at
   start), a frame the game would skip runs anyway when all of these hold:
   - it was skipped only for focus (`WindowActive` 0);
   - the device isn't lost (0x1A5570B 0);
