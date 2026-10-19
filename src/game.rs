@@ -10,11 +10,13 @@ use crate::chao::{CHAO_SIZE, ChaoData};
 const CURRENT_LEVEL: usize = 0x0193_4B70;
 /// Stage control bytes the game's own goal routine (0x43E6D0) uses: `ControllerEnabled[0]`
 /// (1 = player can move) and `TimerStopped` (1 = stage timer frozen).
-const CONTROLLER_ENABLED: usize = 0x0174_AFFF;
+pub(crate) const CONTROLLER_ENABLED: usize = 0x0174_AFFF;
 const TIMER_STOPPED: usize = 0x0174_AFDA;
 /// `MissionNum` (0..=4) and `GameState` (16 = in game), SA2Variables.h; heavily used in code.
 const MISSION_NUM: usize = 0x0174_AFE3;
-const GAME_STATE: usize = 0x0193_4BE0;
+pub(crate) const GAME_STATE: usize = 0x0193_4BE0;
+/// GameModeHandler 0x434160: 5 runs the stage; 7/8 load/run EVENT, 15/16 ENDING.
+pub(crate) const GAME_MODE: usize = 0x0174_B040;
 pub const GAME_STATE_INGAME: i16 = 16;
 /// `CurrentChaoArea` (SA2Variables.h, `int` at 0x134046C).
 const CURRENT_CHAO_AREA: usize = 0x0134_046C;
@@ -627,7 +629,6 @@ fn main_menu_label(entry: usize) -> Option<(f32, f32, bool)> {
 
 /// On the game's main menu (the 1P / 2P / options screen).
 pub fn on_main_menu() -> bool {
-    const GAME_MODE: usize = 0x0174_B040;
     const CURRENT_MENU: usize = 0x01D7_BB10;
     // SAFETY: static ints in the game's data section.
     unsafe {

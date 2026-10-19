@@ -240,8 +240,24 @@ const PLAYER_CODE: [(usize, usize); 2] = [(0x0045_0000, 0x0047_8000), (0x0071_00
 #[cfg(target_arch = "x86")]
 static VOICE_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Set while a voiced skin is on: the hook drops character voices and leaves the id here.
+/// Set while a voiced skin replaces interactive gameplay voices. Each hook also checks the
+/// live game context: a scene can start before the next OnFrame has cleared this flag.
 static MUTE: AtomicU8 = AtomicU8::new(0);
+
+fn gameplay_voices(mode: i32, state: i16, player_control: bool) -> bool {
+    mode == 5 && state == game::GAME_STATE_INGAME && player_control
+}
+
+fn interactive_gameplay() -> bool {
+    // SAFETY: the stage mode/state and player-control byte used by the game's own handlers.
+    unsafe {
+        gameplay_voices(
+            (game::GAME_MODE as *const i32).read_volatile(),
+            (game::GAME_STATE as *const i16).read_volatile(),
+            (game::CONTROLLER_ENABLED as *const u8).read_volatile() != 0,
+        )
+    }
+}
 
 /// The player's skin voice volume (F9 menu, config.ini `SkinVoiceVolume`), percent, on top of each
 /// skin's own `voice_volume`.
@@ -371,6 +387,12 @@ unsafe extern "C" fn numbered_voice_thunk() {
     std::arch::naked_asm!(
         "cmp byte ptr [{mute}], 0",
         "je 3f",
+        "cmp dword ptr [{mode}], 5",
+        "jne 3f",
+        "cmp word ptr [{state}], {ingame}",
+        "jne 3f",
+        "cmp byte ptr [{control}], 0",
+        "je 3f",
         "push ecx",
         "mov ecx, dword ptr [esp + 4]",
         "cmp ecx, {a0}",
@@ -392,6 +414,10 @@ unsafe extern "C" fn numbered_voice_thunk() {
         "jmp dword ptr [{next}]",
         mute = sym MUTE,
         next = sym VOICE_NEXT,
+        mode = const game::GAME_MODE,
+        state = const game::GAME_STATE,
+        ingame = const game::GAME_STATE_INGAME,
+        control = const game::CONTROLLER_ENABLED,
         a0 = const PLAYER_CODE[0].0,
         a1 = const PLAYER_CODE[0].1,
         b0 = const PLAYER_CODE[1].0,
@@ -408,6 +434,12 @@ unsafe extern "C" fn garden_voice_thunk() {
     std::arch::naked_asm!(
         "cmp byte ptr [{mute}], 0",
         "je 2f",
+        "cmp dword ptr [{mode}], 5",
+        "jne 2f",
+        "cmp word ptr [{state}], {ingame}",
+        "jne 2f",
+        "cmp byte ptr [{control}], 0",
+        "je 2f",
         // What the voice call returns when it doesn't play (EDX is left as the caller set it).
         "or eax, -1",
         "ret",
@@ -416,6 +448,10 @@ unsafe extern "C" fn garden_voice_thunk() {
         "ret",
         mute = sym MUTE,
         voice = const PLAY_VOICE,
+        mode = const game::GAME_MODE,
+        state = const game::GAME_STATE,
+        ingame = const game::GAME_STATE_INGAME,
+        control = const game::CONTROLLER_ENABLED,
     )
 }
 
@@ -426,6 +462,12 @@ unsafe extern "C" fn garden_voice_thunk() {
 unsafe extern "C" fn voice_thunk() {
     std::arch::naked_asm!(
         "cmp byte ptr [{mute}], 0",
+        "je 2f",
+        "cmp dword ptr [{mode}], 5",
+        "jne 2f",
+        "cmp word ptr [{state}], {ingame}",
+        "jne 2f",
+        "cmp byte ptr [{control}], 0",
         "je 2f",
         "cmp edi, {first}",
         "jb 2f",
@@ -446,6 +488,10 @@ unsafe extern "C" fn voice_thunk() {
         first = const VOICE_IDS.0,
         end = const VOICE_IDS.1,
         resume = const PLAY_SOUND + 6,
+        mode = const game::GAME_MODE,
+        state = const game::GAME_STATE,
+        ingame = const game::GAME_STATE_INGAME,
+        control = const game::CONTROLLER_ENABLED,
     )
 }
 
@@ -463,15 +509,26 @@ pub fn frame(skin: Option<&Path>) {
         watch: Watch::default(),
         rng: 0x9E37_79B9 ^ std::process::id(),
     });
+    if !interactive_gameplay() {
+        if MUTE.swap(0, Ordering::Relaxed) != 0 {
+            log!("voice: skin voices suspended; normal scene dialogue enabled");
+        }
+        PENDING.store(0, Ordering::Relaxed);
+        quiet(s);
+        return;
+    }
     let wanted = skin.map(|d| d.join("sounds"));
     if s.voices.as_ref().map(|v| &v.dir) != wanted.as_ref() {
         s.voices = wanted.as_deref().and_then(load);
         s.watch = Watch::default();
     }
     let voiced = s.voices.is_some();
-    MUTE.store(voiced as u8, Ordering::Relaxed);
+    if MUTE.swap(voiced as u8, Ordering::Relaxed) == 0 && voiced {
+        log!("voice: skin gameplay voices active");
+    }
     let pending = PENDING.swap(0, Ordering::Relaxed);
     if !voiced {
+        quiet(s);
         return;
     }
     let Some(me) = game::local_player() else {
@@ -495,6 +552,16 @@ pub fn frame(skin: Option<&Path>) {
             play(s, m);
         }
     }
+}
+
+/// Stop our asynchronous clip before dropping its backing bytes, and forget movement seen
+/// before the scene. Scripted actor movement must not become a jump/hurt event on return.
+fn quiet(s: &mut State) {
+    if s.playing.is_some() {
+        stop();
+        s.playing = None;
+    }
+    s.watch = Watch::default();
 }
 
 /// What happened this frame that the skin answers.
@@ -812,9 +879,57 @@ fn start(wav: &[u8]) {
     let _ = wav;
 }
 
+fn stop() {
+    #[cfg(windows)]
+    {
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn PlaySoundA(sound: *const u8, module: usize, flags: u32) -> i32;
+        }
+        // SAFETY: NULL stops PlaySound's asynchronous playback before its memory is freed.
+        unsafe { PlaySoundA(std::ptr::null(), 0, 0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skin_voices_apply_only_while_the_player_controls_gameplay() {
+        assert!(gameplay_voices(5, 16, true)); // stages and gardens
+        assert!(!gameplay_voices(8, 16, true)); // EVENT with leftover player state
+        assert!(!gameplay_voices(16, 16, true)); // ENDING
+        assert!(!gameplay_voices(5, 16, false)); // scripted intro inside a stage
+        assert!(!gameplay_voices(5, 17, true)); // pause
+        assert!(!gameplay_voices(4, 16, true)); // loading
+        assert!(!gameplay_voices(14, 16, true)); // menus with stale player data
+    }
+
+    #[test]
+    fn entering_a_scene_clears_the_skin_clip_and_old_movement() {
+        let mut state = State {
+            voices: None,
+            playing: Some((vec![0; 16].into_boxed_slice(), Instant::now(), 1)),
+            last: vec![None; MOMENTS.len() + 1],
+            last_clip: None,
+            played: Default::default(),
+            jump_signature: false,
+            last_line: None,
+            watch: Watch {
+                position: Some([10.0, 0.0, 20.0]),
+                falling: 90,
+                still_since: Some(Instant::now()),
+                ..Default::default()
+            },
+            rng: 1,
+        };
+        quiet(&mut state);
+        assert!(state.playing.is_none());
+        assert!(state.watch.position.is_none());
+        assert!(state.watch.still_since.is_none());
+        assert_eq!(state.watch.falling, 0);
+    }
 
     fn wav(bits: u16, samples: &[i16]) -> Vec<u8> {
         let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();

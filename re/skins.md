@@ -478,6 +478,21 @@ The game's own voice banks are in `resource/gd_PC/MLT`.
   0x450000..0x478000 (shared player helpers: pick up, pet, tree) and 0x710000..0x760000 (the
   characters' mains and actions). Cutscene, Omochao and story voices come from elsewhere.
 
+### Cutscene voice protection (2026-10-19)
+
+Sonic dialogue was reported silent while wearing SpongeBob. Previously `MUTE` depended only
+on a loaded skin voice set, including while an event retained the previous player/skin.
+All three mute hooks now check live mode/state/control before filtering any call, so a
+transition earlier than the next OnFrame cannot swallow the first scene line.
+
+REA of `GameModeHandler` `0x434160` confirms mode 5 runs `0x43A780` (stage states); mode 7
+loads `EVENT` (string `0x8B7674`) and mode 8 runs it; modes 15/16 load/run `ENDING`
+(`0x8B76D8`). Skin replacements require mode 5, state 16 and `ControllerEnabled[0]`
+(`0x174AFFF`) nonzero. This also leaves input-locked scripted intros within a stage alone.
+The per-frame voice player uses the same conditions, clears pending events and movement
+history, and stops PlaySound before dropping an active skin WAV on entering a scene/pause.
+Only gameplay resumes skin voices. The reported Sonic/SpongeBob scene needs an in-game retest.
+
 ## Hurt blink (2026-10-18, REA)
 
 After a hit a character can't be hurt again for a while: EntityData1 +6 (u16) counts it down.

@@ -74,8 +74,10 @@ picked at random and never twice in a row:
 | `happy`, `idle` | Standing about now and then. |
 | `signature` | The skin's catchphrase: on some jumps, now and then going fast, in idle chatter. |
 
-While a skin with sounds is on, the character's own voice is muted (cutscenes, Omochao and the
-story still speak). File names: letters, digits, spaces and `_ - . ( ) ! ' , & +` only, and the
+Skin voices replace the character's voice only during player-controlled gameplay. Cutscenes
+keep their original dialogue; skin chatter stops when a scripted scene starts and resumes
+when control returns. Omochao and story voices are kept. File names: letters, digits, spaces
+and `_ - . ( ) ! ' , & +` only, and the
 whole path under 96 characters, or it won't be shared.
 
 How chatty it is goes in `skin.ini` (all optional; in our build, `skins-src/sounds/<who>/voice.ini`
