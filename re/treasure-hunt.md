@@ -1,5 +1,57 @@
 # Treasure hunt: emerald pieces, selection, collection, radar/hints (for a room hunt battle)
 
+## Shared physical locations correction (2026-10-19, REA VM/Ghidra)
+
+Reported in co-op Death Chamber: one player saw a buried key while another saw a flying
+key, although shared credit worked. Local log 07:16:33 selected `(10,12),(5,2),(4,5)`;
+collection at 07:17:43/07:19:19 confirmed the existing referee path worked. Server logs
+only contained joins/leaves, not treasure/boss payloads. Do not infer matching physical
+objects from matching scores.
+
+Rechecked native code in REA:
+
+- **0x6D0AD0**: normal/hidden/buried piece. Data1 +1 queries in state 1, then stays active
+  (2) or hidden (3); active objects do not automatically reconsider a changed slot.
+- **0x6D2310**: moving piece has the same selection sub-states, but a different MainSub.
+  The mod's old re-query scan only recognized 0x6D0AD0, leaving old moving picks active.
+- **0x6D2880**: enemy-drop object collects through 0x73B3E0. Enemy registration at
+  **0x4789D0** takes its ID from Data1 rotation Y's low byte into work +0x45, and appends
+  its position to the E list while the manager is in states 1/2/3. IDs are not random
+  per-machine counters. Ghosts/moving enemies can still be in different physical states;
+  they are not all synchronized by the enemy module.
+- **0x73AFE0**: fixed candidate lists C/B/A are manager pointers +0x5C/+0x60/+0x64,
+  counts +6/+7/+8, 16-byte entries, allocated capacity 48 each. The native picker mutates
+  the enemy list when selecting, but leaves these three fixed pools available.
+- **0x739570** manager assembly verifies PUSH EDI / CALL **0x7380A0** at
+  **0x739A54/0x739A55**, caller pops 4, then sets manager state 4. Hooking this call
+  reapplies the shared slots before EMERALD objects can select/collide after a retry.
+
+The lowest present party ID supplies the canonical set. Followers only accept that
+authority and can replace an earlier conflicting set; only the authority broadcasts.
+Co-op participation includes same-stage/mission members still loading or starting, rather
+than requiring their start flags to have arrived already. Competitive hunt participation
+keeps its start-together requirement.
+
+Keep native fixed choices (C kinds 1/3, B kinds 0/2/5, A kind 4). Replace enemy-held,
+moving and upgrade-only picks with the nearest eligible native candidate in the same
+list. This keeps buried/hidden treasure and native hint IDs without promising physical
+enemy/path movement that is not synchronized. Exclude duplicate `(kind,id)` candidates
+(notably Mad Space 3/6) so one shared ID cannot point at two physical spots. Mission 5
+keeps native FINAL IDs 0/1/2. Read existing in-memory candidates, respecting loaded SET
+replacements; no game data/assets are bundled or new placements invented.
+
+Validate finite positions, list counts/pointers and slot roles. Rebinding writes positions
+even when an ID coincides, clears old local collected markers for a different set, resets
+hints, recomputes remaining count and re-queries normal and moving objects. The native
+picker hook projects known owners/claims into collected slots on retry. Native collection,
+referee ownership and team completion remain in charge. Preserve pickup acknowledgements
+that arrive before their set announcement; reject other stages/outsiders.
+
+Headless regressions cover fixed fallbacks, duplicate IDs, authoritative replacement,
+repeated announcements preserving credit, early acknowledgements, retries and invalid sets.
+Read-only checks of retail SET files found unique fixed C/B/A candidates in every supported
+normal hunt stage. The user's exact buried/flying reproduction still needs an in-game retest.
+
 Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
 of `re/bin/sonic2app.dumped.exe` plus the game's own SET files in `resource/gd_PC` (parsed
 offline). None of it has been run in game yet.

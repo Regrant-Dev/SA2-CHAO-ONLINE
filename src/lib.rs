@@ -130,6 +130,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     hide::install();
     race::install();
     garden::install();
+    hunt::install();
     game::prepare_loader_profile(&path);
     guarded("jewel eggs init", || jewel_eggs::init(&path, helpers));
     guarded("online init", || online::init(&path));
@@ -212,8 +213,11 @@ pub extern "C" fn OnFrame() {
             let here: Vec<u8> = peers
                 .iter()
                 .filter(|p| members.contains(&p.id) && p.level == level && p.mission == mission)
-                // Only those who started it with us (a late joiner hunts on their own).
-                .filter(|p| p.flags & (game::POSE_WAITING | game::POSE_PLAYING) != 0)
+                // Co-op members share their hunt regardless of small loading/start delays.
+                .filter(|p| {
+                    room::mode() == room::Mode::Coop
+                        || p.flags & (game::POSE_WAITING | game::POSE_PLAYING) != 0
+                })
                 .map(|p| p.id)
                 .collect();
             watch::mark("hunt::on_frame");

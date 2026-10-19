@@ -788,7 +788,17 @@ fn pump(online: &mut Online, now: Instant) {
                         progress,
                         finish,
                     },
-            } => crate::stage_race::received_status(from, level, mission, progress, finish),
+            } => {
+                crate::stage_race::received_status(from, level, mission, progress, finish);
+                if crate::bosses::should_share_clear(
+                    level,
+                    room::shares_room(from),
+                    room::mode() == room::Mode::Coop,
+                    finish.is_some(),
+                ) {
+                    crate::bosses::received_clear(level, mission);
+                }
+            }
             Event::Game {
                 body:
                     Body::Route {
@@ -843,15 +853,20 @@ fn pump(online: &mut Online, now: Instant) {
                     },
             } => {
                 if room::shares_room(from) {
-                    crate::hunt::received_set(level, mission, pieces);
+                    crate::hunt::received_set(from, level, mission, pieces);
                 }
             }
             Event::Game {
-                body: Body::HuntTaken {
-                    sig, slot, player, ..
-                },
+                body:
+                    Body::HuntTaken {
+                        level,
+                        mission,
+                        sig,
+                        slot,
+                        player,
+                    },
                 ..
-            } => crate::hunt::received_taken(sig, slot, player),
+            } => crate::hunt::received_taken(level, mission, sig, slot, player),
             // For the host's referee only (net/referee.rs).
             Event::Game {
                 body: Body::HuntClaim { .. },

@@ -1,5 +1,52 @@
 # Bosses: HP and the boss gauge (for shared boss HP in co-op)
 
+## Party completion for every boss (2026-10-19, REA VM/Ghidra)
+
+User reproduced shared damage without shared completion on King Boom Boo and Egg Golem.
+Local log level 63: HP 4 -> 3 -> 2 -> 1 from friends, followed by leaving the stage.
+The sender explicitly required `hp > 0`, so a finishing hit was never transmitted. The
+receiver also intentionally clamped shared HP to 0.01 and required its own final hit.
+Server logs contain joins/leaves only, with no detailed boss events to prove otherwise.
+
+All boss arenas **60..67** and rivals **19,20,29,33,42** now share confirmed completion
+in co-op. Use the existing `RaceStatus.finish` message, emitted from native LevelClear
+flag **0x174B002**, not zero HP alone: multi-phase fights must not end at an intermediate
+HP reset. Send the initial clear reliably, including fights without a start-together clock,
+and repeat the completed status during results. Do not overwrite that first reliable
+announcement with a periodic status in the same frame. Only accept a co-op party member's
+matching stage/mission completion; competitive rooms and normal/hunt stages keep their rules.
+
+REA rechecked **0x43E6D0** (usercall ESI = player): it guards duplicate clears, disables
+controls, stops the timer, sets 0x174B002, plays the clear sound, creates native results
+through 0x451450 and selects the victory action/camera. A matching confirmed party win
+calls this same routine for player 0. Wait through loading, pause, death/restart requests,
+disabled controls and the start hold. Pending wins are applied after normal control returns.
+Use the engine's results/save/story progression rather than writing save bits or GameState.
+The local surviving boss's visual state can differ while entering these results; physical
+boss-animation synchronization remains separate from confirmed stage completion.
+
+King Boom Boo additionally supports its full native remote defeat sequence:
+
+- Actual main **0x6129C0**, HP at ObjectMaster +0x40 work +0x28. Its switch maps mode 11
+  to vulnerable handler **0x611470**, mode 12 to ending **0x612230**.
+- Finishing hit at **0x611FE7..0x6120D0** subtracts 1, tests <= 0, sets physics at
+  ObjectMaster +0x38 to velocity `(0,1,0)` and zero next vector, disables all 11 collision
+  slots (0x486A60: EAX=index, ECX=object, stack 0; 0x486A80: EAX=index, EDX=object,
+  stack 3; both caller-pop 4), clears Data1 flag 4 and calls **0x60CE40(object,12)**.
+- That cdecl mode helper clears a phase child, rotations X/Z, flag 0x800 and physics +0x4C,
+  then sets mode/sub to 12/0. The ending runs its native animation/sounds/effects through
+  substates 0..6 and finally invokes 0x43E6D0, camera and results routines itself.
+- Match the live boss's work HP pointer to the current gauge, require its collision,
+  physics, motion and phase work, verify the mode-helper prefix, then perform only the
+  native defeat setup. Do not call the whole vulnerable hit handler: it also affects the
+  local player. Never dereference a cached gauge unless it still belongs to the live lists.
+
+Finishing HP is normalized to zero and sent immediately despite normal rate limiting,
+with periodic resends; an initial unobserved zero is not a defeat. Bosses without a traced
+remote death animation use the confirmed-clear mechanism above. No packet format or
+server protocol change is needed. Headless tests cover terminal HP, intro zero, resends and
+party/mode/stage gating. Full Golem, Boo, rival and final-boss gameplay retests remain needed.
+
 Read from the objdump listing of `re/bin/sonic2app.dumped.exe` (2026-10-17). Not run in game yet.
 
 ## The boss gauge: one mechanism for all of them

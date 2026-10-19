@@ -352,8 +352,13 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
             !story_kart && unsafe { (CLEARED as *const u8).read_volatile() } != 0
         };
         let started = crate::together::started_at();
+        let shared_boss = connected
+            && crate::room::in_room()
+            && crate::room::mode() == crate::room::Mode::Coop
+            && crate::bosses::is_boss_stage(level);
         let position = game::player_position().map(|(p, _)| p);
-        if cleared && !r.cleared {
+        let just_cleared = cleared && !r.cleared;
+        if just_cleared {
             let game_cs = if kart {
                 crate::kart::finished().unwrap_or(0)
             } else {
@@ -363,7 +368,9 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
             let race_cs = if kart {
                 started.map(|_| game_cs)
             } else {
-                started.map(|at| (at.elapsed().as_millis() / 10) as u32)
+                started
+                    .map(|at| (at.elapsed().as_millis() / 10) as u32)
+                    .or_else(|| shared_boss.then_some(game_cs))
             };
             log!(
                 "race: cleared level {level} mission {} in {} (game clock)",
@@ -404,6 +411,9 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
 
         // Our status, ~4 times a second while racing in a room.
         r.frame = r.frame.wrapping_add(1);
+        if shared_boss && cleared && !just_cleared && r.frame.is_multiple_of(SEND_EVERY) {
+            r.status_out = Some((level, mission, RACE_PROGRESS_MAX, r.finish, false));
+        }
         if started.is_some()
             && connected
             && r.frame.is_multiple_of(SEND_EVERY)

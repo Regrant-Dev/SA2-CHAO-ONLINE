@@ -461,6 +461,44 @@ static REBOOT_DIALOG_BLOCKED: AtomicBool = AtomicBool::new(false);
 
 const RESTORE_SOUNDS: usize = 0x0043_5FD0;
 
+/// Native completion flag, set by LevelClear and reset by the game's stage/restart setup.
+pub fn stage_cleared() -> bool {
+    unsafe { (0x0174_B002 as *const u8).read_volatile() != 0 }
+}
+
+/// Run the same victory/results path used by a locally defeated boss. The caller must have
+/// received a confirmed co-op boss clear; wait through local death, loading and the start hold.
+pub fn complete_shared_boss() -> bool {
+    if !cfg!(all(windows, target_arch = "x86")) || stage_cleared() {
+        return false;
+    }
+    if game_state() != GAME_STATE_INGAME
+        || two_player()
+        || local_entity().is_null()
+        || FROZEN.load(Ordering::Relaxed)
+        || unsafe {
+            (CONTROLLER_ENABLED as *const u8).read_volatile() == 0
+                || (STATE_REQUEST as *const u16).read_volatile() != 0
+        }
+    {
+        return false;
+    }
+    // REA: 0x43E6D0 uses ESI as player, sets the clear/control/timer flags, creates the native
+    // results task and applies the player's victory action. It guards against duplicate wins.
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        if std::slice::from_raw_parts(0x0043_E6D0 as *const u8, 8)
+            != [0x53, 0x33, 0xD2, 0x55, 0x57, 0x38, 0x15, 0x02]
+        {
+            return false;
+        }
+        std::arch::asm!(
+            "push esi", "xor esi, esi", "call eax", "pop esi",
+            in("eax") 0x0043_E6D0usize, clobber_abi("C"));
+    }
+    stage_cleared()
+}
+
 /// In a stage started together, the pause screen doesn't stop the game (like online games):
 /// the stage keeps running behind the menu, only our player ignores the controller.
 pub fn set_live_pause(live: bool) {

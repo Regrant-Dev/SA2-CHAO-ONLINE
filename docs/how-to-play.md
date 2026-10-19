@@ -82,8 +82,10 @@ them. From Stage Select you're taken into their stage.
   switches open everyone's doors and gates, and you see each other's mech shots. A checkpoint
   one of you passes counts for everyone: if you fall behind and die, you restart there, unless
   you passed a checkpoint further along yourself.
-  Bosses share one health bar: every hit anyone lands counts, and each of you lands your own
-  final hit.
+  Bosses share one health bar. When a party member clears the fight, everyone in the same
+  boss stage and mission gets the game's normal victory/results sequence. This covers all
+  boss arenas, both Egg Golem fights and the character rival fights. A paused or dying player
+  finishes after resuming or respawning; an empty HP phase alone does not finish the fight.
   Standard wooden and iron crates stay per player: they can be stepping stones, so a friend
   breaking one cannot remove your route. They respawn normally when you die or restart.
   Solid kart skins such as Lightning McQueen also work in Route 101/280 and Kart Race.
@@ -93,6 +95,9 @@ them. From Stage Select you're taken into their stage.
 - **Kart Race:** pick a course and your party races each other, without CPU karts.
 - **Treasure Hunt:** pick a Knuckles or Rouge hunting stage. Everyone hunts the same 3 pieces and
   whoever grabs a piece first gets it.
+  Shared hunts use fixed native spots, including buried and hidden treasure. Moving,
+  enemy-held and upgrade-only choices are replaced with fixed candidates so every player
+  has the same physical pickups. Retries keep the shared selection and pickup credit.
 
 Tabbing out pauses your game like normal SA2: you stay connected and the others see you
 stand still (the garden's keeper passes to someone else meanwhile). Choose Fullscreen,
