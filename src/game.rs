@@ -51,6 +51,10 @@ pub const CO2_CHAR_ID: usize = 0x03;
 /// `CharObj2Base::Upgrades` (bit flags of the character's upgrades).
 pub const CO2_UPGRADES: usize = 0x24;
 pub const CO2_ANIM: usize = 0x178;
+/// The character's speed (3 f32: forward, up, sideways, in its own frame), what the game's own
+/// movement and animations go by (0x45B610 compares +0x64 with the physics' speeds at +0xE8..);
+/// a hit sets it to the knock-back (0x46C340).
+const CO2_SPEED: usize = 0x64;
 pub const CO2_FRAME: usize = 0x184;
 pub const CO2_ANIM_INFO: usize = 0x198;
 const CO2_MOTION_MODE: usize = 0x174;
@@ -176,9 +180,207 @@ pub fn freeze_world_after(frames: u32) {
     }
 }
 
-// Tabbing out pauses the game as usual: forcing the Mod Loader's `WindowActive` back on to keep
-// playing in the background froze the game under Proton (2026-10-17): fullscreen D3D9 loses its
-// device on focus loss and the loader waits for focus before resetting it.
+// Tabbing out (re/addresses.md "Running while unfocused"): under Proton the window is minimized
+// on every focus loss (client 160x31), so the game can't draw then and idles (`frame_skip`);
+// the network thread keeps the session alive meanwhile. Coming back is the risky part: with the
+// Mod Loader's "pause when inactive" off, three returns on 2026-10-18 hung in the first frame's
+// drawing (last mark "puppet display"), while with it on returning never hung. Its own
+// reactivation handling (in its Present hook, 0x867AE0 → the loader) is what that setting
+// switches, so `prepare_loader_profile` keeps it on. Forcing `WindowActive` (0x174F5AC) from the
+// mod froze the game too (2026-10-17/18).
+
+/// At start: makes the Mod Loader's current profile fit for online play, from its next launch
+/// (`mods/.modloader/profiles`: `Profiles.json` names it). Fullscreen (`ScreenMode` 1; 0 is
+/// windowed, 2 borderless, 3 custom) becomes borderless, which looks the same. "Pause when
+/// inactive" is kept on (an earlier build turned it off: that's undone), because the loader's
+/// handling of the window coming back depends on it (above).
+pub fn prepare_loader_profile(mod_path: &str) {
+    let profiles = std::path::Path::new(mod_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("mods"))
+        .join(".modloader")
+        .join("profiles");
+    let Some(path) = std::fs::read_to_string(profiles.join("Profiles.json"))
+        .ok()
+        .and_then(|list| current_profile(&list))
+        .map(|file| profiles.join(file))
+    else {
+        crate::log!("game: no Mod Loader profile found; tabbing out pauses the game");
+        return;
+    };
+    let Ok(profile) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mode = json_value(&profile, "ScreenMode");
+    let pauses = json_value(&profile, "EnablePauseOnInactive");
+    // `run_unfocused` may keep the game going without focus only when this launch isn't
+    // fullscreen and the loader's own pause is off (with it on, the loader handles inactivity
+    // its own way and we stay out of it).
+    WINDOWED.store(
+        matches!(mode, Some("0" | "2" | "3")) && pauses == Some("false"),
+        Ordering::Relaxed,
+    );
+    crate::log!("game: Mod Loader screen mode {mode:?}, pause when inactive {pauses:?}");
+    let mut changed = profile.clone();
+    if mode == Some("1") {
+        changed = set_json_value(&changed, "ScreenMode", "2").unwrap_or(changed);
+    }
+    if pauses == Some("false") {
+        changed = set_json_value(&changed, "EnablePauseOnInactive", "true").unwrap_or(changed);
+    }
+    if changed == profile {
+        return;
+    }
+    match std::fs::write(&path, changed) {
+        Ok(()) => {
+            crate::log!("game: Mod Loader profile set to borderless, pause when inactive on");
+            crate::hud::toast(
+                "From your next launch the game runs borderless and pauses while tabbed out \
+                 (the others keep playing)",
+            );
+        }
+        Err(e) => crate::log!("game: can't update {}: {e}", path.display()),
+    }
+}
+
+/// WinMain's loop asks 0x425DA0 before each frame (its call at 0x401DE0) whether to skip it:
+/// yes while `WindowActive` (0x174F5AC, kept by the game's own window procedure on
+/// WM_ACTIVATEAPP, 0x40186C) is 0, otherwise whether the D3D device is lost (0x1A5570B, reset
+/// there). `frame_skip` stands in for that call: online, in a windowed or borderless game, it
+/// lets the frame run without focus, but only when the window can take a frame (not minimized,
+/// a client area to draw to), the device isn't lost and the game isn't paused. `WindowActive`
+/// itself is never touched (the 2026-10-17/18 hangs came from forcing it).
+const SKIP_FRAME_CALL: usize = 0x0040_1DE0;
+const WINDOW_ACTIVE: usize = 0x0174_F5AC;
+const DEVICE_LOST: usize = 0x01A5_570B;
+const GAME_STATE_PAUSED: i16 = 17;
+
+static WINDOWED: AtomicBool = AtomicBool::new(false);
+static RUNS_UNFOCUSED: AtomicBool = AtomicBool::new(false);
+static SKIP_FRAME: AtomicUsize = AtomicUsize::new(0);
+/// `WindowActive` as `frame_skip` last saw it (for its log line on each focus change).
+static LAST_ACTIVE: AtomicU32 = AtomicU32::new(1);
+/// While we keep the game running without focus: the controller flag as we found it when focus
+/// went (restored when it comes back), or None while focused.
+static UNFOCUSED_CONTROLS: std::sync::Mutex<Option<u8>> = std::sync::Mutex::new(None);
+
+/// Hooks WinMain's frame-skip check (`run_unfocused`). Call once at startup.
+pub fn install_frame_skip() {
+    let target = frame_skip as extern "C" fn() -> u8 as usize;
+    match crate::patch::redirect_call(SKIP_FRAME_CALL, target) {
+        Some(original) => SKIP_FRAME.store(original, Ordering::SeqCst),
+        None => crate::log!("game: can't hook {SKIP_FRAME_CALL:#x}; tabbing out stops the game"),
+    }
+}
+
+/// Returns nonzero to skip the frame (WinMain then only idles: 0x401E53).
+extern "C" fn frame_skip() -> u8 {
+    let original = SKIP_FRAME.load(Ordering::SeqCst);
+    // SAFETY: the game's own check, which this call site called (no arguments, result in AL).
+    let skip = unsafe { std::mem::transmute::<usize, extern "C" fn() -> u8>(original)() };
+    // SAFETY: static game variables, read on the game thread.
+    let (active, lost) = unsafe {
+        (
+            (WINDOW_ACTIVE as *const u32).read_volatile(),
+            (DEVICE_LOST as *const u8).read_volatile(),
+        )
+    };
+    // Each focus change: why the next frames run or not (this runs every loop pass, idle too).
+    if LAST_ACTIVE.swap(active, Ordering::Relaxed) != active {
+        let (iconic, (width, height)) = crate::input::game_window_state();
+        crate::log!(
+            "game: focus {}: online {}, not fullscreen {}, device lost {lost}, game state {}, \
+             minimized {iconic}, client {width}x{height}, game skips {skip}",
+            if active != 0 { "back" } else { "gone" },
+            RUNS_UNFOCUSED.load(Ordering::Relaxed),
+            WINDOWED.load(Ordering::Relaxed),
+            game_state(),
+        );
+    }
+    if skip == 0 || !RUNS_UNFOCUSED.load(Ordering::Relaxed) {
+        return skip;
+    }
+    // Skipped for another reason than focus, or nothing to draw to: as the game decides.
+    if active != 0 || lost != 0 || game_state() == GAME_STATE_PAUSED {
+        return skip;
+    }
+    if !crate::input::game_window_drawable() {
+        return skip;
+    }
+    0
+}
+
+/// Online, a windowed or borderless game keeps running while another window has focus (the
+/// player stands still: their pad and keyboard are ignored meanwhile). Fullscreen is left
+/// alone: there D3D9 loses its device on focus loss and the game must wait.
+pub fn run_unfocused(on: bool) {
+    let on = on && WINDOWED.load(Ordering::Relaxed);
+    RUNS_UNFOCUSED.store(on, Ordering::Relaxed);
+    // Without focus our player ignores the controller (the pad still reads in the background).
+    let focused = !on || crate::input::game_focused();
+    let mut held = UNFOCUSED_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a static byte the game itself toggles (goal routine 0x43E6D0).
+    unsafe {
+        let at = CONTROLLER_ENABLED as *mut u8;
+        match (focused, *held) {
+            (false, None) => {
+                *held = Some(at.read_volatile());
+                at.write_volatile(0);
+            }
+            (true, Some(was)) => {
+                // Unless the game changed it meanwhile (a goal, a cutscene).
+                if at.read_volatile() == 0 {
+                    at.write_volatile(was);
+                }
+                *held = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The value after `"key":` in a JSON text (the first one), when it's a number or a word.
+fn json_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let (start, len) = json_value_at(text, key)?;
+    Some(&text[start..start + len])
+}
+
+/// `text` with the value after `"key":` (the first one, a number or a word) replaced.
+fn set_json_value(text: &str, key: &str, value: &str) -> Option<String> {
+    let (start, len) = json_value_at(text, key)?;
+    Some(format!("{}{value}{}", &text[..start], &text[start + len..]))
+}
+
+fn json_value_at(text: &str, key: &str) -> Option<(usize, usize)> {
+    let quoted = format!("\"{key}\"");
+    let key_at = text.find(&quoted)? + quoted.len();
+    let rest = text[key_at..].trim_start().strip_prefix(':')?;
+    let start = text.len() - rest.trim_start().len();
+    let len = text[start..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(text.len() - start);
+    (len > 0).then_some((start, len))
+}
+
+/// The profile file `Profiles.json` points at (`ProfileIndex` into `ProfilesList`).
+fn current_profile(list: &str) -> Option<String> {
+    let index = usize::try_from(json_number(list, "ProfileIndex")?).ok()?;
+    let mut rest = list;
+    let mut files = Vec::new();
+    while let Some(at) = rest.find("\"Filename\"") {
+        rest = &rest[at + "\"Filename\"".len()..];
+        let open = rest.find('"')? + 1;
+        let len = rest[open..].find('"')?;
+        files.push(rest[open..open + len].to_string());
+        rest = &rest[open + len..];
+    }
+    files.into_iter().nth(index)
+}
+
+/// The number after `"key":` in a JSON text (the first one).
+fn json_number(text: &str, key: &str) -> Option<i64> {
+    json_value(text, key)?.parse().ok()
+}
 
 /// While online, the game's "Reboot to change the control scheme" dialog (opened when the number
 /// of connected XInput pads changes) never opens: it stops the whole game update until
@@ -292,7 +494,7 @@ pub fn two_player() -> bool {
 
 const TWO_PLAYER_MODE: usize = 0x0174_AFDE;
 
-/// While online, the main menu's 2P entry (ROOM BATTLES) does nothing in the game itself:
+/// While online, the main menu's 2P entry (PARTY BATTLES) does nothing in the game itself:
 /// its `jz` at 0x6650D9 becomes a `jmp` to the end of the "can't select" path, past the sound
 /// (0x6654A4 cleans the 3 pushed arguments and returns), and `battles` opens its picker.
 pub fn block_two_player_menu(online: bool) {
@@ -608,6 +810,8 @@ pub struct LocalPlayer {
     pub action: u8,
     /// Holding something (status +4 & 0x800: a Chao, fruit, ...).
     pub holding: bool,
+    /// Ground speed (units a frame), from the game's own speed (forward and sideways).
+    pub speed: f32,
 }
 
 /// Player 1's EntityData1 (position, angles, action), or null when no player exists.
@@ -623,6 +827,28 @@ pub fn set_player_position(at: Vector) {
 pub fn local_entity() -> *const u8 {
     // SAFETY: static pointer array in the game's data section.
     unsafe { (MAIN_CHAR_OBJ1 as *const *const u8).read_volatile() }
+}
+
+/// EntityData1 +6: the time left a character can't be hurt again (u16, counting down after a
+/// hit). The characters' displays (Sonic's 0x720090) and their shadows (0x71E520) skip the body
+/// while its bit 2 is set: the blink. Not while 0x174B009 is set (the split screen's view of
+/// one player is being drawn).
+pub const ENTITY_INVULNERABLE: usize = 0x06;
+pub const SPLIT_VIEW: usize = 0x0174_B009;
+
+/// Player 1 was just hurt and can't be hurt again yet (it blinks).
+pub fn local_invulnerable() -> bool {
+    let entity = local_entity();
+    // SAFETY: the live player's EntityData1 (null-checked).
+    !entity.is_null()
+        && unsafe { (entity.add(ENTITY_INVULNERABLE) as *const u16).read_unaligned() } != 0
+}
+
+/// A character blinks out on frames where `timer` has bit 2, as the game draws them (unless the
+/// split screen draws one player's view).
+pub fn blinks_out(timer: u32) -> bool {
+    // SAFETY: a static byte in the game's data section.
+    timer & 2 != 0 && unsafe { (SPLIT_VIEW as *const u8).read_volatile() } == 0
 }
 
 /// Player 1's CharObj2, or null when no player exists.
@@ -684,6 +910,12 @@ pub fn local_player() -> Option<LocalPlayer> {
             grounded,
             action,
             holding: status & STATUS_HOLDING != 0,
+            speed: {
+                let v = co2.add(CO2_SPEED) as *const f32;
+                let (forward, sideways) = (v.read_unaligned(), v.add(2).read_unaligned());
+                let speed = (forward * forward + sideways * sideways).sqrt();
+                if speed.is_finite() { speed } else { 0.0 }
+            },
         })
     }
 }
@@ -763,3 +995,29 @@ pub fn game_build() -> [u8; 8] {
 
 /// Fingerprint of the build in docs/game-version.md, for tools running outside the game.
 pub const KNOWN_GAME_BUILD: [u8; 8] = [0xE8, 0x1A, 0x60, 0x50, 0x00, 0xC0, 0x3F, 0x02];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_loader_profile() {
+        let list = r#"{ "ProfileIndex": 1, "ProfilesList": [
+            { "Name": "Default", "Filename": "Default.json" },
+            { "Name": "Online", "Filename": "Online.json" } ] }"#;
+        assert_eq!(current_profile(list).as_deref(), Some("Online.json"));
+        let profile = r#"{ "Graphics": { "SelectedScreen": 1, "ScreenMode": 2 } }"#;
+        assert_eq!(json_number(profile, "ScreenMode"), Some(2));
+        assert_eq!(json_number(profile, "Missing"), None);
+        assert_eq!(
+            set_json_value(profile, "ScreenMode", "1").as_deref(),
+            Some(r#"{ "Graphics": { "SelectedScreen": 1, "ScreenMode": 1 } }"#)
+        );
+        let pause = r#"{ "EnablePauseOnInactive": true, "X": 1 }"#;
+        assert_eq!(json_value(pause, "EnablePauseOnInactive"), Some("true"));
+        assert_eq!(
+            set_json_value(pause, "EnablePauseOnInactive", "false").as_deref(),
+            Some(r#"{ "EnablePauseOnInactive": false, "X": 1 }"#)
+        );
+    }
+}

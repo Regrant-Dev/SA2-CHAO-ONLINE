@@ -6,7 +6,7 @@ Online multiplayer for **Sonic Adventure 2** (Steam PC), for up to 8 players. It
 [SA2 Mod Loader](https://github.com/X-Hax/sa2-mod-loader).
 
 - See your friends in stages and Chao gardens.
-- Make a room to play together: stages start at the same time, story mode included, and you can
+- Make a party to play together: stages start at the same time, story mode included, and you can
   race each other or clear stages co-op.
 - Kart races and treasure hunts against each other.
 - Your Chao can visit friends' gardens, run in their Chao Races and fight them in karate.

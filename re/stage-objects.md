@@ -319,3 +319,326 @@ Confidence:
   restart paths (0x43C822, 0x43C90F), so a death switches everything off locally.
 - Co-op shares switches turning **on** only (`Body::Switch`), and sets the room's switches again
   after a restart; sharing "off" would close the others' doors when one player died.
+
+## Stage sync audit (2026-10-18, REA/Ghidra on the dumped exe + objdump scans)
+
+The goal was to find what one co-op player sees in a stage that the others' games don't, from
+the code instead of from playtesting.
+- **Method:** every write that marks a SET record (`and [rec+2],0x7FFF` "alive", and `or` of
+  0x4/0x10/0x20/0x40) was mapped to its function. Then from the function to the object list
+  entry whose MainSub reaches it, through calls and MainSub installs (a scan of all the exe's
+  object lists: 955 MainSubs with names).
+- **Destroyed for real:** a function that clears "alive" and also calls AddScore 0x44D2D0
+  counts as destroyed by a player.
+
+### Ring groups (fixed: `Body::StageRings`, tag 50)
+- **Most of a stage's rings weren't shared.** RINGLINE 0x6C5ED0, RINGCIRC 0x6C6180, KDDRNGL
+  0x6E4830, KDDRNGC 0x6E4FB0, SWDRNGL 0x6ECAE0 and SWDRNGC 0x6ECE10 are ring lines and circles.
+  Their rings aren't SET records: the group spawns them with RING's own MainSub 0x6C0F80 and no
+  record (LoadObject "Ring", 0x6C62C4).
+- **Group layout:**
+  - Data1+3 is the ring count (1..=8, from the SET scale Z, Data1+0x28, 0x6C5FB1).
+  - Data2 (+0x38, 0xA4 bytes from 0x6C5F70) holds 8-byte slots: +0 flags, +4 the ring object.
+  - +0x40 holds the 12-byte ring positions.
+- **Slot flags:** bit 2 means collected. RING sets it as it goes (0x6C1425: `[slot] |= 2`,
+  slot+4 = 0, ring+0x38 = 0, then DeleteObject; a record ring calls KillObject instead). Bit 1
+  means out of range (0x6C0FCB).
+- **While loaded:** the update (0x6C6230, 0x6E4B40, 0x6E5120, 0x6ECF60) respawns every
+  uncollected slot that has no ring. When no slot is uncollected it clears "alive" (KillObject's
+  writes, inlined).
+- **While unloaded:** the record's byte +1 keeps the collected slots. The DeleteSub (0x6C6050,
+  0x6E4A20, 0x6ECCF0) folds slot i's bit 2 into bit 7 - i, and the init (0x6C5FD8, 0x6E49B6,
+  0x6ECC81) sets slot i to 2 from it. A death restart zeroes byte +1 (0x488AD0), so the rings
+  come back.
+- **Co-op (`coop.rs`):**
+  - **Detection:** a group's collected rings come from its slots while loaded, or from byte +1
+    reversed while not. New ones are sent.
+  - **Applying a friend's ring:** in a loaded group, its ring is deleted and the slot marked, the
+    way RING does it. In an unloaded group, byte +1 gets the bit. The receiver also gets a ring
+    (AddRings) unless it already had that one.
+  - **Restarts and late joiners:** reapplied after a death restart, and sent in full to a player
+    who arrives.
+
+### More breakables (fixed: added to `coop.rs` BREAKABLES)
+These clear "alive" in the same function that gives the destroy score:
+- MDCONTBOX 0x5C3B50 (0x5C3DA5)
+- BOMBE 0x6060C0 (0x6061BC) and 0x69EF30 (0x69F04C)
+- TANK 0x6079E0 (0x607C46), 0x637980 (0x637B98), 0x69C980 (0x69CBE6) and 0x78BA60 (0x78BCD4)
+- ORI 0x6D29F0 (0x6D2CD5) and 0x77C870 (0x77CB55)
+- SHUT 0x76D760 (0x76D946)
+
+### Left as they are, and why
+- **Cars and BUFFER: left out.** CARMAN / CARMANC / CARKAZ (0x5E0820, 0x5E0B10, 0x5E0DE0,
+  0x5B5D30) and BUFFER 0x5B30A0 clear "alive" with the score (0x5DEA20, 0x5B4BE0, 0x5B30F0).
+  - They also clear it in paths without a score (0x5E15B0, 0x5EC7A0, 0x5B61C0), which look like
+    traffic leaving its route.
+  - CARKAZ/BUFFER sit with the kart objects, so syncing them could delete cars a slower player
+    still has ahead. Add them only after checking those paths.
+- **Per-player rewards: not shared, on purpose.** Each player should get their own:
+  - CONTCHAO 0x6DE3B0 (Chao box: sets 0x4|0x20 and clears "alive", 0x6DE735);
+  - SCHBOX / SG_SEARCHBOX (hint boxes);
+  - GOALRING 0x6C63C0 (each player clears the stage);
+  - item box contents (the breaker gets the item, the others get the broken shell);
+  - the animals from kills (1P only, the killer's game);
+  - the upgrades.
+- **Enemy flags other than "alive":** E NAMIE 0x4 (0x4F7C5F, 0x4F8CAB), E AKAHIGE 0x4
+  (0x7A0A85) and E AI 0x20 (0x4FEF87) are per-enemy persistent marks set on their kill paths.
+  The "alive" sync already covers those enemies.
+- **Springs:** SPRA / SPRB / KDSPRING clear "alive" (0x6C4698, 0x6C50AC) without a score. They
+  are probably one-shot or level-scripted springs, so they are left alone.
+- **Not attributed:**
+  - 0x62DEB0 clears "alive" with a score, but sits inside a larger function near the mech
+    boss objects (LOCKON 0x629DB0, LAZER 0x62CED0). Not attributed.
+  - 0x5B11B0 / 0x5B1580 / 0x5B18C0 (kart) and 0x7A2930 / 0x7A2C50 are breakable-part callbacks
+    in data tables. Their owner's record is the parent's (E BEETON is already synced).
+- **Enemies' live state (not synced; fine for co-op):**
+  - Enemies are local: each game's enemies react only to its own player (the 1P loader
+    0x488630 checks player 1). On your screen, a friend's puppet is ignored by enemies.
+  - Only "destroyed" needs one owner, and it's shared.
+  - Boss positions and attacks are per game too. HP is shared (bosses.md).
+- **Mech homing shots:** `shots.rs` fires a friend's bazooka shell from the same place in the
+  same direction, but without their lock-on target. A friend's lock-on volley flies straight on
+  your screen. What it destroys still goes away through the kill sync.
+- **Puppet effects:** see effects.md. The spin and homing balls are drawn (from `action`). Still
+  missing: Tails' mech jet and the kart exhaust/tilt.
+- **Moving platforms and timed objects:** they run from the stage start, which rooms start
+  together. They drift only for a player who restarts.
+
+## Mech lock-on (2026-10-18): what a volley is, and why it isn't replayed
+- **The volley isn't a homing projectile.** `WalkerBulletExecutor` (main 0x75D520) and
+  `WalkerBazookaExecutor` (0x75D9F0) fly straight along Data1+0x20 and have no target field.
+  They're the tap shots (0x741692 bazooka with the upgrade bit co2+0x24 & 0x200000, 0x741727
+  bullet), and `shots.rs` already mirrors them.
+- **Lock-on (holding B, co2+0x35C = 1):** each frame, 0x74CCF0 scans for a target while
+  co2+0x368 (the locked count) < 0x20.
+  - **Where it looks:** the candidate is the nearer of two collision lists, scanned by 0x74CB30
+    (list 0x1DE4EE0 with count 0x1DE4EC8, list 0x1DE6DA0 with count 0x1DE944A). In 2P it also
+    looks at the other player (0x74CC40).
+  - **What it skips:** targets whose Data1+2 is 0x16/0x17.
+- **Per target, a marker:** a child of our player object (0x470C00, list 2, main 0x74C260),
+  with 0x20 bytes of data at +0x40:
+  - +8 the player index;
+  - +0x10 the target's collision centre (0x47EEC0);
+  - +0x1C **the target ObjectMaster**.
+
+  The target links back to the marker: an enemy at its work +0x40 (`obj+0x38` +0x40), a player
+  at CharObj2+0x38C (0x486CB0 tells them apart). co2+0x368 counts up, and co2+0x390 is the last
+  target's position.
+- **Fire (B released):** each marker's main sets its Data1 +0x14 to our gun (co2+0x23C..0x244),
+  +0x20 to the aim direction (co2+0x2D8..0x2E0), and switches to the flight main 0x74B920
+  (display 0x74B620).
+  - **Flight:** it homes on +0x1C every frame and on arrival hits the target with the player
+    index (0x7617C0 / 0x75D310).
+  - **Laser line:** the line is the marker's own display.
+- **Why it isn't replayed on the friends' screens:**
+  - **It hits as us:** a marker is our player's child and attacks as player +8. A friend's
+    volley rebuilt here would fire from our mech's gun and hit for us (our score, combo and
+    animals).
+  - **Crash risk:** it holds a raw target pointer, while the kill sync deletes the same targets
+    on its own schedule. The game avoids the dangling pointer only by checking the target's main
+    for DeleteObject in the same frame (0x74C2A3), and our deletes don't go through it.
+  - **Doing it right:** a draw-only copy of the laser (the 0x74B620 display driven from our own
+    data, as puppet.rs draws characters), fed with the friend's gun position and the SET
+    records of their targets.
+  - **Until then:** the targets still disappear through the kill sync, so only the laser lines
+    are missing.
+
+## Enemies and friends (2026-10-18; src/enemies.rs. The stand-in and the loading near friends below were removed the same day: see "Stage hook safety audit")
+- **What an enemy looks at:** player 1's EntityData1 through `PLAYERS[0]` 0x1DEA6C0 (62 reads in
+  the E-enemy code 0x4F5000..0x512000 and 0x7A0000..0x7A4000). It also reads player 1's CharObj2
+  0x1DE9600 (15 reads) and `PLAYERS[1]` only for 2P (0x4FDD8A, 0x50856B). Range-out (0x488C80)
+  checks `PLAYERS[0]` and `[1]`.
+- **Writes through those pointers in enemy code:** only E GHOST does any, a grab that sets the
+  player's NextAction to 0x16/0x21 (0x501F2D, 0x502599) and CharObj2+0x28 (0x501F31, 0x50259D).
+- **The fix (`src/enemies.rs`):** an enemy whose nearest player is a friend's puppet (within 600,
+  at least 20 nearer than us to switch) runs its own MainSub with `PLAYERS[0]` pointing at a copy
+  of our EntityData1 (0x30 bytes) moved to the friend's position. Then it turns, chases and fires
+  at the friend.
+  - **Nothing can reach us through it:** writes during its update land in the copy, and hits on
+    us come only from real collisions.
+  - **MainSub changes:** an enemy changing its own MainSub (next state, or DeleteObject) is
+    followed.
+  - **Left out:** E GHOST / E PATHGHOST (the grab writes our CharObj2).
+  - **Not checked:** shared helpers the enemies call with a player index (outside the enemy
+    ranges).
+- **Loading:** the 1P loader 0x488630 loads SET objects only around player 1. So enemies near a
+  friend but out of our range (default 400, `ObjectListEntry+4`) don't exist in our game until
+  we get close.
+  - **What the stand-in changes:** a turned enemy's range-out check sees the friend's position,
+    so once loaded it stays loaded while the friend is near it.
+  - **Loading around friends:** the 2P loader 0x4883D0 (used when `MainCharObj1[1]` exists)
+    loads around both players. Running a pass of it with `PLAYERS[1]` set to a stand-in at a
+    friend could load enemies around them.
+  - **Not done:** 2P code paths read `MainCharObj1[1]`/`CharObj2[1]` too (camera, HUD), so it
+    needs its own audit.
+
+### Lock-on drawn for friends (2026-10-18, src/lockon.rs, `Body::LockOn` tag 51)
+- **Sending ours:** our markers are found among our player object's children. The list starts at
+  ObjectMaster+0xC and runs circularly through +0 (0x470C00 links them).
+  - Main 0x74C260 means locked; 0x74B920 means flying.
+  - Each marker's target (+0x40, +0x1C) is mapped to its SET record (`coop::record_of`).
+  - What's sent: the gun (CharObj2+0x23C), the locked records with their aim points, and the
+    ones that just started flying (fired).
+- **Drawing a friend's:**
+  - **The object:** one of our own per cursor or laser (LoadObject, list 3). Its Data1 (0x30)
+    and marker block (0x20) come from the game's allocator with the 0x12345678 header, so the
+    game's DeleteObject frees them.
+  - **Slots:** display +0x1C is the game's cursor (0x74BEC0) or laser (0x74B620); the delete
+    callback +0x18 is ours.
+  - **Marker block:** +8 = 0, because the displays take the mech textures from player 0's
+    CharObj2+0x444, so they draw only while we're a mech. +0xE = 7 (fully shown), +0x10 the
+    aim.
+  - **Target:** +0x1C points at a stand-in object of ours. 0x74C4E0 reads its Data1+2,
+    Data1+0x2C, collision +0xC and +4, so the stand-in is built with those fields: the cursor
+    draws and nothing real is touched.
+  - **Movement:** the updates are ours. A cursor stays on the target, at its position here if
+    it's loaded, otherwise where the friend aimed. A laser flies 12 units a frame from the
+    friend's gun to the target and then goes. Nothing is hit or scored; the kills arrive as
+    StageKills.
+
+### Loading enemies near friends (2026-10-18, `coop::load_enemies_near`, src/enemies.rs)
+- **What the 2P loader reads:** 0x4883D0 reads only `PLAYERS[0]` (or the camera 0x1A5A784 when
+  there's no player 1) and `PLAYERS[1]`+0x14 (their positions). It loads unloaded alive records
+  in range of either player with the same LoadObject/Data1 setup as 0x488630. Nothing in it
+  reads `MainCharObj1[1]` or `CharObj2[1]`.
+- **How we use it:**
+  1. Every 10 frames, for each friend at least 200 from us, run one pass of it.
+  2. During the pass, `PLAYERS[1]` points at a 0x30-byte stand-in at the friend's position.
+  3. Every record except unloaded enemies within 300 of the friend (ghosts left out) has its
+     "alive" bit cleared for the pass, so nothing else loads.
+  4. The flags and the slot are put back right after.
+- **Why player 2 is never seen:** what loads starts running on the next object pass, by when
+  player 2 is gone again. `enemies.rs` turns it toward the friend that same frame, so its
+  range-out check (0x488C80) sees the friend and it stays loaded while they're near.
+- **Not before the first pass:** never called before the stage's first loader pass (0x1A5A33C),
+  because that pass loads some objects regardless of range and our pass would mark it done.
+- **Known churn:** an enemy loaded near a friend but nearer to us (not turned) can range out
+  and load again on the next pass, every 10 frames at most.
+
+### Lock-on when we aren't a mech
+- **Where the textures come from:** the cursor and laser displays take the effect textures
+  from a player's CharObj2+0x444, the "WALKTEX" archive (0x900E00, loaded by the walker loaders
+  0x740DDE / 0x74103E / 0x741220 / 0x741400).
+- **What we do instead:**
+  - We load WALKTEX ourselves (0x44C510, as puppets load character textures) the first time a
+    friend's lock-on arrives, and release it when the stage changes.
+  - Only while one of our marker displays runs, player 2's slots (`PLAYERS`+4 0x1DEA6E4 and
+    the CharObj2 array+4 0x1DE9604, empty except in rival fights, and put back right after) point at a stand-in player whose
+    CharObj2 holds that texlist. The marker's +8 is set to 1.
+  - The display reads only +0x444, +0x24 and +1 of it (the model variant).
+- **Model and texture variant:** taken from our zeroed stand-in, not from the friend's mech.
+
+### Enemy owners (2026-10-18, src/enemies.rs, `Body::EnemyStates` tag 56)
+- **Who runs an enemy:** an enemy (alive, not a ghost) with another party player within 600 is
+  run by the game of the player nearest it.
+  - **The owner** sends its position, rotation and distance at 10 Hz.
+  - **The others** keep its MainSub wrapped. After its own update runs, they ease it toward the
+    owner's position (half the gap a frame, jumping past 80) and copy the rotation, so it stands
+    in the same place on every screen.
+  - **Taking it over:** another player takes it over only when nearer by 50. Between two
+    senders, the nearer one keeps it, then the lower id. A sender stops when its state isn't
+    heard for 0.6 s.
+- **Turning toward friends:** only where we run the enemy (owner, or nobody else near). There,
+  an enemy after a friend runs with the stand-in.
+  - **Its shots are real.** Deleting them at once (EnemyBulletExecutor 0x511AB0,
+    EnemyLaserExecutor 0x510560, ...) hung a party stage with fakepeer on 2026-10-18 (the
+    watchdog stopped at "stage update"), so it was removed.
+    - **The likely cause:** an enemy keeps pointers to the shots it makes (E AI steers its
+      moving laser every frame). Deleting one under it is a use after free in the game's heap.
+    - **Now:** the shots fly at the friend's puppet and hit us only if we're in their way. In
+      the friend's game, their copy of the enemy fires at them for real.
+- **Per-type coverage:** all 18 E-enemy MainSubs in `coop.rs` ENEMIES, except E GHOST /
+  E PATHGHOST (their grab writes CharObj2[0]): shared position and facing, turning, and shot
+  suppression.
+  - **Not frozen:** none of them is frozen like the bosses. Their state machines are inlined in
+    each MainSub (no separate mode functions), so a copy still animates and attacks from its
+    own update. Its attacks then aim at its own game's player 1, which is real and correct for
+    that player.
+  - **Not drawn:** shots at a friend aren't drawn as copies. The projectile displays weren't
+    checked.
+
+## Shared rewards (2026-10-18, src/coop.rs)
+Rule: in a co-op party stage, what anyone collects or opens is gone for everyone (the kill
+sync above), and each player gets its reward, once per item, through the game's own
+function.
+
+| Object | How it rewards (RE) | Shared? |
+|---|---|---|
+| RING / SGRING | AddRings 0x44CE10 | yes (since 2026-10-17): a ring each |
+| Ring lines/circles (RINGLINE etc.) | the ring's own pickup | yes: a ring each (tag 50) |
+| ITEMBOX 0x6C7C10, ITEMBOX2_B 0x6C7CE0 | item = SET scale X truncated to 0..10 (inits 0x6C7DB0 / 0x6C7F20); breaking calls icon 0x6DF440 cdecl(player, icon) then table 0xB4D120[item]+4 cdecl(box, player) (0x6C8101..0x6C811E) | yes: a friend's box, already broken here, gives us its item with those two calls for player 0 and a stand-in box of ours (Data1 at the box, no record). Not item 6 (blows up the enemies around the box: those kills come as kills) or 9 (nothing); the 1-up (2) not when the record says it was taken (flag 0x20). Score, rings, shields, speed shoes, invincibility, 1-ups all come with the item's own function |
+| Upgrades (LEVUPDAI 0x6D8540) | sets its flag byte `0x1DEB300[i]` (i < 0x1E, the save's table, copied in at 0x68DBA1) and ORs its bits into the player's CharObj2+0x24 when CharObj2+1 is its character (0x6D87F9..0x6D881B; descriptor at Data2+8: +0 character, +8 bits, +0xC flag) | yes (tag 57): everyone sets the flag (kept with their save), and gets the bits now when playing that character |
+| ITEMBOXAIR 0x6C8EF0, ITEMBOXBALLOON 0x6DB030, SGITEMBOX 0x6EABC0 | the same rule with their own tables: air 0xB493A0 (item in Data1+3, from the SET scale X, init 0x6C9022; break 0x6C9266), balloon 0xB19928 (+0x3C, 0x6DB136; 0x6DB28B), SG 0xB0AFA0 (+0x3C, 0x6EAC93; 0x6EADF4) | yes, as the ground boxes (`ITEM_TABLES`). The stand-in box now has a record of its own: the air box's 1-up (0x6C97F0) writes +0x30's flags without checking for none |
+| KDITEMBOX 0x6E9350 | shares the air box's break (0x6C91F0) but its Data1+3 isn't the SET scale (0x6E955C sets it) | broken for everyone; its item isn't given yet |
+| CONTCHAO 0x6DE3B0 (Chao box) | opened (0x6DE5E8): while the stage's Chao key isn't got (0x6E9C20: `0x174B004` != 1 and `0x1AEFF64` == 0) it lets out the **Chao key** (0x6E9D10 makes "ObjectChaoKeyExec", main 0x6E9DE0; EBX = &position, cdecl (height, 2.5)); otherwise animals (0x48ACD0, ESI = kind, cdecl (x, y, z)): four (kinds 2, 1, 2, 1, 10 around, 10 up) for the stage's first opened box (bit 0x100 of `0x1A5A32C`), one (kind 0) for the second (0x200), none after. Then its record gets 0x4|0x20 and loses alive | yes: opening is shared (BREAKABLES), and a friend's opening lets the same out here (`chao_box_reward`): the key, or the animals by the same first/second rule, for us to pick up |
+| Animals (MINIMAL 0x48ADE0) | spawned by kills and boxes, collected by touching | no: they're not SET records; each game's are its own |
+| HINTBOX / OMOCHAO / SCHBOX | hint text for the one who opens it | no: nothing to share (and opening isn't consumed) |
+| Lost Chao, treasure pieces, emeralds | mission goals | no: see "Mission rules" (treasure: hunt.rs) |
+| Chao keys | made by the Chao box (above) | yes, through the Chao box: each player picks up their own |
+| GOALRING | stage clear | no: each player finishes |
+
+## Mission rules in co-op (2026-10-18, decisions)
+- **Mission 1 (clear):** each player finishes on their own goal ring.
+- **Mission 2 (100 rings):** shared rings count for everyone, so the party collects together.
+  Each player's own counter reaches 100.
+- **Mission 3 (lost Chao):** finding the Chao clears the mission for the finder. Sharing it would
+  clear it for players who never got there, so it stays per player. The Chao box and its
+  animals aren't shared yet either (above).
+- **Mission 4 (time limit):** the timer is per player (each game's own). A death restart keeps
+  the party's kills and switches.
+- **Mission 5 (hard mode):** different SET files (`_hd_`), the same for everyone in the mission.
+  Everything above applies.
+- **Treasure hunts:** shared through hunt.rs (one set of pieces, first claim wins).
+- **Chao keys:** the Chao box makes them (0x6E9D10). When a friend opens one, ours lets out its key too, for each player to pick up.
+
+## Stage objects with state outside the SET flags (2026-10-18 audit)
+| Object | Where its state lives | Co-op |
+|---|---|---|
+| Switch doors and gates (SWITCH, GSWITCH2, LIGHT SW, CC SWITCH, CLEAR SW) | `SwitchFlags` 0x1DE9460 (32 bytes; doors and gates read their id's byte) | shared since 2026-10-17 (on only; set again after a restart) |
+| Key doors (KEY, KEYHOLE, KEYDOOR) | key state machine in the key's Data2 | shared (`KeyUsed`) |
+| Checkpoints | SET flag 0x40 and the restart point | shared |
+| Breakable doors, walls and shutters (KDDOOR, BIGSHUTTER, SHUT, CONT*) | SET "alive" | shared (kills) |
+| Moving platforms, elevators, rotating things (UGOKIDAI, MLIFT, ELV, MILIFT, KAITEN...) | their own timers from the stage start | not synced. Party stages start together (together.rs), so they run in step. A player who restarts gets their own timing back, like the game |
+| Falling platforms (FALLASHIBA) | each falls under its own game's player and then clears "alive" (0x5DC8F9, no score) | not shared on purpose: dropping one because a friend stood on it would drop whoever stands on it here |
+| Gravity switches (GRAV_SW) | the player's own gravity | not shared on purpose: they flip one player's gravity |
+| Story cutscenes and scripted camera events | each game's player | not shared |
+
+## Stage hook safety audit (2026-10-18)
+**The hang.** Twice in a party Co-op stage with fakepeer, the game thread stopped for good
+inside the stage update. The second time the watchdog's last mark was "enemy update
+(enemies.rs)", which is at the very start of the wrapper that ran an enemy's own MainSub with
+`PLAYERS[0]` swapped for a stand-in at the friend.
+- **What was already ruled out:** the first fix (no more deleting the shots an enemy just fired)
+  didn't stop it, and our locks can't deadlock there (the wrapper takes `ENEMIES` only around its
+  bookkeeping, never across the enemy's code, and the network thread's lock order ONLINE →
+  ENEMIES has no reverse).
+- **Most likely cause:** the stand-in itself. It was a 0x30-byte copy of our real EntityData1
+  holding the same collision pointer (+0x2C, our player's real collision info), at another
+  position and under another address than any player in `PLAYERS`/`MainCharObj1`. During that
+  update the enemy's code (and the shared helpers it calls with "player 1": collision checks,
+  0x486520/0x4865B0/0x46DCC0-style lookups that tie a collision back to a player, the 62
+  `PLAYERS[0]` reads) sees a player whose collision belongs to another entity. The game's own
+  code that walks those links can then go round forever. Which helper spun wasn't pinned down
+  statically.
+- **Fix:** the stand-in is gone from enemies.rs. Enemies aim only at their own game's player.
+  The two-player loader pass that loaded enemies around friends (which only fed the stand-in)
+  is gone too.
+
+| Hook (runs in) | What the game code we call reads and writes through ours | Pointers that outlive the call | Complete enough? Loops? | Verdict |
+|---|---|---|---|---|
+| enemies.rs `enemy_main` (stage update, enemy MainSub) | now only the enemy's own update, untouched; then we write its Data1 position and rotation (where its owner has it) | none | yes; no loop of ours | **kept**: position following only, and only for enemies whose owner sends `EnemyStates` |
+| enemies.rs stand-in `PLAYERS[0]` while an enemy runs | everything an enemy reads of player 1 (62 reads; collision through +0x2C, which pointed at our real player's collision) | the stand-in's address (a shot or collision link can keep it) | no: a copy can't be complete (collision, CharObj2 and the player tables disagree); the hang | **removed** |
+| enemies.rs / coop.rs two-player loader pass (0x4883D0, `PLAYERS[1]` stand-in at a friend) | the loader reads only the two positions | none | yes, but what it loads near a friend only stays with the stand-in above | **removed** |
+| enemies.rs deleting fresh shots | — | the enemy's own pointer to its shot (E AI steers its laser) | no: use after free | **removed** (first fix) |
+| boss_follow.rs `boss_main` frozen (stage update, boss MainSub) | the boss's own main with Data1[0] = a mode its switch skips: head turn, motion, inlined hit code (0x46C340 hurts *our* real player, as in the game), parts; then we write Data1 mode bytes, flags, timer, position, rotation and start a motion (0x793C40, id checked against the table) | none | yes (all three bosses' attack code is in mode functions, which don't run; the pit child is passive) | **kept** |
+| boss_follow.rs leader running mode functions with a stand-in player 1 at a friend | the mode functions' player-1 reads and writes (and the cursor objects they make keep the stand-in pointer) | the stand-in (made static so it lived, but it's still a player that isn't in the player tables) | no, for the same reason as the enemies | **removed**: the boss is after the leader only |
+| boss_follow.rs attack copies (list 3, our main, the game's display) | the display reads Data1 0..0x2B only (missile 0x5D6AA0, beam 0x5D9890, bomb 0x5D9CA0, pillar 0x5DA2D0, smoke 0x5D6BA0, flame 0x5D5730) plus static models and textures; Data1 from the game's allocator | none (freed by the game's DeleteObject; our delete callback forgets it) | yes; no loops | **kept** |
+| lockon.rs cursors and lasers (list 3, our main, the game's marker displays 0x74BEC0 / 0x74B620) | display-only reads: marker +8/+0xE/+0x10/+0x1C, the stand-in target's Data1+2, +0x2C → +0xC → +4, `MainCharObj1[n]`+0x40 → +0x444, `CharObj2s[n]`+0x24/+1; the marker chain via +0/+4 (0 here) | player-2 slots swapped only during our call and put back; the target stand-in is static | yes (every field the displays read is set); no writes; the chain is empty | **kept** |
+| coop.rs item-box rewards (OnFrame, not the stage update) | the reward function with a stand-in box (Data1 0x30, +1 = 0, a record of its own at +0x30 for the 1-up) and player 0 (us) | the box isn't kept (rewards take the player index; the blast item that uses the box's position is skipped) | yes | **kept** |
+| coop.rs Chao box `let_out_key` / `let_out_animal` (OnFrame) | the key maker copies the position (0x6E9D4D..); the animal maker takes floats | none | yes | **kept** |
+| shots.rs friends' walker shots (OnFrame) | the creators copy position and direction | none | yes | kept (unchanged) |
+| puppet.rs display, skins.rs / hide.rs draw replacements (display pass) | draw-only, unchanged this round | — | — | unchanged (earlier tests in stages) |
+
+- **Safety switch:** config.ini `StageSync=Off` (shown as "Shared enemies and bosses" in the
+  mod settings) turns off enemies.rs, boss_follow.rs and lockon.rs entirely. Kills, rings,
+  boxes and switches stay shared.

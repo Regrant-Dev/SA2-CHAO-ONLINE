@@ -81,7 +81,13 @@ struct Toys {
     /// Jumps to make our toys do (toy, mode), and jumps to send (toy, mode).
     to_make: Vec<(u8, u8)>,
     to_send: Vec<(u8, u8)>,
+    /// The server's last jumps were looked at since we came into this garden.
+    server_seen: bool,
 }
+
+/// A server's last jump younger than this (seconds) is made by a newcomer's toys: a TV
+/// programme runs 3600 frames.
+const SERVER_JUMP_FRESH: u16 = 60;
 
 static TOYS_NOW: Mutex<Toys> = Mutex::new(Toys {
     area: 0,
@@ -89,6 +95,7 @@ static TOYS_NOW: Mutex<Toys> = Mutex::new(Toys {
     objects: [0; 3],
     to_make: Vec::new(),
     to_send: Vec::new(),
+    server_seen: false,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, Toys> {
@@ -101,6 +108,22 @@ pub fn received(keeper: bool, area: u8, toy: u8, mode: u8) {
     let mut s = lock();
     if s.area == area && area != 0 && (keeper || s.keeper) && mode <= TOY_MAX_MODE {
         s.to_make.push((toy, mode));
+    }
+}
+
+/// Network (the host's referee): garden `area`'s toys' last jumps as the server keeps them,
+/// (mode, age in seconds) per toy. Coming into a shared garden, ours make the recent ones, so
+/// they're on what everyone's are on (re/chao-garden-items.md 7).
+pub fn received_server(area: u8, toys: [(u8, u16); 3]) {
+    let mut s = lock();
+    if s.area != area || area == 0 || s.server_seen || !crate::garden::friends_here() {
+        return;
+    }
+    s.server_seen = true;
+    for (toy, (mode, age)) in TOYS.iter().zip(toys) {
+        if mode != 0 && mode <= TOY_MAX_MODE && age < SERVER_JUMP_FRESH {
+            s.to_make.push((toy.id, mode));
+        }
     }
 }
 
@@ -122,6 +145,7 @@ pub fn on_frame(area: u8, keeper: bool) -> Vec<Body> {
                 objects: [0; 3],
                 to_make: Vec::new(),
                 to_send: Vec::new(),
+                server_seen: false,
             };
         }
         return Vec::new();
@@ -131,6 +155,7 @@ pub fn on_frame(area: u8, keeper: bool) -> Vec<Body> {
         s.objects = [0; 3];
         s.to_make.clear();
         s.to_send.clear();
+        s.server_seen = false;
     }
     s.keeper = keeper;
     // Our toys: found in their list, and their updates wrapped (so their jumps are seen).

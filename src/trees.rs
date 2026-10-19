@@ -10,6 +10,13 @@
 //! and their own trees come back (from their save, untouched) when they keep the trees again.
 //! A copy is remade when the keeper's tree changes (planted, grown, fruit dropped).
 //!
+//! The server's trees (re/chao-garden-items.md 7): the host's referee keeps each shared
+//! garden's 7 records (seeded by the first keeper's) and sends them (`ServerGarden`). With
+//! friends in the garden, the keeper runs trees made from those (records the mod owns, the
+//! tree's own MainSub), not their own save's: a keeper change no longer swaps the trees. Fruit
+//! they drop is made without a save record (in no one's save), so it stays in the garden when
+//! its keeper leaves. Alone, a player's own trees are back.
+//!
 //! What a player does to a copy goes to the keeper, whose game does it for real:
 //! - Planting: a seed plants itself by marking the empty spot's registry entry (+0x34 = 5,
 //!   +0x36 = seed kind), and the tree takes it on its next frame. The keeper's game is marked the
@@ -52,15 +59,8 @@ const CREATE_FRUIT: usize = 0x0054_6180;
 #[cfg(target_arch = "x86")]
 const FRUIT_CATEGORY: u32 = 3;
 
-/// Chao-world registry: counts per category, then 0x1200 bytes of 0x48-byte entries per
-/// category. Trees are in categories 4 (grown) and 5 (growing).
-const WORLD_COUNTS: usize = 0x01DC_0F80;
-const WORLD: usize = 0x01DC_0FC0;
-const WORLD_ENTRY_SIZE: usize = 0x48;
-const WORLD_CATEGORY_SIZE: usize = 0x1200;
-const WORLD_CATEGORY_SLOTS: usize = 64;
+/// Chao-world registry (registry.rs): trees are in categories 4 (grown) and 5 (growing).
 const TREE_CATEGORIES: [usize; 2] = [4, 5];
-const ENTRY_OBJECT: usize = 0x3C;
 /// A seed planting itself sets these on the spot's entry.
 const ENTRY_TOUCH: usize = 0x34;
 const ENTRY_SEED: usize = 0x36;
@@ -100,10 +100,24 @@ const COPY_TIMER: i32 = 100;
 const SEND_EVERY: u32 = 60;
 /// After asking the keeper to plant, a copy isn't remade from older news this long (frames).
 const PLANT_QUIET: u32 = 180;
+/// With friends here and no set from the server this long (frames; it sends every 2 s), our
+/// own trees become the garden's (they seed the server's).
+const SEED_AFTER: u32 = 300;
 
 /// Records the copies are made from (the game keeps pointers into them while they live, and
 /// writes them every frame).
 static mut COPY_RECORDS: [Record; TREE_SLOTS] = [[0; TREE_RECORD]; TREE_SLOTS];
+/// Records the keeper's server trees are made from and grow in (sent as its `GardenTrees`).
+static mut SERVER_RECORDS: [Record; TREE_SLOTS] = [[0; TREE_RECORD]; TREE_SLOTS];
+
+/// Fruit: registry category, and freeing a save record (EAX = record).
+const FRUIT_ENTRIES: usize = 3;
+#[cfg(target_arch = "x86")]
+const RELEASE_RECORD: usize = 0x0052_F680;
+const ENTRY_RECORD: usize = 0x08;
+/// Objects' Data1 position, and how far from its tree a fruit it drops can be.
+const TREE_POSITION: usize = 0x14;
+const FRUIT_REACH: f32 = 30.0;
 
 struct Trees {
     area: u8,
@@ -119,6 +133,12 @@ struct Trees {
     asked: Vec<(u8, u8, u8, u8)>,
     /// What players did to our copies, to send: (slot, action, kind).
     done: Vec<(u8, u8, u8)>,
+    /// The server's trees per garden (`ServerGarden`).
+    server: Vec<(u8, [Record; TREE_SLOTS])>,
+    /// The server's trees we run as the keeper: object per spot.
+    kept: [usize; TREE_SLOTS],
+    /// Since when (frame) we keep a shared garden the server has no set for.
+    unknown_since: Option<u32>,
 }
 
 static TREES: Mutex<Trees> = Mutex::new(Trees {
@@ -130,6 +150,9 @@ static TREES: Mutex<Trees> = Mutex::new(Trees {
     latest: Vec::new(),
     asked: Vec::new(),
     done: Vec::new(),
+    server: Vec::new(),
+    kept: [0; TREE_SLOTS],
+    unknown_since: None,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, Trees> {
@@ -141,6 +164,13 @@ pub fn received_trees(from: u8, area: u8, trees: [Record; TREE_SLOTS]) {
     let mut s = lock();
     s.latest.retain(|&(f, a, _)| (f, a) != (from, area));
     s.latest.push((from, area, trees));
+}
+
+/// Network (the host's referee): garden `area`'s trees as the server keeps them.
+pub fn received_server(area: u8, trees: [Record; TREE_SLOTS]) {
+    let mut s = lock();
+    s.server.retain(|&(a, _)| a != area);
+    s.server.push((area, trees));
 }
 
 /// Network: someone planted or shook tree spot `slot` of garden `area` in their copy.
@@ -169,6 +199,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
         // Out of the garden: its objects (copies and all) went with it.
         if s.area != 0 {
             s.copies = [0; TREE_SLOTS];
+            s.kept = [0; TREE_SLOTS];
             s.area = 0;
             s.latest.clear();
             s.asked.clear();
@@ -178,6 +209,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
     };
     if s.area != area {
         s.copies = [0; TREE_SLOTS];
+        s.kept = [0; TREE_SLOTS];
         s.area = area;
         s.asked.clear();
         s.done.clear();
@@ -186,7 +218,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
     if trees_alive().len() < TREE_SLOTS {
         return out;
     }
-    // Copies that went (the garden reloaded) are forgotten.
+    // Copies and server trees that went (the garden reloaded) are forgotten.
     for slot in 0..TREE_SLOTS {
         let object = s.copies[slot];
         // SAFETY: an object we made; checked to still run our MainSub.
@@ -196,19 +228,69 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
         {
             s.copies[slot] = 0;
         }
+        let object = s.kept[slot];
+        // SAFETY: as above.
+        if object != 0
+            && unsafe { ((object + OBJ_MAIN) as *const usize).read() }
+                != kept_main as *const () as usize
+        {
+            s.kept[slot] = 0;
+        }
     }
+    let shared = crate::garden::friends_here();
+    let server = s.server.iter().find(|&&(a, _)| a == area).map(|&(_, t)| t);
     // Nobody keeps the garden yet (friends just met): as they are for now.
     let Some(keeper) = crate::keeper::current() else {
         return out;
     };
     if keeper == me {
-        // Ours are the real ones: back from copies if we had them.
-        if s.copies.iter().any(|&o| o != 0) {
+        let asked: Vec<_> = std::mem::take(&mut s.asked);
+        if let (true, Some(trees)) = (shared, server) {
+            s.unknown_since = None;
+            // With friends, the server's trees: made from its set once, then ours to run.
+            if s.kept.iter().all(|&o| o == 0) {
+                for (slot, record) in trees.iter().enumerate() {
+                    for object in [
+                        std::mem::take(&mut s.copies[slot]),
+                        std::mem::take(&mut s.kept[slot]),
+                        real_tree(area, slot).unwrap_or(0),
+                    ] {
+                        if object != 0 {
+                            // SAFETY: a live tree of ours; it goes on its next run (a real one's
+                            // save record untouched).
+                            unsafe { ((object + OBJ_MAIN) as *mut usize).write(FREE_OBJECT) };
+                        }
+                    }
+                    s.kept[slot] = make_kept(area, slot, record);
+                }
+                log!("trees: keeping garden {area}'s trees (the server's)");
+            }
+            for (a, slot, action, kind) in asked {
+                if a == area
+                    && let Some(&object) = s.kept.get(usize::from(slot))
+                    && object != 0
+                {
+                    unsaving_new_fruit(object, || act_on(object, usize::from(slot), action, kind));
+                }
+            }
+            if s.frame.is_multiple_of(SEND_EVERY) {
+                // SAFETY: our own records, only touched on the game thread.
+                let trees = unsafe { (&raw const SERVER_RECORDS).read() };
+                out.push(Body::GardenTrees { area, trees });
+            }
+            return out;
+        }
+        // Ours are the real ones: back from copies (or the server's) if we had them.
+        if s.copies.iter().chain(&s.kept).any(|&o| o != 0) {
             for slot in 0..TREE_SLOTS {
-                let object = std::mem::take(&mut s.copies[slot]);
-                if object != 0 {
-                    // SAFETY: a live copy of ours; it goes on its next run.
-                    unsafe { ((object + OBJ_MAIN) as *mut usize).write(FREE_OBJECT) };
+                for object in [
+                    std::mem::take(&mut s.copies[slot]),
+                    std::mem::take(&mut s.kept[slot]),
+                ] {
+                    if object != 0 {
+                        // SAFETY: a live tree we made; it goes on its next run.
+                        unsafe { ((object + OBJ_MAIN) as *mut usize).write(FREE_OBJECT) };
+                    }
                 }
                 if real_tree(area, slot).is_none() {
                     make_real(area, slot);
@@ -216,13 +298,24 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
             }
             log!("trees: keeping garden {area}'s trees");
         }
-        let asked: Vec<_> = std::mem::take(&mut s.asked);
         for (a, slot, action, kind) in asked {
             if a == area {
                 act(area, usize::from(slot), action, kind);
             }
         }
-        if s.frame.is_multiple_of(SEND_EVERY)
+        // Only shared with friends here (alone, our own trees are nobody else's business), and
+        // only once the server has had time to send its set: ours seed it when it has none, and
+        // must not overwrite one it kept.
+        if !shared {
+            s.unknown_since = None;
+        } else if s.unknown_since.is_none() {
+            s.unknown_since = Some(s.frame);
+        }
+        let waited = s
+            .unknown_since
+            .is_some_and(|since| s.frame.wrapping_sub(since) > SEED_AFTER);
+        if waited
+            && s.frame.is_multiple_of(SEND_EVERY)
             && let Some(trees) = saved_trees(area)
         {
             out.push(Body::GardenTrees { area, trees });
@@ -230,12 +323,14 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
         return out;
     }
     s.asked.clear();
-    // The keeper's trees: copies of them in place of ours.
+    // The keeper's trees (or, until they send theirs, the server's): copies of them in place of
+    // ours.
     let Some(trees) = s
         .latest
         .iter()
         .find(|&&(f, a, _)| f == keeper && a == area)
         .map(|&(_, _, t)| t)
+        .or(server.filter(|_| shared))
     else {
         return out;
     };
@@ -245,9 +340,13 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
         if current != 0 && (frame < s.quiet_until[slot] || !changed(&s.made_from[slot], record)) {
             continue;
         }
+        let kept = std::mem::take(&mut s.kept[slot]);
         if current != 0 {
             // SAFETY: a live copy of ours; it goes on its next run.
             unsafe { ((current + OBJ_MAIN) as *mut usize).write(FREE_OBJECT) };
+        } else if kept != 0 {
+            // SAFETY: a server tree we ran as the keeper; it goes on its next run.
+            unsafe { ((kept + OBJ_MAIN) as *mut usize).write(FREE_OBJECT) };
         } else if let Some(real) = real_tree(area, slot) {
             // SAFETY: our own tree; it goes on its next run, its save record untouched.
             unsafe { ((real + OBJ_MAIN) as *mut usize).write(FREE_OBJECT) };
@@ -319,18 +418,16 @@ fn real_tree(area: u8, slot: usize) -> Option<usize> {
 fn trees_alive() -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for cat in TREE_CATEGORIES {
-        // SAFETY: the game's static registry; the count is clamped and objects are checked.
+        // SAFETY: registry entries' live objects; Data1 is checked for null.
         unsafe {
-            let count = ((WORLD_COUNTS + cat * 4) as *const u32).read() as usize;
-            for i in 0..count.min(WORLD_CATEGORY_SLOTS) {
-                let entry = WORLD + cat * WORLD_CATEGORY_SIZE + i * WORLD_ENTRY_SIZE;
-                let object = ((entry + ENTRY_OBJECT) as *const usize).read();
-                if object == 0 {
-                    continue;
-                }
+            for (_, object) in crate::registry::entries(cat) {
                 let main = ((object + OBJ_MAIN) as *const usize).read();
                 let data1 = ((object + OBJ_DATA1) as *const usize).read();
-                if data1 != 0 && (main == TREE_MAIN || main == copy_main as *const () as usize) {
+                if data1 != 0
+                    && (main == TREE_MAIN
+                        || main == copy_main as *const () as usize
+                        || main == kept_main as *const () as usize)
+                {
                     out.push((object, data1));
                 }
             }
@@ -363,6 +460,104 @@ fn make_copy(area: u8, slot: usize, record: &Record) -> usize {
     }
     object
 }
+
+/// One of the server's trees for us to run at spot `slot`, from its `record` (0 if it couldn't
+/// be made).
+fn make_kept(area: u8, slot: usize, record: &Record) -> usize {
+    // SAFETY: our own records, only touched on the game thread.
+    let at = unsafe {
+        let records = &raw mut SERVER_RECORDS;
+        (*records)[slot] = *record;
+        (&raw mut (*records)[slot]) as usize
+    };
+    // SAFETY: game thread, in this garden; a record that outlives the tree (static).
+    let object = unsafe { create_tree(spot(area, slot), at) };
+    if object != 0 {
+        // SAFETY: the object just made: our MainSub instead of its own (which we call).
+        unsafe { ((object + OBJ_MAIN) as *mut usize).write(kept_main as *const () as usize) };
+    }
+    object
+}
+
+/// A server tree's MainSub: the tree's own (it grows, ripens, drops fruit), but fruit it drops
+/// goes in no one's save.
+extern "C" fn kept_main(object: usize) {
+    // SAFETY: the tree's own MainSub, which this object had.
+    unsaving_new_fruit(object, || unsafe {
+        std::mem::transmute::<usize, extern "C" fn(usize)>(TREE_MAIN)(object)
+    });
+}
+
+/// Runs `f` for our tree `tree`; fruit it makes with a save record (the game's drop, or ours)
+/// lose the record: they belong to no one's save (re/chao-garden-items.md 7).
+///
+/// The registry isn't packed: removing an item leaves a hole and lowers the count, and a new one
+/// takes the first hole, so the game's own walk (0x530470: the first `count` slots) can miss the
+/// last ones. A fruit already there (saved) must never look new: all 64 slots are compared, by
+/// entry and object, and only a fruit by this tree counts.
+fn unsaving_new_fruit<R>(tree: usize, f: impl FnOnce() -> R) -> R {
+    let before = fruit_entries();
+    let result = f();
+    // SAFETY: our live tree's Data1 (checked for null).
+    let at = unsafe {
+        let d = ((tree + OBJ_DATA1) as *const usize).read();
+        (d != 0).then(|| ((d + TREE_POSITION) as *const [f32; 3]).read_unaligned())
+    };
+    let Some(at) = at else {
+        return result;
+    };
+    for (entry, object) in new_entries(&before, &fruit_entries()) {
+        // SAFETY: a live fruit's registry entry and object, made just now.
+        unsafe {
+            let d = ((object + OBJ_DATA1) as *const usize).read();
+            if d == 0 {
+                continue;
+            }
+            let p = ((d + TREE_POSITION) as *const [f32; 3]).read_unaligned();
+            let (dx, dz) = (p[0] - at[0], p[2] - at[2]);
+            if dx * dx + dz * dz > FRUIT_REACH * FRUIT_REACH {
+                continue;
+            }
+            let record = ((entry + ENTRY_RECORD) as *const usize).read();
+            if record != 0 {
+                release_record(record);
+                ((entry + ENTRY_RECORD) as *mut usize).write(0);
+            }
+        }
+        crate::items::mark_unsaved(object);
+    }
+    result
+}
+
+/// (entry, object) pairs in `after` that weren't in `before`.
+fn new_entries(before: &[(usize, usize)], after: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    after
+        .iter()
+        .filter(|pair| !before.contains(pair))
+        .copied()
+        .collect()
+}
+
+/// Every fruit entry with an object: (entry, object), all of them (registry.rs).
+fn fruit_entries() -> Vec<(usize, usize)> {
+    crate::registry::entries(FRUIT_ENTRIES)
+}
+
+#[cfg(target_arch = "x86")]
+unsafe fn release_record(record: usize) {
+    // SAFETY: the game's record free (EAX = record), as the caller promises.
+    unsafe {
+        std::arch::asm!(
+            "call {func}",
+            func = in(reg) RELEASE_RECORD,
+            inout("eax") record => _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86"))]
+unsafe fn release_record(_record: usize) {}
 
 #[cfg(target_arch = "x86")]
 unsafe fn create_tree(position: usize, record: usize) -> usize {
@@ -417,10 +612,14 @@ extern "C" fn copy_main(object: usize) {
 
 /// Does what another player did to their copy of our tree at spot `slot`.
 fn act(area: u8, slot: usize, action: u8, kind: u8) {
-    let Some(object) = real_tree(area, slot) else {
-        return;
-    };
-    // SAFETY: our live real tree (Data1 0x100 bytes, its registry entry).
+    if let Some(object) = real_tree(area, slot) {
+        act_on(object, slot, action, kind);
+    }
+}
+
+/// `act` on our live tree `object` (real, or one of the server's).
+fn act_on(object: usize, slot: usize, action: u8, kind: u8) {
+    // SAFETY: our live tree (Data1 0x100 bytes, its registry entry).
     unsafe {
         let data1 = ((object + OBJ_DATA1) as *const usize).read();
         let entry = ((object + OBJ_ENTRY) as *const usize).read();
@@ -532,6 +731,17 @@ fn random() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_fruit_made_now_is_new() {
+        // Slot 2 freed (a hole), the count dropped: a saved fruit in slot 3 was past the old
+        // walk. A drop fills the hole: only that one is new, not the one in slot 3.
+        let before = [(10, 100), (11, 101), (13, 103)];
+        let after = [(10, 100), (11, 101), (12, 200), (13, 103)];
+        assert_eq!(new_entries(&before, &after), vec![(12, 200)]);
+        // A slot reused by a new object is new too.
+        assert_eq!(new_entries(&[(10, 100)], &[(10, 300)]), vec![(10, 300)]);
+    }
 
     #[test]
     fn copies_are_remade_only_for_real_changes() {

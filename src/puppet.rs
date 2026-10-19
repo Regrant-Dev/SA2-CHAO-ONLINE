@@ -370,12 +370,14 @@ extern "C" fn delete(_object: usize) {
     });
 }
 
+/// Display frames so far (the puppets' blink beat).
+static BLINK_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 extern "C" fn display(_object: usize) {
     crate::watch::mark("puppet display");
     let _ = std::panic::catch_unwind(|| {
         // Asked before taking our lock: the online code takes its lock, then ours.
         let connected = crate::online::my_id().is_some();
-        let mut p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
         let co2 = game::local_char_obj2();
         let Some(me) = game::local_player() else {
             return;
@@ -383,11 +385,36 @@ extern "C" fn display(_object: usize) {
         if co2.is_null() {
             return;
         }
-        let poses: Vec<(Pose, Option<String>, String)> = p
-            .remotes
-            .iter()
-            .map(|(pose, name, skin)| (*pose, Some(name.clone()), skin.clone()))
-            .collect();
+        // What to draw, read under our lock; the drawing (and the other modules it asks:
+        // garden, room, skins, kart) happens without it.
+        let poses: Vec<(Pose, String, String, Option<Source>)> = {
+            let p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
+            p.remotes
+                .iter()
+                .map(|(pose, name, skin)| {
+                    let source = if pose.character == me.character {
+                        texlist_slot(pose.character).map(|slot| Source {
+                            // SAFETY: the local player's CharObj2 (checked non-null above).
+                            anim_info: unsafe { read::<usize>(co2 as usize + game::CO2_ANIM_INFO) },
+                            texlist: unsafe { read::<usize>(co2 as usize + slot) },
+                            lists: None,
+                        })
+                    } else {
+                        p.loaded
+                            .iter()
+                            .find(|l| l.character == pose.character)
+                            .and_then(|l| {
+                                character_files(l.character).map(|f| Source {
+                                    anim_info: f.anim_info,
+                                    texlist: l.texlist,
+                                    lists: Some((l.models, l.motions)),
+                                })
+                            })
+                    };
+                    (*pose, name.clone(), skin.clone(), source)
+                })
+                .collect()
+        };
         // SAFETY: display callback on the game thread; the matrix stack top is the camera view.
         let tags = if NAME_TAGS.load(std::sync::atomic::Ordering::Relaxed) {
             unsafe { TagProjector::new(me.position) }
@@ -416,39 +443,25 @@ extern "C" fn display(_object: usize) {
                 tags.draw_scaled(at, CHAO_TAG_HEIGHT, &label, CHAO_TAG_SCALE);
             }
         }
-        for (pose, name, skin) in poses {
-            if let (Some(tags), Some(name)) = (&tags, &name) {
-                tags.draw(pose.position, name);
+        // Puppets blink while their player was just hurt, as characters do: every other two
+        // frames (their own timer stays in their game; this keeps the same beat).
+        let blink =
+            game::blinks_out(BLINK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let in_kart_race = crate::kart::in_kart_race();
+        for (pose, name, skin, source) in poses {
+            if let Some(tags) = &tags {
+                tags.draw(pose.position, &name);
             }
-            // Wearing a skin we have: that instead of the character (skins.rs).
-            if !skin.is_empty()
-                && !crate::kart::in_kart_race()
-                && crate::skins::draw_other(name.as_deref().unwrap_or(""), &skin, &pose)
-            {
+            if blink && pose.status & crate::net::protocol::STATUS_INVULNERABLE != 0 {
                 continue;
             }
-            let source = if pose.character == me.character {
-                texlist_slot(pose.character).map(|slot| Source {
-                    // SAFETY: the local player's CharObj2 (checked non-null above).
-                    anim_info: unsafe { read::<usize>(co2 as usize + game::CO2_ANIM_INFO) },
-                    texlist: unsafe { read::<usize>(co2 as usize + slot) },
-                    lists: None,
-                })
-            } else {
-                p.loaded
-                    .iter()
-                    .find(|l| l.character == pose.character)
-                    .and_then(|l| {
-                        character_files(l.character).map(|f| Source {
-                            anim_info: f.anim_info,
-                            texlist: l.texlist,
-                            lists: Some((l.models, l.motions)),
-                        })
-                    })
-            };
+            // Wearing a skin we have: that instead of the character (skins.rs).
+            if !skin.is_empty() && !in_kart_race && crate::skins::draw_other(&name, &skin, &pose) {
+                continue;
+            }
             let result = match source {
                 // In a Kart Race the others are drawn as karts (kart.rs); keep their name tags.
-                _ if crate::kart::in_kart_race() => Ok(()),
+                _ if in_kart_race => Ok(()),
                 // Mechs and walkers: their own walker display draws them with their upgrade parts
                 // when every model it reads is loaded; otherwise just the body
                 // (re/characters.md "Drawing other players' walkers").
@@ -461,10 +474,10 @@ extern "C" fn display(_object: usize) {
                 }
                 None => Err("character not drawable yet"),
             };
-            if let Some(name) = &name {
-                // SAFETY: display callback on the game thread.
-                unsafe { spin_ball(&mut p, name, &pose) };
-            }
+            // Our own bookkeeping again: the ball trail and what wasn't drawn.
+            let mut p = PUPPETS.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: display callback on the game thread.
+            unsafe { spin_ball(&mut p, &name, &pose) };
             // Log each distinct reason a pose wasn't drawn, once.
             if let Err(reason) = result
                 && p.skipped.insert((pose.character, pose.anim, reason))

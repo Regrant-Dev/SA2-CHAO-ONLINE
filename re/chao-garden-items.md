@@ -345,8 +345,9 @@ Hard:
    B+0x4D8 and spawns the hat. It then clears `+0xD5` only in that Chao's data. For a visitor,
    that duplicates the friend's hat into your save, while their real Chao keeps it. Fix: hook
    these paths, or clear `+0xD5` in visitor buffers and draw the hat some other way, or create
-   the hat with `save = NULL`.
-2. **Visitor Chao puts on YOUR hat.** 0x569240 frees the local hat record and deletes the hat.
+   the hat with `save = NULL`. **Done 2026-10-18** (garden.rs `drop_hat`): a visitor keeps its hat.
+2. **Visitor Chao puts on YOUR hat.** (**Done 2026-10-18**: visitors skip the hat check
+   0x5691B0, garden.rs `may_wear_hat`.) 0x569240 frees the local hat record and deletes the hat.
    The hat ends up only in the visitor buffer, so it is lost from your save. Your own Chao
    wearing a *mirrored* hat duplicates it unless the owner is told to remove theirs.
 3. **Visitor Chao eats or absorbs your items.** The local record is freed (fruit 0x545DD9;
@@ -397,3 +398,64 @@ Hard:
 | Carried item cat / record / Chao | 0x19F6450 / 0x19F6454 / 0x1A5CA5C |
 | Player held object | `*0x1DE9600 + 0x94` (`+0x98` pending) |
 | Player grab / drop | 0x46E5B0 / 0x46E5E0 |
+
+## 7. The server's share of a garden (design, 2026-10-18)
+
+Goal: nothing in a shared garden belongs to a player who can leave, unless it really is in
+their save. The host's referee (`net/referee.rs`; the dedicated server and a hosting player run
+the same one) keeps it; the dedicated server also keeps it in a file across restarts.
+
+**Trees.** The referee keeps 7 records (`TREE_RECORD` bytes each) per garden.
+- Seeded by the first `GardenTrees` it hears for a garden (the first keeper's own trees, as
+  today), then updated by every later one.
+- It sends its set (`ServerGarden`, every 2 s and to newcomers' first tick) to everyone.
+- The keeper's game, once it has the server's set, runs trees made from it (records the mod
+  owns, like the copies' records) with the tree's own MainSub: they grow and ripen as usual. Its
+  wrapper keeps the game from dropping fruit itself (that would make a save record), and drops
+  ripe fruit (by itself at 1.9, or shaken) the mod's way, *without* a save record. It sends
+  those records as its `GardenTrees`.
+- Everyone else shows copies of the keeper's (or, before the keeper has sent any, the
+  server's). A new keeper starts from the server's set, so a keeper change no longer swaps the
+  trees.
+- Players' own trees stay untouched in their saves; the real ones come back when nobody else is
+  in the garden.
+
+**Toys.** The referee keeps each garden's last toy jump (`ToyMode`) and when. `ServerGarden`
+carries them with their age; a player entering a garden makes its toys jump to modes younger
+than a minute (a TV programme runs 3600 frames), so the newcomer sees what everyone sees.
+
+**Items.** Ownership stays as it is (the owner's game has the real object and reports it; the
+others show copies and claim what they use). New: an item can be *unsaved*, in no one's save:
+fruit from the server's trees, or a copy we hold for the server. Its owner reports it with
+`place | 0x80`.
+- When its owner leaves the garden (their `PlayerState` shows another area) or the lobby, the
+  referee keeps their unsaved items itself: from then on *it* reports them (`ServerItems`, every
+  second, with a fresh id from its own counter so they can't clash with a player's) and they
+  stay where they were.
+- Every game shows a server item as a copy. A claim (picked up, or a Chao took it) is answered as
+  now: the first claimer gets it (`ItemOwner`), adopts it into their save (it's saved now), and
+  reports it; the referee forgets it.
+- Items in a leaver's save (what they brought or picked up and kept) still leave with them. If
+  the server kept them, they'd be in their save *and* in the garden: one item twice. That's why
+  only unsaved items stay.
+- The dedicated server keeps its items in its file too; a player-hosted session keeps them while
+  it runs.
+
+What the server keeps is plain data (records, modes, item kinds and spots), no game code: the
+server needs no game files.
+
+**Fix after the first live test (2026-10-18).** The host saw extra mangoes and egg shells kept by
+the server. Two causes:
+- The item registry isn't packed. Removing an item (0x5307F0) lowers the category count and
+  leaves a hole; registering one (0x530750) takes the first hole. So the first `count` slots
+  (what the game's own walk 0x530470 looks at, and what the server trees' fruit check looked at)
+  can miss the last item. When a tree drop filled a hole, the count went up and a saved fruit
+  further on came into view, looked new, and lost its save record. Those were the host's saved
+  mangoes; their spots are the game's fixed item spots (0x1366260, where the pre-save pass
+  0x52E710 puts items), hence several at one spot. Fix: all 64 slots are compared, by (entry,
+  object), and only a fruit within reach of the tree that dropped it counts (test
+  `only_fruit_made_now_is_new`).
+- An egg's shell is a hat made by the hatch (0x57AFA2, 0x57B1A2, 0x57B416) with a record from the
+  hat list, or none when the list is full (24): the game itself drops those on reload. "No record"
+  isn't "the server's", so only items the mod made unsaved (`items::mark_unsaved`, the server
+  trees' fruit) are reported unsaved now.

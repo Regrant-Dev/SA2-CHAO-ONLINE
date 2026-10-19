@@ -406,7 +406,12 @@ mod rects {
             }
             let original = ORIGINAL.load(Ordering::SeqCst);
             // SAFETY: the function the game called here before we were installed.
-            unsafe { std::mem::transmute::<usize, extern "C" fn() -> f64>(original)() }
+            let result =
+                unsafe { std::mem::transmute::<usize, extern "C" fn() -> f64>(original)() };
+            // The game loop gets here every frame, paused or not (0x433EE0); the Mod Loader's
+            // OnFrame doesn't come while the game is paused.
+            crate::loop_frame();
+            result
         }
 
         unsafe fn fill(queue: &[([i32; 4], u32)]) {

@@ -6,7 +6,10 @@
 //! ```
 //!
 //! With `SA2CO_STATUS=<file>` it keeps a JSON file up to date (every few seconds) with who's
-//! online, where they are and their rooms, for a web page (the Boyz Hub) to show.
+//! online, where they are and their parties, for a web page (the Boyz Hub) to show.
+//!
+//! With `SA2CO_DATA=<folder>` it keeps the shared gardens (their trees and the server's items:
+//! re/chao-garden-items.md 7) in `gardens.txt` there, so they outlive a restart.
 //!
 //! Players join it like any host: F9 > Multiplayer: Join, Host address `<server>:<port>`.
 //! They need the mod version printed at start. Stops cleanly on Ctrl+C / SIGTERM.
@@ -31,6 +34,9 @@ const TICK: Duration = Duration::from_millis(5);
 const STATUS_EVERY: Duration = Duration::from_secs(3);
 /// The shared skins folder is looked at again this often (new or changed skins go out).
 const SKINS_EVERY: Duration = Duration::from_secs(60);
+/// The shared gardens are written (when they changed) this often.
+const GARDENS_EVERY: Duration = Duration::from_secs(10);
+const GARDENS_FILE: &str = "gardens.txt";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -75,6 +81,19 @@ fn main() {
     let mut skins_seen = None;
     let mut last_skins = Instant::now() - SKINS_EVERY;
 
+    // Shared gardens kept across restarts (SA2CO_DATA: a folder, e.g. a mounted volume).
+    let gardens_file = std::env::var("SA2CO_DATA")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join(GARDENS_FILE));
+    if let Some(file) = &gardens_file
+        && let Ok(text) = std::fs::read_to_string(file)
+    {
+        host.load_garden_state(&text);
+        println!("Shared gardens from {}", file.display());
+    }
+    let mut last_gardens = Instant::now();
+
     let status_file = std::env::var("SA2CO_STATUS").ok().filter(|f| !f.is_empty());
     let mut last_status = Instant::now() - STATUS_EVERY;
     let mut names: BTreeMap<u8, String> = BTreeMap::new();
@@ -117,6 +136,12 @@ fn main() {
                 _ => {}
             }
         }
+        if let Some(file) = &gardens_file
+            && last_gardens.elapsed() >= GARDENS_EVERY
+        {
+            last_gardens = Instant::now();
+            save_gardens(&mut host, file);
+        }
         if let Some(file) = &status_file
             && last_status.elapsed() >= STATUS_EVERY
         {
@@ -130,8 +155,22 @@ fn main() {
     if let Some(file) = &status_file {
         let _ = write_status(file, &BTreeMap::new(), &BTreeMap::new());
     }
+    if let Some(file) = &gardens_file {
+        save_gardens(&mut host, file);
+    }
     println!("Stopping: telling {} player(s)", names.len());
     host.shutdown(Instant::now());
+}
+
+/// Writes the shared gardens to `file` if they changed (to a temporary file, then renamed).
+fn save_gardens(host: &mut Host, file: &Path) {
+    let Some(text) = host.garden_state() else {
+        return;
+    };
+    let tmp = file.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file)) {
+        eprintln!("can't write {}: {e}", file.display());
+    }
 }
 
 /// A JSON string literal.

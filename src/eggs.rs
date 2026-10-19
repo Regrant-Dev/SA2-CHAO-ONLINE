@@ -22,14 +22,8 @@ use crate::chao::CHAO_SIZE;
 use crate::game::Vector;
 use crate::net::protocol::Body;
 
-/// Chao-world registry: eggs are category 1.
-const WORLD_COUNTS: usize = 0x01DC_0F80;
-const WORLD: usize = 0x01DC_0FC0;
-const WORLD_ENTRY_SIZE: usize = 0x48;
-const WORLD_CATEGORY_SIZE: usize = 0x1200;
+/// Chao-world registry (registry.rs): eggs are category 1.
 const EGG_CATEGORY: usize = 1;
-const EGG_SLOTS: usize = 16;
-const ENTRY_OBJECT: usize = 0x3C;
 const OBJ_MAIN: usize = 0x10;
 const OBJ_DATA1: usize = 0x34;
 /// Egg Data1: mode, position, its Chao record.
@@ -226,6 +220,8 @@ pub fn on_frame(area: u8, friends: &HashMap<u8, Vector>) -> Vec<Body> {
                     copy.target = at;
                     copy.seen = when;
                 }
+                // Its owner's game idles (still here by their last state): it stays put.
+                Some(_) if crate::garden::paused_here(owner) => {}
                 _ => {
                     gone.push((owner, index));
                     continue;
@@ -274,19 +270,16 @@ fn held_object() -> usize {
 /// Our live egg object whose record is save slot `slot`.
 fn real_egg(slot: usize) -> Option<usize> {
     let record = CHAO_SLOTS + slot * CHAO_SIZE;
-    // SAFETY: the game's static registry; the count is clamped and objects are checked.
-    unsafe {
-        let count = ((WORLD_COUNTS + EGG_CATEGORY * 4) as *const u32).read() as usize;
-        (0..count.min(EGG_SLOTS)).find_map(|i| {
-            let entry = WORLD + EGG_CATEGORY * WORLD_CATEGORY_SIZE + i * WORLD_ENTRY_SIZE;
-            let object = ((entry + ENTRY_OBJECT) as *const usize).read();
-            if object == 0 {
-                return None;
+    crate::registry::entries(EGG_CATEGORY)
+        .into_iter()
+        .map(|(_, object)| object)
+        .find(|&object| {
+            // SAFETY: a registry entry's live object; its Data1 is checked for null.
+            unsafe {
+                let data1 = ((object + OBJ_DATA1) as *const usize).read();
+                data1 != 0 && ((data1 + D_RECORD) as *const usize).read() == record
             }
-            let data1 = ((object + OBJ_DATA1) as *const usize).read();
-            (data1 != 0 && ((data1 + D_RECORD) as *const usize).read() == record).then_some(object)
         })
-    }
 }
 
 fn position(object: usize) -> Vector {

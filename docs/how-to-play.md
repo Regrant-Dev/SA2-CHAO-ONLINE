@@ -22,8 +22,8 @@ Pause the game before typing, since letter keys also move your character.
 | Host address | When joining: the host's or server's address, e.g. `100.101.102.103` |
 | Port | When hosting: the port to use (default 43902) |
 | Name tags | Show names above players |
-| Room | Create, join or leave a room |
-| Mode | Race or Co-op (set by whoever made the room) |
+| Party | Create, join or leave a party |
+| Mode | Race or Co-op (set by whoever made the party) |
 | Go to | Jump to a friend |
 | My Chao | The Chao you race and fight with |
 | Visit friends | Whether your Chao visit friends' gardens |
@@ -65,12 +65,12 @@ You see everyone who's in the same stage or garden as you.
 **Go to:** F9 > Go to, pick a friend. If you're in the same stage or garden you're moved next to
 them. From Stage Select you're taken into their stage.
 
-**Rooms:** one player creates a room in F9 > Room and the others join it. In a room:
+**Parties:** one player creates a party in F9 > Party and the others join it. Parties are for stages, races and Karate; gardens are shared with everyone in them, party or not. In a party:
 
 - Stages wait at the start until everyone there has loaded, then anyone presses **F8** (or
   Start) for a 3-2-1 countdown. This works in story mode too, each on your own save. If the
   others already started before you loaded, your countdown starts by itself.
-- A stage someone picks on Stage Select takes along everyone in the room who's on Stage Select.
+- A stage someone picks on Stage Select takes along everyone in the party who's on Stage Select.
 - **Race mode:** everyone has their own enemies. Your position shows at the top right.
 - **Co-op mode:** enemies, item boxes and other breakable things someone destroys are gone for
   everyone. A ring one of you picks up is gone for both, and you both get it. Keys and
@@ -80,14 +80,16 @@ them. From Stage Select you're taken into their stage.
   Bosses share one health bar: every hit anyone lands counts, and each of you lands your own
   final hit.
 
-**Room battles:** while online, the main menu's 2P button becomes **ROOM BATTLES**:
+**Party battles:** while online, the main menu's 2P button becomes **PARTY BATTLES**:
 
-- **Kart Race:** pick a course and your room races each other, without CPU karts.
+- **Kart Race:** pick a course and your party races each other, without CPU karts.
 - **Treasure Hunt:** pick a Knuckles or Rouge hunting stage. Everyone hunts the same 3 pieces and
   whoever grabs a piece first gets it.
 
-Tabbing out pauses your game like normal SA2 (the others see you stand still); you stay
-connected. Pausing during a room stage doesn't stop it for the others.
+Tabbing out pauses your game like normal SA2: you stay connected and the others see you
+stand still (the garden's keeper passes to someone else meanwhile). The mod sets the Mod
+Loader to Borderless, which looks just like fullscreen. Pausing during a party stage, or in
+Chao World with others around, doesn't stop the game for anyone.
 
 ## Chao
 
@@ -114,10 +116,10 @@ friends' Chao come to you. Visiting eggs show up for everyone (only the owner's 
 
 Set **Visit friends** to Off and your Chao go home within a few seconds.
 
-**Chao Race:** friends' Chao run in the other lanes of your races. In a room, everyone at the
+**Chao Race:** friends' Chao run in the other lanes of your races. In a party, everyone at the
 race entrance races together live.
 
-**Karate** (needs the Battle DLC): in a room, start a karate fight and it becomes a live fight
+**Karate** (needs the Battle DLC): in a party, start a karate fight and it becomes a live fight
 against a friend's Chao. Practice karate lets you fight a copy of a friend's Chao on your own.
 
 Races and karate never change your Chao's save, win or lose.

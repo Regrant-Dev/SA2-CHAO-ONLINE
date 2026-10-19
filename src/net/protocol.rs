@@ -35,6 +35,8 @@ pub const MAX_CHAT: usize = 80;
 const MAX_CHAO_CHANGES: usize = 128;
 /// Stage object records per stage (`SETObjectData[0x600]`, re/stage-objects.md).
 pub const MAX_STAGE_OBJECTS: u16 = 0x600;
+/// A mech locks on to at most this many objects (co2+0x368 < 0x20).
+pub const MAX_LOCK_ON: u8 = 32;
 /// Largest boss HP accepted (bosses use single digits).
 pub const MAX_BOSS_HP: f32 = 1000.0;
 /// Animation frames; real motions are a few hundred frames long.
@@ -49,6 +51,11 @@ pub const SKIN_CHUNK: usize = 1024;
 /// `PlayerState::status` bits.
 pub const STATUS_GROUNDED: u8 = 1;
 pub const STATUS_HOLDING: u8 = 2;
+/// Just hurt: it can't be hurt again for a moment, and blinks meanwhile (EntityData1 +6).
+pub const STATUS_INVULNERABLE: u8 = 4;
+/// Standing still by the game's own speed (CharObj2 +0x64): its puppet's skin stands, whatever
+/// small moves its position makes.
+pub const STATUS_STILL: u8 = 8;
 
 /// Identifies the exact game build (PE TimeDateStamp + SizeOfImage).
 pub type GameBuild = [u8; 8];
@@ -134,6 +141,32 @@ pub enum Body {
     GardenKeeper {
         area: u8,
         term: u32,
+    },
+    /// Shared garden: sounds and jingles the sender's game just played for Chao it runs, for
+    /// the others' copies of them to play too.
+    ChaoSounds {
+        sounds: Vec<ChaoSound>,
+    },
+    /// From the host's referee: shared garden `area` as the server keeps it: its 7 tree records
+    /// and each toy's last mode with its age in seconds (`TOY_TV`, `TOY_RADIO`, `TOY_BOX`).
+    /// Every couple of seconds (re/chao-garden-items.md 7).
+    ServerGarden {
+        area: u8,
+        trees: [[u8; TREE_RECORD]; TREE_SLOTS],
+        toys: [(u8, u16); 3],
+    },
+    /// From the host's referee: items in garden `area` that are the server's (their owner left;
+    /// they were in no one's save). Every second; claimed like anyone's.
+    ServerItems {
+        area: u8,
+        items: Vec<GardenItem>,
+    },
+    /// The sender carries this Chao around Chao World outside the gardens (lobby, kindergarten,
+    /// entrances), `offset` from them in their frame; `None`: not any more. On a change and
+    /// every second or so while carrying.
+    CarriedChao {
+        chao: Option<Box<ChaoData>>,
+        offset: [f32; 3],
     },
     /// Shared garden: the sender's interaction changed `owner`'s visiting Chao `index`
     /// (`chao::changes::diff` output) for the owner to apply to the real one.
@@ -346,6 +379,116 @@ pub enum Body {
         offset: u32,
         data: Vec<u8>,
     },
+    /// Co-op room: rings of ring lines and circles collected in this stage: (the group's SET
+    /// record index, which ring 0..8). New ones as they're collected; all of them when a room
+    /// player enters the stage.
+    StageRings {
+        level: i16,
+        mission: u8,
+        rings: Vec<(u16, u8)>,
+    },
+    /// Co-op room: the sender's mech lock-on: its gun, the stage objects it has locked on to now
+    /// (SET record, where it aims) and those it just fired its lasers at. The others draw the
+    /// cursors and lasers (only drawn: what the lasers destroy comes as `StageKills`).
+    LockOn {
+        level: i16,
+        mission: u8,
+        gun: [f32; 3],
+        locked: Vec<(u16, [f32; 3])>,
+        fired: Vec<(u16, [f32; 3])>,
+    },
+    /// Co-op room: the sender is fighting this stage's boss; with `term` > 0 its game leads the
+    /// boss (boss_follow.rs: the others' bosses follow it), 0 just says it's there.
+    BossClaim {
+        level: i16,
+        mission: u8,
+        term: u32,
+    },
+    /// Co-op room: the leader's boss as it is now: its Data1 mode bytes, flags and timer, where
+    /// it is and faces, and its motion.
+    BossState(BossState),
+    /// Co-op room: the sender hit its (following) boss; the leader's boss flinches for it.
+    BossHit {
+        level: i16,
+        mission: u8,
+    },
+    /// Co-op party: the leading boss's attacks in flight (missiles, energy-gun beams, bombs and
+    /// pillars, smoke, flames): the others draw the ones aimed at someone else.
+    BossAttacks {
+        level: i16,
+        mission: u8,
+        attacks: Vec<BossAttack>,
+    },
+    /// Co-op party: stage enemies the sender's game runs (it's the nearest player) that another
+    /// player is near too: where each is and faces, and how far the sender is from it. The
+    /// others' copies follow (enemies.rs).
+    EnemyStates {
+        level: i16,
+        mission: u8,
+        enemies: Vec<EnemyState>,
+    },
+    /// Co-op party: the sender picked up upgrade `index` (its flag in the save), for
+    /// `character`, which gave that character's CharObj2 the bits `mask`. Everyone gets it.
+    UpgradeGot {
+        level: i16,
+        mission: u8,
+        index: u8,
+        character: u8,
+        mask: u32,
+    },
+}
+
+/// At most this many enemies in one `EnemyStates`.
+pub const MAX_ENEMY_STATES: usize = 32;
+
+/// One enemy as its owner's game has it (`Body::EnemyStates`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EnemyState {
+    /// Its SET record.
+    pub record: u16,
+    pub position: [f32; 3],
+    pub rotation: [i32; 3],
+    /// How far the owner's player is from it (who's nearest owns it).
+    pub distance: f32,
+}
+
+/// Bytes of an attack's Data1 sent (`Body::BossAttacks`): everything its display reads, up to
+/// its collision pointer (+0x2C).
+pub const BOSS_ATTACK_DATA: usize = 0x2C;
+/// At most this many attacks in one `BossAttacks`.
+pub const MAX_BOSS_ATTACKS: usize = 24;
+
+/// One of a leading boss's attacks in flight.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BossAttack {
+    /// The leader's number for it while it flies.
+    pub serial: u16,
+    /// Which attack (boss_follow.rs `ATTACKS`).
+    pub kind: u8,
+    /// The player it was fired at.
+    pub target: u8,
+    /// Its Data1.
+    pub data: [u8; BOSS_ATTACK_DATA],
+}
+
+/// A leading boss (`Body::BossState`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BossState {
+    pub level: i16,
+    pub mission: u8,
+    /// Data1 +0 mode, +1 sub-mode, +3 counter.
+    pub mode: u8,
+    pub sub: u8,
+    pub counter: u8,
+    /// Data1 +4 flags, +6 timer.
+    pub flags: u16,
+    pub timer: u16,
+    pub position: [f32; 3],
+    pub rotation: [i32; 3],
+    /// Its motion controller's motion now.
+    pub motion: u16,
+    /// The player it's after (turns to, aims and fires at).
+    pub target: u8,
 }
 
 /// A short signature of a treasure hunt's 3 pieces (kind, id): claims name the hunt they're for.
@@ -390,7 +533,34 @@ pub struct GardenChao {
     pub drum: u8,
     /// In a cocoon: 0 none, else 1 + its kind (0..=2, `MayuObjectList`).
     pub cocoon: u8,
+    /// The picture book in front of it: 0 none, else 1 + the book's mode (0..=3: opening,
+    /// open, turning a page, page turning).
+    pub book: u8,
+    /// From its owner: their game runs it now (it's evolving, or its life is ending), so
+    /// everyone follows the owner's, not the keeper's.
+    pub owner_runs: bool,
 }
+
+/// A sound a Chao made (`Body::ChaoSounds`): player `owner`'s visiting Chao `index`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChaoSound {
+    pub owner: u8,
+    pub index: u8,
+    /// `SOUND_AT` or `SOUND_HELD` (the game's two sound-at-a-place calls, `id` a sound id),
+    /// or `SOUND_JINGLE` (`id` an index into `garden::JINGLES`).
+    pub call: u8,
+    pub id: u16,
+    /// Where, from the Chao, in world axes.
+    pub offset: [f32; 3],
+    /// The call's own three arguments as the game passed them.
+    pub args: [i16; 3],
+}
+
+pub const SOUND_AT: u8 = 0;
+pub const SOUND_HELD: u8 = 1;
+pub const SOUND_JINGLE: u8 = 2;
+/// Sounds in one `ChaoSounds`.
+pub const MAX_CHAO_SOUNDS: usize = 16;
 
 /// Entries in `garden::PROPS` (`GardenChao::props` values go up to this).
 pub const MAX_CHAO_PROP: u8 = 20;
@@ -411,9 +581,10 @@ pub enum ItemPlace {
     Ground,
     /// In its owner's hands: `position` is the offset from them, in their frame.
     Player,
-    /// Held or being eaten by the owner's visiting Chao `n` (`Body::Chao` index): offset from
-    /// it, in its frame.
-    Chao(u8),
+    /// Held or being eaten by player `owner`'s visiting Chao `index` (`Body::Chao` index):
+    /// offset from it, in its frame. The Chao is the item owner's own, or one their game runs
+    /// as the garden's keeper (keeper.rs).
+    Chao { owner: u8, index: u8 },
     /// In use where others can't see it (one of the owner's other Chao has it): `position` is
     /// where it is. Not claimable, like the others.
     Busy,
@@ -431,6 +602,9 @@ pub struct GardenItem {
     pub bites: u8,
     pub place: ItemPlace,
     pub position: [f32; 3],
+    /// In no one's save (fruit from the server's trees, or the server's own item): when its
+    /// owner leaves the garden, the server keeps it (re/chao-garden-items.md 7).
+    pub unsaved: bool,
 }
 
 impl GardenItem {
@@ -587,6 +761,88 @@ mod tag {
     pub const EGG_HELD: u8 = 39;
     pub const TOY_MODE: u8 = 40;
     pub const GARDEN_KEEPER: u8 = 41;
+    pub const CHAO_SOUNDS: u8 = 42;
+    pub const SERVER_GARDEN: u8 = 43;
+    pub const SERVER_ITEMS: u8 = 44;
+    pub const CARRIED_CHAO: u8 = 45;
+    // 46..=49 are left for the garden.
+    pub const STAGE_RINGS: u8 = 50;
+    pub const LOCK_ON: u8 = 51;
+    pub const BOSS_CLAIM: u8 = 52;
+    pub const BOSS_STATE: u8 = 53;
+    pub const BOSS_HIT: u8 = 54;
+    // 43..=49 are the garden's.
+    pub const BOSS_ATTACKS: u8 = 55;
+    pub const ENEMY_STATES: u8 = 56;
+    pub const UPGRADE_GOT: u8 = 57;
+}
+
+/// Garden items as `GardenItems` and `ServerItems` carry them.
+fn write_items(w: &mut Writer, items: &[GardenItem]) {
+    w.u8(items.len() as u8);
+    for i in items {
+        let (place, chao) = match i.place {
+            ItemPlace::Ground => (0, 0),
+            ItemPlace::Player => (1, 0),
+            // Both in one byte: index (< 4) low, owner (< 8) high.
+            ItemPlace::Chao { owner, index } => (2, owner << 4 | index),
+            ItemPlace::Busy => (3, 0),
+        };
+        w.u8(i.id.origin)
+            .u16(i.id.serial)
+            .u8(i.category)
+            .u8(i.kind)
+            .u8(i.bites)
+            .u8(place | if i.unsaved { UNSAVED } else { 0 })
+            .u8(chao);
+        for v in i.position {
+            w.f32(v);
+        }
+    }
+}
+
+/// The place byte's flag for `GardenItem::unsaved`.
+const UNSAVED: u8 = 0x80;
+
+fn read_items(r: &mut Reader, area: u8) -> Result<Vec<GardenItem>> {
+    let count = usize::from(r.u8()?);
+    if !(1..=3).contains(&area) || count > MAX_GARDEN_ITEMS {
+        return Err(WireError::BadValue("garden items"));
+    }
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = item_id(r)?;
+        let (category, kind, bites) = (r.u8()?, r.u8()?, r.u8()?);
+        let (place, chao) = (r.u8()?, r.u8()?);
+        let unsaved = place & UNSAVED != 0;
+        let place = match (place & !UNSAVED, chao) {
+            (0, _) => ItemPlace::Ground,
+            (1, _) => ItemPlace::Player,
+            (2, n)
+                if usize::from(n & 0xF) < MAX_CARRIED_CHAO && usize::from(n >> 4) < MAX_PLAYERS =>
+            {
+                ItemPlace::Chao {
+                    owner: n >> 4,
+                    index: n & 0xF,
+                }
+            }
+            (3, _) => ItemPlace::Busy,
+            _ => return Err(WireError::BadValue("item place")),
+        };
+        if !matches!(category, 2 | 3 | 7 | 9) || bites > 4 {
+            return Err(WireError::BadValue("garden item"));
+        }
+        items.push(GardenItem {
+            id,
+            category,
+            kind,
+            bites,
+            place,
+            position: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+            unsaved,
+        });
+    }
+    Ok(items)
 }
 
 fn item_id(r: &mut Reader) -> Result<ItemId> {
@@ -772,6 +1028,18 @@ impl Body {
             Self::GardenKeeper { area, term } => {
                 w.u8(tag::GARDEN_KEEPER).u8(*area).u32(*term);
             }
+            Self::ChaoSounds { sounds } => {
+                w.u8(tag::CHAO_SOUNDS).u8(sounds.len() as u8);
+                for s in sounds {
+                    w.u8(s.owner).u8(s.index).u8(s.call).u16(s.id);
+                    for v in s.offset {
+                        w.f32(v);
+                    }
+                    for a in s.args {
+                        w.i16(a);
+                    }
+                }
+            }
             Self::GardenChao { owner, list } => {
                 w.u8(tag::GARDEN_CHAO).u8(*owner).u8(list.len() as u8);
                 for c in list {
@@ -791,7 +1059,10 @@ impl Body {
                     for p in c.props {
                         w.u8(p);
                     }
-                    w.u8(c.drum).u8(c.cocoon);
+                    w.u8(c.drum)
+                        .u8(c.cocoon)
+                        .u8(c.book)
+                        .u8(u8::from(c.owner_runs));
                 }
             }
             Self::ChaoChanges {
@@ -818,24 +1089,30 @@ impl Body {
                 }
             }
             Self::GardenItems { area, items } => {
-                w.u8(tag::GARDEN_ITEMS).u8(*area).u8(items.len() as u8);
-                for i in items {
-                    let (place, chao) = match i.place {
-                        ItemPlace::Ground => (0, 0),
-                        ItemPlace::Player => (1, 0),
-                        ItemPlace::Chao(n) => (2, n),
-                        ItemPlace::Busy => (3, 0),
-                    };
-                    w.u8(i.id.origin)
-                        .u16(i.id.serial)
-                        .u8(i.category)
-                        .u8(i.kind)
-                        .u8(i.bites)
-                        .u8(place)
-                        .u8(chao);
-                    for v in i.position {
-                        w.f32(v);
-                    }
+                w.u8(tag::GARDEN_ITEMS).u8(*area);
+                write_items(w, items);
+            }
+            Self::ServerItems { area, items } => {
+                w.u8(tag::SERVER_ITEMS).u8(*area);
+                write_items(w, items);
+            }
+            Self::CarriedChao { chao, offset } => {
+                w.u8(tag::CARRIED_CHAO);
+                for v in offset {
+                    w.f32(*v);
+                }
+                match chao {
+                    Some(chao) => w.u8(1).bytes(&chao.bytes),
+                    None => w.u8(0),
+                };
+            }
+            Self::ServerGarden { area, trees, toys } => {
+                w.u8(tag::SERVER_GARDEN).u8(*area);
+                for b in trees.iter().flatten() {
+                    w.u8(*b);
+                }
+                for (mode, age) in toys {
+                    w.u8(*mode).u16(*age);
                 }
             }
             Self::Chat { text } => {
@@ -1072,6 +1349,114 @@ impl Body {
                     .f32(*hp)
                     .f32(*full);
             }
+            Self::StageRings {
+                level,
+                mission,
+                rings,
+            } => {
+                w.u8(tag::STAGE_RINGS)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u16(rings.len() as u16);
+                for (record, ring) in rings {
+                    w.u16(*record).u8(*ring);
+                }
+            }
+            Self::LockOn {
+                level,
+                mission,
+                gun,
+                locked,
+                fired,
+            } => {
+                w.u8(tag::LOCK_ON).i16(*level).u8(*mission);
+                for v in gun {
+                    w.f32(*v);
+                }
+                for list in [locked, fired] {
+                    w.u8(list.len() as u8);
+                    for (record, at) in list {
+                        w.u16(*record);
+                        for v in at {
+                            w.f32(*v);
+                        }
+                    }
+                }
+            }
+            Self::BossClaim {
+                level,
+                mission,
+                term,
+            } => {
+                w.u8(tag::BOSS_CLAIM).i16(*level).u8(*mission).u32(*term);
+            }
+            Self::BossState(b) => {
+                w.u8(tag::BOSS_STATE)
+                    .i16(b.level)
+                    .u8(b.mission)
+                    .u8(b.mode)
+                    .u8(b.sub)
+                    .u8(b.counter)
+                    .u16(b.flags)
+                    .u16(b.timer);
+                for v in b.position {
+                    w.f32(v);
+                }
+                for v in b.rotation {
+                    w.i32(v);
+                }
+                w.u16(b.motion).u8(b.target);
+            }
+            Self::BossHit { level, mission } => {
+                w.u8(tag::BOSS_HIT).i16(*level).u8(*mission);
+            }
+            Self::BossAttacks {
+                level,
+                mission,
+                attacks,
+            } => {
+                w.u8(tag::BOSS_ATTACKS)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u8(attacks.len() as u8);
+                for a in attacks {
+                    w.u16(a.serial).u8(a.kind).u8(a.target).bytes(&a.data);
+                }
+            }
+            Self::UpgradeGot {
+                level,
+                mission,
+                index,
+                character,
+                mask,
+            } => {
+                w.u8(tag::UPGRADE_GOT)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u8(*index)
+                    .u8(*character)
+                    .u32(*mask);
+            }
+            Self::EnemyStates {
+                level,
+                mission,
+                enemies,
+            } => {
+                w.u8(tag::ENEMY_STATES)
+                    .i16(*level)
+                    .u8(*mission)
+                    .u8(enemies.len() as u8);
+                for e in enemies {
+                    w.u16(e.record);
+                    for v in e.position {
+                        w.f32(v);
+                    }
+                    for v in e.rotation {
+                        w.i32(v);
+                    }
+                    w.f32(e.distance);
+                }
+            }
             Self::SkinWorn { skin } => {
                 w.u8(tag::SKIN_WORN).str(skin);
             }
@@ -1191,6 +1576,28 @@ impl Body {
                 }
                 Self::GardenKeeper { area, term }
             }
+            tag::CHAO_SOUNDS => {
+                let count = usize::from(r.u8()?);
+                if count > MAX_CHAO_SOUNDS {
+                    return Err(WireError::BadValue("chao sounds"));
+                }
+                let mut sounds = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (owner, index, call, id) = (player_id(r)?, r.u8()?, r.u8()?, r.u16()?);
+                    if usize::from(index) >= MAX_CARRIED_CHAO || call > SOUND_JINGLE {
+                        return Err(WireError::BadValue("chao sound"));
+                    }
+                    sounds.push(ChaoSound {
+                        owner,
+                        index,
+                        call,
+                        id,
+                        offset: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                        args: [r.i16()?, r.i16()?, r.i16()?],
+                    });
+                }
+                Self::ChaoSounds { sounds }
+            }
             tag::GARDEN_CHAO => {
                 let owner = player_id(r)?;
                 let count = usize::from(r.u8()?);
@@ -1215,9 +1622,12 @@ impl Body {
                     if props.iter().any(|&p| p > MAX_CHAO_PROP) {
                         return Err(WireError::BadValue("garden chao prop"));
                     }
-                    let (drum, cocoon) = (r.u8()?, r.u8()?);
+                    let (drum, cocoon, book, owner_runs) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
                     if cocoon > 3 {
                         return Err(WireError::BadValue("garden chao cocoon"));
+                    }
+                    if book > 4 || owner_runs > 1 {
+                        return Err(WireError::BadValue("garden chao book"));
                     }
                     list.push(GardenChao {
                         index,
@@ -1232,6 +1642,8 @@ impl Body {
                         props,
                         drum,
                         cocoon,
+                        book,
+                        owner_runs: owner_runs == 1,
                     });
                 }
                 Self::GardenChao { owner, list }
@@ -1268,34 +1680,51 @@ impl Body {
                 }
             }
             tag::GARDEN_ITEMS => {
-                let (area, count) = (r.u8()?, usize::from(r.u8()?));
-                if !(1..=3).contains(&area) || count > MAX_GARDEN_ITEMS {
-                    return Err(WireError::BadValue("garden items"));
+                let area = r.u8()?;
+                Self::GardenItems {
+                    area,
+                    items: read_items(r, area)?,
                 }
-                let mut items = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let id = item_id(r)?;
-                    let (category, kind, bites) = (r.u8()?, r.u8()?, r.u8()?);
-                    let place = match (r.u8()?, r.u8()?) {
-                        (0, _) => ItemPlace::Ground,
-                        (1, _) => ItemPlace::Player,
-                        (2, n) if usize::from(n) < MAX_CARRIED_CHAO => ItemPlace::Chao(n),
-                        (3, _) => ItemPlace::Busy,
-                        _ => return Err(WireError::BadValue("item place")),
-                    };
-                    if !matches!(category, 2 | 3 | 7 | 9) || bites > 4 {
-                        return Err(WireError::BadValue("garden item"));
+            }
+            tag::SERVER_ITEMS => {
+                let area = r.u8()?;
+                Self::ServerItems {
+                    area,
+                    items: read_items(r, area)?,
+                }
+            }
+            tag::CARRIED_CHAO => {
+                let offset = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                let chao = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let chao =
+                            ChaoData::from_bytes(r.take(CHAO_SIZE)?).ok_or(WireError::Truncated)?;
+                        chao.validate()
+                            .map_err(|_| WireError::BadValue("carried chao"))?;
+                        Some(Box::new(chao))
                     }
-                    items.push(GardenItem {
-                        id,
-                        category,
-                        kind,
-                        bites,
-                        place,
-                        position: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
-                    });
+                    _ => return Err(WireError::BadValue("carried chao")),
+                };
+                Self::CarriedChao { chao, offset }
+            }
+            tag::SERVER_GARDEN => {
+                let area = r.u8()?;
+                if !(1..=3).contains(&area) {
+                    return Err(WireError::BadValue("server garden"));
                 }
-                Self::GardenItems { area, items }
+                let mut trees = [[0u8; TREE_RECORD]; TREE_SLOTS];
+                for b in trees.iter_mut().flatten() {
+                    *b = r.u8()?;
+                }
+                let mut toys = [(0u8, 0u16); 3];
+                for t in &mut toys {
+                    *t = (r.u8()?, r.u16()?);
+                    if t.0 > TOY_MAX_MODE {
+                        return Err(WireError::BadValue("server garden toy"));
+                    }
+                }
+                Self::ServerGarden { area, trees, toys }
             }
             tag::ITEM_CLAIM => Self::ItemClaim { id: item_id(r)? },
             tag::RACE_STATUS => {
@@ -1577,6 +2006,155 @@ impl Body {
                     full,
                 }
             }
+            tag::STAGE_RINGS => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                let count = r.u16()?;
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || count > MAX_STAGE_OBJECTS {
+                    return Err(WireError::BadValue("stage rings"));
+                }
+                let rings = (0..count)
+                    .map(|_| {
+                        let (record, ring) = (r.u16()?, r.u8()?);
+                        if record < MAX_STAGE_OBJECTS && ring < 8 {
+                            Ok((record, ring))
+                        } else {
+                            Err(WireError::BadValue("stage ring"))
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::StageRings {
+                    level,
+                    mission,
+                    rings,
+                }
+            }
+            tag::LOCK_ON => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 {
+                    return Err(WireError::BadValue("lock-on"));
+                }
+                let gun = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                let mut list = || {
+                    let count = r.u8()?;
+                    if count > MAX_LOCK_ON {
+                        return Err(WireError::BadValue("lock-on count"));
+                    }
+                    (0..count)
+                        .map(|_| {
+                            let record = r.u16()?;
+                            let at = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+                            if record < MAX_STAGE_OBJECTS {
+                                Ok((record, at))
+                            } else {
+                                Err(WireError::BadValue("lock-on record"))
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()
+                };
+                let locked = list()?;
+                let fired = list()?;
+                Self::LockOn {
+                    level,
+                    mission,
+                    gun,
+                    locked,
+                    fired,
+                }
+            }
+            tag::BOSS_CLAIM | tag::BOSS_HIT => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 {
+                    return Err(WireError::BadValue("boss"));
+                }
+                if t == tag::BOSS_CLAIM {
+                    Self::BossClaim {
+                        level,
+                        mission,
+                        term: r.u32()?,
+                    }
+                } else {
+                    Self::BossHit { level, mission }
+                }
+            }
+            tag::BOSS_ATTACKS => {
+                let (level, mission, count) = (r.i16()?, r.u8()?, usize::from(r.u8()?));
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || count > MAX_BOSS_ATTACKS {
+                    return Err(WireError::BadValue("boss attacks"));
+                }
+                let attacks = (0..count)
+                    .map(|_| {
+                        Ok(BossAttack {
+                            serial: r.u16()?,
+                            kind: r.u8()?,
+                            target: player_id(r)?,
+                            data: r.take(BOSS_ATTACK_DATA)?.try_into().unwrap(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::BossAttacks {
+                    level,
+                    mission,
+                    attacks,
+                }
+            }
+            tag::UPGRADE_GOT => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                let (index, character, mask) = (r.u8()?, r.u8()?, r.u32()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || index >= 0x1E {
+                    return Err(WireError::BadValue("upgrade"));
+                }
+                Self::UpgradeGot {
+                    level,
+                    mission,
+                    index,
+                    character,
+                    mask,
+                }
+            }
+            tag::ENEMY_STATES => {
+                let (level, mission, count) = (r.i16()?, r.u8()?, usize::from(r.u8()?));
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 || count > MAX_ENEMY_STATES {
+                    return Err(WireError::BadValue("enemy states"));
+                }
+                let enemies = (0..count)
+                    .map(|_| {
+                        let record = r.u16()?;
+                        if record >= MAX_STAGE_OBJECTS {
+                            return Err(WireError::BadValue("enemy record"));
+                        }
+                        Ok(EnemyState {
+                            record,
+                            position: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                            rotation: [r.i32()?, r.i32()?, r.i32()?],
+                            distance: r.f32(MAX_COORD)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::EnemyStates {
+                    level,
+                    mission,
+                    enemies,
+                }
+            }
+            tag::BOSS_STATE => {
+                let (level, mission) = (r.i16()?, r.u8()?);
+                if !(0..=MAX_LEVEL).contains(&level) || mission > 4 {
+                    return Err(WireError::BadValue("boss state"));
+                }
+                Self::BossState(BossState {
+                    level,
+                    mission,
+                    mode: r.u8()?,
+                    sub: r.u8()?,
+                    counter: r.u8()?,
+                    flags: r.u16()?,
+                    timer: r.u16()?,
+                    position: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                    rotation: [r.i32()?, r.i32()?, r.i32()?],
+                    motion: r.u16()?,
+                    target: player_id(r)?,
+                })
+            }
             tag::SKIN_WORN => {
                 let skin = r.str(MAX_SKIN_ID)?;
                 if !skin.is_empty() && !skin_id_ok(&skin) {
@@ -1718,6 +2296,8 @@ mod tests {
                             props: [5, 0, 20],
                             drum: 200,
                             cocoon: 2,
+                            book: 3,
+                            owner_runs: true,
                         },
                         GardenChao::default(),
                     ],
@@ -1754,6 +2334,7 @@ mod tests {
                             bites: 4,
                             place: ItemPlace::Player,
                             position: [0.0, 5.0, 3.0],
+                            unsaved: false,
                         },
                         GardenItem {
                             id: ItemId {
@@ -1763,8 +2344,9 @@ mod tests {
                             category: 2,
                             kind: 0x16,
                             bites: 0,
-                            place: ItemPlace::Chao(1),
+                            place: ItemPlace::Chao { owner: 3, index: 1 },
                             position: [0.0, 1.5, 1.0],
+                            unsaved: false,
                         },
                         GardenItem {
                             id: ItemId {
@@ -1776,6 +2358,7 @@ mod tests {
                             bites: 0,
                             place: ItemPlace::Ground,
                             position: [10.0, 0.5, -40.0],
+                            unsaved: false,
                         },
                     ],
                 },
@@ -1952,6 +2535,59 @@ mod tests {
                 body: Body::GardenKeeper { area: 3, term: 7 },
             },
             Message::Game {
+                from: 0,
+                body: Body::ServerGarden {
+                    area: 2,
+                    trees: [[1, 2, 3, 4, 5, 6, 7, 8]; TREE_SLOTS],
+                    toys: [(3, 12), (0, u16::MAX), (1, 0)],
+                },
+            },
+            Message::Game {
+                from: 0,
+                body: Body::ServerItems {
+                    area: 3,
+                    items: vec![GardenItem {
+                        id: ItemId {
+                            origin: 4,
+                            serial: 0xF001,
+                        },
+                        category: 3,
+                        kind: 1,
+                        bites: 2,
+                        position: [5.0, 0.5, -7.0],
+                        unsaved: true,
+                        ..GardenItem::default()
+                    }],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::CarriedChao {
+                    chao: None,
+                    offset: [0.0, 4.0, 1.2],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::ChaoSounds {
+                    sounds: vec![
+                        ChaoSound {
+                            owner: 2,
+                            index: 3,
+                            call: SOUND_HELD,
+                            id: 0x101C,
+                            offset: [0.0, 1.5, -0.5],
+                            args: [1, -5, 60],
+                        },
+                        ChaoSound {
+                            call: SOUND_JINGLE,
+                            id: 4,
+                            ..ChaoSound::default()
+                        },
+                    ],
+                },
+            },
+            Message::Game {
                 from: 2,
                 body: Body::ToyMode {
                     area: 2,
@@ -1984,6 +2620,91 @@ mod tests {
                     mission: 0,
                     hp: 2.5,
                     full: 8.0,
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::StageRings {
+                    level: 13,
+                    mission: 0,
+                    rings: vec![(4, 0), (4, 7), (0x5FF, 3)],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::LockOn {
+                    level: 14,
+                    mission: 1,
+                    gun: [1.0, 2.5, -3.0],
+                    locked: vec![(9, [10.0, 0.0, 5.0])],
+                    fired: vec![(3, [-1.0, 8.0, 2.0]), (0x5FF, [0.0, 0.0, 0.0])],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::BossClaim {
+                    level: 61,
+                    mission: 0,
+                    term: 3,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::BossState(BossState {
+                    level: 60,
+                    mission: 0,
+                    mode: 5,
+                    sub: 2,
+                    counter: 1,
+                    flags: 0x11,
+                    timer: 300,
+                    position: [10.0, -2.0, 300.5],
+                    rotation: [0, 0x4000, -1],
+                    motion: 3,
+                    target: 2,
+                }),
+            },
+            Message::Game {
+                from: 4,
+                body: Body::BossHit {
+                    level: 61,
+                    mission: 0,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::BossAttacks {
+                    level: 60,
+                    mission: 0,
+                    attacks: vec![BossAttack {
+                        serial: 7,
+                        kind: 2,
+                        target: 3,
+                        data: [5; BOSS_ATTACK_DATA],
+                    }],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::EnemyStates {
+                    level: 14,
+                    mission: 0,
+                    enemies: vec![EnemyState {
+                        record: 40,
+                        position: [1.0, 2.0, 3.0],
+                        rotation: [0, 0x2000, 0],
+                        distance: 55.5,
+                    }],
+                },
+            },
+            Message::Game {
+                from: 3,
+                body: Body::UpgradeGot {
+                    level: 3,
+                    mission: 0,
+                    index: 4,
+                    character: 0,
+                    mask: 0x40,
                 },
             },
             Message::Game {

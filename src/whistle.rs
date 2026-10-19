@@ -27,12 +27,6 @@ const ACTION_WHISTLE: u8 = 42;
 /// The whistle's reach (0x5637B0: squared distance under 10000).
 const REACH: f32 = 100.0;
 
-/// Chao-world registry: Chao are category 0.
-const WORLD_COUNTS: usize = 0x01DC_0F80;
-const WORLD: usize = 0x01DC_0FC0;
-const WORLD_ENTRY_SIZE: usize = 0x48;
-const WORLD_CHAO_MAX: usize = 32;
-const ENTRY_OBJECT: usize = 0x3C;
 const OBJ_MAIN: usize = 0x10;
 const OBJ_DATA1: usize = 0x34;
 const D_POSITION: usize = 0x14;
@@ -140,15 +134,9 @@ pub fn on_frame(friends: &[(u8, Vector, u8)]) {
 /// Our own Chao in the garden (live, running their own MainSub or ours): (object, position).
 fn our_chao() -> Vec<(usize, Vector)> {
     let mut out = Vec::new();
-    // SAFETY: the game's static registry; the count is clamped and objects are checked.
+    // SAFETY: registry entries' live objects; Data1 is checked for null.
     unsafe {
-        let count = (WORLD_COUNTS as *const u32).read() as usize;
-        for i in 0..count.min(WORLD_CHAO_MAX) {
-            let entry = WORLD + i * WORLD_ENTRY_SIZE;
-            let object = ((entry + ENTRY_OBJECT) as *const usize).read();
-            if object == 0 {
-                continue;
-            }
+        for (_, object) in crate::registry::entries(crate::registry::CHAO) {
             let main = ((object + OBJ_MAIN) as *const usize).read();
             let data1 = ((object + OBJ_DATA1) as *const usize).read();
             if data1 != 0 && (main == CHAO_MAIN || main == called_main as *const () as usize) {

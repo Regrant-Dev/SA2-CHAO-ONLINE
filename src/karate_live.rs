@@ -448,7 +448,7 @@ pub fn on_frame(
                 }
                 _ => hud::toast("Live karate: waiting for your opponent's Chao (normal fight)"),
             },
-            _ => hud::toast("Room: nobody free in your room is at Karate (normal fight)"),
+            _ => hud::toast("Party: nobody free in your party is at Karate (normal fight)"),
         }
     }
 

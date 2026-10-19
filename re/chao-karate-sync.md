@@ -340,3 +340,18 @@ Confidence:
   gives lockstep if every `rand` consumer runs identically on both machines. Effects, other
   objects and frame drops make that fragile. So it is **only a fallback**. The streamed
   pos/HP plus forced end above is the reliable path.
+
+## 6. Gaps (audit 2026-10-18)
+
+Live karate already streams both fighters (position, rotation, HP, morale, motion) and the clock
+from the leader; the follower's fighters are puppets (action 8). Left:
+- Sounds: fighter voices and hits are played by the fighter actions (0x437260, ESI = id, 3 cdecl
+  arguments, e.g. 0x5772A2, 0x577741, 0x5787C8) in the leader's game only, so the follower's fight
+  is quieter. The same calls in 0x579xxx (around the fighter code) couldn't be told apart from ones
+  that run in both games (menus, announcer), so they aren't redirected: sending them would play
+  some twice. Left as is.
+- Hit sparks and the drummer (KarateDrummerMgrExec 0x575551): not traced in this pass; check
+  in game whether the follower shows them.
+- Non-live karate (a friend's Chao as the CPU opponent, karate.rs) is each player's own fight by
+  design.
+

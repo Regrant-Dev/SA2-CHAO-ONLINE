@@ -23,19 +23,18 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::chao::{self, CHAO_SIZE, ChaoData};
 use crate::game::{self, Vector};
 use crate::log;
-use crate::net::protocol::GardenChao;
+use crate::net::protocol::{ChaoSound, GardenChao, SOUND_AT, SOUND_HELD, SOUND_JINGLE};
 
 /// Chao-world object registry: 0x48-byte entries, 0x1200 bytes per category; an entry's record
 /// pointer is at +8 and its ObjectMaster at +0x3C (objects point back to their entry at +0x3C).
 const WORLD: usize = 0x01DC_0FC0;
-const WORLD_ENTRY_SIZE: usize = 0x48;
 const WORLD_CATEGORY_SIZE: usize = 0x1200;
-const WORLD_CHAO_MAX: usize = 32;
 /// Item categories a Chao takes from the player: animals and drives, fruit, hats.
 const ITEM_CATEGORIES: [usize; 3] = [2, 3, 9];
 const CHAO_SLOTS: usize = 0x019F_6EC4;
@@ -125,12 +124,48 @@ const BUSY_NEAR: f32 = 6.0;
 /// The keeper sends what its visitors' AI changed this often (frames).
 const KEPT_CHANGES_EVERY: u32 = 30;
 /// Record: lifespan left (u16). At 0 the Chao's end of life starts (0x562A20 starts 0x568F60,
-/// then death or reincarnation as an egg made from its own record, 0x568570); a visitor the
-/// keeper runs is kept above it, so that only ever happens in its owner's game.
+/// then death or reincarnation as an egg made from its own record, 0x568570); a visitor copy is
+/// kept above it (`hold_life`), so that only ever happens in its owner's game.
 const C_LIFESPAN: usize = 0x8A;
+/// Record: type (2 = child) and evolution progress (f32). A child past 1.0 starts evolving when
+/// its AI next picks what to do (0x562800 starts the cocoon 0x568D30); a visitor copy is kept
+/// just under it, so a Chao evolves only in its owner's game.
+const C_TYPE: usize = 0x80;
+const TYPE_CHILD: u8 = 2;
+const C_EVOLUTION: usize = 0xC0;
+const EVOLVE_HELD: f32 = 0.99;
+/// The Chao's behaviour stack (Data1+0x438 index into the functions at +0x43C) and the life
+/// events (the reactions check 0x53DB10 leaves them alone): evolving (0x568D30, the cocoon
+/// behaviour 0x562800 starts) and its life ending (0x568F60, which 0x562A20 starts).
+const D_BEHAVIOUR_INDEX: usize = 0x438;
+const D_BEHAVIOURS: usize = 0x43C;
+const BEHAVIOUR_SLOTS: usize = 16;
+const LIFE_EVENTS: [usize; 2] = [0x0056_8D30, 0x0056_8F60];
+/// While a friend keeps the garden, our Chao due a life event runs in our game, and goes on
+/// doing so this long after it was last due (or in one), so the event plays out.
+const SELF_RUN_AFTER: Duration = Duration::from_secs(10);
+/// An owner's word that their game runs a Chao counts this long.
+const OWNER_RUNS_FRESH: Duration = Duration::from_secs(1);
+/// The save's Chao records: 24 slots from `CHAO_SLOTS`, in each of the save's two copies in
+/// memory (0x173D06C picks one). Any other record is a visitor's (a buffer of ours).
+const SAVE_COPY_SIZE: usize = 0xCA6C;
+const SAVE_CHAO_SLOTS: usize = 24;
 /// A friend's Chao whose owner stopped sending it this long ago (visits off, left the garden,
 /// gone) leaves our garden. Long enough to ride out a hiccup.
 const LEFT: Duration = Duration::from_secs(8);
+/// While its owner is still in our garden by their last state but their game sends nothing (it
+/// idles: a tab-out, a loading hiccup), their Chao stays; only after this long does it go. A
+/// disconnect sends it home at once (`player_left`).
+const PAUSED_LEFT: Duration = Duration::from_secs(300);
+/// The status balloon over a Chao (ParamFukidasi, made by 0x5659E0, one at a time in
+/// 0x1AED28C): its data (object +0x40) keeps the Chao object at +0x38 and reads that Chao's
+/// position (Data1 +0x14) while it shows (0x564DA5, its states 4 and 6). A Chao deleted under
+/// it left it reading a freed object: the crash at 0x77FB53 (2026-10-18). Its creator closes an
+/// old one by setting its state to 7 and clearing the global; so do we.
+const BALLOON: usize = 0x01AE_D28C;
+const BALLOON_DATA: usize = 0x40;
+const BALLOON_CHAO: usize = 0x38;
+const BALLOON_CLOSE: u8 = 7;
 /// Setting an object's MainSub to DeleteObject removes it on the next object pass.
 const DELETE_OBJECT: usize = 0x0046_F720;
 /// A friend holding our Chao: their updates count this long.
@@ -157,6 +192,18 @@ struct Mirror {
     local_until: Option<Instant>,
     /// Created then.
     since: Instant,
+    /// Frames it has shown the bubble wand (it blows bubbles here as its brain's does).
+    bubbles: u32,
+    /// Its owner last said their game runs it (`GardenChao::owner_runs`) then.
+    owner_runs: Option<Instant>,
+}
+
+impl Mirror {
+    /// Its owner's game runs it now, not the keeper's.
+    fn owner_runs(&self) -> bool {
+        self.owner_runs
+            .is_some_and(|at| at.elapsed() < OWNER_RUNS_FRESH)
+    }
 }
 
 /// Our Chao held by a friend.
@@ -192,7 +239,19 @@ struct Garden {
     /// Our visitor rows that now carry a different Chao, and when: friends' changes for a row
     /// are ignored for a while after, since their copy may still be the old Chao.
     rows_changed: HashMap<u8, Instant>,
+    /// Our Chao our game runs for a life event while a friend keeps the garden: index -> until.
+    self_run: HashMap<u8, Instant>,
+    /// Sounds our Chao made, to send; friends' Chao's sounds, to play (with who sent them).
+    sounds_out: Vec<ChaoSound>,
+    sounds_in: Vec<(u8, ChaoSound)>,
+    /// Friends' Chao whose copy is being made anew (their look changed): where the old one was
+    /// (position, facing, motion), its owner-runs word, and when.
+    rebuilt: HashMap<(u8, u8), Rebuilt>,
+    /// Other players whose state came lately (`set_alive`).
+    alive: Vec<u8>,
 }
+
+type Rebuilt = ((Vector, i32, i32), Option<Instant>, Instant);
 
 static GARDEN: Mutex<Option<Garden>> = Mutex::new(None);
 
@@ -212,6 +271,11 @@ fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
         left: Vec::new(),
         looks_in: HashMap::new(),
         rows_changed: HashMap::new(),
+        self_run: HashMap::new(),
+        sounds_out: Vec::new(),
+        sounds_in: Vec::new(),
+        rebuilt: HashMap::new(),
+        alive: Vec::new(),
     }))
 }
 
@@ -219,6 +283,27 @@ fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
 pub fn spawned(owner: u8, index: u8, object: usize) {
     if object != 0 {
         with(|g| {
+            let mut owner_runs = None;
+            if let Some(((at, rotation, motion), runs, when)) = g.rebuilt.remove(&(owner, index))
+                && when.elapsed() < LEFT
+            {
+                owner_runs = runs;
+                // SAFETY: the Chao object the game just made for this visitor, on the game
+                // thread; its motion id is checked against the shared table first.
+                unsafe {
+                    let d = data1(object);
+                    if d != 0 {
+                        ((d + D_POSITION) as *mut Vector).write_unaligned(at);
+                        ((d + D_ROTATION_Y) as *mut i32).write(rotation);
+                        if let Ok(id) = u16::try_from(motion)
+                            && motion_ok(d + D_MOTION, id)
+                        {
+                            start_motion(d + D_MOTION, id);
+                        }
+                    }
+                }
+                log!("garden: player {owner}'s Chao {index}: new copy in the old one's place");
+            }
             g.mirrors.insert(
                 (owner, index),
                 Mirror {
@@ -230,6 +315,8 @@ pub fn spawned(owner: u8, index: u8, object: usize) {
                     snapshot: None,
                     local_until: None,
                     since: Instant::now(),
+                    bubbles: 0,
+                    owner_runs,
                 },
             )
         });
@@ -251,6 +338,10 @@ pub fn clear() {
         g.left.clear();
         g.looks_in.clear();
         g.rows_changed.clear();
+        g.self_run.clear();
+        g.sounds_out.clear();
+        g.sounds_in.clear();
+        g.rebuilt.clear();
     });
 }
 
@@ -274,6 +365,38 @@ pub fn set_mine(slots: Vec<(u8, usize)>) {
     });
 }
 
+/// Deletes a Chao object of ours (a friend's copy) the safe way: the status balloon over it,
+/// if any, is closed first (`BALLOON`), so nothing reads it after it's gone. The game deletes
+/// it on its next object pass (its delete sub takes it out of the registry and unlinks its
+/// partner, 0x5307F0).
+pub fn delete_chao(object: usize) {
+    // SAFETY: the game's balloon global and, when set, its live object and data; then our own
+    // live Chao object, on the game thread.
+    unsafe {
+        let balloon = (BALLOON as *const usize).read();
+        if balloon != 0 {
+            let data = ((balloon + BALLOON_DATA) as *const usize).read();
+            if data != 0 && ((data + BALLOON_CHAO) as *const usize).read() == object {
+                (data as *mut u8).write(BALLOON_CLOSE);
+                (BALLOON as *mut usize).write(0);
+                log!("garden: closed the status balloon over a Chao going away");
+            }
+        }
+        ((object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT);
+    }
+}
+
+/// Player `owner` is in our garden by their last state but their game sends nothing now (it
+/// idles): what they brought stays.
+pub fn paused_here(owner: u8) -> bool {
+    with(|g| g.holders.contains_key(&owner) && !g.alive.contains(&owner))
+}
+
+/// Other players whose game is sending its state now (not idling): see `PAUSED_LEFT`.
+pub fn set_alive(ids: Vec<u8>) {
+    with(|g| g.alive = ids);
+}
+
 /// Network: player `owner` left (or we lost everyone: `None`). Their Chao go home now rather
 /// than after `LEFT`, so a new player given the same id never drives the old copies.
 pub fn player_left(owner: Option<u8>) {
@@ -287,6 +410,9 @@ pub fn player_left(owner: Option<u8>) {
                 g.heard.insert((o, index), long_ago);
             }
         }
+        // Gone, not idling: their Chao don't wait (`PAUSED_LEFT`).
+        g.holders.retain(|&id, _| owner.is_some_and(|o| o != id));
+        g.alive.retain(|&id| owner.is_some_and(|o| o != id));
     });
 }
 
@@ -302,7 +428,15 @@ pub fn received(from: u8, owner: u8, list: Vec<GardenChao>) {
             if from == owner {
                 g.heard.insert((owner, c.index), now);
             }
-            if brain && let Some(m) = g.mirrors.get_mut(&(owner, c.index)) {
+            let Some(m) = g.mirrors.get_mut(&(owner, c.index)) else {
+                continue;
+            };
+            if from == owner && c.owner_runs {
+                m.owner_runs = Some(now);
+            }
+            // While its owner's game runs it, theirs is the one to follow.
+            let follow = if m.owner_runs() { from == owner } else { brain };
+            if follow {
                 m.target = Some((c, now, from));
             }
         }
@@ -486,6 +620,151 @@ unsafe fn show_cocoon(object: usize, d: usize, want: u8) {
     let _ = (object, kind, CREATE_COCOON);
 }
 
+/// The picture book a reading Chao has in front of it (Data1+0x38): made by 0x55E180 (EBX = Chao
+/// object) when the reading behaviour (0x55E210) starts, MainSub 0x55DF90. Its Data1 byte 0 is
+/// its mode: 0 opening, 1 open, 2 and 3 turning a page (the behaviour sets 2), 4 closing, after
+/// which it deletes itself (the Chao's pointer stays as it was).
+const D_BOOK: usize = 0x38;
+const BOOK_MAIN: usize = 0x0055_DF90;
+const CREATE_BOOK: usize = 0x0055_E180;
+const BOOK_TURN: u8 = 2;
+const BOOK_CLOSE: u8 = 4;
+
+/// The Chao's book, if it has one now (not closing).
+///
+/// # Safety
+/// `d` is a live Chao's Data1.
+unsafe fn book(d: usize) -> Option<(usize, u8)> {
+    unsafe {
+        let book = ((d + D_BOOK) as *const usize).read();
+        if book == 0 || ((book + OBJ_MAIN) as *const usize).read() != BOOK_MAIN {
+            return None;
+        }
+        let bd = ((book + OBJ_DATA1) as *const usize).read();
+        if bd == 0 {
+            return None;
+        }
+        let mode = (bd as *const u8).read();
+        (mode < BOOK_CLOSE).then_some((bd, mode))
+    }
+}
+
+/// Our Chao's book for `GardenChao`: 0 none, else 1 + its mode.
+///
+/// # Safety
+/// `d` is a live Chao's Data1.
+unsafe fn book_of(d: usize) -> u8 {
+    unsafe { book(d) }.map_or(0, |(_, mode)| mode + 1)
+}
+
+/// A friend's Chao copy reads (or stops reading) as their real one does.
+///
+/// # Safety
+/// `object` is our live copy and `d` its Data1, on the game thread.
+unsafe fn show_book(object: usize, d: usize, want: u8) {
+    match (unsafe { book(d) }, want) {
+        (None, 0) => {}
+        (Some((bd, _)), 0) => unsafe { (bd as *mut u8).write(BOOK_CLOSE) },
+        (Some((bd, mode)), _) => {
+            if want - 1 == BOOK_TURN && mode == BOOK_TURN - 1 {
+                unsafe { (bd as *mut u8).write(BOOK_TURN) };
+            }
+        }
+        (None, _) => {
+            // An old book's pointer (it deleted itself): the creator would delete whatever
+            // now lives there.
+            unsafe { ((d + D_BOOK) as *mut usize).write(0) };
+            #[cfg(target_arch = "x86")]
+            // SAFETY: the game's book creator as the reading behaviour calls it (EBX = Chao
+            // object), on the game thread.
+            unsafe {
+                std::arch::asm!(
+                    "push ebx",
+                    "mov ebx, ecx",
+                    "call eax",
+                    "pop ebx",
+                    inout("ecx") object => _,
+                    inout("eax") CREATE_BOOK => _,
+                    clobber_abi("C"),
+                );
+            }
+            #[cfg(not(target_arch = "x86"))]
+            let _ = (object, CREATE_BOOK);
+        }
+    }
+}
+
+/// Bubbles: the bubble behaviour (0x55DB10) holds the wand (`PROPS[0]` at node 4, used by
+/// nothing else) and, from its 60th frame, every 10 frames 4 times in 10 makes a bubble
+/// (0x55DA10: EBX = &position, push &velocity, the caller pops) at the wand: the hand node at
+/// Data1+0x5E4 and its direction at +0x614.
+const WAND: u8 = 1;
+const BLOW_BUBBLE: usize = 0x0055_DA10;
+const D_HAND: usize = 0x5E4;
+const D_HAND_DIRECTION: usize = 0x614;
+/// The game's rand (0..=0x7FFF).
+#[cfg(target_arch = "x86")]
+const RAND: usize = 0x007A_89D8;
+
+fn rand() -> f32 {
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the C runtime's rand, no arguments.
+    let r = unsafe { std::mem::transmute::<usize, extern "C" fn() -> i32>(RAND)() };
+    #[cfg(not(target_arch = "x86"))]
+    let r = 0;
+    r as f32 / 32768.0
+}
+
+/// A copy showing the wand blows bubbles as the behaviour does.
+///
+/// # Safety
+/// `d` is our live copy's Data1, on the game thread.
+unsafe fn blow_bubbles(d: usize, props: [u8; 3], frames: &mut u32) {
+    if props[0] != WAND {
+        *frames = 0;
+        return;
+    }
+    *frames += 1;
+    if *frames <= 60 || !frames.is_multiple_of(10) || rand() >= 0.4 {
+        return;
+    }
+    let (hand, dir) = unsafe {
+        (
+            ((d + D_HAND) as *const [f32; 3]).read_unaligned(),
+            ((d + D_HAND_DIRECTION) as *const [f32; 3]).read_unaligned(),
+        )
+    };
+    let f = rand() * 0.1 + 0.2;
+    let velocity = [
+        rand() * 0.1 + f * dir[0],
+        dir[1] * f + 0.1,
+        dir[2] * f + rand() * 0.1,
+    ];
+    let at = [
+        hand[0] + dir[0] * 0.5,
+        hand[1] + dir[1] * 0.5 + 0.05,
+        hand[2] + dir[2] * 0.5,
+    ];
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the game's bubble maker as the behaviour calls it, with our two vectors.
+    unsafe {
+        std::arch::asm!(
+            "push ebx",
+            "mov ebx, ecx",
+            "push edx",
+            "call eax",
+            "add esp, 4",
+            "pop ebx",
+            inout("ecx") at.as_ptr() => _,
+            inout("edx") velocity.as_ptr() => _,
+            inout("eax") BLOW_BUBBLE => _,
+            clobber_abi("C"),
+        );
+    }
+    #[cfg(not(target_arch = "x86"))]
+    let _ = (at, velocity, BLOW_BUBBLE);
+}
+
 /// What our Chao holds now, for `GardenChao`: props per node and the drum's size.
 ///
 /// # Safety
@@ -655,7 +934,21 @@ fn looks_frame(g: &mut Garden) {
                 later.push(((owner, index), new));
                 continue;
             }
-            ((m.object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT);
+            // The new copy takes the old one's place: where its brain has it, facing and moving
+            // the same (`spawned`), not where new visitors appear.
+            let here = ((d + D_POSITION) as *const Vector).read_unaligned();
+            let rotation = ((d + D_ROTATION_Y) as *const i32).read();
+            let motion = ((d + D_MOTION_CURRENT) as *const i32).read();
+            let place = match m.target {
+                Some((t, _, _)) => {
+                    let [x, y, z] = t.position;
+                    (Vector { x, y, z }, t.rotation_y, i32::from(t.motion))
+                }
+                None => (here, rotation, motion),
+            };
+            g.rebuilt
+                .insert((owner, index), (place, m.owner_runs, Instant::now()));
+            delete_chao(m.object);
             log!("garden: player {owner}'s Chao {index} changed its look; making a new copy");
             g.mirrors.remove(&(owner, index));
             g.heard.remove(&(owner, index));
@@ -720,9 +1013,23 @@ pub fn received_held(holder: u8, owner: u8, index: u8, offset: [f32; 3]) {
     });
 }
 
-/// Whether our game runs player `owner`'s Chao: we keep the garden, or nobody does and it's
-/// ours.
-pub fn brain_here(owner: u8) -> bool {
+/// Whether our game runs player `owner`'s Chao `index`: we keep the garden, or nobody does and
+/// it's ours, or it's ours and our game runs it for a life event (`self_run`). A friend's that
+/// its owner's game runs for one isn't ours to run.
+pub fn brain_here(owner: u8, index: u8) -> bool {
+    let me = crate::keeper::me();
+    let owner_runs = with(|g| {
+        if me == Some(owner) {
+            g.self_run.contains_key(&index)
+        } else {
+            g.mirrors
+                .get(&(owner, index))
+                .is_some_and(|m| m.owner_runs())
+        }
+    });
+    if owner_runs {
+        return me == Some(owner);
+    }
     match crate::keeper::current() {
         Some(keeper) => crate::keeper::me() == Some(keeper),
         None => crate::keeper::me() == Some(owner),
@@ -732,6 +1039,11 @@ pub fn brain_here(owner: u8) -> bool {
 /// Where other players are drawn this frame (their puppets), for Chao they hold.
 pub fn set_holders(holders: HashMap<u8, (Vector, i32)>) {
     with(|g| g.holders = holders);
+}
+
+/// Other players are in our garden now (it's a shared garden).
+pub fn friends_here() -> bool {
+    with(|g| !g.holders.is_empty())
 }
 
 /// To send: (changes to friends' Chao: owner, index, changes; friends' Chao we hold: owner,
@@ -750,8 +1062,13 @@ pub fn holder(owner: u8) -> Option<(Vector, i32)> {
     with(|g| g.holders.get(&owner).copied())
 }
 
-/// Our copy of friend `owner`'s Chao `index`, when it follows them (not being touched by us).
+/// Player `owner`'s Chao `index` as shown here, when it follows its brain: our copy of a friend's
+/// (not being touched by us), or our own.
 pub fn following_copy(owner: u8, index: u8) -> Option<usize> {
+    if crate::keeper::me() == Some(owner) {
+        let slot = with(|g| g.mine.iter().find(|&&(i, _)| i == index).map(|&(_, s)| s))?;
+        return live_object(slot);
+    }
     with(|g| {
         g.mirrors
             .get(&(owner, index))
@@ -760,17 +1077,47 @@ pub fn following_copy(owner: u8, index: u8) -> Option<usize> {
     })
 }
 
-/// Our visiting Chao now in this garden: (index, registry entry, object).
-pub fn my_chao_entries() -> Vec<(u8, usize, usize)> {
-    let mine = with(|g| g.mine.clone());
-    mine.into_iter()
+/// The Chao our game runs: our visiting ones (unless they follow a friend's game), and friends'
+/// while we keep the garden. (owner, index, registry entry, object).
+pub fn run_here() -> Vec<(u8, u8, usize, usize)> {
+    let Some(me) = crate::keeper::me() else {
+        return Vec::new();
+    };
+    let keeping = crate::keeper::current() == Some(me);
+    let (mine, kept) = with(|g| {
+        let kept: Vec<(u8, u8, usize)> = g
+            .mirrors
+            .iter()
+            .filter(|(_, m)| keeping && !m.own && !m.owner_runs())
+            .map(|(&(owner, index), m)| (owner, index, m.object))
+            .collect();
+        // Ours, unless they follow a friend's game.
+        let mine: Vec<(u8, usize)> = g
+            .mine
+            .iter()
+            .filter(|&&(index, _)| !g.mirrors.contains_key(&(me, index)))
+            .copied()
+            .collect();
+        (mine, kept)
+    });
+    let mut out: Vec<(u8, u8, usize, usize)> = mine
+        .into_iter()
         .filter_map(|(index, slot)| {
             let entry = live_entry(slot)?;
             // SAFETY: a live registry entry's object pointer.
             let object = unsafe { ((entry + OBJ_ENTRY) as *const usize).read() };
-            Some((index, entry, object))
+            Some((me, index, entry, object))
         })
-        .collect()
+        .collect();
+    for (owner, index, object) in kept {
+        // SAFETY: our visitor's live object (cleared when we leave the garden): its registry
+        // entry.
+        let entry = unsafe { ((object + OBJ_ENTRY) as *const usize).read() };
+        if entry != 0 {
+            out.push((owner, index, entry, object));
+        }
+    }
+    out
 }
 
 /// Rotates (x, z) by a BAMS angle about Y; `-angle` undoes it.
@@ -787,13 +1134,11 @@ fn record_of(slot: usize) -> usize {
 /// The registry entry of the Chao in save slot `slot`, if it's in this garden.
 fn live_entry(slot: usize) -> Option<usize> {
     let record = record_of(slot);
-    // SAFETY: the game's static Chao object table (category 0); entries are checked for null.
-    unsafe {
-        (0..WORLD_CHAO_MAX)
-            .map(|i| WORLD + i * WORLD_ENTRY_SIZE)
-            .find(|&e| ((e + 8) as *const usize).read() == record)
-            .filter(|&e| ((e + OBJ_ENTRY) as *const usize).read() != 0)
-    }
+    crate::registry::entries(crate::registry::CHAO)
+        .into_iter()
+        // SAFETY: a live registry entry's record pointer.
+        .find(|&(e, _)| unsafe { ((e + 8) as *const usize).read() } == record)
+        .map(|(e, _)| e)
 }
 
 /// The live object of the Chao in save slot `slot`, if it's in this garden.
@@ -851,23 +1196,30 @@ pub fn streams() -> Vec<(u8, Vec<GardenChao>)> {
     let Some(me) = crate::keeper::me() else {
         return Vec::new();
     };
-    let (slots, kept) = with(|g| {
+    let (slots, kept, self_run) = with(|g| {
         let kept: Vec<(u8, u8, usize)> = if crate::keeper::current() == Some(me) {
             g.mirrors
                 .iter()
-                .filter(|(_, m)| !m.own)
+                .filter(|(_, m)| !m.own && !m.owner_runs())
                 .map(|(&(owner, index), m)| (owner, index, m.object))
                 .collect()
         } else {
             Vec::new()
         };
-        (g.mine.clone(), kept)
+        let self_run: Vec<u8> = g.self_run.keys().copied().collect();
+        (g.mine.clone(), kept, self_run)
     });
     let mut out: Vec<(u8, Vec<GardenChao>)> = vec![(
         me,
         slots
             .iter()
-            .filter_map(|&(index, slot)| chao_state(index, live_object(slot)?))
+            .filter_map(|&(index, slot)| {
+                let state = chao_state(index, live_object(slot)?)?;
+                Some(GardenChao {
+                    owner_runs: self_run.contains(&index),
+                    ..state
+                })
+            })
             .collect(),
     )];
     for (owner, index, object) in kept {
@@ -895,6 +1247,7 @@ fn chao_state(index: u8, object: usize) -> Option<GardenChao> {
         let p = ((d + D_POSITION) as *const Vector).read_unaligned();
         let (props, drum) = props_of(d);
         let cocoon = cocoon_of(d);
+        let book = book_of(d);
         // Blending: the motion it's going to, unless there's none yet (-1).
         let motion_flags = ((d + D_MOTION) as *const u16).read();
         let current = ((d + D_MOTION_CURRENT) as *const i32).read();
@@ -929,6 +1282,8 @@ fn chao_state(index: u8, object: usize) -> Option<GardenChao> {
             props,
             drum,
             cocoon,
+            book,
+            owner_runs: false,
         })
     }
 }
@@ -942,6 +1297,7 @@ pub fn on_frame() {
         mirrors_frame(g, now);
         looks_frame(g);
         mine_frame(g);
+        sounds_frame(g);
     });
 }
 
@@ -951,9 +1307,26 @@ fn own_frame(g: &mut Garden) {
     let Some(me) = crate::keeper::me() else {
         return;
     };
-    let follow = crate::keeper::current().is_some_and(|k| k != me);
+    let keeper_elsewhere = crate::keeper::current().is_some_and(|k| k != me);
+    let now = Instant::now();
     for (index, slot) in g.mine.clone() {
         let object = live_object(slot);
+        // Evolving, or its life ending: our game runs it for that (its AI does it), and the
+        // others follow ours meanwhile (`GardenChao::owner_runs`).
+        // SAFETY: our own Chao's live object and its record (our save's).
+        if let Some(object) = object
+            && unsafe { life_event(data1(object), record_of(slot)) }
+        {
+            if !g.self_run.contains_key(&index) {
+                log!("garden: our Chao {index} evolves or ends its life: our game runs it");
+            }
+            g.self_run.insert(index, now + SELF_RUN_AFTER);
+        }
+        if g.self_run.get(&index).is_some_and(|&until| now >= until) {
+            g.self_run.remove(&index);
+            log!("garden: our Chao {index} is done; it follows the keeper again");
+        }
+        let follow = keeper_elsewhere && !g.self_run.contains_key(&index);
         let current = g.mirrors.get(&(me, index)).map(|m| m.object);
         if !follow || object != current {
             release_own(g, (me, index));
@@ -975,6 +1348,8 @@ fn own_frame(g: &mut Garden) {
                 snapshot: None,
                 local_until: None,
                 since: Instant::now(),
+                bubbles: 0,
+                owner_runs: None,
             },
         );
         log!("garden: our Chao {index} now follows the keeper");
@@ -1041,17 +1416,21 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
             }
             let main = (m.object + OBJ_MAIN) as *mut usize;
             // Its owner took it home (visits off, left, disconnected): it leaves, unless we're
-            // holding or still touching it (then once we let go).
+            // holding or still touching it (then once we let go). Not because their updates
+            // paused while they're still here by their last state (their game idles on a
+            // tab-out or a hiccup): the keeper runs it meanwhile, or it stands where it was.
             let heard = g
                 .heard
                 .get(&(owner, index))
                 .map_or(m.since, |at| (*at).max(m.since));
+            let paused_here = g.holders.contains_key(&owner) && !g.alive.contains(&owner);
             if !m.own
                 && heard.elapsed() > LEFT
+                && (!paused_here || heard.elapsed() > PAUSED_LEFT)
                 && player_held() != m.object
                 && m.local_until.is_none()
             {
-                main.write(DELETE_OBJECT);
+                delete_chao(m.object);
                 log!("garden: player {owner}'s Chao {index} went home; removing its copy");
                 gone.push((owner, index));
                 continue;
@@ -1061,10 +1440,13 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                 continue;
             }
             let flags = (d + D_FLAGS) as *mut u32;
+            if !m.own {
+                hold_life(record, m.snapshot.as_deref_mut());
+            }
 
             // We keep the garden: a friend's Chao is ours to run, AI and all (a hold by a friend
             // wraps it in `mine_frame`). What its AI changes goes to its owner now and then.
-            if keeping && !m.own {
+            if keeping && !m.own && !m.owner_runs() {
                 if m.driven {
                     m.driven = false;
                     m.local_until = None;
@@ -1076,14 +1458,6 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                     let status = (d + D_STATUS) as *mut u16;
                     status.write(status.read() & !STATUS_HELD);
                     log!("garden: running player {owner}'s Chao {index} here (we keep the garden)");
-                }
-                let lifespan = (record + C_LIFESPAN) as *mut u16;
-                if lifespan.read_unaligned() == 0 {
-                    lifespan.write_unaligned(1);
-                    if let Some(before) = m.snapshot.as_mut() {
-                        before.bytes[C_LIFESPAN..C_LIFESPAN + 2]
-                            .copy_from_slice(&1u16.to_le_bytes());
-                    }
                 }
                 let before = m
                     .snapshot
@@ -1245,16 +1619,19 @@ fn mine_frame(g: &mut Garden) {
 
     g.held.retain(|_, h| h.at.elapsed() < HELD_STALE);
     let mut runs_here: Vec<((u8, u8), usize)> = Vec::new();
-    if let Some(me) = me.filter(|&me| brain_here(me)) {
+    if let Some(me) = me {
+        // Ours, unless they follow a friend's game.
         for &(index, slot) in &g.mine {
-            if let Some(object) = live_object(slot) {
+            if !g.mirrors.contains_key(&(me, index))
+                && let Some(object) = live_object(slot)
+            {
                 runs_here.push(((me, index), object));
             }
         }
     }
     if keeping {
         for (&key, m) in &g.mirrors {
-            if !m.own {
+            if !m.own && !m.owner_runs() {
                 runs_here.push((key, m.object));
             }
         }
@@ -1278,6 +1655,792 @@ fn mine_frame(g: &mut Garden) {
         }
     }
 }
+
+/// Whether our Chao is due a life event or in one: a child past the evolve point, a life at
+/// its end, or the evolving or end-of-life behaviour (with its cocoon).
+///
+/// # Safety
+/// `d` is our Chao's live Data1 (or 0) and `record` its record.
+unsafe fn life_event(d: usize, record: usize) -> bool {
+    if d == 0 {
+        return false;
+    }
+    unsafe {
+        let child = ((record + C_TYPE) as *const u8).read() == TYPE_CHILD;
+        let evolution = ((record + C_EVOLUTION) as *const f32).read_unaligned();
+        let lifespan = ((record + C_LIFESPAN) as *const u16).read_unaligned();
+        let slot = ((d + D_BEHAVIOUR_INDEX) as *const usize).read();
+        let behaviour = if slot < BEHAVIOUR_SLOTS {
+            ((d + D_BEHAVIOURS + slot * 4) as *const usize).read()
+        } else {
+            0
+        };
+        (child && evolution > 1.0)
+            || lifespan == 0
+            || LIFE_EVENTS.contains(&behaviour)
+            || cocoon_of(d) != 0
+    }
+}
+
+/// Sounds: what our Chao made goes out as theirs; friends' Chao's sounds play on our copies
+/// (only those following the game that sent them, not ones we run or touch).
+fn sounds_frame(g: &mut Garden) {
+    SOUNDS_ON.store(
+        !g.holders.is_empty() || !g.mirrors.is_empty(),
+        Ordering::Relaxed,
+    );
+    let heard = std::mem::take(&mut *HEARD.lock().unwrap_or_else(|e| e.into_inner()));
+    if !heard.is_empty()
+        && let Some(me) = crate::keeper::me()
+    {
+        let keeping = crate::keeper::current() == Some(me);
+        for (object, call, id, at, args) in heard {
+            // Ours (not following a friend's game), or a friend's we run as the keeper.
+            let key = g
+                .mine
+                .iter()
+                .find(|&&(index, slot)| {
+                    live_object(slot) == Some(object) && !g.mirrors.contains_key(&(me, index))
+                })
+                .map(|&(index, _)| (me, index))
+                .or_else(|| {
+                    g.mirrors
+                        .iter()
+                        .find(|(_, m)| keeping && m.object == object && !m.own && !m.owner_runs())
+                        .map(|(&key, _)| key)
+                });
+            let Some((owner, index)) = key else {
+                continue;
+            };
+            let id = if call == SOUND_JINGLE {
+                match JINGLES.iter().position(|&j| j as u32 == id) {
+                    Some(i) => i as u16,
+                    None => continue,
+                }
+            } else {
+                match u16::try_from(id) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                }
+            };
+            // SAFETY: the Chao's live object (it just ran).
+            let here =
+                unsafe { ((data1(object) + D_POSITION) as *const [f32; 3]).read_unaligned() };
+            let narrow = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            g.sounds_out.push(ChaoSound {
+                owner,
+                index,
+                call,
+                id,
+                offset: if call == SOUND_JINGLE {
+                    [0.0; 3]
+                } else {
+                    [at[0] - here[0], at[1] - here[1], at[2] - here[2]]
+                },
+                // 0x4372E0's first is a holder key (like 0x437590's EBX): only whether there
+                // was one goes, and the copy is the holder there.
+                args: if call == SOUND_AT {
+                    [i16::from(args[0] != 0), narrow(args[1]), narrow(args[2])]
+                } else {
+                    args.map(narrow)
+                },
+            });
+        }
+    }
+    for (from, sound) in std::mem::take(&mut g.sounds_in) {
+        let Some(m) = g.mirrors.get(&(sound.owner, sound.index)) else {
+            continue;
+        };
+        let follows = m.driven
+            && m.local_until.is_none()
+            && m.target.is_some_and(|(_, _, sender)| sender == from);
+        if !follows {
+            continue;
+        }
+        // SAFETY: the copy's live object, on the game thread.
+        unsafe {
+            let d = data1(m.object);
+            if d == 0 {
+                continue;
+            }
+            let here = ((d + D_POSITION) as *const [f32; 3]).read_unaligned();
+            let at = [
+                here[0] + sound.offset[0],
+                here[1] + sound.offset[1],
+                here[2] + sound.offset[2],
+            ];
+            play(m.object, &sound, at);
+        }
+    }
+}
+
+/// Plays a friend's Chao's sound as their game did, from our copy `object` at `at`.
+///
+/// # Safety
+/// Game thread; `object` is our live copy.
+unsafe fn play(object: usize, sound: &ChaoSound, at: [f32; 3]) {
+    let function = match sound.call {
+        SOUND_AT => SOUND_AT_FN,
+        SOUND_HELD => SOUND_HELD_FN,
+        _ => {
+            let Some(&name) = JINGLES.get(usize::from(sound.id)) else {
+                return;
+            };
+            #[cfg(target_arch = "x86")]
+            // SAFETY: the game's jingle call as the behaviours make it (EBX = name).
+            unsafe {
+                std::arch::asm!(
+                    "push ebx",
+                    "mov ebx, ecx",
+                    "call eax",
+                    "pop ebx",
+                    inout("ecx") name => _,
+                    inout("eax") JINGLE_FN => _,
+                    clobber_abi("C"),
+                );
+            }
+            #[cfg(not(target_arch = "x86"))]
+            let _ = name;
+            return;
+        }
+    };
+    // {function, &position, id, holder, three arguments}, read by the call below.
+    let [mut a, b, c] = sound.args.map(|v| i32::from(v) as u32);
+    if sound.call == SOUND_AT && a != 0 {
+        a = object as u32;
+    }
+    let block: [u32; 7] = [
+        function as u32,
+        at.as_ptr() as u32,
+        u32::from(sound.id),
+        object as u32,
+        a,
+        b,
+        c,
+    ];
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the game's sound call as the Chao code makes it (EDI id, ESI &position, EBX the
+    // holder, 3 cdecl arguments the caller pops); `block` and `at` outlive it.
+    unsafe {
+        std::arch::asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "mov ebx, dword ptr [ecx + 12]",
+            "mov esi, dword ptr [ecx + 4]",
+            "mov edi, dword ptr [ecx + 8]",
+            "push dword ptr [ecx + 24]",
+            "push dword ptr [ecx + 20]",
+            "push dword ptr [ecx + 16]",
+            "call dword ptr [ecx]",
+            "add esp, 12",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            inout("ecx") block.as_ptr() => _,
+            clobber_abi("C"),
+        );
+    }
+    #[cfg(not(target_arch = "x86"))]
+    let _ = block;
+}
+
+/// Sounds our Chao made since last time, to send.
+pub fn take_sounds() -> Vec<ChaoSound> {
+    with(|g| std::mem::take(&mut g.sounds_out))
+}
+
+/// Network: sounds player `from`'s game played for Chao it runs.
+pub fn received_sounds(from: u8, sounds: Vec<ChaoSound>) {
+    with(|g| g.sounds_in.extend(sounds.into_iter().map(|s| (from, s))));
+}
+
+/// Keeps a visitor copy's life in its owner's game: lifespan above 0 (no death or rebirth here)
+/// and a child's evolution just under 1.0 (no cocoon here). The snapshot takes the same, so it
+/// isn't forwarded.
+///
+/// # Safety
+/// `record` is a live visitor copy's record, on the game thread.
+unsafe fn hold_life(record: usize, snapshot: Option<&mut ChaoData>) {
+    unsafe {
+        let lifespan = (record + C_LIFESPAN) as *mut u16;
+        if lifespan.read_unaligned() == 0 {
+            lifespan.write_unaligned(1);
+            if let Some(before) = snapshot {
+                before.bytes[C_LIFESPAN..C_LIFESPAN + 2].copy_from_slice(&1u16.to_le_bytes());
+            }
+        }
+        let evolution = (record + C_EVOLUTION) as *mut f32;
+        if ((record + C_TYPE) as *const u8).read() == TYPE_CHILD
+            && evolution.read_unaligned() > EVOLVE_HELD
+        {
+            evolution.write_unaligned(EVOLVE_HELD);
+        }
+    }
+}
+
+/// Whether `record` is one of our save's Chao records (not a visitor's).
+fn in_save(record: usize) -> bool {
+    (0..2).any(|copy| {
+        let start = CHAO_SLOTS + copy * SAVE_COPY_SIZE;
+        (start..start + SAVE_CHAO_SLOTS * CHAO_SIZE).contains(&record)
+    })
+}
+
+/// The record of a Chao object (0 without one).
+///
+/// # Safety
+/// `object` is a live Chao object.
+#[cfg(target_arch = "x86")]
+unsafe fn record_of_object(object: usize) -> usize {
+    unsafe {
+        let d = data1(object);
+        if d == 0 {
+            0
+        } else {
+            ((d + D_RECORD) as *const usize).read()
+        }
+    }
+}
+
+// --- Hooks: the game's own Chao code, kept from touching our save for visitors ------------
+
+/// A hit (0x563E84) or thrown (0x56440A) Chao drops its hat: 0x54A540 (cdecl kind, &position
+/// (Data1+0x14), angle, &velocity, record) makes the hat with a record in our save's hat list,
+/// then the caller clears the Chao's hat (+0xD5: 0x563E92 `mov byte [edx+0xD5], 0`, 0x564418
+/// the same with EAX). For a visitor that duplicated its owner's hat into our save
+/// (re/chao-garden-items.md 5.1): it keeps it on instead (no hat made, the clear skipped).
+const HAT_DROP_CALLS: [usize; 2] = [0x0056_3E84, 0x0056_440A];
+const DROP_HAT: usize = 0x0054_A540;
+#[cfg(target_arch = "x86")]
+const HAT_CLEARS: [(usize, [u8; 7]); 2] = [
+    (0x0056_3E92, [0xC6, 0x82, 0xD5, 0x00, 0x00, 0x00, 0x00]),
+    (0x0056_4418, [0xC6, 0x80, 0xD5, 0x00, 0x00, 0x00, 0x00]),
+];
+/// The hat check among a Chao's reactions (0x53DB10 calls it at 0x53DB87; ESI = Chao object):
+/// touching a hat starts putting it on (0x569240), which takes the hat out of our save and into
+/// the Chao's record (5.2). Visitors don't.
+const HAT_WEAR_CALL: usize = 0x0053_DB87;
+const WEAR_HAT_CHECK: usize = 0x0056_91B0;
+/// The garden's life tick (0x5363D0 calls it at 0x53640F for one Chao every few frames; ESI =
+/// Chao object): emotions, lifespan, and for a child its evolution and, in the Hero and Dark
+/// gardens, its alignment. It runs on visitor copies too, and in their owner's game on the real
+/// Chao; what it changes on a copy goes into the copy's snapshot, so it isn't forwarded (the
+/// owner's Chao would get it twice).
+const LIFE_TICK_CALL: usize = 0x0053_640F;
+const LIFE_TICK: usize = 0x0053_53C0;
+/// A Chao's AI tick, called from its MainSub at 0x54FE49 (EAX = object): every behaviour and
+/// reaction runs inside it, so sounds the game plays meanwhile are that Chao's.
+const AI_TICK_CALL: usize = 0x0054_FE49;
+const AI_TICK: usize = 0x0053_DC40;
+/// The game's sounds at a place (EDI = sound id, ESI = &position, its 3 floats copied), and
+/// their calls in the Chao code with ESI at an object's position. Their 3 cdecl arguments, read
+/// in the callees: 0x4372E0 (a holder key kept at slot +0x10, a value for the slot search
+/// 0x4370D0, volume byte at +5/+6); 0x437590 (one for the slot search, volume byte, length
+/// short, +1 at +0xC), which also keeps one sound per (EBX = its holder, at +0x10; id).
+const SOUND_AT_FN: usize = 0x0043_72E0;
+const SOUND_HELD_FN: usize = 0x0043_7590;
+const SOUND_AT_CALLS: [usize; 82] = [
+    0x0053_D69E,
+    0x0053_F0CC,
+    0x0054_6B63,
+    0x0054_7201,
+    0x0054_F243,
+    0x0054_F4B9,
+    0x0054_FA45,
+    0x0054_FAA4,
+    0x0054_FB98,
+    0x0056_07AE,
+    0x0056_0A08,
+    0x0056_0BA0,
+    0x0056_0C9B,
+    0x0056_0D6A,
+    0x0056_1490,
+    0x0056_16DF,
+    0x0056_1F34,
+    0x0056_21FB,
+    0x0056_2DC7,
+    0x0056_3732,
+    0x0056_4867,
+    0x0056_4A5E,
+    0x0056_4A8A,
+    0x0056_5CCF,
+    0x0056_6553,
+    0x0056_6EB8,
+    0x0056_6F4B,
+    0x0056_7780,
+    0x0056_794F,
+    0x0056_7D67,
+    0x0056_7EC6,
+    0x0056_7F1F,
+    0x0056_81F3,
+    0x0056_8A01,
+    0x0056_939F,
+    0x0057_AD00,
+    0x0057_AD91,
+    0x0057_B43D,
+    0x0057_BF3B,
+    0x0057_C4B3,
+    0x0057_C5FB,
+    0x0057_C6E9,
+    0x0057_D7EB,
+    0x0057_D88F,
+    0x0057_D95D,
+    0x0057_DB92,
+    0x0057_DD01,
+    0x0057_DE80,
+    0x0058_02ED,
+    0x0059_9F0C,
+    0x0059_A084,
+    0x0059_A146,
+    0x0059_A1F3,
+    0x0059_A3DD,
+    0x0059_A57C,
+    0x0059_A684,
+    0x0059_B334,
+    0x0059_D6DD,
+    0x0059_D72C,
+    0x0059_D888,
+    0x0059_D9ED,
+    0x0059_DCBD,
+    0x0059_DE3B,
+    0x0059_E07E,
+    0x0059_E0C4,
+    0x0059_E279,
+    0x0059_E4A4,
+    0x0059_E6BF,
+    0x0059_F1F0,
+    0x0059_F46B,
+    0x0059_FFF5,
+    0x005A_041F,
+    0x005A_0DD2,
+    0x005A_1097,
+    0x005A_15DA,
+    0x005A_1875,
+    0x005A_1B1F,
+    0x005A_21AE,
+    0x005A_26B8,
+    0x005A_2D78,
+    0x005A_3337,
+    0x005A_B47F,
+];
+const SOUND_HELD_CALLS: [usize; 19] = [
+    0x0053_77F2,
+    0x0053_8BD0,
+    0x0054_6DBE,
+    0x0055_8108,
+    0x0056_1ADE,
+    0x0056_1DEB,
+    0x0056_89B8,
+    0x0057_C2F8,
+    0x0058_160A,
+    0x0059_A80A,
+    0x0059_A991,
+    0x0059_AB21,
+    0x0059_ACB1,
+    0x0059_AE25,
+    0x0059_AE81,
+    0x0059_B001,
+    0x0059_B02F,
+    0x0059_B1D1,
+    0x0059_F68F,
+];
+/// Jingles (0x443480, EBX = the .adx name) the Chao behaviours play: hatching/evolving
+/// (0x56880C.., born_*), dying (0x5690C6), dancing (0x59C10F) and 0x565066. Sent as an index into
+/// `JINGLES`.
+const JINGLE_FN: usize = 0x0044_3480;
+const JINGLE_CALLS: [usize; 8] = [
+    0x0056_880C,
+    0x0056_887E,
+    0x0056_8E6D,
+    0x0056_8E89,
+    0x0056_8EA5,
+    0x0056_90C6,
+    0x0059_C10F,
+    0x0056_5066,
+];
+/// Their names: chao_g_born_h2/_d2/_c/_h/_d, chao_g_dead, chao_g_dance, chao_k_net_fine (.adx).
+pub const JINGLES: [usize; 8] = [
+    0x012B_E8BC,
+    0x012B_EBBC,
+    0x012B_EEBC,
+    0x012B_F2D4,
+    0x012B_F6EC,
+    0x012F_5944,
+    0x011C_3FF4,
+    0x012B_FC24,
+];
+
+/// The copy the life tick is on, and its record before.
+#[cfg(target_arch = "x86")]
+static TICKING: Mutex<Option<(usize, Box<ChaoData>)>> = Mutex::new(None);
+/// The Chao whose AI is running now (0 outside), and sounds heard meanwhile: (Chao, call, id,
+/// position, args), while friends are about (`SOUNDS_ON`).
+#[cfg(target_arch = "x86")]
+static THINKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SOUNDS_ON: AtomicBool = AtomicBool::new(false);
+type Heard = (usize, u8, u32, [f32; 3], [i32; 3]);
+static HEARD: Mutex<Vec<Heard>> = Mutex::new(Vec::new());
+#[cfg(target_arch = "x86")]
+const MAX_HEARD: usize = 32;
+
+/// Hooks the hat, life tick, AI tick, sound and jingle calls. Call once at startup.
+pub fn install() {
+    type DropHat = extern "C" fn(u32, usize, i32, usize, usize) -> usize;
+    let drop = drop_hat as DropHat as usize;
+    let thunk = |f: unsafe extern "C" fn()| f as usize;
+    let mut hooks = vec![
+        (HAT_DROP_CALLS[0], drop, DROP_HAT),
+        (HAT_DROP_CALLS[1], drop, DROP_HAT),
+        (HAT_WEAR_CALL, thunk(wear_hat_thunk), WEAR_HAT_CHECK),
+        (LIFE_TICK_CALL, thunk(life_tick_thunk), LIFE_TICK),
+        (AI_TICK_CALL, thunk(ai_tick_thunk), AI_TICK),
+    ];
+    hooks.extend(SOUND_AT_CALLS.map(|site| (site, thunk(sound_at_thunk), SOUND_AT_FN)));
+    hooks.extend(SOUND_HELD_CALLS.map(|site| (site, thunk(sound_held_thunk), SOUND_HELD_FN)));
+    hooks.extend(JINGLE_CALLS.map(|site| (site, thunk(jingle_thunk), JINGLE_FN)));
+    let mut failed = Vec::new();
+    for (site, target, expected) in hooks {
+        // Only a `call` to the function we expect is redirected (a different game build, or
+        // something else's hook there, is left alone).
+        if calls(site) != Some(expected) {
+            failed.push(site);
+            continue;
+        }
+        if crate::patch::redirect_call(site, target) != Some(expected) {
+            failed.push(site);
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    for (i, (site, expected)) in HAT_CLEARS.into_iter().enumerate() {
+        let ours = [hat_clear_edx_thunk, hat_clear_eax_thunk][i] as unsafe extern "C" fn() as usize;
+        let mut call = [0x90u8; 7];
+        call[0] = 0xE8;
+        call[1..5].copy_from_slice(&(ours.wrapping_sub(site + 5) as u32).to_le_bytes());
+        if !crate::patch::replace_code(site, &expected, &call) {
+            failed.push(site);
+        }
+    }
+    if !failed.is_empty() {
+        log!(
+            "garden: {} Chao code hook(s) left out, their code isn't what we expect: {:x?}",
+            failed.len(),
+            failed
+        );
+    }
+}
+
+/// Where the `call rel32` at `site` goes, if that's what's there.
+fn calls(site: usize) -> Option<usize> {
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the game's own code at a fixed address, read only.
+    unsafe {
+        let code = site as *const u8;
+        if code.read() != 0xE8 {
+            return None;
+        }
+        let rel = (code.add(1) as *const i32).read_unaligned();
+        Some((site + 5).wrapping_add(rel as usize))
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        let _ = site;
+        None
+    }
+}
+
+extern "C" fn drop_hat(kind: u32, at: usize, angle: i32, velocity: usize, record: usize) -> usize {
+    // SAFETY: `at` is the Chao's Data1+0x14 (both callers), so its record is at Data1+0x5C.
+    let chao = unsafe { (((at - D_POSITION) + D_RECORD) as *const usize).read() };
+    if is_visitor(chao) != 0 {
+        return 0;
+    }
+    // SAFETY: the game's own function these calls made, with their arguments.
+    unsafe {
+        std::mem::transmute::<usize, extern "C" fn(u32, usize, i32, usize, usize) -> usize>(
+            DROP_HAT,
+        )(kind, at, angle, velocity, record)
+    }
+}
+
+/// Whether `record` is a visitor's (not 0, not our save's).
+extern "C" fn is_visitor(record: usize) -> u32 {
+    u32::from(record != 0 && !in_save(record))
+}
+
+/// The hat clears' replacement (`call`, then the 2 leftover bytes are `nop`s): clears the hat
+/// of the record in EDX / EAX, unless it's a visitor's. Registers kept.
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn hat_clear_edx_thunk() {
+    std::arch::naked_asm!(
+        "push ecx",
+        "push edx",
+        "push eax",
+        "push edx",
+        "call {visitor}",
+        "add esp, 4",
+        "test eax, eax",
+        "pop eax",
+        "pop edx",
+        "pop ecx",
+        "jnz 2f",
+        "mov byte ptr [edx + 0xD5], 0",
+        "2:",
+        "ret",
+        visitor = sym is_visitor,
+    )
+}
+
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn hat_clear_eax_thunk() {
+    std::arch::naked_asm!(
+        "push ecx",
+        "push edx",
+        "push eax",
+        "push eax",
+        "call {visitor}",
+        "add esp, 4",
+        "test eax, eax",
+        "pop eax",
+        "pop edx",
+        "pop ecx",
+        "jnz 2f",
+        "mov byte ptr [eax + 0xD5], 0",
+        "2:",
+        "ret",
+        visitor = sym is_visitor,
+    )
+}
+
+/// The AI tick with `THINKING` set to its Chao (EAX).
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn ai_tick_thunk() {
+    std::arch::naked_asm!(
+        "mov dword ptr [{thinking}], eax",
+        "mov edx, {tick}",
+        "call edx",
+        "mov dword ptr [{thinking}], 0",
+        "ret",
+        thinking = sym THINKING,
+        tick = const AI_TICK,
+    )
+}
+
+/// A sound played while a Chao thinks (game thread, from the thunks): noted for `sounds_frame`.
+#[cfg(target_arch = "x86")]
+extern "C" fn heard(call: u32, id: u32, at: usize, a: i32, b: i32, c: i32) {
+    let chao = THINKING.load(Ordering::Relaxed);
+    if chao == 0 || !SOUNDS_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: the sound's position the game passes (3 floats), or the jingle's name.
+    let position = if call == u32::from(SOUND_JINGLE) {
+        [0.0; 3]
+    } else {
+        unsafe { (at as *const [f32; 3]).read_unaligned() }
+    };
+    let id = if call == u32::from(SOUND_JINGLE) {
+        at as u32
+    } else {
+        id
+    };
+    let mut heard = HEARD.lock().unwrap_or_else(|e| e.into_inner());
+    if heard.len() < MAX_HEARD {
+        heard.push((chao, call as u8, id, position, [a, b, c]));
+    }
+}
+
+/// A sound call in the Chao code: noted (`heard`), then the call goes on as it was. Registers
+/// and the caller's arguments kept.
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn sound_at_thunk() {
+    std::arch::naked_asm!(
+        "push eax",
+        "push ecx",
+        "push edx",
+        "push dword ptr [esp + 0x18]",
+        "push dword ptr [esp + 0x18]",
+        "push dword ptr [esp + 0x18]",
+        "push esi",
+        "push edi",
+        "push {call}",
+        "call {heard}",
+        "add esp, 0x18",
+        "pop edx",
+        "pop ecx",
+        "pop eax",
+        "push {sound}",
+        "ret",
+        call = const SOUND_AT,
+        heard = sym heard,
+        sound = const SOUND_AT_FN,
+    )
+}
+
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn sound_held_thunk() {
+    std::arch::naked_asm!(
+        "push eax",
+        "push ecx",
+        "push edx",
+        "push dword ptr [esp + 0x18]",
+        "push dword ptr [esp + 0x18]",
+        "push dword ptr [esp + 0x18]",
+        "push esi",
+        "push edi",
+        "push {call}",
+        "call {heard}",
+        "add esp, 0x18",
+        "pop edx",
+        "pop ecx",
+        "pop eax",
+        "push {sound}",
+        "ret",
+        call = const SOUND_HELD,
+        heard = sym heard,
+        sound = const SOUND_HELD_FN,
+    )
+}
+
+/// A jingle call in the Chao behaviours (EBX = name): noted, then played as it was.
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn jingle_thunk() {
+    std::arch::naked_asm!(
+        "push eax",
+        "push ecx",
+        "push edx",
+        "push 0",
+        "push 0",
+        "push 0",
+        "push ebx",
+        "push 0",
+        "push {call}",
+        "call {heard}",
+        "add esp, 0x18",
+        "pop edx",
+        "pop ecx",
+        "pop eax",
+        "push {jingle}",
+        "ret",
+        call = const SOUND_JINGLE,
+        heard = sym heard,
+        jingle = const JINGLE_FN,
+    )
+}
+
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn ai_tick_thunk() {}
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn sound_at_thunk() {}
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn sound_held_thunk() {}
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn jingle_thunk() {}
+
+/// Whether Chao `object` may put on a hat: our save's Chao only.
+#[cfg(target_arch = "x86")]
+extern "C" fn may_wear_hat(object: usize) -> u32 {
+    // SAFETY: the Chao object the reactions check runs for.
+    let record = unsafe { record_of_object(object) };
+    u32::from(record == 0 || in_save(record))
+}
+
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn wear_hat_thunk() {
+    std::arch::naked_asm!(
+        "push esi",
+        "call {may}",
+        "add esp, 4",
+        "test eax, eax",
+        "jz 2f",
+        "push {check}",
+        "ret",
+        "2:",
+        "ret",
+        may = sym may_wear_hat,
+        check = const WEAR_HAT_CHECK,
+    )
+}
+
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn wear_hat_thunk() {}
+
+#[cfg(target_arch = "x86")]
+extern "C" fn life_tick_before(object: usize) {
+    let copy = std::panic::catch_unwind(|| {
+        with(|g| g.mirrors.values().any(|m| m.object == object && !m.own))
+    })
+    .unwrap_or(false);
+    // SAFETY: the Chao object the tick is for; its record is a visitor buffer when `copy`.
+    let record = unsafe { record_of_object(object) };
+    let before = (copy && record != 0 && !in_save(record)).then(|| {
+        (
+            object,
+            Box::new(unsafe { (record as *const ChaoData).read() }),
+        )
+    });
+    *TICKING.lock().unwrap_or_else(|e| e.into_inner()) = before;
+}
+
+#[cfg(target_arch = "x86")]
+extern "C" fn life_tick_after(object: usize) {
+    let Some((ticked, before)) = TICKING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if ticked != object {
+        return;
+    }
+    let _ = std::panic::catch_unwind(|| {
+        // SAFETY: the copy's record (a visitor buffer, never freed), on the game thread.
+        let record = unsafe { record_of_object(object) };
+        if record == 0 {
+            return;
+        }
+        let after = unsafe { (record as *const ChaoData).read() };
+        let ticked = chao::changes::diff(&before, &after);
+        with(|g| {
+            let Some(m) = g.mirrors.values_mut().find(|m| m.object == object) else {
+                return;
+            };
+            if let Some(snapshot) = m.snapshot.as_deref_mut() {
+                chao::changes::apply(snapshot, &ticked);
+            }
+            // SAFETY: as above.
+            unsafe { hold_life(record, m.snapshot.as_deref_mut()) };
+        });
+    });
+}
+
+/// The life tick between our before and after (ESI = Chao object, kept for after).
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn life_tick_thunk() {
+    std::arch::naked_asm!(
+        "push esi",
+        "push esi",
+        "call {before}",
+        "add esp, 4",
+        "mov esi, dword ptr [esp]",
+        "mov eax, {tick}",
+        "call eax",
+        "call {after}",
+        "pop esi",
+        "ret",
+        before = sym life_tick_before,
+        after = sym life_tick_after,
+        tick = const LIFE_TICK,
+    )
+}
+
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn life_tick_thunk() {}
 
 /// Adds `changes` to the Chao record at `record` (with the game's limits), and has its live
 /// object (if any) redo its look.
@@ -1442,6 +2605,8 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
         // Toys and instruments in its hands, and the drum.
         show_props(object, d, t.props, t.drum);
         show_cocoon(object, d, t.cocoon);
+        show_book(object, d, t.book);
+        blow_bubbles(d, t.props, &mut m.bubbles);
     }
     if t.held
         && let Some(&(holder, angle)) = holders.get(&brain)
@@ -1598,7 +2763,18 @@ extern "C" fn held_main(object: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChaoData, LOOK_FORM_LEN, look, rotate};
+    use super::{
+        CHAO_SIZE, CHAO_SLOTS, ChaoData, LOOK_FORM_LEN, SAVE_COPY_SIZE, in_save, look, rotate,
+    };
+
+    #[test]
+    fn save_records_are_the_slots_of_either_copy() {
+        assert!(in_save(CHAO_SLOTS));
+        assert!(in_save(CHAO_SLOTS + 23 * CHAO_SIZE));
+        assert!(in_save(CHAO_SLOTS + SAVE_COPY_SIZE + 5 * CHAO_SIZE));
+        assert!(!in_save(CHAO_SLOTS - CHAO_SIZE));
+        assert!(!in_save(0x0800_0000));
+    }
 
     #[test]
     fn looks_follow_colour_and_parts_but_not_tiny_changes() {

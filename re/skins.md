@@ -477,3 +477,47 @@ The game's own voice banks are in `resource/gd_PC/MLT`.
   loader's `jmp`, followed on) and drops calls whose return address is in the player code:
   0x450000..0x478000 (shared player helpers: pick up, pet, tree) and 0x710000..0x760000 (the
   characters' mains and actions). Cutscene, Omochao and story voices come from elsewhere.
+
+## Hurt blink (2026-10-18, REA)
+
+After a hit a character can't be hurt again for a while: EntityData1 +6 (u16) counts it down.
+The character's display (Sonic's family 0x720090) skips the body while +6 has bit 2 (`(+6 & 2)
+&& !*0x174B009`), so it blinks every other two frames; 0x174B009 is set while the split screen
+draws one player's view, which turns the blink off. Its shadow display (0x71E520) has the same
+check around the body it draws into the shadow map, so the shadow blinks too.
+- Solid and animated skins aren't drawn on those frames (skins.rs `blinked_out`); a rigged skin
+  is drawn by the character's display, which already skips it. The skin's shadow is drawn inside
+  the shadow display's own body draw (hide.rs `replacing`), so it blinks with it already.
+- Puppets: the sender's `PlayerState` status has 4 while +6 is nonzero; puppets (skinned or not)
+  aren't drawn on blink frames of our own beat (puppet.rs), with the same 0x174B009 rule. Puppets
+  have no shadows.
+
+## Walking in place (2026-10-18)
+
+Animated skins chose idle/walk/run from how far the character's position moved between draws.
+The position also moves while the character stands (pushed back by the ground on a slope or a
+wall, carried by a platform), and that kept skins walking in place now and then. The game's own
+movement goes by CharObj2 +0x64 (3 f32: forward, up, sideways speed in the character's frame;
+0x45B610 compares +0x64 with the physics speeds at +0xE8.., a hit sets it to the knock-back,
+0x46C340), so the skin now goes by its forward and sideways part. Puppets: the sender's status has
+8 when that speed is under 0.05 on the ground, and their skin stands; moving, it still goes by
+their position. The animator also steps once per game frame (`Animator::step_once`, the skins'
+frame count), however many times it's drawn.
+
+
+## Boards and rails (2026-10-18, REA + objdump)
+
+Sonic's family (Sonic, Shadow, Amy, Metal Sonic) share one action table: Sonic's main 0x717840
+switches on the action (0..0x57) through 0x7197B4, its action step through 0x71E1A0.
+- **Board: actions 0x4C..=0x52.** Their handlers work with the board object at CharObj2 +0xA0
+  (0x71D450..: City Escape's board, o_ce_board.c, checks `co2+0xA0 == itself`, 0x5EB104), and a
+  City Escape object checks the player's action against 0x4C..0x52 (0x5EA1C6). The board draws
+  itself (its own display 0x5EBCE0 and shadow 0x5EBFC0, set at 0x5EBCAE), so hiding the
+  character's body never hides it.
+- **Rail: actions 0x47 and 0x48.** Their handlers call 0x46D040 (speed kept only along the way)
+  and 0x46D140, which moves the player along a path (CharObj2 +0xB8, distance +0x30, 0x4905A0).
+- An animated skin rides there (`ride_role`): its `ride=` / `grind=` animation if it has one,
+  else it stands (idle), never runs. Puppets the same, from the `PlayerState` character and
+  action. Not checked: 0x45/0x46/0x49 (next to the rail ones; ground/air movement handlers) and
+  the other "carried along" moves (pulleys, rockets, swing poles, light dash): in the air they
+  play jump/fall as before.

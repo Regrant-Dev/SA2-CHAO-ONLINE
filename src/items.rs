@@ -23,20 +23,13 @@ use crate::garden;
 use crate::log;
 use crate::net::protocol::{GardenItem, ItemId, ItemPlace, MAX_GARDEN_ITEMS};
 
-/// Chao-world object registry (shared with garden.rs): counts, then 0x1200 bytes per category
-/// of 0x48-byte entries.
-const WORLD_COUNTS: usize = 0x01DC_0F80;
-const WORLD: usize = 0x01DC_0FC0;
-const WORLD_ENTRY_SIZE: usize = 0x48;
-const WORLD_CATEGORY_SIZE: usize = 0x1200;
-const WORLD_CATEGORY_SLOTS: usize = 64;
+/// Chao-world object registry: registry.rs.
 /// Item categories: animals and drives, fruit, seeds, hats. 0 is Chao.
 const CATEGORIES: [usize; 4] = [2, 3, 7, 9];
 const CHAO_CATEGORY: usize = 0;
 /// Entry: +0 u16 category, +6 u16 flags (2 = held by a Chao), +8 save record, +0x40 partner.
 const ENTRY_FLAGS: usize = 0x06;
 const ENTRY_HELD_BY_CHAO: u16 = 0x2;
-#[cfg(target_arch = "x86")]
 const ENTRY_RECORD: usize = 0x08;
 const ENTRY_PARTNER: usize = 0x40;
 
@@ -108,6 +101,10 @@ struct Items {
     reports: HashMap<ItemId, (u8, u8, GardenItem, Instant)>,
     claims_out: Vec<ItemId>,
     owner_in: Vec<(ItemId, u8)>,
+    /// Our items in no one's save that the mod made so (fruit from the server's trees): only
+    /// these are reported unsaved. Ones the game itself made without a record (an egg's shell
+    /// with the hat list full) aren't the server's to keep.
+    unsaved: Vec<usize>,
 }
 
 static ITEMS: Mutex<Option<Items>> = Mutex::new(None);
@@ -142,6 +139,7 @@ fn lock() -> Guard {
         reports: HashMap::new(),
         claims_out: Vec::new(),
         owner_in: Vec::new(),
+        unsaved: Vec::new(),
     });
     Guard(g)
 }
@@ -153,6 +151,24 @@ pub fn received(from: u8, area: u8, items: Vec<GardenItem>) {
     for item in items {
         s.reports.insert(item.id, (from, area, item, now));
     }
+}
+
+/// Our new item `object` was made in no one's save on purpose (trees.rs: the server's trees'
+/// fruit): it's reported unsaved, and stays in the garden when we leave it.
+pub fn mark_unsaved(object: usize) {
+    let mut s = lock();
+    if !s.unsaved.contains(&object) {
+        s.unsaved.push(object);
+    }
+}
+
+/// The server, as an items' owner: its items come from the referee (`ServerItems`), not from a
+/// player (re/chao-garden-items.md 7).
+pub const SERVER: u8 = 0xFF;
+
+/// Network (the referee): the server's own items in garden `area`.
+pub fn received_server(area: u8, items: Vec<GardenItem>) {
+    received(SERVER, area, items);
 }
 
 /// Network (the referee): item `id` belongs to `owner`.
@@ -167,23 +183,15 @@ pub fn take_claims() -> Vec<ItemId> {
 
 // --- Reading the registry ---------------------------------------------------------------
 
-/// Live items: (entry, object).
+/// Live items: (entry, object). Every entry (registry.rs: the count can miss some), found by
+/// the entry's object pointer, never the object's own back-pointer (Chaos Drives don't set it).
 fn live_items() -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    for cat in CATEGORIES {
-        // SAFETY: the game's static registry; the count is clamped and objects are checked.
-        unsafe {
-            let count = ((WORLD_COUNTS + cat * 4) as *const u32).read() as usize;
-            for i in 0..count.min(WORLD_CATEGORY_SLOTS) {
-                let entry = WORLD + cat * WORLD_CATEGORY_SIZE + i * WORLD_ENTRY_SIZE;
-                let object = ((entry + OBJ_ENTRY) as *const usize).read();
-                if object != 0 && data1(object) != 0 {
-                    out.push((entry, object));
-                }
-            }
-        }
-    }
-    out
+    CATEGORIES
+        .iter()
+        .flat_map(|&cat| crate::registry::entries(cat))
+        // SAFETY: a registry entry's live object.
+        .filter(|&(_, object)| unsafe { data1(object) } != 0)
+        .collect()
 }
 
 /// # Safety
@@ -262,7 +270,7 @@ fn attached(object: usize, main: usize) -> bool {
 }
 
 fn category_of(entry: usize) -> usize {
-    (entry.wrapping_sub(WORLD)) / WORLD_CATEGORY_SIZE
+    crate::registry::category_of(entry)
 }
 
 /// Some garden item is within `distance` of `at`.
@@ -458,8 +466,11 @@ fn place(owner: u8, item: &GardenItem) -> Option<(Vector, bool)> {
             let (at, angle) = garden::holder(owner)?;
             Some((garden::in_hands(at, angle, item.position), true))
         }
-        ItemPlace::Chao(n) => {
-            let chao = garden::following_copy(owner, n)?;
+        ItemPlace::Chao {
+            owner: chao_owner,
+            index,
+        } => {
+            let chao = garden::following_copy(chao_owner, index)?;
             Some((
                 garden::in_hands(position(chao), facing(chao), item.position),
                 true,
@@ -494,6 +505,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
     let alive = |o: usize| live.iter().any(|&(_, x)| x == o);
     s.mine.retain(|&o, _| alive(o));
     s.copies.retain(|_, c| alive(c.object));
+    s.unsaved.retain(|&o| alive(o));
 
     apply_owners(&mut s, me, area);
 
@@ -590,7 +602,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
     if !s.frame.is_multiple_of(SEND_EVERY) {
         return Vec::new();
     }
-    let chao: Vec<(u8, usize, usize)> = garden::my_chao_entries();
+    let chao: Vec<(u8, u8, usize, usize)> = garden::run_here();
     let player = game::player_position();
     let copies: Vec<usize> = s.copies.values().map(|c| c.object).collect();
     let mut out = Vec::new();
@@ -616,11 +628,11 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
                 garden::rotate([p.x - at.x, p.y - at.y, p.z - at.z], angle.wrapping_neg()),
             )
         } else if let Some(partner) = chao_with(entry, object) {
-            match chao.iter().find(|(_, e, _)| *e == partner) {
-                Some(&(index, _, chao)) => {
+            match chao.iter().find(|(_, _, e, _)| *e == partner) {
+                Some(&(owner, index, _, chao)) => {
                     let c = position(chao);
                     (
-                        ItemPlace::Chao(index),
+                        ItemPlace::Chao { owner, index },
                         garden::rotate(
                             [p.x - c.x, p.y - c.y, p.z - c.z],
                             facing(chao).wrapping_neg(),
@@ -632,6 +644,20 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
         } else {
             (ItemPlace::Ground, [p.x, p.y, p.z])
         };
+        // SAFETY: a live registry entry: its save record (0 for none).
+        let mut unsaved = s.unsaved.contains(&object)
+            && unsafe { ((entry + ENTRY_RECORD) as *const usize).read() } == 0;
+        if unsaved && used_here(entry, object) {
+            // One in no one's save (fruit from the server's trees) that we or our Chao now use
+            // is ours: in our save from now on.
+            // SAFETY: our live item without a record, on the game thread.
+            unsafe { adopt(entry, object, area) };
+            // SAFETY: as above.
+            unsaved = unsafe { ((entry + ENTRY_RECORD) as *const usize).read() } == 0;
+            if !unsaved {
+                s.unsaved.retain(|&o| o != object);
+            }
+        }
         out.push(GardenItem {
             id,
             category,
@@ -639,6 +665,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
             bites,
             place,
             position,
+            unsaved,
         });
     }
     out.chunks(MAX_GARDEN_ITEMS)
@@ -703,6 +730,7 @@ fn apply_owners(s: &mut Items, me: u8, area: u8) {
                         bites,
                         place: ItemPlace::Ground,
                         position: [p.x, p.y, p.z],
+                        unsaved: false,
                     },
                     seen: Instant::now(),
                     main,
@@ -723,6 +751,18 @@ fn apply_owners(s: &mut Items, me: u8, area: u8) {
             if garden::player_held() == c.object {
                 // SAFETY: game thread.
                 unsafe { drop_held() };
+            }
+            // A Chao here has it (eating it, putting it on): it would use up what isn't ours, so
+            // the copy goes now; the owner's next report makes it again.
+            if entry_of(c.object).is_some_and(|entry| chao_with(entry, c.object).is_some()) {
+                delete(c.object);
+                s.copies.remove(&id);
+                log!(
+                    "items: item {}:{} was in a Chao's hands here; its copy goes",
+                    id.origin,
+                    id.serial
+                );
+                continue;
             }
             log!(
                 "items: item {}:{} stays with player {owner}",

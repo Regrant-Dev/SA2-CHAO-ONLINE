@@ -79,3 +79,24 @@ Sonic's display swaps model slots depending on co2 state (0x7205A3..0x7205D1: sl
 3. Homing start ball (Action 13): small, same draw code.
 4. Tails' mech jet: medium (asm stub, nozzle data in the protocol), nice in co-op mech stages.
 5. Spin-dash streak (0x757040) and on-foot upgrade models: high effort, low value. Skip.
+
+## Shields and invincibility on puppets (2026-10-18 RE; not built)
+- **Power bits:** CharObj2+0x10 holds them: 0x1 barrier, 0x2 magnetic barrier, 0x8000
+  invincibility. They're set by 0x46E2E0 / 0x46E180 / 0x46E440, the item-box rewards.
+- **The effect objects:** each of those makes one for player index n (Data1+1):
+  - NBarrier 0x753210: main 0x753D40, display 0x7533B0;
+  - TBarrier 0x753280: main 0x7533E0, display 0x7533B0;
+  - Muteki 0x7532F0: main 0x754150.
+- **How the barrier works:**
+  - **Its main** stays while `CharObj2s[n]+0x10 & 1` and spawns random sparkle children
+    (0x470C00, main 0x753E10, display 0x753E30). Those sparkles are what you see.
+  - **Its display** only places itself: 0x753350 takes `EntityData1[n]`+0x20 (scale) and
+    `CharObj2s[n]`+0x230 (or +0x218 for a mech) as its centre.
+- **Drawing one on a puppet would need:**
+  - the sender's bits (a small message);
+  - the lockon.rs player-2 lender, extended so the stand-in CharObj2 has the bits, +1 =
+    character and +0x230 = the puppet's centre, and the stand-in EntityData1 has scale 1;
+  - that lender in place around the barrier's main, display *and* each sparkle child's
+    callbacks.
+
+  The sparkles' callbacks weren't read, so it isn't built.

@@ -364,7 +364,22 @@ impl Host {
         for id in stale {
             self.drop_client(id, now, &mut events);
         }
+        // The referee's shared gardens, now and then.
+        let mut out = Vec::new();
+        self.referee.tick(now, &mut out);
+        self.deliver(out, now, &mut events);
         events
+    }
+
+    /// The shared gardens the referee keeps, as text for a file, when they changed since last
+    /// time (re/chao-garden-items.md 7).
+    pub fn garden_state(&mut self) -> Option<String> {
+        self.referee.changed().then(|| self.referee.saved())
+    }
+
+    /// Takes back shared gardens `garden_state` wrote.
+    pub fn load_garden_state(&mut self, text: &str) {
+        self.referee.load(text);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -778,6 +793,7 @@ mod tests {
                 bites: 4,
                 place: ItemPlace::Ground,
                 position: [0.0; 3],
+                unsaved: false,
             }],
         };
         lobby.host.send(report, false, now);

@@ -430,5 +430,171 @@ is an ordinary saved fruit and already syncs as an item.
   death or reincarnation: 0x568570 makes an egg from the Chao's own record (+0x8E reincarnations).
   The keeper keeps its visitor copies' lifespan at 1 or more without sending that, so this only
   happens in the owner's game.
-- Still open: hats (section 5 of re/chao-garden-items.md, items 1 and 2). A visitor running here
-  all the time can drop its hat into the keeper's save when hit or thrown.
+- Hats (section 5 of re/chao-garden-items.md, items 1 and 2): closed for visitors, see the next
+  section.
+
+## What a copy shows vs. its brain's Chao (2026-10-18, REA/Ghidra + objdump; src/garden.rs)
+
+An audit of everything the Chao's update and draw read, against what `GardenChao` and the look
+sync carry. A copy runs the full MainSub 0x54FE20 with the AI bit (Data1+0xA0 & 0x10) off, so
+everything except 0x53DC40 (reactions 0x53DB10, behaviours, think timers 0x562C00) still runs.
+
+Shown the same on a copy (nothing to send):
+- Emotion ball and the icon over it (0x53CB70 → 0x53CA40, handler table 0x1353834: 6 handlers
+  0x53C180..0x53C790 that read only the mood block Data1+0x6EC..0x76C; icon id at +0x726, drawn by
+  the delayed display 0x53CEB0 from table 0x1366ACC, 10 = none). The mood state, timer and
+  length are sent, so the rest follows.
+- Face: eyes/mouth are sent; 0x53A3E0 counts their timers and blinks (0x53A1E0, +0x6C0..0x6E8)
+  locally.
+- Shape and colour (0x56CCF0 → 0x5A49C0 when +0x674 bit 2): from the record (look sync).
+- Draw 0x540B60: body from +0x510, +0x650 model (written only in the stadium, 0x59E196), drum
+  +0x660 (sent). Held: -1.0 Y from Status 0x8000 (set by `put`).
+- Physics 0x53DF00 / 0x796780: overwritten by `put`. Shadow list 0x540FD0: local.
+- Param window ("ParamFukidasi", 0x5659E0): the local player's UI, not the Chao's.
+
+Life tick, runs on every Chao including copies: 0x5363D0 (garden master) takes one registry
+Chao every few frames (`0x1312DE2`) and calls 0x5353C0 (ESI = object, only with Data1+0xA0 &
+0x20000): emotions (+0x12D..+0x156), lifespan, and for a child evolution progress (0x536110) and
+in the Hero/Dark garden (0x134046C = 2/3) alignment ± (0x536260). It touches only the record.
+Since it also runs on the owner's real Chao, what it does to a copy must not be forwarded, or
+the owner's Chao drifts twice (alignment was: the keeper's 30-frame diff sent it). The mod
+wraps the call (0x53640F) and adds a copy's tick changes to its snapshot.
+
+Evolution: only the behaviour chooser starts it: 0x562A80 → 0x562800: child (record +0x80 = 2)
+with evolution progress (+0xC0) > 1.0 (0x1312C90) → cocoon behaviour 0x568D30. A copy whose AI
+runs (the keeper's, or a touched one) is kept at 0.99 (also lifespan ≥ 1), so a Chao evolves,
+dies or is reborn only in its owner's game. When it's due, its owner's game runs it (below).
+
+Hats, fixed for visitors (records outside our save's 24 Chao slots in either save copy):
+- Dropping (hit 0x563E84, thrown 0x56440A): 0x54A540 (cdecl kind, &pos = Data1+0x14, angle,
+  &velocity, record in our save's hat list B+0x4D8) makes the hat object (ALO_ObakeHeadExecutor)
+  and the record; the caller then clears +0xD5. Hooked: a visitor's isn't made and it keeps it
+  on (the clear is skipped, below).
+- Putting one on: the reactions check calls 0x5691B0 (ESI = object) at 0x53DB87: touch kind
+  0x93 → behaviour 0x569240 (frees our hat record). Hooked: visitors don't.
+
+Behaviour effects that aren't the Chao object (each behaviour runs only in the brain's game):
+- Book (BookExecutor, 0x55E180, EBX = Chao): reading behaviour 0x55E210 (motions 0x151..0x153).
+  Pointer at Data1+0x38 (the cocoon is at +0x34); MainSub 0x55DF90, display 0x55E050, Data1[0]
+  mode: 0 opening (scale +0x24 to 1), 1 open, 2/3 page turn (+0x20), 4 closing, then it deletes
+  itself without clearing the Chao's pointer. Sent (`GardenChao::book`); the copy makes its own,
+  turns its page and closes it.
+- Bubbles (ALO_ShabonExecutor, 0x55DA10: EBX = &pos, push &velocity): the bubble behaviour
+  0x55DB10 attaches the wand (0x12FE33C node 4, 0x12FE574 node 11; nothing else uses them), plays
+  0x146 and from frame 60, every 10 frames with chance 0.4, blows one at the hand node
+  (Data1+0x5E4, direction +0x614). A copy showing the wand does the same.
+- Items in a Chao's hands (0x56CFF0 keeps the partner item at the hand nodes +0x5D8/+0x5E4 by
+  Data1+0xA0 bits 0x400/0x800): the item's owner reports it as held by that Chao. A keeper's item
+  held by a visitor it runs was reported as "busy" at a fixed spot; `ItemPlace::Chao` now names
+  the Chao's owner too.
+- Sounds: synced, see the next section.
+
+## Chao sounds and life events during a visit (2026-10-18; src/garden.rs)
+
+Sounds. Every Chao behaviour and reaction runs inside the AI tick 0x53DC40, which the MainSub
+calls once, at 0x54FE49 (EAX = object); the mod wraps that call and notes the Chao while it runs.
+Two calls play a sound at a place: 0x4372E0 and 0x437590, both EDI = sound id, ESI = &position
+(the 3 floats are copied), 3 cdecl arguments the caller pops (0x4372E0: a value kept with the
+sound, volume byte, then a third; 0x437590 also takes EBX = the sound's holder, keeping one
+sound per (holder, id), and its third argument is a length). The Chao code has 82 and 19 calls
+with ESI at an object's position (Data1+0x14), redirected through the mod (`SOUND_AT_CALLS`,
+`SOUND_HELD_CALLS`). The character voice hook (voice.rs) patches 0x4372E0's start, so sites are
+redirected rather than the function. Sounds made while a Chao our game runs thinks are sent
+(`ChaoSounds`) with the offset from the Chao; copies following the sender play them with the same
+call at their own place (EBX = the copy). 0x437260 (no position) is only called from menus,
+karate and the garden masters, not from Chao.
+
+Jingles: 0x443480 (EBX = .adx name) plays music ("JingleTask"). The Chao behaviours call it for
+hatching/evolving (0x56880C, 0x56887E, 0x568E6D, 0x568E89, 0x568EA5: chao_g_born_h2/_d2/_c/_h/_d),
+dying (0x5690C6, chao_g_dead), dancing (0x59C10F, chao_g_dance) and 0x565066 (chao_k_net_fine).
+These go the same way, as an index into `garden::JINGLES`. The TV and radio play theirs from
+their own mains (0x55C5F3.., 0x57C9BE), kept in step by the toy sync.
+
+Hats: the clears after a drop (0x563E92 `mov byte [edx+0xD5],0`, 0x564418 the same with EAX)
+are now a call to the mod, which skips a visitor's; no frame without the hat.
+
+Life events of our own Chao while a friend keeps the garden. A copy's AI never starts them
+(`hold_life`), and our Chao follows the keeper with its AI off, so nothing would. Instead, our
+game watches its own: a child past 1.0 evolution, a life at 0, or one in the evolving (0x568D30)
+or end-of-life (0x568F60) behaviour or with a cocoon (Data1+0x34). While that holds, and 10 s
+after, it stops following the keeper: its AI runs here, so the game's own chooser starts the
+event and plays it out (cocoon, evolution or death/rebirth, all in our save, as at home). It's
+sent with `GardenChao::owner_runs`; everyone, the keeper too, then follows our game for that
+Chao (the keeper stops running and sending its copy, its holds come to us), and our game sends
+its sounds and jingles. After an evolution its look changed, so it's sent again
+(`Body::Chao`) and the copies are made anew. A death ends its visit (its row goes); a rebirth
+leaves an egg, which visits as eggs do.
+
+## Patch sites checked, and what's left (2026-10-18, third pass)
+
+All 116 patched spots were checked in `re/bin/sonic2app.dumped.exe` (sha256 d1ac8ed9…, the file
+REA analyses; spot reads through REA at 0x54FE49, 0x563E92, 0x5A2D78 match): every redirected
+call is `E8 rel32` to the function named (82 × 0x4372E0, 19 × 0x437590, 8 × 0x443480, 2 ×
+0x54A540, 0x5691B0 at 0x53DB87, 0x5353C0 at 0x53640F, 0x53DC40 at 0x54FE49), and the hat clears
+are `C6 82 D5 00 00 00 00` (0x563E92) and `C6 80 D5 00 00 00 00` (0x564418). The mod checks the
+same before patching each one and leaves out (and logs) any that differs.
+
+Sound call arguments, read in the callees (both `push ecx; push ebx/ebp` first):
+- 0x4372E0: `bl = [esp+0x14]` = 3rd argument, the volume byte (slot +5/+6); `[esp+0xC]` = 1st,
+  kept at slot +0x10 (a holder key, where 0x437590 keeps EBX); the 2nd goes to the slot search
+  0x4370D0. Callers pass 0 or a register for the 1st; the mod sends only whether there was one,
+  and the copy is the holder.
+- 0x437590: `dl = [esp+0x10]` = 2nd, volume (+5/+6); `bp = [esp+0x14]` = 3rd, length (+0xC);
+  EBX at +0x10, EDI at +0x14, so one sound per (holder, id). Callers pass 1, volume, length.
+
+A copy made anew (its look changed: evolved, took an animal) used to appear where new visitors
+do; it now takes the old copy's place (where its brain has it), facing and motion.
+
+Items a Chao here takes from a friend: the claim goes to the referee; if it's refused while
+the Chao still has it (eating a fruit, putting a hat on: 0x569240 links it with 0x56CFB0, and
+0x569430 frees its record only when it has one), the copy is deleted so nothing that isn't ours
+is used up; the owner's next report makes it again.
+
+Checked and needing nothing new:
+- Carrying a visitor out of the garden (kindergarten, lobby, any exit): visitors.rs clears the
+  carried Chao (0x1A5CA5C) for visitor buffers, eggs too. Our own Chao, following the keeper or
+  not, is our save's and goes as usual.
+- Race and karate entrances: no garden Chao there; races use the sent Chao data.
+- Name tags: friends' copies (not our own following ones).
+- Hats: visitors neither drop nor put on hats here; our own Chao taking a friend's hat item goes
+  through the item claim (above).
+
+## The other Chao World areas (2026-10-18)
+
+ChaoArea (0x134046C): 0 lobby, 4 race, 5 entrance (race/karate), 6 kindergarten, 9 stadium,
+10 karate; the gardens are 1..=3. Players in the same area see each other's puppets (online.rs
+draws everyone in the same level and, in Chao World, the same area).
+
+- Kindergarten (classroom, doctor, black market, name machine, fortune teller), the lobby's
+  machines and the stadium/entrance menus are each player's own menus on their own save: the
+  classroom takes your Chao for a lesson in your save, the doctor reads your Chao, the black
+  market spends your rings. Nothing there is world state another player sees, so nothing to
+  share beyond the puppets.
+- Visible gap, fixed: a Chao carried out of the garden (the game makes it again in the next
+  area from 0x1A5CA5C) showed as empty hands on the carrier's puppet. `carried.rs` sends it
+  (`CarriedChao`) and the others show a display-only copy in the puppet's hands (CreateChao, as
+  the game does for a carried Chao in these areas; menu flags: no AI, no collision).
+- Not shown: a Chao the carrier puts down outside the garden (rare; it goes back to their
+  garden when they leave the area).
+- Races and karate: re/chao-race-sync.md 4 and re/chao-karate-sync.md 6.
+
+
+## Crash at 0x77FB53 when a kept visitor went home (2026-10-18, minidump + REA)
+
+The live test crashed in the same second the keeper removed a visitor it was running with its AI
+on. Minidump: EIP 0x77FB53 in 0x77FB00 (world point to screen: ESI = &point, EBX = out),
+`fld [esi+8]` with ESI = 0x14, called from 0x564DB2. That caller is the status balloon over a
+Chao (ParamFukidasi, made by 0x5659E0, one at a time in 0x1AED28C): its data (object +0x40) keeps
+the Chao object at +0x38, and in its states 4 and 6 it projects that Chao's position
+(`[[data+0x38]+0x34]+0x14`, 0x564DA5). Behaviours make it when the player deals with a Chao
+(0x560771, 0x565B62, 0x566ED2), so a copy whose AI runs (the keeper's) can have one; the copy
+was deleted under it and its Data1 read as 0. The game's own Chao never vanish under a balloon.
+Fix (`garden::delete_chao`): before deleting a Chao object, a balloon over it is closed the way
+its creator closes an old one (state 7, the global cleared); then the object goes through the
+normal delete (its delete sub unlinks it from the registry and its partner, 0x5307F0). Used for
+every copy the garden deletes (gone home, made anew) and carried.rs's copies.
+
+Visitors also no longer go home just because their owner's updates stopped while the owner is
+still in our garden by their last state (their game idles on a tab-out): `garden::set_alive`
+(players whose state came in the last 2 s) and `PAUSED_LEFT` (5 minutes); a disconnect still
+sends them home at once. Egg copies stay put the same way.

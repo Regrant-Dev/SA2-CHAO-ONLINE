@@ -247,3 +247,19 @@ Caveats:
 Confidence: lane table, finish function, goal trigger and end rule high. Flag 0x10 skipping
 all AI medium-high (read from 0x53FAF5, not run). Effects of 0x53DF00 and the other movement
 callees not verified, which is why the post-main position overwrite is recommended.
+
+## 4. Gaps (audit 2026-10-18)
+
+What a friend's lane shows in our party race, against their real Chao in theirs:
+- Position: theirs (shifted by the lane gap), set after the lane's own update (race.rs).
+- Animation: was the lane's own behaviour's (running), so a friend's Chao that stopped to rest,
+  tripped, swam or cheered in their race ran on the spot in ours. Fixed: the racer's state now
+  carries its motion id in `PlayerState::anim` (current, or the one it blends into), and the
+  lane starts it (SetMotionLink 0x793C40, checked against the shared table) when theirs changes.
+- Facing and progress (`Data1+0xA8`) stay the lane's: the lane follows the course, so it faces
+  the right way, and the ranking (0x52BC40) keeps working.
+- Finish: the lane's own goal check fires when it reaches the goal where their Chao is, so the
+  finish order follows the real one to within the update delay.
+- Not synced: the lane's emotion ball and face (the race shows them small), sounds. Results and
+  rewards are each player's own (0x5396C0 in each game).
+

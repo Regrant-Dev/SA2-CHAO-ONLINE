@@ -375,8 +375,10 @@ pub fn start_frame(peers: &[Peer], connected: bool) {
 // check, progress) but, while the race runs, after each update is put where their real Chao
 // is, shifted by the gap between their lane in their game and in ours (measured when the race
 // starts), so speed-ups and the finish happen when they really did (re/chao-race-sync.md 3).
-// Only the position is set: facing and progress stay the game's, which keeps the camera and
-// ranking sane.
+// Only the position and the animation are set: facing and progress stay the game's, which
+// keeps the camera and ranking sane. The animation is their Chao's (sent in the state's `anim`)
+// whenever theirs changes, so a friend's Chao resting, tripping or cheering in their race does
+// it in ours too, not just the run its lane's own behaviour would play.
 
 const RACE_CHAO_MAIN: usize = 0x0053_FC10;
 const OBJ_MAIN: usize = 0x10;
@@ -388,11 +390,72 @@ const RACE_RUNNING: i32 = 3;
 /// Stop following a friend's Chao when their updates stop for this long.
 const DRIVE_STALE: Duration = Duration::from_secs(1);
 
-/// A friend's racing Chao as last seen: when and where.
+/// A friend's racing Chao as last seen: when, where, and its animation.
 #[derive(Clone, Copy)]
 struct Target {
     at: Instant,
     position: crate::game::Vector,
+    motion: u16,
+}
+
+/// Data1: the motion controller (flags +0, bit 2 blending; current +4, next +8; table +0x48 of
+/// 0x1C-byte entries) and SetMotionLink (EAX = controller, EDX = id).
+const DATA1_MOTION: usize = 0xAC;
+const MC_FLAGS: usize = 0x00;
+const MC_CURRENT: usize = 0x04;
+const MC_NEXT: usize = 0x08;
+const MC_TABLE: usize = 0x48;
+const MOTION_ENTRY_SIZE: usize = 0x1C;
+const MOTION_BLENDING: u16 = 0x2;
+const MAX_MOTION_ID: u16 = 0x400;
+#[cfg(target_arch = "x86")]
+const START_MOTION: usize = 0x0079_3C40;
+
+/// The animation a race Chao plays (or is blending into).
+///
+/// # Safety
+/// `data1` is a live race Chao's Data1.
+unsafe fn motion_of(data1: usize) -> u16 {
+    unsafe {
+        let mc = data1 + DATA1_MOTION;
+        let next = ((mc + MC_NEXT) as *const i32).read();
+        let id = if ((mc + MC_FLAGS) as *const u16).read() & MOTION_BLENDING != 0 && next >= 0 {
+            next
+        } else {
+            ((mc + MC_CURRENT) as *const i32).read()
+        };
+        u16::try_from(id).unwrap_or(0)
+    }
+}
+
+/// Starts animation `id` on a race Chao, if it's in the shared motion table.
+///
+/// # Safety
+/// `data1` is a live race Chao's Data1, on the game thread.
+#[cfg_attr(not(target_arch = "x86"), allow(clippy::needless_return))]
+unsafe fn start_motion(data1: usize, id: u16) {
+    let mc = data1 + DATA1_MOTION;
+    // SAFETY: the Chao's motion controller and its table (checked for null).
+    let ok = unsafe {
+        let table = ((mc + MC_TABLE) as *const usize).read();
+        id < MAX_MOTION_ID
+            && table != 0
+            && ((table + usize::from(id) * MOTION_ENTRY_SIZE) as *const usize).read() != 0
+    };
+    if !ok {
+        return;
+    }
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the game's SetMotionLink as behaviours call it.
+    unsafe {
+        std::arch::asm!(
+            "call {f}",
+            f = in(reg) START_MOTION,
+            inout("eax") mc => _,
+            inout("edx") u32::from(id) => _,
+            clobber_abi("C"),
+        );
+    }
 }
 
 struct Driving {
@@ -400,16 +463,19 @@ struct Driving {
     targets: std::collections::HashMap<u8, Target>,
     /// Our objects for friends' lanes -> owner, and the lane gap once the race runs.
     objects: Vec<(usize, u8, Option<crate::game::Vector>)>,
+    /// The animation each lane was last given from its owner's: object -> id.
+    motions: std::collections::HashMap<usize, u16>,
 }
 
 static DRIVING: Mutex<Option<Driving>> = Mutex::new(None);
 
 /// Network: a friend's racing Chao (their own lane 0) in their game.
-pub fn set_target(owner: u8, position: [f32; 3]) {
+pub fn set_target(owner: u8, position: [f32; 3], motion: u16) {
     let mut d = DRIVING.lock().unwrap_or_else(|e| e.into_inner());
     let d = d.get_or_insert_with(|| Driving {
         targets: Default::default(),
         objects: Vec::new(),
+        motions: Default::default(),
     });
     let [x, y, z] = position;
     d.targets.insert(
@@ -417,12 +483,14 @@ pub fn set_target(owner: u8, position: [f32; 3]) {
         Target {
             at: Instant::now(),
             position: crate::game::Vector { x, y, z },
+            motion,
         },
     );
 }
 
-/// Our own racing Chao, to send instead of our character: (position, facing, progress).
-pub fn my_racer() -> Option<([f32; 3], i32, f32)> {
+/// Our own racing Chao, to send instead of our character: (position, facing, progress,
+/// animation).
+pub fn my_racer() -> Option<([f32; 3], i32, f32, u16)> {
     let in_race = crate::game::current_level() == crate::game::LEVEL_CHAO_WORLD
         && crate::game::current_chao_area() == AREA_RACE;
     if !in_race {
@@ -436,6 +504,7 @@ pub fn my_racer() -> Option<([f32; 3], i32, f32)> {
             [p.x, p.y, p.z],
             ((mine.data1 + DATA1_ROTATION_Y) as *const i32).read_unaligned(),
             ((mine.data1 + DATA1_PROGRESS) as *const f32).read_unaligned(),
+            motion_of(mine.data1),
         ))
     }
 }
@@ -449,6 +518,7 @@ pub fn drive_frame() {
     if !in_race || !crate::room::in_room() {
         // The race objects are gone (or we're not racing together): forget them.
         d.objects.clear();
+        d.motions.clear();
         return;
     }
     let owners: Vec<(usize, u8)> = {
@@ -529,6 +599,13 @@ extern "C" fn drive_main(object: usize) {
                 y: t.position.y + gap.y,
                 z: t.position.z + gap.z,
             });
+            // Their animation when theirs changes (and ours isn't it already).
+            if d.motions.get(&object) != Some(&t.motion) {
+                d.motions.insert(object, t.motion);
+                if motion_of(data1) != t.motion {
+                    start_motion(data1, t.motion);
+                }
+            }
         }
     });
 }

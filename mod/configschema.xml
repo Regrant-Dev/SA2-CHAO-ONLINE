@@ -35,7 +35,7 @@
       <Property name="Visitor4" display="Visitor 4 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
         <HelpText>Which Chao visits fourth. Easier to pick in game: F9 > Visitor 4.</HelpText>
       </Property>
-      <Property name="RoomMode" display="Room mode (rooms you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
+      <Property name="RoomMode" display="Party mode (parties you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
         <HelpText>Race: everyone has their own enemies. Coop: enemies someone destroys are gone for everyone.</HelpText>
       </Property>
       <Property name="SkinVoiceVolume" display="Skin voice volume (%)" type="int" defaultvalue="100" minvalue="0" maxvalue="150" alwaysinclude="true">
@@ -43,6 +43,9 @@
       </Property>
       <Property name="GameVolume" display="Game volume (%)" type="int" defaultvalue="100" minvalue="0" maxvalue="100" alwaysinclude="true">
         <HelpText>The whole game's volume: music, sounds, voices and skins (the game has no volume option of its own). Also in game: F9 > Game volume.</HelpText>
+      </Property>
+      <Property name="StageSync" display="Shared enemies and bosses" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>In party Co-op stages, enemies, bosses and mech lock-ons are shared between players. Turn this off if a party stage misbehaves; everything else stays shared.</HelpText>
       </Property>
       <Property name="ChaoRace" display="Friends' Chao in races" type="bool" defaultvalue="True" alwaysinclude="true">
         <HelpText>Friends' Chao fill the other lanes in your Chao Races.</HelpText>

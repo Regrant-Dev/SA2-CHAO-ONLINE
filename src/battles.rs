@@ -1,4 +1,4 @@
-//! ROOM BATTLES: online, the main menu's 2P entry opens this picker (the game's own 2P handler
+//! PARTY BATTLES: online, the main menu's 2P entry opens this picker (the game's own 2P handler
 //! returns without doing anything, see `game::block_two_player_menu`). It's drawn over the
 //! main menu and driven by the game's menu buttons while the main menu waits.
 
@@ -22,7 +22,7 @@ struct Choice {
 const CHOICES: [Choice; 3] = [
     Choice {
         label: "KART RACE",
-        note: "Pick a course: your room races along, no CPU karts",
+        note: "Pick a course: your party races along, no CPU karts",
     },
     Choice {
         label: "TREASURE HUNT",

@@ -37,6 +37,11 @@ use crate::visitors;
 pub const DEFAULT_PORT: u16 = 43_902;
 /// Send our state every N frames (60 fps / 2 = 30 Hz).
 const STATE_EVERY_FRAMES: u32 = 2;
+/// Below this ground speed (units a frame, the game's own) we stand still: our puppet's skin
+/// stands too (`STATUS_STILL`). A skin walks from 0.15 by default.
+const STILL_SPEED: f32 = 0.05;
+/// A player whose state came this recently is sending (not idling, e.g. tabbed out).
+const ALIVE: Duration = Duration::from_secs(2);
 /// How often our visitors' looks are checked for changes.
 const LOOK_EVERY_FRAMES: u32 = 60;
 /// A friend counts for keeping the garden while their updates are this fresh.
@@ -522,6 +527,7 @@ fn pump(online: &mut Online, now: Instant) {
                     .unwrap_or_default();
                 log!("online: player {id} '{name}' left");
                 crate::garden::player_left(Some(id));
+                crate::carried::player_left(id);
                 hud::toast(format!("{name} left"));
             }
             Event::Game {
@@ -664,6 +670,21 @@ fn pump(online: &mut Online, now: Instant) {
                 from,
                 body: Body::GardenTrees { area, trees },
             } => crate::trees::received_trees(from, area, trees),
+            Event::Game {
+                body: Body::ServerGarden { area, trees, toys },
+                ..
+            } => {
+                crate::trees::received_server(area, trees);
+                crate::garden_toys::received_server(area, toys);
+            }
+            Event::Game {
+                body: Body::ServerItems { area, items },
+                ..
+            } => crate::items::received_server(area, items),
+            Event::Game {
+                from,
+                body: Body::CarriedChao { chao, offset },
+            } => crate::carried::received(from, chao, offset),
             Event::Game {
                 from,
                 body: Body::ToyMode { area, toy, mode },
@@ -820,6 +841,14 @@ fn pump(online: &mut Online, now: Instant) {
             }
             Event::Game {
                 from,
+                body: Body::ChaoSounds { sounds },
+            } => {
+                if in_my_garden(online, from) {
+                    crate::garden::received_sounds(from, sounds);
+                }
+            }
+            Event::Game {
+                from,
                 body:
                     Body::ChaoHeld {
                         owner,
@@ -828,7 +857,7 @@ fn pump(online: &mut Online, now: Instant) {
                     },
             } => {
                 // To whoever's game runs that Chao.
-                if crate::garden::brain_here(owner) && in_my_garden(online, from) {
+                if crate::garden::brain_here(owner, index) && in_my_garden(online, from) {
                     crate::garden::received_held(from, owner, index, offset);
                 }
             }
@@ -844,6 +873,74 @@ fn pump(online: &mut Online, now: Instant) {
                 // Co-op messages count only from players in our room.
                 if room::shares_room(from) {
                     crate::coop::received(level, mission, objects);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::StageRings {
+                        level,
+                        mission,
+                        rings,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::coop::received_group_rings(level, mission, rings);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    body @ (Body::BossClaim { .. }
+                    | Body::BossState(_)
+                    | Body::BossHit { .. }
+                    | Body::BossAttacks { .. }),
+            } => {
+                if room::shares_room(from) {
+                    crate::boss_follow::received(from, body);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::UpgradeGot {
+                        level,
+                        mission,
+                        index,
+                        character,
+                        mask,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::coop::received_upgrade(level, mission, (index, character, mask));
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::EnemyStates {
+                        level,
+                        mission,
+                        enemies,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::enemies::received(from, level, mission, enemies);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::LockOn {
+                        level,
+                        mission,
+                        gun,
+                        locked,
+                        fired,
+                    },
+            } => {
+                if room::shares_room(from) {
+                    crate::lockon::received(from, (level, mission, gun, locked, fired));
                 }
             }
             Event::Game {
@@ -1072,6 +1169,34 @@ pub fn on_frame() {
             })
             .collect();
         crate::garden::set_holders(holders);
+        // Who's sending their state now (an idling game sends nothing, but is still here).
+        let alive = online
+            .remote
+            .iter()
+            .filter(|(_, r)| r.heard.elapsed() < ALIVE)
+            .map(|(&id, _)| id)
+            .collect();
+        crate::garden::set_alive(alive);
+    }
+    // Outside the gardens: Chao carried about (carried.rs).
+    let outside = level == game::LEVEL_CHAO_WORLD && garden <= 0;
+    let carriers: Vec<(u8, game::Vector, i32)> = online
+        .remote
+        .iter()
+        .filter(|(_, r)| {
+            outside
+                && r.latest
+                    .is_some_and(|s| s.level == level && i32::from(s.chao_area) == area)
+        })
+        .filter_map(|(&id, r)| {
+            r.timeline.sample(clock).map(|p| {
+                let [x, y, z] = p.position;
+                (id, game::Vector { x, y, z }, p.rotation[1])
+            })
+        })
+        .collect();
+    if let Some(body) = crate::carried::on_frame(outside, &carriers) {
+        online.session.send(body, true, now);
     }
     if garden != online.garden || RESEND_GARDEN_CHAO.swap(false, Ordering::Relaxed) {
         online.garden = garden;
@@ -1205,7 +1330,7 @@ pub fn on_frame() {
         if let Some(s) = remote.latest
             && s.flags & game::POSE_RACE_CHAO != 0
         {
-            crate::race::set_target(id, s.position);
+            crate::race::set_target(id, s.position, s.anim);
         }
     }
 
@@ -1243,6 +1368,13 @@ pub fn on_frame() {
         online.session.send(body, true, now);
     }
     if garden > 0 {
+        let sounds = crate::garden::take_sounds();
+        for sounds in sounds.chunks(crate::net::protocol::MAX_CHAO_SOUNDS) {
+            let body = Body::ChaoSounds {
+                sounds: sounds.to_vec(),
+            };
+            online.session.send(body, false, now);
+        }
         let (changes, held) = crate::garden::take_outgoing();
         for (owner, index, changes) in changes {
             let body = Body::ChaoChanges {
@@ -1479,6 +1611,45 @@ pub fn on_frame() {
             online.session.send(body, true, now);
         }
     }
+    for (level, mission, (index, character, mask)) in crate::coop::take_upgrades() {
+        let body = Body::UpgradeGot {
+            level,
+            mission,
+            index,
+            character,
+            mask,
+        };
+        online.session.send(body, true, now);
+    }
+    if let Some((level, mission, enemies)) = crate::enemies::take_outgoing() {
+        let body = Body::EnemyStates {
+            level,
+            mission,
+            enemies,
+        };
+        online.session.send(body, false, now);
+    }
+    for (body, reliable) in crate::boss_follow::take_outgoing() {
+        online.session.send(body, reliable, now);
+    }
+    if let Some((level, mission, gun, locked, fired)) = crate::lockon::take_outgoing() {
+        let body = Body::LockOn {
+            level,
+            mission,
+            gun,
+            locked,
+            fired,
+        };
+        online.session.send(body, true, now);
+    }
+    if let Some((level, mission, rings)) = crate::coop::take_group_rings() {
+        let body = Body::StageRings {
+            level,
+            mission,
+            rings,
+        };
+        online.session.send(body, true, now);
+    }
     if let Some((level, mission, objects)) = crate::coop::take_outgoing() {
         let body = Body::StageKills {
             level,
@@ -1519,6 +1690,16 @@ pub fn on_frame() {
             status: me.map_or(0, |m| {
                 (if m.grounded { STATUS_GROUNDED } else { 0 })
                     | if m.holding { STATUS_HOLDING } else { 0 }
+                    | if game::local_invulnerable() {
+                        crate::net::protocol::STATUS_INVULNERABLE
+                    } else {
+                        0
+                    }
+                    | if m.grounded && m.speed < STILL_SPEED {
+                        crate::net::protocol::STATUS_STILL
+                    } else {
+                        0
+                    }
             }),
         };
         // In a room race, our racing Chao goes out instead of our (absent) character.
@@ -1529,12 +1710,12 @@ pub fn on_frame() {
             state.chao_area = -1;
         }
         if room::in_room()
-            && let Some((position, rotation_y, progress)) = crate::race::my_racer()
+            && let Some((position, rotation_y, progress, motion)) = crate::race::my_racer()
         {
             state.position = position;
             state.rotation = [0, rotation_y, 0];
             state.frame = if progress.is_finite() { progress } else { 0.0 };
-            state.anim = 0;
+            state.anim = motion;
             state.flags |= game::POSE_RACE_CHAO;
         }
         online.session.send(Body::PlayerState(state), false, now);

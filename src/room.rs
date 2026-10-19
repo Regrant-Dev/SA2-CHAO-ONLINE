@@ -284,14 +284,14 @@ pub fn update(me: Option<u8>, others: Vec<Other>) {
         for o in &r.others {
             let theirs = RoomId { owner: o.id };
             if o.room == Some(theirs) && !was_in(o.id, theirs) && r.room != Some(theirs) {
-                hud::toast(format!("{} created a room (F9 > Room to join)", o.name));
+                hud::toast(format!("{} created a party (F9 > Party to join)", o.name));
             }
         }
         // Players joining and leaving our room (its creator leaving closes it, below).
         if let Some(room) = r.room {
             for o in r.others.iter().filter(|o| o.room == Some(room)) {
                 if !was_in(o.id, room) {
-                    hud::toast(format!("{} joined the room", o.name));
+                    hud::toast(format!("{} joined the party", o.name));
                 }
             }
             for p in previous
@@ -303,7 +303,7 @@ pub fn update(me: Option<u8>, others: Vec<Other>) {
                     .iter()
                     .any(|o| o.id == p.id && o.room == Some(room))
                 {
-                    hud::toast(format!("{} left the room", p.name));
+                    hud::toast(format!("{} left the party", p.name));
                 }
             }
             // The creator switched the room between Race and Co-op.
@@ -316,7 +316,7 @@ pub fn update(me: Option<u8>, others: Vec<Other>) {
                 if let (Some(before), Some(now)) = (kind_of(&previous), kind_of(&r.others))
                     && before != now
                 {
-                    hud::toast(format!("The room is now {}", now.label()));
+                    hud::toast(format!("The party is now {}", now.label()));
                 }
             }
         }
@@ -334,7 +334,7 @@ pub fn update(me: Option<u8>, others: Vec<Other>) {
             r.room = None;
             reset_picks(&mut r);
             if me.is_some() {
-                hud::toast(format!("{name} room closed"));
+                hud::toast(format!("{name} party closed"));
             }
         }
     }
@@ -366,14 +366,14 @@ pub fn choices() -> Vec<(Choice, String)> {
         let count = r.others.iter().filter(|o| o.room == Some(room)).count();
         out.push((
             Choice::Join(room),
-            format!("Join {} room ({count})", owner_name(&r, room.owner)),
+            format!("Join {} party ({count})", owner_name(&r, room.owner)),
         ));
     }
     if role(&r) != Role::Lead {
-        out.push((Choice::Create, "Create a room".into()));
+        out.push((Choice::Create, "Create a party".into()));
     }
     if r.room.is_some() {
-        out.push((Choice::Leave, "Leave the room".into()));
+        out.push((Choice::Leave, "Leave the party".into()));
     }
     out
 }
@@ -388,20 +388,20 @@ pub fn choose(choice: Choice) -> String {
     match choice {
         Choice::Leave => {
             r.room = None;
-            "Left the room".into()
+            "Left the party".into()
         }
         Choice::Create => {
             r.room = Some(RoomId { owner: me });
-            "Created a room".into()
+            "Created a party".into()
         }
         Choice::Join(room) => {
             r.room = Some(room);
-            format!("Joined {} room", owner_name(&r, room.owner))
+            format!("Joined {} party", owner_name(&r, room.owner))
         }
     }
 }
 
-/// "Sam's room: You, Sam, Alex", while in a room.
+/// "Sam's party: You, Sam, Alex", while in a party.
 pub fn summary() -> Option<String> {
     let r = lock();
     let room = r.room?;
@@ -413,7 +413,7 @@ pub fn summary() -> Option<String> {
             .map(|o| o.name.clone()),
     );
     Some(format!(
-        "{} room: {}",
+        "{} party: {}",
         owner_name(&r, room.owner),
         names.join(", ")
     ))
@@ -511,7 +511,7 @@ fn race_frame(r: &mut Room, connected: bool) {
             log!("room: picked race {pick:?}");
             if connected && pick.category <= 4 {
                 r.race_outgoing = Some(pick);
-                hud::toast("Room: taking everyone along to this race");
+                hud::toast("Party: taking everyone along to this race");
             }
         }
     } else if state != Some(ENTRANCE_PRESS_A) {
@@ -526,7 +526,7 @@ fn race_frame(r: &mut Room, connected: bool) {
         if let (true, Some((work, data1))) = (ready, menu) {
             r.race_incoming = None;
             log!("room: {leader} picked race {pick:?}, going along");
-            hud::toast(format!("Room: {leader} picked a race"));
+            hud::toast(format!("Party: {leader} picked a race"));
             write(RACE_CATEGORY, pick.category);
             write(RACE_COURSE, pick.course);
             write(RACE_LEVEL, pick.level);
@@ -539,7 +539,7 @@ fn race_frame(r: &mut Room, connected: bool) {
             // Only worth a message while in Chao World, where the player could go along.
             if read::<i16>(CURRENT_LEVEL) == crate::game::LEVEL_CHAO_WORLD {
                 hud::toast(format!(
-                    "Room: {leader} started a race (choose your Chao and open the course list to go along)"
+                    "Party: {leader} started a race (choose your Chao and open the course list to go along)"
                 ));
             }
         }
@@ -623,7 +623,7 @@ pub fn on_frame(connected: bool) {
                 (1..=100).contains(&pick.level) && pick.level != crate::game::LEVEL_CHAO_WORLD;
             if connected && stage {
                 r.outgoing = Some(pick);
-                hud::toast("Room: taking everyone along");
+                hud::toast("Party: taking everyone along");
             }
         }
     } else {
@@ -633,21 +633,21 @@ pub fn on_frame(connected: bool) {
     if let Some((pick, leader)) = r.incoming.take() {
         if selecting && !leaving {
             log!("room: {leader} picked {pick:?}, going along");
-            hud::toast(format!("Room: {leader} picked a stage"));
+            hud::toast(format!("Party: {leader} picked a stage"));
             go(pick);
         } else {
             log!("room: {leader} picked {pick:?}, but we're not on Stage Select");
             // Only worth a message in the menus (not in the middle of a stage or Chao World).
             if read::<i32>(GAME_MODE) == MODE_MENUS {
                 hud::toast(format!(
-                    "Room: {leader} started a stage (be on Stage Select to go along)"
+                    "Party: {leader} started a stage (be on Stage Select to go along)"
                 ));
             }
         }
     }
 
     if selecting && !leaving && connected {
-        hud::banner("Room: a stage anyone here picks takes the room along");
+        hud::banner("Party: a stage anyone here picks takes the party along");
     }
 }
 

@@ -13,6 +13,9 @@
 //! Set FAKEPEER_CHAO to a comma-separated list of .sa2chao files (e.g. F9 > Export my Chao) and it
 //! brings those Chao (up to 2) to the shared garden whenever someone connects.
 //!
+//! Set FAKEPEER_ITEMS=1 to have it own a copy of each of your garden items (tests item hand-offs).
+//! Picking one up then puts a real extra item in your save, so it's off by default.
+//!
 //! Set FAKEPEER_ROOM_PICK=level,mission,character (e.g. 13,0,0 for City Escape mission 1 as
 //! Sonic) and every 30 s it "picks" that stage, which takes you along if you're in its Stage
 //! room (FAKEPEER_ROOM=1) and on Stage Select.
@@ -126,6 +129,7 @@ fn main() {
         }
     });
     let mut last_pick = Instant::now();
+    let copy_items = std::env::var("FAKEPEER_ITEMS").is_ok_and(|v| v == "1");
     let mut karate = std::env::var("FAKEPEER_KARATE").is_ok_and(|v| v == "1");
     // A room is (creator id, 1) in PlayerState (room.rs).
     let own_room: Option<u8> = std::env::var("FAKEPEER_ROOM")
@@ -232,7 +236,7 @@ fn main() {
                 Event::Game {
                     from,
                     body: Body::GardenItems { area, items },
-                } => {
+                } if copy_items => {
                     let me = session.my_id().unwrap_or(0);
                     let items: Vec<GardenItem> = items
                         .into_iter()
@@ -246,6 +250,13 @@ fn main() {
                                 [i.position[0] + 40.0, i.position[1], i.position[2]]
                             } else {
                                 i.position
+                            },
+                            // Held by their Chao: by our copy of it.
+                            place: match i.place {
+                                ItemPlace::Chao { owner, index } if owner == from => {
+                                    ItemPlace::Chao { owner: me, index }
+                                }
+                                place => place,
                             },
                             ..i
                         })

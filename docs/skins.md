@@ -44,7 +44,12 @@ The tools write most of it: `name`, `textures`, `height`, `character_scale` (the
 at), `characters` (who can wear it; empty for anyone; a rigged skin: whoever it has a
 `rig_<character>=<body slots>;<texture field>;<height>` line for), and for animated skins the animations
 and which one plays when (`idle=`, `walk=`, `run=`, `jump=`, `fall=`, `pickup=`, `carry=`,
-`carry_walk=`, `carry_run=`, `throw=`, `put_down=`, `pet=`, `shake=`, `whistle=`).
+`carry_walk=`, `carry_run=`, `throw=`, `put_down=`, `pet=`, `shake=`, `whistle=`, and optionally
+`ride=` for a board and `grind=` for a rail).
+
+When a skin has no animation for one of these, the nearest one plays: by default it stands
+(idle) on a board and runs in place on a rail. `<role>_fallback=<role>` picks another for any
+of them, e.g. `grind_fallback=idle` to stand on rails or `ride_fallback=run`.
 
 How an animated skin's walks and runs keep up with the character (optional):
 

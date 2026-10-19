@@ -141,6 +141,9 @@ pub struct Settings {
     pub voice_volume: u32,
     /// The game's volume, percent (`audio::set_volume`).
     pub game_volume: u32,
+    /// The party-stage enemy, boss and lock-on hooks (`coop::stage_sync`): Off is a safety
+    /// switch if one of them misbehaves.
+    pub stage_sync: bool,
 }
 
 impl Settings {
@@ -160,6 +163,7 @@ impl Settings {
             skin: String::new(),
             voice_volume: 100,
             game_volume: 100,
+            stage_sync: true,
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -202,6 +206,12 @@ impl Settings {
                         "off" | "0" | "false" | "no"
                     )
                 }
+                "stagesync" => {
+                    s.stage_sync = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
                 "nametags" => {
                     s.name_tags = !matches!(
                         v.to_ascii_lowercase().as_str(),
@@ -218,7 +228,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n{}RoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n{}RoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -236,6 +246,7 @@ impl Settings {
             self.skin,
             self.voice_volume,
             self.game_volume,
+            if self.stage_sync { "On" } else { "Off" },
         )
     }
 }
@@ -302,6 +313,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         skin: String::new(),
         voice_volume: 100,
         game_volume: 100,
+        stage_sync: true,
     },
     message: String::new(),
     keys: Vec::new(),
@@ -706,7 +718,7 @@ fn draw(m: &Menu, rows: &[Row]) {
             Row::Port => format!("Port:         {}", m.settings.port),
             Row::RoomInfo => format!(
                 "  {}",
-                room::summary().unwrap_or_else(|| "Not in a room".into())
+                room::summary().unwrap_or_else(|| "Not in a party".into())
             ),
             Row::RoomMode if room::is_leader() => {
                 format!("  Mode:       < {} >", room::mode().label())
@@ -731,8 +743,8 @@ fn draw(m: &Menu, rows: &[Row]) {
             Row::Room => {
                 let choices = room::choices();
                 match choices.get(m.room_choice.min(choices.len().saturating_sub(1))) {
-                    Some((_, label)) => format!("Room:         < {label} >  (Enter)"),
-                    None => "Room:         (connect first)".into(),
+                    Some((_, label)) => format!("Party:        < {label} >  (Enter)"),
+                    None => "Party:        (connect first)".into(),
                 }
             }
             Row::Visitor(i) => format!(
@@ -841,6 +853,7 @@ mod tests {
             skin: "race_car".into(),
             voice_volume: 70,
             game_volume: 60,
+            stage_sync: false,
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.

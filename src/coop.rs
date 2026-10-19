@@ -58,10 +58,11 @@ const ENEMIES: [usize; 18] = [
 const GROUND_BOXES: [usize; 2] = [0x006C_7C10, 0x006C_7CE0];
 /// Air, balloon, KD and SG boxes: gone once broken.
 const OTHER_BOXES: [usize; 4] = [0x006C_8EF0, 0x006D_B030, 0x006E_9350, 0x006E_ABC0];
-/// Objects removed for good by KillObject (0x488DA0, clears "alive") when destroyed: every
-/// object list entry whose update calls it (re/stage-objects.md "Breakables"). Rings are
-/// separate (`RINGS`); treasure hunt pieces never go through here.
-const BREAKABLES: [usize; 25] = [
+/// Objects removed for good when destroyed: every object list entry whose update calls
+/// KillObject (0x488DA0, clears "alive"), and those that clear it themselves where they give
+/// the destroy score (re/stage-objects.md "Breakables", "Stage sync audit"). Rings are separate
+/// (`RINGS`, `RING_GROUPS`); treasure hunt pieces never go through here.
+const BREAKABLES: [usize; 36] = [
     0x004B_6A40, // DRMCN
     0x004B_6D60, // PPSHED
     0x004D_7AB0, // MITRUCK
@@ -87,12 +88,43 @@ const BREAKABLES: [usize; 25] = [
     0x0077_7250, // POISON
     0x0077_9FB0, // SGOLID
     0x0077_A950, // CGWOOD
+    0x006D_E3B0, // CONTCHAO (its contents: `chao_box_reward`)
+    0x005C_3B50, // MDCONTBOX
+    0x0060_60C0, // BOMBE
+    0x0060_79E0, // TANK
+    0x0063_7980, // TANK
+    0x0069_C980, // TANK
+    0x0069_EF30, // BOMBE
+    0x006D_29F0, // ORI
+    0x0076_D760, // SHUT
+    0x0077_C870, // ORI
+    0x0078_BA60, // TANK
 ];
 /// RING and SGRING: collected by one player, gone for everyone and a ring for each.
 const RINGS: [usize; 2] = [0x006C_0F80, 0x006C_1470];
 /// A friend's ring pickup only counts once our stage has run this long (someone joining late
 /// gets the whole list of what's gone, but not those rings).
 const RING_REWARD_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// Ring lines and circles (re/stage-objects.md "Ring groups"): RINGLINE, RINGCIRC and the
+/// Knuckles/Rouge ones (KDDRNGL/C, SWDRNGL/C). A group spawns up to 8 rings of its own (RING's
+/// MainSub, no record): its Data2 (+0x38) is 8-byte slots, +0 bit 2 collected, +4 the ring
+/// (0 while there's none), and Data1+3 how many. While it's unloaded, the record's byte +1
+/// keeps which were collected (bit 7 - ring); it clears "alive" once all of them are.
+const RING_GROUPS: [usize; 6] = [
+    0x006C_5ED0,
+    0x006C_6180,
+    0x006E_4830,
+    0x006E_4FB0,
+    0x006E_CAE0,
+    0x006E_CE10,
+];
+const GROUP_RINGS: u8 = 8;
+const SLOT_SIZE: usize = 8;
+const SLOT_COLLECTED: u32 = 2;
+const OBJ_DATA1: usize = 0x34;
+const OBJ_DATA2: usize = 0x38;
+/// A ring a group spawned: its slot (Data2), which it marks when it goes.
+const RING_SLOT: usize = 0x38;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -135,6 +167,16 @@ struct Coop {
     checkpoint_last: Option<Checkpoint>,
     /// We died (or restarted) and the stage is coming back: set the room's switches again.
     restarting: bool,
+    /// Upgrades: the flags as last seen, our CharObj2 upgrade bits as last seen, and ours to send.
+    upgrades_seen: Option<[u8; UPGRADES]>,
+    upgrade_bits_seen: u32,
+    upgrades_out: Vec<Upgrade>,
+    /// This stage's ring groups (records; found for `groups_of` records), group rings anyone
+    /// collected, and ours to send.
+    groups: Vec<u16>,
+    groups_of: Option<usize>,
+    group_rings: BTreeSet<GroupRing>,
+    group_rings_out: Vec<GroupRing>,
 }
 
 /// Something a room player did in a stage.
@@ -143,7 +185,12 @@ enum Inbound {
     Key(u8),
     Switch(u8),
     Checkpoint(Checkpoint),
+    GroupRings(Vec<GroupRing>),
+    Upgrade(Upgrade),
 }
+
+/// A ring of a ring group: (the group's SET record, which ring 0..8).
+pub type GroupRing = (u16, u8);
 
 /// Most queued from the others while our stage loads.
 const INBOX_MAX: usize = 512;
@@ -171,6 +218,13 @@ impl Coop {
             checkpoints_out: Vec::new(),
             checkpoint_last: None,
             restarting: false,
+            upgrades_seen: None,
+            upgrade_bits_seen: 0,
+            upgrades_out: Vec::new(),
+            groups: Vec::new(),
+            groups_of: None,
+            group_rings: BTreeSet::new(),
+            group_rings_out: Vec::new(),
         }
     }
 }
@@ -300,6 +354,321 @@ fn destroy(n: usize, kind: Kind) {
     }
 }
 
+fn record_count() -> usize {
+    // SAFETY: the game's record count for this stage.
+    unsafe { (RECORD_COUNT as *const i16).read_volatile() }.clamp(0, MAX_RECORDS as i16) as usize
+}
+
+/// SET record `n`'s live object, while it's loaded and alive.
+pub fn record_object(n: u16) -> Option<usize> {
+    let n = usize::from(n);
+    if n >= record_count() || flags(n) & (ALIVE | LOADED) != ALIVE | LOADED {
+        return None;
+    }
+    // SAFETY: a loaded record's object pointer, in the game's static table.
+    let obj = unsafe { ((record(n) + 4) as *const usize).read() };
+    (obj != 0).then_some(obj)
+}
+
+/// The SET record whose loaded object is `object`, if any.
+pub fn record_of(object: usize) -> Option<u16> {
+    (0..record_count())
+        .find(|&n| {
+            // SAFETY: as in `record_object`.
+            flags(n) & LOADED != 0 && unsafe { ((record(n) + 4) as *const usize).read() } == object
+        })
+        .map(|n| n as u16)
+}
+
+/// The enemies loaded in our stage now: (object, its list entry's MainSub, still alive, its SET
+/// record).
+pub fn live_enemies() -> Vec<(usize, usize, bool, u16)> {
+    // SAFETY: the game's record count for this stage.
+    let count = unsafe { (RECORD_COUNT as *const i16).read_volatile() }.clamp(0, MAX_RECORDS as i16)
+        as usize;
+    (0..count)
+        .filter(|&n| flags(n) & LOADED != 0)
+        .filter_map(|n| {
+            let main = main_of(n).filter(|m| ENEMIES.contains(m))?;
+            // SAFETY: a loaded record's object pointer, in the game's static table.
+            let obj = unsafe { ((record(n) + 4) as *const usize).read() };
+            (obj != 0).then_some((obj, main, flags(n) & ALIVE != 0, n as u16))
+        })
+        .collect()
+}
+
+/// Item boxes (re/stage-objects.md "Shared rewards"): the item is the SET entry's scale X
+/// (+0x14) truncated to 0..=10 (inits 0x6C7DB0, 0x6C7F20, 0x6C9022, 0x6DB136, 0x6EAC93), an
+/// index into its kind's table (8 bytes each: +0 the icon, +4 the reward, cdecl (box, player)).
+/// Breaking one shows the icon (0x6DF440, cdecl (player, icon)) and calls the reward (0x6C8101,
+/// 0x6C9266, 0x6DB28B, 0x6EADF4). KDITEMBOX shares the air box's break but not its item.
+const ITEM_TABLES: [(usize, usize); 5] = [
+    (0x006C_7C10, 0x00B4_D120), // ITEMBOX
+    (0x006C_7CE0, 0x00B4_D120), // ITEMBOX2_B
+    (0x006C_8EF0, 0x00B4_93A0), // ITEMBOXAIR
+    (0x006D_B030, 0x00B1_9928), // ITEMBOXBALLOON
+    (0x006E_ABC0, 0x00B0_AFA0), // SGITEMBOX
+];
+
+fn item_table(main: usize) -> Option<usize> {
+    ITEM_TABLES
+        .iter()
+        .find(|&&(m, _)| m == main)
+        .map(|&(_, table)| table)
+}
+const SHOW_ITEM: usize = 0x006D_F440;
+const ITEM_LAST: i32 = 10;
+/// Items not given again: 6 blows up the enemies around the box (those kills come as kills),
+/// 9 is nothing; 2, the 1-up, isn't while the record says it was taken (flag 0x20).
+const ITEM_BLAST: usize = 6;
+const ITEM_NOTHING: usize = 9;
+const ITEM_ONE_UP: usize = 2;
+const ONE_UP_TAKEN: u16 = 0x20;
+
+/// A box for the rewards to look at: an object whose Data1 is where the box is, with Data1+1
+/// 0 and a record (+0x30) of its own (a 1-up marks it taken: some don't check for none).
+/// Ours, never freed.
+fn reward_box(at: [f32; 3]) -> usize {
+    static BOX: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let &(object, data1) = BOX.get_or_init(|| {
+        let data1: &'static mut [u8; 0x30] = Box::leak(Box::new([0; 0x30]));
+        let record: &'static mut [u8; RECORD_SIZE] = Box::leak(Box::new([0; RECORD_SIZE]));
+        let object: &'static mut [usize; 0x50 / 4] = Box::leak(Box::new([0; 0x50 / 4]));
+        object[0x34 / 4] = data1.as_ptr() as usize;
+        object[0x30 / 4] = record.as_ptr() as usize;
+        (object.as_ptr() as usize, data1.as_ptr() as usize)
+    });
+    // SAFETY: our own Data1 block (0x30 bytes).
+    unsafe { ((data1 + 0x14) as *mut [f32; 3]).write_unaligned(at) };
+    object
+}
+
+/// Gives us the item in item box `n` (a friend opened it), as breaking it would, from its
+/// kind's item table.
+fn box_reward(n: usize, table: usize) {
+    // SAFETY: the record's SET entry (the game's for this stage, checked for null) and the
+    // game's item table.
+    let (item, at) = unsafe {
+        let entry = ((record(n) + 8) as *const usize).read();
+        if entry == 0 {
+            return;
+        }
+        let param = ((entry + 0x14) as *const f32).read_unaligned();
+        (
+            (param as i32).clamp(0, ITEM_LAST) as usize,
+            ((entry + 8) as *const [f32; 3]).read_unaligned(),
+        )
+    };
+    if item == ITEM_BLAST
+        || item == ITEM_NOTHING
+        || (item == ITEM_ONE_UP && flags(n) & ONE_UP_TAKEN != 0)
+    {
+        return;
+    }
+    // SAFETY: the game's item table entry and its own icon and reward functions, called as the
+    // box calls them (0x6C810B..), for player 0 (us), on the game thread.
+    unsafe {
+        let icon = ((table + item * 8) as *const u32).read();
+        let reward = ((table + item * 8 + 4) as *const usize).read();
+        let show: extern "C" fn(i32, u32) = std::mem::transmute(SHOW_ITEM);
+        show(0, icon);
+        let give: extern "C" fn(usize, i32) = std::mem::transmute(reward);
+        give(reward_box(at), 0);
+    }
+    log!("coop: a friend opened item box {n}; item {item} for us too");
+}
+
+/// Chao boxes (CONTCHAO 0x6DE3B0, opened at 0x6DE5E8..): while this stage's Chao key isn't got
+/// (0x6E9C20: `0x174B004` != 1 and `0x1AEFF64` == 0) it lets out the key (0x6E9D10:
+/// "ObjectChaoKeyExec", EBX = &position, cdecl (height, 2.5)); otherwise small animals
+/// (0x48ACD0: ESI = kind, cdecl (x, y, z)), four around it the first time in a stage and one
+/// the second (bits 0x100 / 0x200 of `0x1A5A32C`). Then its record gets 0x4 | 0x20 and loses
+/// "alive".
+const CHAO_BOX: usize = 0x006D_E3B0;
+const KEY_GOT: usize = 0x0174_B004;
+const KEY_GOT_STAGE: usize = 0x01AE_FF64;
+const LET_OUT_KEY: usize = 0x006E_9D10;
+const LET_OUT_ANIMAL: usize = 0x0048_ACD0;
+const CHAO_BOXES_OPENED: usize = 0x01A5_A32C;
+const OPENED_FIRST: u32 = 0x100;
+const OPENED_SECOND: u32 = 0x200;
+const CHAO_BOX_MARKS: u16 = 0x0024;
+
+/// A friend opened Chao box `n`: what it holds comes out here too (the key, or animals), for
+/// us to pick up.
+fn chao_box_reward(n: usize) {
+    // SAFETY: the record's SET entry (checked for null) and the game's static stage flags.
+    let (at, key_got, opened) = unsafe {
+        let entry = ((record(n) + 8) as *const usize).read();
+        if entry == 0 {
+            return;
+        }
+        (
+            ((entry + 8) as *const [f32; 3]).read_unaligned(),
+            (KEY_GOT as *const u8).read_volatile() == 1
+                || (KEY_GOT_STAGE as *const u32).read_volatile() != 0,
+            (CHAO_BOXES_OPENED as *const u32).read_volatile(),
+        )
+    };
+    set_flags(n, flags(n) | CHAO_BOX_MARKS);
+    if !key_got {
+        let_out_key(at);
+        log!("coop: a friend opened Chao box {n}; its key is out here too");
+        return;
+    }
+    let animals: Vec<(i32, [f32; 3])> = if opened & OPENED_FIRST == 0 {
+        (0..4)
+            .map(|i| {
+                let a = i as f32 * std::f32::consts::FRAC_PI_2;
+                let kind = if i % 2 == 0 { 2 } else { 1 };
+                (
+                    kind,
+                    [at[0] + a.sin() * 10.0, at[1] + 10.0, at[2] + a.cos() * 10.0],
+                )
+            })
+            .collect()
+    } else if opened & OPENED_SECOND == 0 {
+        vec![(0, [at[0], at[1] + 10.0, at[2]])]
+    } else {
+        Vec::new()
+    };
+    let bit = if opened & OPENED_FIRST == 0 {
+        OPENED_FIRST
+    } else {
+        OPENED_SECOND
+    };
+    // SAFETY: the game's static flag word, on the game thread.
+    unsafe { (CHAO_BOXES_OPENED as *mut u32).write_volatile(opened | bit) };
+    for (kind, p) in animals {
+        let_out_animal(kind, p);
+    }
+    log!("coop: a friend opened Chao box {n}; its animals are out here too");
+}
+
+#[cfg(target_arch = "x86")]
+fn let_out_key(at: [f32; 3]) {
+    let position = at;
+    let (height, spin) = (at[1], 2.5f32);
+    // SAFETY: the game's key maker as CONTCHAO calls it (0x6DE624..): EBX = &position, two
+    // floats on the stack (caller pops), on the game thread.
+    unsafe {
+        std::arch::asm!(
+            "push ebx",
+            "mov ebx, ecx",
+            "push edx",
+            "push eax",
+            "mov eax, {f}",
+            "call eax",
+            "add esp, 8",
+            "pop ebx",
+            f = const LET_OUT_KEY,
+            inout("ecx") &raw const position as usize => _,
+            inout("eax") height.to_bits() => _,
+            inout("edx") spin.to_bits() => _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86"))]
+fn let_out_key(_: [f32; 3]) {
+    let _ = LET_OUT_KEY;
+}
+
+#[cfg(target_arch = "x86")]
+fn let_out_animal(kind: i32, at: [f32; 3]) {
+    let [x, y, z] = at.map(f32::to_bits);
+    // SAFETY: the game's animal maker as CONTCHAO calls it (0x6DE711): ESI = kind, x, y, z on
+    // the stack (caller pops), on the game thread.
+    unsafe {
+        std::arch::asm!(
+            "push esi",
+            "mov esi, ecx",
+            "push edi",
+            "push edx",
+            "push eax",
+            "mov eax, {f}",
+            "call eax",
+            "add esp, 12",
+            "pop esi",
+            f = const LET_OUT_ANIMAL,
+            inout("edi") z => _,
+            inout("ecx") kind => _,
+            inout("eax") x => _,
+            inout("edx") y => _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86"))]
+fn let_out_animal(_: i32, _: [f32; 3]) {
+    let _ = LET_OUT_ANIMAL;
+}
+
+/// Ring group `n`'s slots while it's loaded: (Data2, how many).
+fn group_slots(n: usize) -> Option<(usize, u8)> {
+    if flags(n) & LOADED == 0 {
+        return None;
+    }
+    // SAFETY: a loaded record's live object and its Data1/Data2, each checked for null.
+    unsafe {
+        let obj = ((record(n) + 4) as *const usize).read();
+        if obj == 0 {
+            return None;
+        }
+        let (d1, d2) = (
+            ((obj + OBJ_DATA1) as *const usize).read(),
+            ((obj + OBJ_DATA2) as *const usize).read(),
+        );
+        (d1 != 0 && d2 != 0).then(|| (d2, ((d1 + 3) as *const u8).read().min(GROUP_RINGS)))
+    }
+}
+
+/// Which of ring group `n`'s rings are collected in our game (bit = ring).
+fn group_collected(n: usize) -> u8 {
+    if let Some((d2, count)) = group_slots(n) {
+        (0..count)
+            .filter(|&i| {
+                // SAFETY: slot `i` of the group's Data2 (i < its count, at most 8).
+                let slot = unsafe { ((d2 + usize::from(i) * SLOT_SIZE) as *const u32).read() };
+                slot & SLOT_COLLECTED != 0
+            })
+            .fold(0, |m, i| m | 1 << i)
+    } else {
+        // SAFETY: the record's byte +1, in the game's static table.
+        let kept = unsafe { ((record(n) + 1) as *const u8).read_volatile() };
+        kept.reverse_bits()
+    }
+}
+
+/// Ring `i` of group `n` is gone in our game, as if collected (no ring for us): the ring goes
+/// and its slot is marked, the way the ring does it itself (0x6C1425); or, unloaded, the record
+/// keeps it for when the group loads.
+fn collect_group_ring(n: usize, i: u8) {
+    if let Some((d2, count)) = group_slots(n) {
+        if i >= count {
+            return;
+        }
+        let slot = d2 + usize::from(i) * SLOT_SIZE;
+        // SAFETY: the group's slot `i` and the ring it spawned (its own object, checked for
+        // null); DeleteObject as its MainSub removes it on the next object pass.
+        unsafe {
+            let ring = ((slot + 4) as *const usize).read();
+            if ring != 0 {
+                ((ring + RING_SLOT) as *mut usize).write(0);
+                ((ring + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT);
+            }
+            (slot as *mut u32).write((slot as *const u32).read() | SLOT_COLLECTED);
+            ((slot + 4) as *mut usize).write(0);
+        }
+    } else {
+        let kept = (record(n) + 1) as *mut u8;
+        // SAFETY: the record's byte +1, on the game thread.
+        unsafe { kept.write_volatile(kept.read_volatile() | 0x80 >> i) };
+    }
+}
+
 /// Queues what a room player did in the stage we're in (or loading).
 fn receive(level: i16, mission: u8, what: Inbound) {
     if level == game::current_level() && mission == game::mission() {
@@ -313,6 +682,124 @@ fn receive(level: i16, mission: u8, what: Inbound) {
 /// Network: kills from another player in a stage.
 pub fn received(level: i16, mission: u8, objects: Vec<u16>) {
     receive(level, mission, Inbound::Kills(objects));
+}
+
+/// Network: rings of ring groups another player collected in a stage.
+pub fn received_group_rings(level: i16, mission: u8, rings: Vec<GroupRing>) {
+    let rings: Vec<GroupRing> = rings
+        .into_iter()
+        .filter(|&(_, i)| i < GROUP_RINGS)
+        .collect();
+    receive(level, mission, Inbound::GroupRings(rings));
+}
+
+/// An upgrade someone picked up: (its flag, the character it's for, its CharObj2 bits).
+pub type Upgrade = (u8, u8, u32);
+
+/// Upgrades (LEVUPDAI 0x6D8540, re/stage-objects.md "Shared rewards"): picking one up sets its
+/// byte in the upgrade flags 0x1DEB300 (the save's, copied in at 0x68DBA1; 0x1E of them) and
+/// ORs its bits into the player's CharObj2+0x24 when it's their character's (CharObj2+1).
+const UPGRADE_FLAGS: usize = 0x01DE_B300;
+const UPGRADES: usize = 0x1E;
+const CHAR_OBJ2S: usize = 0x01DE_9600;
+const CO2_CHARACTER: usize = 0x01;
+const CO2_UPGRADES: usize = 0x24;
+
+/// Network: a party player picked up an upgrade.
+pub fn received_upgrade(level: i16, mission: u8, upgrade: Upgrade) {
+    if usize::from(upgrade.0) < UPGRADES {
+        receive(level, mission, Inbound::Upgrade(upgrade));
+    }
+}
+
+/// Our upgrades picked up, to send: (level, mission, upgrade).
+pub fn take_upgrades() -> Vec<(i16, u8, Upgrade)> {
+    let mut c = lock();
+    let Some((level, mission)) = c.stage else {
+        return Vec::new();
+    };
+    std::mem::take(&mut c.upgrades_out)
+        .into_iter()
+        .map(|u| (level, mission, u))
+        .collect()
+}
+
+fn upgrade_flags() -> [u8; UPGRADES] {
+    // SAFETY: the game's static upgrade flags.
+    unsafe { (UPGRADE_FLAGS as *const [u8; UPGRADES]).read_volatile() }
+}
+
+/// Our CharObj2 (null without a player).
+fn char_obj2() -> usize {
+    // SAFETY: the game's static player array.
+    unsafe { (CHAR_OBJ2S as *const usize).read_volatile() }
+}
+
+/// Ours picked up are sent (with the bits they gave our character).
+fn upgrades_frame(c: &mut Coop) {
+    let now = upgrade_flags();
+    let co2 = char_obj2();
+    // SAFETY: our live CharObj2 (checked for null).
+    let (bits, character) = if co2 == 0 {
+        (0, 0)
+    } else {
+        unsafe {
+            (
+                ((co2 + CO2_UPGRADES) as *const u32).read_unaligned(),
+                ((co2 + CO2_CHARACTER) as *const u8).read(),
+            )
+        }
+    };
+    if let Some(before) = c.upgrades_seen {
+        for i in 0..UPGRADES {
+            if before[i] == 0 && now[i] != 0 {
+                let mask = bits & !c.upgrade_bits_seen;
+                c.upgrades_out.push((i as u8, character, mask));
+                log!("coop: we got upgrade {i}");
+            }
+        }
+    }
+    c.upgrades_seen = Some(now);
+    c.upgrade_bits_seen = bits;
+}
+
+/// A friend's upgrade is ours too: its flag (kept in our save) and, when it's for our
+/// character, its bits now.
+fn give_upgrade(c: &mut Coop, (i, character, mask): Upgrade) {
+    let flag = (UPGRADE_FLAGS + usize::from(i)) as *mut u8;
+    // SAFETY: one of the game's static upgrade flags (i < UPGRADES).
+    unsafe {
+        if flag.read_volatile() != 0 {
+            return;
+        }
+        flag.write_volatile(1);
+    }
+    let co2 = char_obj2();
+    if co2 != 0 {
+        // SAFETY: our live CharObj2.
+        unsafe {
+            if ((co2 + CO2_CHARACTER) as *const u8).read() == character {
+                let at = (co2 + CO2_UPGRADES) as *mut u32;
+                at.write_unaligned(at.read_unaligned() | mask);
+            }
+        }
+    }
+    c.upgrades_seen = Some(upgrade_flags());
+    c.upgrade_bits_seen = if co2 == 0 {
+        0
+    } else {
+        // SAFETY: as above.
+        unsafe { ((co2 + CO2_UPGRADES) as *const u32).read_unaligned() }
+    };
+    log!("coop: a friend got upgrade {i}; ours too");
+}
+
+/// Our group rings to send, or all of them when someone joined the stage.
+pub fn take_group_rings() -> Option<(i16, u8, Vec<GroupRing>)> {
+    let mut c = lock();
+    let (level, mission) = c.stage?;
+    let rings = std::mem::take(&mut c.group_rings_out);
+    (!rings.is_empty()).then_some((level, mission, rings))
 }
 
 /// Stage switch flags (re/stage-objects.md "Switches"): one byte per switch id, bit 0 on
@@ -562,6 +1049,27 @@ pub fn take_outgoing() -> Option<(i16, u8, Vec<u16>)> {
     (!objects.is_empty()).then_some((level, mission, objects))
 }
 
+/// The party-stage enemy, boss and lock-on hooks are on (config.ini `StageSync`, default On).
+/// Off, enemies.rs, boss_follow.rs and lockon.rs leave the game's objects alone: a safety
+/// switch if one of them misbehaves.
+static STAGE_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// At startup: `StageSync` from config.ini.
+pub fn init(mod_path: &str) {
+    let text = std::fs::read_to_string(std::path::Path::new(mod_path).join("config.ini"))
+        .unwrap_or_default();
+    let on = crate::menu::Settings::parse(&text).stage_sync;
+    STAGE_SYNC.store(on, std::sync::atomic::Ordering::Relaxed);
+    if !on {
+        log!("coop: StageSync=Off: enemies, bosses and lock-on aren't synced");
+    }
+}
+
+/// The enemy, boss and lock-on hooks may run (`init`).
+pub fn stage_sync() -> bool {
+    STAGE_SYNC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn active(connected: bool) -> bool {
     let level = game::current_level();
     connected
@@ -627,6 +1135,13 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
     if c.last.len() != count {
         c.last = (0..count).map(flags).collect();
     }
+    if c.groups_of != Some(count) {
+        c.groups_of = Some(count);
+        c.groups = (0..count)
+            .filter(|&n| main_of(n).is_some_and(|main| RING_GROUPS.contains(&main)))
+            .map(|n| n as u16)
+            .collect();
+    }
     if std::mem::take(&mut c.restarting) {
         for id in 0..SWITCHES {
             if c.switches_on & (1 << id) != 0 {
@@ -656,6 +1171,21 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                         {
                             game::add_rings(1);
                         }
+                        // An item box a friend opened: its item for us too, unless we opened
+                        // it ourselves.
+                        let i = usize::from(n);
+                        if rewards
+                            && let Some(table) = main_of(i).and_then(item_table)
+                            && kind(i).is_some_and(|k| !is_destroyed(k, flags(i)))
+                        {
+                            box_reward(i, table);
+                        }
+                        if rewards
+                            && main_of(i) == Some(CHAO_BOX)
+                            && !is_destroyed(Kind::Breakable, flags(i))
+                        {
+                            chao_box_reward(i);
+                        }
                     }
                 }
             }
@@ -668,6 +1198,17 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                 set_switch_on(usize::from(id));
             }
             Inbound::Checkpoint(cp) => apply_checkpoint(&mut c, count, cp),
+            Inbound::Upgrade(upgrade) => give_upgrade(&mut c, upgrade),
+            Inbound::GroupRings(rings) => {
+                for (n, i) in rings {
+                    if c.groups.contains(&n) && c.group_rings.insert((n, i)) {
+                        // One for us too, as for a single ring.
+                        if rewards && group_collected(usize::from(n)) & 1 << i == 0 {
+                            game::add_rings(1);
+                        }
+                    }
+                }
+            }
         }
     }
     // Everything destroyed by anyone stays destroyed here (a death restart brings it back).
@@ -681,7 +1222,23 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
         }
     }
 
+    // Group rings anyone collected stay collected here; ours are sent.
+    for &(n, i) in &c.group_rings {
+        if group_collected(usize::from(n)) & 1 << i == 0 {
+            collect_group_ring(usize::from(n), i);
+        }
+    }
+    for n in c.groups.clone() {
+        let collected = group_collected(usize::from(n));
+        for i in 0..GROUP_RINGS {
+            if collected & 1 << i != 0 && c.group_rings.insert((n, i)) {
+                c.group_rings_out.push((n, i));
+            }
+        }
+    }
+
     keys_frame(&mut c);
+    upgrades_frame(&mut c);
     switches_frame(&mut c);
     // Our own kills: records that became destroyed since last frame.
     for n in 0..count {
@@ -698,6 +1255,10 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
                 c.checkpoint_last = Some(cp);
                 log!("coop: we passed checkpoint {n}");
             }
+            continue;
+        }
+        if c.groups.contains(&(n as u16)) {
+            // Its rings are shared one by one (above).
             continue;
         }
         let Some(kind) = kind(n) else {
@@ -740,6 +1301,7 @@ pub fn on_frame(peers: &[Peer], connected: bool) {
         if let Some(cp) = c.checkpoint_last {
             c.checkpoints_out.push(cp);
         }
+        c.group_rings_out = c.group_rings.iter().copied().collect();
     }
     c.here = here;
 }

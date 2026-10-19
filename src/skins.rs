@@ -57,6 +57,7 @@ const ENTITY_SCALE: usize = 0x20;
 /// The player's ObjectMaster (re/characters.md): its display draws the character.
 const PLAYER_OBJECT: usize = 0x01DE_A6E0;
 const OBJ_DISPLAY: usize = 0x14;
+const OBJ_DATA1: usize = 0x34;
 /// The object's later display passes (the object list runs them after every display, 0x470010):
 /// what a character draws there (Sonic's +0x1C draws a model at the player) is hidden too.
 const OBJ_LATER_DISPLAYS: [usize; 3] = [0x1C, 0x20, 0x24];
@@ -100,7 +101,7 @@ pub struct Info {
 
 /// Animation roles: what an animated skin's character is doing. The garden ones come from the
 /// player's action and holding something (re/skins.md "Garden actions").
-const ROLES: usize = 14;
+const ROLES: usize = 16;
 const IDLE: usize = 0;
 const WALK: usize = 1;
 const RUN: usize = 2;
@@ -115,6 +116,10 @@ const PUT_DOWN: usize = 10;
 const PET: usize = 11;
 const SHAKE: usize = 12;
 const WHISTLE: usize = 13;
+/// On a board (City Escape's, the 2P ones) and grinding a rail: the skin stands on it (the board
+/// is its own object, drawn as usual), or plays its `ride=` / `grind=` animation if it has one.
+const RIDE: usize = 14;
+const GRIND: usize = 15;
 const ROLE_NAMES: [&str; ROLES] = [
     "idle",
     "walk",
@@ -130,6 +135,8 @@ const ROLE_NAMES: [&str; ROLES] = [
     "pet",
     "shake",
     "whistle",
+    "ride",
+    "grind",
 ];
 
 /// The role a player action plays, and whether it plays once (holding its last frame) rather
@@ -149,6 +156,31 @@ fn action_role(action: u8) -> Option<(usize, bool)> {
     }
 }
 
+/// Sonic's family (Sonic, Shadow, Amy, Metal Sonic: one action table, Sonic's main 0x717840,
+/// jump tables 0x7197B4 / 0x71E1A0) on a board or a rail (re/skins.md "Boards and rails"):
+/// - board, actions 0x4C..=0x52: their handlers work with the board object kept at CharObj2
+///   +0xA0 (City Escape's board checks `co2+0xA0 == itself`, and its stage objects check the
+///   player's action against 0x4C..0x52);
+/// - rail, 0x47 and 0x48: the player follows the rail's path (CharObj2 +0xB8, distance +0x30,
+///   0x46D140 / 0x46D040).
+const SONIC_FAMILY: [u8; 4] = [0, 1, 8, 9];
+const BOARD_ACTIONS: std::ops::RangeInclusive<u8> = 0x4C..=0x52;
+const GRIND_ACTIONS: std::ops::RangeInclusive<u8> = 0x47..=0x48;
+
+/// The role for riding a board or grinding a rail, by character and action.
+pub fn ride_role(character: u8, action: u8) -> Option<usize> {
+    if !SONIC_FAMILY.contains(&character) {
+        return None;
+    }
+    if BOARD_ACTIONS.contains(&action) {
+        Some(RIDE)
+    } else if GRIND_ACTIONS.contains(&action) {
+        Some(GRIND)
+    } else {
+        None
+    }
+}
+
 /// What the character is doing, for its animated skin.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Doing {
@@ -162,6 +194,11 @@ pub struct Doing {
     pub progress: Option<f32>,
     /// The skin's pacing.
     pub pace: Pace,
+    /// The character's own ground speed (units a frame), when known: walks and runs go by it.
+    /// Without it, by how far the character's position moves.
+    pub speed: Option<f32>,
+    /// On a board or a rail (`ride_role`): it rides, not runs.
+    pub ride: Option<usize>,
 }
 
 /// A rigged skin's model for one character: its file, the model-table slots the character's
@@ -232,6 +269,18 @@ impl Info {
                 }
                 "character_scale" => info.character_scale = v.parse().unwrap_or(1.0),
                 "turn" => info.turn = (v.parse::<f32>().unwrap_or(0.0) * 65536.0 / 360.0) as i32,
+                key if key
+                    .strip_suffix("_fallback")
+                    .is_some_and(|r| ROLE_NAMES.contains(&r)) =>
+                {
+                    let role = key.trim_end_matches("_fallback");
+                    let i = ROLE_NAMES.iter().position(|&r| r == role).unwrap_or(0);
+                    let to = v.to_ascii_lowercase();
+                    info.pace.fallback[i] = ROLE_NAMES
+                        .iter()
+                        .position(|&r| r == to)
+                        .and_then(|r| u8::try_from(r).ok());
+                }
                 "kart" => {
                     info.kart =
                         matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "yes" | "true")
@@ -1481,6 +1530,8 @@ pub struct Animator {
     frame: f32,
     last: Option<[f32; 3]>,
     speed: f32,
+    /// The game frame it last stepped in, and what it gave.
+    stepped: Option<(usize, (usize, f32))>,
 }
 
 /// The skins' animations are 30 frames a second; the game draws 60.
@@ -1503,6 +1554,10 @@ pub struct Pace {
     /// The fastest a walk or run may play, times its own pace (`anim_max_rate`): a run only
     /// blurs so much.
     pub max_rate: f32,
+    /// What plays instead when the skin has no animation for a role (`<role>_fallback=<role>`,
+    /// e.g. `grind_fallback=idle`), before the usual nearest ones. By default a rail runs in
+    /// place and a board stands.
+    pub fallback: [Option<u8>; ROLES],
 }
 
 impl Default for Pace {
@@ -1513,6 +1568,11 @@ impl Default for Pace {
             walk_speed: 0.8,
             run_speed: 3.0,
             max_rate: 6.0,
+            fallback: {
+                let mut f = [None; ROLES];
+                f[GRIND] = Some(RUN as u8);
+                f
+            },
         }
     }
 }
@@ -1551,7 +1611,29 @@ impl Animator {
             frame: 0.0,
             last: None,
             speed: 0.0,
+            stepped: None,
         }
+    }
+
+    /// `step`, once per game frame (`game_frame`, skins.rs' frame count): a display that runs
+    /// twice in a frame (or a pause that draws again) gets the same role and frame, and its
+    /// speed doesn't see a frame without movement.
+    pub fn step_once(
+        &mut self,
+        game_frame: usize,
+        at: [f32; 3],
+        doing: Doing,
+        size: f32,
+        cycles: [Cycle; ROLES],
+    ) -> (usize, f32) {
+        if let Some((f, got)) = self.stepped
+            && f == game_frame
+        {
+            return got;
+        }
+        let got = self.step(at, doing, size, cycles);
+        self.stepped = Some((game_frame, got));
+        got
     }
 
     /// One drawn frame: where the character is, what it's doing, the skin's size, and each
@@ -1580,7 +1662,10 @@ impl Animator {
             None => (0.0, 0.0),
         };
         self.last = Some(at);
-        self.speed += (moved - self.speed) * SPEED_EASE;
+        // The game's own speed: the position also moves standing still (pushed back by the
+        // ground on a slope, against a wall, on a platform), which kept skins walking in place.
+        let speed = doing.speed.filter(|s| s.is_finite()).unwrap_or(moved);
+        self.speed += (speed - self.speed) * SPEED_EASE;
         let size = size.max(0.1);
         // Run from halfway between the walk's and the run's own paces (carrying, the carrying
         // ones'), or at a set speed without both.
@@ -1609,6 +1694,8 @@ impl Animator {
         } else {
             WALK
         };
+        // On a board or a rail: riding it, however fast it goes (or jumps on it).
+        let moving = doing.ride.unwrap_or(moving);
         // Carrying something: the same, holding it.
         let moving = match moving {
             IDLE if doing.holding => CARRY,
@@ -1634,12 +1721,16 @@ impl Animator {
             &[PET],
             &[SHAKE],
             &[WHISTLE],
+            &[RIDE, IDLE],
+            &[GRIND, RIDE, IDLE],
         ];
         let want = action.map_or(moving, |(r, _)| r);
-        let role = fallbacks[want]
-            .iter()
-            .chain(fallbacks[moving])
-            .copied()
+        // The skin's own choice for a missing one first (`<role>_fallback=`).
+        let chosen = doing.pace.fallback[want].map_or(&[][..], |f| fallbacks[usize::from(f)]);
+        let role = std::iter::once(want)
+            .chain(chosen.iter().copied())
+            .chain(fallbacks[want].iter().copied())
+            .chain(fallbacks[moving].iter().copied())
             .find(|&r| frames[r] > 1)
             .unwrap_or(IDLE);
         if role != self.role {
@@ -1912,7 +2003,7 @@ fn call_display(display: usize, object: usize) {
 /// own animator from what they're doing. Returns whether it drew; if not (a skin we don't
 /// have, or one built on a character's skeleton) the character is drawn as usual.
 pub fn draw_other(key: &str, skin: &str, pose: &crate::puppet::Pose) -> bool {
-    use crate::net::protocol::{STATUS_GROUNDED, STATUS_HOLDING};
+    use crate::net::protocol::{STATUS_GROUNDED, STATUS_HOLDING, STATUS_STILL};
     with(|s| {
         if s.list.iter().any(|i| i.id == skin && i.rigged) {
             return false;
@@ -1935,8 +2026,17 @@ pub fn draw_other(key: &str, skin: &str, pose: &crate::puppet::Pose) -> bool {
                 holding: pose.status & STATUS_HOLDING != 0,
                 progress: None,
                 pace: r.pace,
+                // Their game says when they stand still; moving, by how far they go.
+                speed: (pose.status & STATUS_STILL != 0).then_some(0.0),
+                ride: ride_role(pose.character, pose.action),
             };
-            let (role, frame) = anim.step(pose.position, doing, r.scale, poses.map(|(_, c)| c));
+            let (role, frame) = anim.step_once(
+                FRAME.load(Ordering::Relaxed),
+                pose.position,
+                doing,
+                r.scale,
+                poses.map(|(_, c)| c),
+            );
             if role == JUMP || role == FALL {
                 tilt.spin = 0;
             }
@@ -1960,6 +2060,18 @@ pub fn draw_other(key: &str, skin: &str, pose: &crate::puppet::Pose) -> bool {
         true
     })
     .unwrap_or(false)
+}
+
+/// The character blinks out this frame (just hurt), as its own display would have it.
+fn blinked_out(object: usize) -> bool {
+    // SAFETY: the player object the display runs for (Data1 checked for null).
+    unsafe {
+        let d1 = ((object + OBJ_DATA1) as *const usize).read();
+        d1 != 0
+            && game::blinks_out(u32::from(
+                ((d1 + game::ENTITY_INVULNERABLE) as *const u16).read_unaligned(),
+            ))
+    }
 }
 
 /// The player's display while a skin rides on them: the skin instead of the character.
@@ -2009,7 +2121,7 @@ extern "C" fn player_display(object: usize) {
                 rotation[1],
                 rig.height * rig.scale * size,
             );
-            if drawn == Some(false) {
+            if drawn == Some(false) && !blinked_out(object) {
                 // The characters face -X: rolling forward is about Z.
                 tilt.lean = tilt.spin;
                 tilt.spin = 0;
@@ -2070,13 +2182,19 @@ extern "C" fn player_display(object: usize) {
                 holding: player.holding,
                 progress: game::local_anim_progress(),
                 pace,
+                speed: Some(player.speed),
+                ride: ride_role(player.character, player.action),
             };
-            let (role, frame) = OUR_ANIM.lock().unwrap_or_else(|e| e.into_inner()).step(
-                [player.position.x, player.position.y, player.position.z],
-                doing,
-                scale,
-                poses.map(|(_, c)| c),
-            );
+            let (role, frame) = OUR_ANIM
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .step_once(
+                    FRAME.load(Ordering::Relaxed),
+                    [player.position.x, player.position.y, player.position.z],
+                    doing,
+                    scale,
+                    poses.map(|(_, c)| c),
+                );
             if role == JUMP || role == FALL {
                 tilt.spin = 0;
             }
@@ -2123,17 +2241,20 @@ extern "C" fn player_display(object: usize) {
                 })
             };
         }
-        let p = player.position;
-        draw_skin(Drawn {
-            frame: 0,
-            root,
-            texlist,
-            position: [p.x, p.y, p.z],
-            rotation,
-            scale,
-            tilt,
-            motion,
-        });
+        // Just hurt: it blinks like the character would (its animation goes on meanwhile).
+        if !blinked_out(object) {
+            let p = player.position;
+            draw_skin(Drawn {
+                frame: 0,
+                root,
+                texlist,
+                position: [p.x, p.y, p.z],
+                rotation,
+                scale,
+                tilt,
+                motion,
+            });
+        }
         Some(())
     });
     if !matches!(drawn, Ok(Some(()))) {
@@ -2410,6 +2531,70 @@ mod tests {
             grounded,
             ..Doing::default()
         }
+    }
+
+    #[test]
+    fn boards_and_rails_ride_not_run() {
+        let mut all = [30u32; ROLES];
+        all[RIDE] = 0;
+        all[GRIND] = 0;
+        let c = cycles(&all, &[]);
+        let fast = |action| Doing {
+            grounded: true,
+            speed: Some(5.0),
+            ride: ride_role(0, action),
+            ..Doing::default()
+        };
+        let mut a = Animator::new();
+        // No ride/grind animations: it stands on the board and runs on the rail by default, and
+        // `<role>_fallback=` picks another.
+        assert_eq!(a.step([0.0; 3], fast(0x4C), 1.0, c).0, IDLE);
+        assert_eq!(a.step([0.0; 3], fast(0x47), 1.0, c).0, RUN);
+        let mut pace = Pace::default();
+        pace.fallback[GRIND] = Some(IDLE as u8);
+        pace.fallback[RIDE] = Some(RUN as u8);
+        let chosen = |action| Doing {
+            pace,
+            ..fast(action)
+        };
+        assert_eq!(a.step([0.0; 3], chosen(0x47), 1.0, c).0, IDLE);
+        assert_eq!(a.step([0.0; 3], chosen(0x4C), 1.0, c).0, RUN);
+        // With them, they play; Knuckles' 0x4C isn't a board.
+        let with = cycles(&[30; ROLES], &[]);
+        assert_eq!(a.step([0.0; 3], fast(0x50), 1.0, with).0, RIDE);
+        assert_eq!(a.step([0.0; 3], fast(0x48), 1.0, with).0, GRIND);
+        assert_eq!(ride_role(4, 0x4C), None);
+    }
+
+    #[test]
+    fn the_games_speed_decides_walking_and_one_step_a_frame() {
+        let frames = cycles(&[30; ROLES], &[]);
+        let still = Doing {
+            grounded: true,
+            speed: Some(0.0),
+            ..Doing::default()
+        };
+        // The position creeps (a slope, a wall) but the game says it stands: idle.
+        let mut a = Animator::new();
+        let mut role = WALK;
+        for i in 0..30 {
+            role = a.step([i as f32 * 0.5, 0.0, 0.0], still, 1.0, frames).0;
+        }
+        assert_eq!(role, IDLE);
+        // Moving by the game's speed, without the position saying so.
+        let moving = Doing {
+            speed: Some(1.0),
+            ..still
+        };
+        for _ in 0..30 {
+            role = a.step([0.0; 3], moving, 1.0, frames).0;
+        }
+        assert_ne!(role, IDLE);
+        // Drawn twice in one game frame: the second draw doesn't step it again.
+        let mut b = Animator::new();
+        let first = b.step_once(7, [0.0; 3], moving, 1.0, frames);
+        assert_eq!(b.step_once(7, [0.0; 3], moving, 1.0, frames), first);
+        assert_ne!(b.step_once(8, [0.0; 3], moving, 1.0, frames), first);
     }
 
     #[test]

@@ -424,7 +424,7 @@ fn menu_frame(k: &mut Kart) {
         if !k.picked && crate::room::in_room() && k.incoming.is_none() {
             let course = read::<i32>(menu + K_COURSE).clamp(0, 2) as u8;
             k.outgoing = Some(course);
-            hud::toast("Room: taking everyone along");
+            hud::toast("Party: taking everyone along");
             log!("kart: picked course {course}, taking the room along");
         }
         k.picked = true;
@@ -436,12 +436,12 @@ fn menu_frame(k: &mut Kart) {
     };
     if !(on_menu && sub == SUB_COURSE_LIST && read::<u32>(menu + K_BUSY) == 0) {
         hud::toast(format!(
-            "Room: {who} started a Kart Race (open the Kart Race course list to go along)"
+            "Party: {who} started a Kart Race (open the Kart Race course list to go along)"
         ));
         return;
     }
     log!("kart: {who} picked course {course}, going along");
-    hud::toast(format!("Room: {who} picked a course"));
+    hud::toast(format!("Party: {who} picked a course"));
     write(menu + K_COURSE, i32::from(course));
     write(menu + K_SPECIAL, 0u8);
     write(menu + K_TWO_PLAYER, 0i32);

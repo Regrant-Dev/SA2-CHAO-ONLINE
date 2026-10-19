@@ -67,6 +67,9 @@ ROLES = [
     ("pet", r"pet"),
     ("shake", r"pull|shak"),
     ("whistle", r"whistl|wav|beckon"),
+    # On a board and grinding a rail (the mod plays idle when a skin has neither).
+    ("ride", r"board|skate|surf|ride"),
+    ("grind", r"grind"),
 ]
 
 
