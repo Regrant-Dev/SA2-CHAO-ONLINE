@@ -662,9 +662,14 @@ pub fn in_garden() -> bool {
     current_level() == LEVEL_CHAO_WORLD && (1..=3).contains(&current_chao_area())
 }
 
-/// Saves the active Chao file through AL_Save (0x52E630, cdecl file index). It runs the
-/// game's item write-back/checksum and file writer, respecting the loader's save redirection.
-pub fn save_chao() -> Result<(), String> {
+/// The loader's active Chao save file, including save redirection.
+pub fn chao_save_path() -> Option<&'static std::path::Path> {
+    CHAO_SAVE_PATH.get().map(std::path::Path::new)
+}
+
+/// Runs the game's item/checksum write-back and copies the active save region. The old
+/// AL_Save wrapper depends on mounted file descriptors that aren't ready during normal play.
+pub fn chao_save_snapshot() -> Result<Vec<u8>, String> {
     if !in_garden() || !matches!(game_state(), 16 | 17) || local_entity().is_null() {
         return Err("enter a Chao garden and finish loading first".into());
     }
@@ -672,17 +677,15 @@ pub fn save_chao() -> Result<(), String> {
         return Err("Chao data hasn't loaded yet".into());
     }
     #[cfg(all(windows, target_arch = "x86"))]
-    // SAFETY: the game's synchronous save wrapper (REA: calls 0x52F090, then 0x532360).
-    // The selector picks one of the two save copies, as the game's own readers do.
+    // SAFETY: the game's own pre-save pass and active-buffer getter, called on the game
+    // thread as on garden exits. GetSaveData normalizes the two-copy selector itself.
     unsafe {
-        let file = i32::from((0x0173_D06C as *const u32).read_volatile() == 1);
-        let result =
-            std::mem::transmute::<usize, unsafe extern "C" fn(i32) -> i32>(0x0052_E630)(file);
-        if result != 0 {
-            Ok(())
-        } else {
-            Err("the game couldn't write the Chao save file".into())
+        std::mem::transmute::<usize, unsafe extern "C" fn()>(0x0052_F090)();
+        let base = std::mem::transmute::<usize, unsafe extern "C" fn() -> usize>(0x0052_E440)();
+        if base != 0x019F_6460 && base != 0x019F_6460 + 0xCA6C {
+            return Err("the active Chao save buffer is unavailable".into());
         }
+        Ok(std::slice::from_raw_parts(base as *const u8, 0xCA6C).to_vec())
     }
     #[cfg(not(all(windows, target_arch = "x86")))]
     Err("saving is only available in the game".into())

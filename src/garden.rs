@@ -203,6 +203,16 @@ struct Mirror {
 }
 
 impl Mirror {
+    /// A shared pickup takes priority over a local pet/feed reaction immediately.
+    fn interrupt_touch(&mut self, held_elsewhere: bool, held_by_us: bool) -> bool {
+        if held_elsewhere && !held_by_us && self.local_until.take().is_some() {
+            self.motion = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Its owner's game runs it now, not the keeper's.
     fn owner_runs(&self) -> bool {
         self.owner_runs
@@ -284,7 +294,7 @@ fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
 }
 
 /// Visitors: we created `object` for player `owner`'s Chao `index`.
-pub fn spawned(owner: u8, index: u8, object: usize) {
+pub fn spawned(owner: u8, index: u8, object: usize, initial: Option<GardenChao>) {
     if object != 0 {
         let record = crate::registry::entries(crate::registry::CHAO)
             .into_iter()
@@ -294,7 +304,7 @@ pub fn spawned(owner: u8, index: u8, object: usize) {
                 ((entry + 8) as *const usize).read()
             });
         with(|g| {
-            let mut owner_runs = None;
+            let mut owner_runs = initial.filter(|s| s.owner_runs).map(|_| Instant::now());
             if let Some(((at, rotation, motion), runs, when)) = g.rebuilt.remove(&(owner, index))
                 && when.elapsed() < LEFT
             {
@@ -321,7 +331,7 @@ pub fn spawned(owner: u8, index: u8, object: usize) {
                     object,
                     record,
                     own: false,
-                    target: None,
+                    target: initial.map(|s| (s, Instant::now(), owner)),
                     motion: None,
                     driven: false,
                     snapshot: None,
@@ -330,7 +340,10 @@ pub fn spawned(owner: u8, index: u8, object: usize) {
                     bubbles: 0,
                     owner_runs,
                 },
-            )
+            );
+            // A cached owner snapshot can bootstrap a visitor while the owner is paused.
+            // This arrival is not a new network report: normal updates refresh heard later.
+            g.heard.entry((owner, index)).or_insert_with(Instant::now);
         });
     }
 }
@@ -1010,8 +1023,8 @@ pub fn received_changes(owner: u8, index: u8, changes: Changes) {
     with(|g| g.changes_in.push((owner, index, changes)));
 }
 
-/// Network: friend `holder` is holding player `owner`'s Chao `index`. Taken when our game is
-/// its brain (see `brain_here`).
+/// Network: friend `holder` is holding player `owner`'s Chao `index`. Every follower records
+/// the holder too, so picking up a Chao immediately interrupts another player's petting.
 pub fn received_held(holder: u8, owner: u8, index: u8, offset: [f32; 3]) {
     with(|g| {
         g.held.insert(
@@ -1023,29 +1036,6 @@ pub fn received_held(holder: u8, owner: u8, index: u8, offset: [f32; 3]) {
             },
         )
     });
-}
-
-/// Whether our game runs player `owner`'s Chao `index`: we keep the garden, or nobody does and
-/// it's ours, or it's ours and our game runs it for a life event (`self_run`). A friend's that
-/// its owner's game runs for one isn't ours to run.
-pub fn brain_here(owner: u8, index: u8) -> bool {
-    let me = crate::keeper::me();
-    let owner_runs = with(|g| {
-        if me == Some(owner) {
-            g.self_run.contains_key(&index)
-        } else {
-            g.mirrors
-                .get(&(owner, index))
-                .is_some_and(|m| m.owner_runs())
-        }
-    });
-    if owner_runs {
-        return me == Some(owner);
-    }
-    match crate::keeper::current() {
-        Some(keeper) => crate::keeper::me() == Some(keeper),
-        None => crate::keeper::me() == Some(owner),
-    }
 }
 
 /// Where other players are drawn this frame (their puppets), for Chao they hold.
@@ -1288,7 +1278,9 @@ pub fn streams() -> Vec<(u8, Vec<GardenChao>)> {
             None => out.push((owner, vec![state])),
         }
     }
-    out.retain(|(_, list)| !list.is_empty());
+    // An empty owner list explicitly withdraws visitors, including when visits are turned
+    // off. Receivers can keep paused-owner snapshots without resurrecting withdrawn Chao.
+    out.retain(|(owner, list)| *owner == me || !list.is_empty());
     out
 }
 
@@ -1603,7 +1595,12 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
             let held_by_us = player_held() == m.object;
             let brain_holds = m
                 .target
-                .is_some_and(|(t, at, _)| t.held && at.elapsed() < STALE);
+                .is_some_and(|(t, at, _)| t.held && at.elapsed() < STALE)
+                || shared_hold(g.held.get(&(owner, index)), &g.holders, me, now).is_some();
+            let interrupted = m.interrupt_touch(brain_holds, held_by_us);
+            if interrupted {
+                log!("garden: shared pickup interrupted local reaction for Chao {owner}:{index}");
+            }
             let touched = !brain_holds
                 && (held_by_us
                     || status & STATUS_HIT != 0
@@ -1612,7 +1609,7 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
 
             // Only an item this Chao holds or eats keeps an interaction going. Fruit lying
             // nearby must not keep its AI independent of the shared keeper indefinitely.
-            let busy = m.local_until.is_some() && crate::items::chao_busy(m.object);
+            let busy = !brain_holds && m.local_until.is_some() && crate::items::chao_busy(m.object);
             if touched || busy {
                 if m.local_until.is_none() {
                     log!(
@@ -1623,7 +1620,7 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                 }
                 m.local_until = Some(now + LOCAL_TIME);
             }
-            let local = m.local_until.is_some();
+            let local = m.local_until.is_some() || interrupted;
             if m.local_until.is_some_and(|until| now >= until) {
                 m.local_until = None;
                 m.motion = None;
@@ -1750,7 +1747,7 @@ fn mine_frame(g: &mut Garden) {
         // SAFETY: a live Chao object our game runs; its MainSub is the garden one or a wrapper.
         unsafe {
             let main = (object + OBJ_MAIN) as *mut usize;
-            if main.read() == CHAO_MAIN {
+            if main.read() != held_main as *const () as usize && main.read() != DELETE_OBJECT {
                 main.write(held_main as extern "C" fn(usize) as usize);
                 g.wrapped.insert(object, false);
                 log!(
@@ -2651,7 +2648,38 @@ unsafe fn set_mouth(_object: usize, _id: i16) {}
 /// Where a mirrored Chao should be this frame, or None to leave it to the game.
 fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)> {
     let holders = &g.holders;
-    let (&(owner, _), m) = g.mirrors.iter_mut().find(|(_, m)| m.object == object)?;
+    let (&(owner, index), m) = g.mirrors.iter_mut().find(|(_, m)| m.object == object)?;
+    let held_by_us = player_held() == object;
+    let held = shared_hold(
+        g.held.get(&(owner, index)),
+        holders,
+        crate::keeper::me(),
+        Instant::now(),
+    )
+    .or_else(|| {
+        let (t, at, brain) = m.target?;
+        if !t.held || at.elapsed() >= STALE {
+            return None;
+        }
+        let &(holder, angle) = holders.get(&brain)?;
+        Some((in_hands(holder, angle, t.offset), angle))
+    });
+    if !held_by_us && let Some((at, angle)) = held {
+        // mirrors_frame clears the touch and sends its final record changes. Keep that
+        // bookkeeping intact if this report arrived between OnFrame and this callback.
+        // SAFETY: this mirror's live Data1, in its MainSub. A pickup disables a petting AI
+        // even when it arrived after mirrors_frame, and removes a drum or instrument.
+        unsafe {
+            let flags = (d + D_FLAGS) as *mut u32;
+            flags.write(flags.read() & !FLAG_AI);
+            if m.motion != Some(MOTION_HELD) && motion_ok(d + D_MOTION, MOTION_HELD) {
+                start_motion(d + D_MOTION, MOTION_HELD);
+                m.motion = Some(MOTION_HELD);
+            }
+            show_props(object, d, [0; 3], 0);
+        }
+        return Some((at, angle, true));
+    }
     if m.local_until.is_some() {
         return None;
     }
@@ -2723,6 +2751,20 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
     // SAFETY: the visitor's Data1 (read on the game thread inside its MainSub).
     let here = unsafe { ((d + D_POSITION) as *const Vector).read_unaligned() };
     Some((follow_position(here, t.position), t.rotation_y, false))
+}
+
+fn shared_hold(
+    held: Option<&Held>,
+    holders: &HashMap<u8, (Vector, i32)>,
+    me: Option<u8>,
+    now: Instant,
+) -> Option<(Vector, i32)> {
+    let h = held?;
+    if Some(h.holder) == me || now.duration_since(h.at) >= HELD_STALE {
+        return None;
+    }
+    let &(at, angle) = holders.get(&h.holder)?;
+    Some((in_hands(at, angle, h.offset), angle))
 }
 
 fn keep_following(me: u8, keeper: Option<u8>, was_following: bool) -> bool {
@@ -2910,10 +2952,66 @@ extern "C" fn held_main(object: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_PET, CHAO_SIZE, CHAO_SLOTS, ChaoData, D_POSITION, D_ROTATION_Y, DELETE_OBJECT,
-        LOOK_FORM_LEN, OBJ_DATA1, OBJ_MAIN, SAVE_COPY_SIZE, Vector, follow_position, in_save,
-        keep_following, look, object_pose, petting_near, rotate,
+        ACTION_PET, CHAO_SIZE, CHAO_SLOTS, ChaoData, D_POSITION, D_ROTATION_Y, DELETE_OBJECT, Held,
+        LOOK_FORM_LEN, Mirror, OBJ_DATA1, OBJ_MAIN, SAVE_COPY_SIZE, Vector, follow_position,
+        in_save, keep_following, look, object_pose, petting_near, rotate, shared_hold,
     };
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_shared_pickup_cancels_pet_reactions_without_waiting_five_seconds() {
+        let now = Instant::now();
+        let mut mirror = Mirror {
+            object: 1,
+            record: 1,
+            own: false,
+            target: None,
+            motion: Some(20),
+            driven: true,
+            snapshot: None,
+            local_until: Some(now + Duration::from_secs(5)),
+            since: now,
+            bubbles: 0,
+            owner_runs: None,
+        };
+        assert!(!mirror.interrupt_touch(false, false));
+        assert!(!mirror.interrupt_touch(true, true));
+        assert!(mirror.local_until.is_some());
+        assert!(mirror.interrupt_touch(true, false));
+        assert!(mirror.local_until.is_none());
+        assert!(mirror.motion.is_none());
+    }
+
+    #[test]
+    fn a_third_players_pickup_uses_the_actual_holder_and_expires_after_release() {
+        let now = Instant::now();
+        let held = Held {
+            holder: 2,
+            offset: [1.0, 2.0, 3.0],
+            at: now,
+        };
+        let mut holders = HashMap::new();
+        holders.insert(
+            2,
+            (
+                Vector {
+                    x: 20.0,
+                    y: 30.0,
+                    z: 40.0,
+                },
+                0,
+            ),
+        );
+        let (at, _) = shared_hold(Some(&held), &holders, Some(0), now).unwrap();
+        assert_eq!([at.x, at.y, at.z], [21.0, 32.0, 43.0]);
+        assert!(shared_hold(Some(&held), &holders, Some(2), now).is_none());
+        assert!(
+            shared_hold(Some(&held), &holders, Some(0), now + Duration::from_secs(1)).is_none()
+        );
+        holders.clear();
+        assert!(shared_hold(Some(&held), &holders, Some(0), now).is_none());
+    }
 
     #[test]
     fn an_election_does_not_restart_a_followers_ai() {

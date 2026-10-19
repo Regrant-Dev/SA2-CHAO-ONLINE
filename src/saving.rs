@@ -1,5 +1,7 @@
 //! Manual and five-minute Chao garden saves, on the game thread.
 
+use std::io::Write;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -8,6 +10,11 @@ use crate::{game, hud, log};
 const INTERVAL: Duration = Duration::from_secs(5 * 60);
 const RETRY: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_secs(2);
+/// The Steam save: unchanged 0x3040-byte header/icon region, 0xCA6C-byte Chao payload,
+/// then padding. This is the layout built by the game's 0x532360.
+const FILE_SIZE: usize = 0x10000;
+const PAYLOAD_START: usize = 0x3040;
+const PAYLOAD_SIZE: usize = 0xCA6C;
 
 #[derive(Default)]
 struct Clock {
@@ -70,10 +77,52 @@ pub fn save_now() -> String {
 }
 
 fn save(reason: &str) -> Result<(), String> {
-    game::save_chao()?;
+    let path = game::chao_save_path().ok_or("the Chao save path is unavailable")?;
+    let snapshot = game::chao_save_snapshot()?;
+    write_snapshot(path, &snapshot)?;
     with(|clock| clock.saved(Instant::now()));
-    log!("save: Chao garden saved ({reason})");
+    log!("save: Chao garden saved ({reason}) to {}", path.display());
     Ok(())
+}
+
+/// Keep the existing Steam header and padding, replacing only the game's checksummed region.
+/// Complete a same-directory temporary file before atomically replacing the existing save.
+fn write_snapshot(path: &Path, snapshot: &[u8]) -> Result<(), String> {
+    if snapshot.len() != PAYLOAD_SIZE {
+        return Err("the Chao save snapshot has an unexpected size".into());
+    }
+    let mut file = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if file.len() != FILE_SIZE {
+        return Err(format!(
+            "{} has an unexpected save format; left unchanged",
+            path.display()
+        ));
+    }
+    file[PAYLOAD_START..PAYLOAD_START + PAYLOAD_SIZE].copy_from_slice(snapshot);
+    let name = path
+        .file_name()
+        .ok_or("invalid Chao save path")?
+        .to_string_lossy();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let temporary =
+        path.with_file_name(format!(".{name}.sa2co-{}-{nonce}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        output.write_all(&file)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Call after online changes have been applied, before the F9 menu, on the game thread.
@@ -96,6 +145,55 @@ pub fn on_frame() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_save() -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("sa2-save-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        directory.join("SONIC2B__ALF")
+    }
+
+    #[test]
+    fn saving_preserves_the_steam_header_and_padding_and_replaces_all_chao_data() {
+        let path = temporary_save();
+        let original: Vec<u8> = (0..FILE_SIZE).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &original).unwrap();
+        let snapshot = vec![0xA5; PAYLOAD_SIZE];
+        write_snapshot(&path, &snapshot).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(saved.len(), FILE_SIZE);
+        assert_eq!(&saved[..PAYLOAD_START], &original[..PAYLOAD_START]);
+        assert_eq!(
+            &saved[PAYLOAD_START..PAYLOAD_START + PAYLOAD_SIZE],
+            &snapshot
+        );
+        assert_eq!(
+            &saved[PAYLOAD_START + PAYLOAD_SIZE..],
+            &original[PAYLOAD_START + PAYLOAD_SIZE..]
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_unrecognized_file_or_bad_snapshot_never_overwrites_the_save() {
+        let path = temporary_save();
+        std::fs::write(&path, b"unexpected format").unwrap();
+        assert!(write_snapshot(&path, &vec![0; PAYLOAD_SIZE]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unexpected format");
+        let original = vec![0x5A; FILE_SIZE];
+        std::fs::write(&path, &original).unwrap();
+        assert!(write_snapshot(&path, &[0; 16]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn five_minutes_in_gardens_triggers_one_save() {

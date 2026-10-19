@@ -420,12 +420,25 @@ is an ordinary saved fruit and already syncs as an item.
   registry/record identity disappears, and post-update position writes check the object again.
   These guards address the invalid-memory paths; the shared-crash reproduction still needs
   an in-game check on the updated build.
-- Native Chao save wrapper `0x52E630` is cdecl `(file_index) -> int`: REA confirms it calls
-  item/checksum write-back `0x52F090`, then `0x532360(index, save_base)`. The latter builds the
-  file buffer and completes the write; nonzero means success. Index is 1 only when selector
-  `0x173D06C` is 1, else 0. `saving.rs` uses this on the game thread from F9 and after five
-  minutes in gardens. Saving requires a loaded garden, game state 16/17 and a player; autosave
-  waits two safe seconds after loading and retries failures no faster than every 30 seconds.
+- The first F9/autosave implementation used `0x52E630(file_index)`, which calls pre-save
+  `0x52F090`, then `0x532360(index, save_base)`. Live autosaves failed while ordinary garden
+  exits saved successfully. REA confirms the legacy writer depends on per-slot file state.
+  F9/autosave now runs `0x52F090` on the game thread for native item write-back/checksums and
+  reads `0xCA6C` bytes from the active buffer returned by `0x52E440`. The getter normalizes
+  selector `0x173D06C` to copy 1 only when it equals 1; base is `0x19F6460 + copy*0xCA6C`.
+  `0x532360`'s Steam layout is `0x40` header + `0x3000` icon + payload + padding to `0x10000`.
+  `saving.rs` preserves the existing header/padding, replaces only the payload, syncs a
+  same-directory temporary file and atomically replaces the loader's active Chao path.
+  Unexpected file/snapshot sizes are rejected without changing the save. Saving requires a
+  loaded garden, game state 16/17 and a player; autosave waits two safe seconds after loading
+  and retries failures no faster than every 30 seconds. Disk-format tests cover preservation
+  and rejected writes; native checksum/load compatibility still needs an in-game check.
+- Owner `GardenChao` reports are cached per remote player even while we're in another area.
+  Entering a garden can seed visitors at their reported position without waiting for another
+  packet from a paused owner (observed 44-second delay). Active snapshots expire after 8 s;
+  paused snapshots after 300 s. An area change or complete empty owner roster invalidates
+  cached presence. Empty owner lists are sent even with all visiting rows disabled; the wire
+  format remains protocol 20.
 
 - With friends in a garden, one player's game keeps it: it runs every Chao there with its own AI
   (its own and the visitors' copies), the trees and the toys. The keeper says so with
@@ -440,7 +453,10 @@ is an ordinary saved fruit and already syncs as an item.
 - Everyone else: friends' copies follow the keeper's stream; their own visiting Chao do too
   (wrapped like a copy, AI off, never deleted), and their records stay their save's. The keeper's
   changes go into the save and the follower's snapshot. A touch still runs the AI locally for 5 s,
-  and its changes go to the owner and the keeper. Holds go to the keeper. Petting requires
+  and its changes go to the owner and the keeper. Holds go to all followers as well as the
+  keeper: a fresh pickup interrupts local petting and puts the copy in the actual holder's
+  hands, including when a third player holds it. A local touch's five-second allowance cannot
+  override that hold. Petting requires
   player action 43 within reach: proximity alone used to enable a second AI indefinitely,
   causing different positions and activities (reported with drumming, 2026-10-18). Only an
   item this Chao actually holds/eats (registry partner and held/eaten state) extends a touch;

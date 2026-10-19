@@ -96,8 +96,8 @@ with others around, doesn't stop the game for anyone.
 
 ## Chao
 
-**Saving:** F9 > Save Chao garden now saves your Chao World data through the game's normal
-save system. Gardens also autosave every five minutes spent in them, with a confirmation
+**Saving:** F9 > Save Chao garden now updates your active Chao save file, including when save
+redirection is enabled. Gardens also autosave every five minutes spent in them, with a confirmation
 toast. Autosaving waits until loading finishes; a manual save resets the five-minute timer.
 
 **Visiting:** when you're in a garden with friends, up to 4 of your Chao from that garden visit
@@ -108,7 +108,8 @@ or "You 2", with the Chao's name if it has one. Eggs and Chao without a tag stay
 only; an egg that hatches can visit right away.
 
 You can pet, hold and feed each other's Chao, and that affects the real Chao in its owner's
-save. Garden items are shared too: pick up a friend's fruit and it's yours. The garden ball is
+save. Picking one up interrupts petting on the other screens too. Garden items are shared:
+pick up a friend's fruit and it's yours. The garden ball is
 shared: kick it and it rolls the same way for everyone. Trees drop ripe fruit by themselves for
 only one of you, so fruit doesn't pile up twice as fast; shaking a tree works for everyone.
 With friends in a garden, one player's game runs it (whoever was keeping it already, else the

@@ -23,7 +23,8 @@ use crate::hud;
 use crate::log;
 use crate::net::files::SkinStore;
 use crate::net::protocol::{
-    Body, CHAO_SLOTS, MAX_CARRIED_CHAO, MY_CHAO_INDEX, PlayerState, STATUS_GROUNDED, STATUS_HOLDING,
+    Body, CHAO_SLOTS, GardenChao, MAX_CARRIED_CHAO, MY_CHAO_INDEX, PlayerState, STATUS_GROUNDED,
+    STATUS_HOLDING,
 };
 use crate::net::session::{Client, Event, Host, Identity, Session};
 use crate::net::udp::Endpoint;
@@ -156,8 +157,42 @@ struct Remote {
     /// Chao this player brought to their current garden (they never change our save).
     /// Their garden Chao (visitors), then their chosen Chao (`MY_CHAO_INDEX`).
     chao: [Option<Box<ChaoData>>; CHAO_SLOTS],
+    /// Last complete owner report, retained across our own garden changes. A paused owner's
+    /// already-known visitors can appear immediately when we re-enter their garden.
+    garden: Option<GardenSnapshot>,
     /// The skin they wear ("" for none).
     skin: String,
+}
+
+struct GardenSnapshot {
+    area: i8,
+    states: [Option<GardenChao>; MAX_CARRIED_CHAO],
+    heard: Instant,
+}
+
+impl GardenSnapshot {
+    fn new(area: i8, states: &[GardenChao], now: Instant) -> Self {
+        let mut slots = [None; MAX_CARRIED_CHAO];
+        for state in states {
+            if let Some(slot) = slots.get_mut(usize::from(state.index)) {
+                *slot = Some(*state);
+            }
+        }
+        Self {
+            area,
+            states: slots,
+            heard: now,
+        }
+    }
+
+    fn available(&self, area: i32, owner_active: bool, now: Instant) -> bool {
+        let limit = if owner_active {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(300)
+        };
+        i32::from(self.area) == area && now.duration_since(self.heard) < limit
+    }
 }
 
 fn to_pose(s: &PlayerState) -> puppet::Pose {
@@ -513,6 +548,7 @@ fn pump(online: &mut Online, now: Instant) {
                         heard: Instant::now(),
                         timeline: Timeline::default(),
                         chao: Default::default(),
+                        garden: None,
                         skin: String::new(),
                     },
                 );
@@ -552,6 +588,11 @@ fn pump(online: &mut Online, now: Instant) {
                     // Don't blend across a stage change.
                     if moved_area {
                         remote.timeline.clear();
+                        if remote.garden.as_ref().is_some_and(|g| {
+                            state.level != game::LEVEL_CHAO_WORLD || g.area != state.chao_area
+                        }) {
+                            remote.garden = None;
+                        }
                     }
                     let clock = frames_since(online.started, now);
                     remote.timeline.push(state.time, to_pose(&state), clock);
@@ -648,6 +689,14 @@ fn pump(online: &mut Online, now: Instant) {
                 from,
                 body: Body::GardenChao { owner, list },
             } => {
+                if from == owner
+                    && let Some(remote) = online.remote.get_mut(&owner)
+                    && let Some(state) = remote.latest
+                    && state.level == game::LEVEL_CHAO_WORLD
+                    && (1..=3).contains(&state.chao_area)
+                {
+                    remote.garden = Some(GardenSnapshot::new(state.chao_area, &list, now));
+                }
                 // Only from a friend in our garden: elsewhere their Chao aren't visiting us (and
                 // ours of theirs go home).
                 let here = online
@@ -856,8 +905,9 @@ fn pump(online: &mut Online, now: Instant) {
                         offset,
                     },
             } => {
-                // To whoever's game runs that Chao.
-                if crate::garden::brain_here(owner, index) && in_my_garden(online, from) {
+                // Every follower needs the holder, including a player currently petting the
+                // Chao locally. The brain also uses the report to drive its real object.
+                if in_my_garden(online, from) {
                     crate::garden::received_held(from, owner, index, offset);
                 }
             }
@@ -1317,16 +1367,24 @@ pub fn on_frame() {
             }
             let [x, y, z] = state.position;
             for (index, chao) in remote.chao.iter().take(MAX_CARRIED_CHAO).enumerate() {
+                let initial = remote
+                    .garden
+                    .as_ref()
+                    .filter(|g| g.available(garden, remote.heard.elapsed() < ALIVE, now))
+                    .and_then(|g| g.states[index]);
                 // Only while their game sends it (they can take it home any time).
                 if let Some(chao) = chao
+                    && i32::from(chao.garden()) == garden
                     && (crate::garden::visiting(id, index as u8)
-                        || crate::eggs::visiting(id, index as u8))
+                        || crate::eggs::visiting(id, index as u8)
+                        || initial.is_some())
                 {
                     visitors::spawn_remote(
                         id,
                         index as u8,
                         (**chao).clone(),
                         game::Vector { x, y, z },
+                        initial,
                     );
                 }
             }
@@ -1952,6 +2010,41 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paused_owners_snapshot_can_spawn_without_waiting_for_another_packet() {
+        let now = Instant::now();
+        let state = GardenChao {
+            index: 0,
+            position: [10.0, 2.0, 30.0],
+            ..Default::default()
+        };
+        let snapshot = GardenSnapshot::new(1, &[state], now);
+        assert!(snapshot.available(1, false, now + Duration::from_secs(44)));
+        assert_eq!(snapshot.states[0].unwrap().position, state.position);
+        assert!(!snapshot.available(2, false, now + Duration::from_secs(44)));
+        assert!(!snapshot.available(1, false, now + Duration::from_secs(301)));
+        assert!(!snapshot.available(1, true, now + Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn withdrawing_visitors_replaces_cached_presence_and_uses_the_existing_protocol() {
+        let now = Instant::now();
+        let snapshot = GardenSnapshot::new(1, &[], now);
+        assert!(snapshot.available(1, true, now));
+        assert!(snapshot.states.iter().all(Option::is_none));
+        let message = crate::net::protocol::Message::Game {
+            from: 1,
+            body: Body::GardenChao {
+                owner: 1,
+                list: Vec::new(),
+            },
+        };
+        assert_eq!(
+            crate::net::protocol::Message::decode(&message.encode()).unwrap(),
+            message
+        );
+    }
 
     #[test]
     fn visitors_follow_their_rows() {

@@ -282,9 +282,15 @@ fn import_visitors(mod_path: &str) {
     }
 }
 
-/// Spawns another player's Chao next to `near` (their puppet), once per garden visit.
+/// Spawns another player's Chao at its last reported position, or next to `near` when unknown.
 /// Returns false when it was already spawned or the visitor limit is reached.
-pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -> bool {
+pub fn spawn_remote(
+    player: u8,
+    index: u8,
+    chao: ChaoData,
+    near: game::Vector,
+    initial: Option<crate::net::protocol::GardenChao>,
+) -> bool {
     if !game::in_garden() || chao.validate().is_err() {
         return false;
     }
@@ -294,17 +300,24 @@ pub fn spawn_remote(player: u8, index: u8, chao: ChaoData, near: game::Vector) -
     if pool.has(&source) || pool.count() >= MAX_VISITORS {
         return false;
     }
-    let position = game::Vector {
-        x: near.x + 6.0 + f32::from(index) * 6.0,
-        y: near.y + 5.0,
-        z: near.z + 6.0,
-    };
-    let object = spawn(&mut pool, source, chao, position, 0);
+    let position = initial.map_or(
+        game::Vector {
+            x: near.x + 6.0 + f32::from(index) * 6.0,
+            y: near.y + 5.0,
+            z: near.z + 6.0,
+        },
+        |s| {
+            let [x, y, z] = s.position;
+            game::Vector { x, y, z }
+        },
+    );
+    let angle = initial.map_or(0, |s| s.rotation_y);
+    let object = spawn(&mut pool, source, chao, position, angle);
     // An egg is an egg object, not a Chao: eggs.rs looks after it.
     if egg {
         crate::eggs::spawned(player, index, object);
     } else {
-        crate::garden::spawned(player, index, object);
+        crate::garden::spawned(player, index, object, initial);
     }
     true
 }
