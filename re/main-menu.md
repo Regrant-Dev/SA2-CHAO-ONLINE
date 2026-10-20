@@ -1,7 +1,6 @@
-# Main menu (CurrentMenu == 1) — RE notes
+# Main menu (CurrentMenu == 1)
 
-Binary: unpacked sonic2app.exe, sha256 c95c0143…0386, image base 0x400000. All static
-analysis via REA/Ghidra; nothing here was tested at runtime yet.
+Image base 0x400000.
 
 ## Data
 
@@ -31,8 +30,8 @@ Entry indices (from the A-press dispatch, jump table 0x666154):
 | 5 | SteamFriends()->vtbl[0x60](0x3532C) (overlay/store); skipped by cursor when `[0x1A556F8] != 0` | Steam/DLC |
 | 6 | SubMenu 0x11 (quit confirm) → 0x12 PostQuitMessage | Exit |
 
-`0x1DEFDB4`: compared against -1 in several places; inferred to be "player-2 pad index,
--1 = no second controller" (that is why 2P is refused with no 2nd pad). Not verified.
+`0x1DEFDB4`: compared against -1 in several places; most likely the player-2 pad index, -1 =
+no second controller (2P is refused without a second pad).
 
 ## Update function: FUN_00664EC0 (switch on CurrentSubMenu 0x1D7BB14)
 
@@ -57,42 +56,32 @@ Entry indices (from the A-press dispatch, jump table 0x666154):
   0x8000 / 0x8009 also used). SubMenu 0xE (next frame, when +0x08 == 0) calls
   FUN_00669F40 and sets CurrentMenu = 0x10.
 
-## Recommended block (Q1/Q2) — high confidence
+## Taking over the 2P entry (`game::block_two_player_menu`)
 
-Turn the conditional jump into an unconditional one, so A on "2P" always takes the
-game's own locked path (error sound 0x800A, nothing else happens):
+While online, the `jz` at 0x6650D9 becomes an unconditional jump, so A on "2P" never opens the
+game's Battle menu:
 
 | addr | original | patched |
 |---|---|---|
-| 0x6650D9 | `0F 84` | `90 E9` |
+| 0x6650D9 | `0F 84 BB 03 00 00` | `90 E9 C5 03 00 00` |
 
-The rel32 that follows (`BB 03 00 00`) stays valid: `nop; jmp rel32` at 0x6650DA ends at
-0x6650DF, same as the original `jz`, so the target is still 0x66549A. Only 2 bytes change
-(16-bit write within one cache line), and the stack is identical on both paths
-(3 pushes already done, cleaned at 0x6654A4). Toggle by writing back `0F 84`.
-Needs VirtualProtect(PAGE_EXECUTE_READWRITE) on .text; check the original bytes before
-writing (another mod may have patched them). Safest to toggle from the game's main thread
-(e.g. the mod's per-frame hook), but it is benign at any time.
+`nop; jmp rel32` ends at 0x6650DF like the original `jz`; the target 0x6654A4 cleans the 3
+pushed arguments and returns 0 with no sound. The stack is the same on both paths. Offline the
+original bytes are restored. The mod's own picker (`battles.rs`) opens instead.
 
-Optional, cursor skips the 2P entry (reuses the "skip entry 5" logic):
+Other facts about this code:
+- Patching only the opcode (`0F 84` → `90 E9`, keeping rel32 `BB 03 00 00`) sends 2P to the
+  game's own "can't select" path at 0x66549A (error sound 0x800A).
+- Patching to `90 E9 55 03 00 00` (jmp 0x665434, past the kart unlock check) sends the 2P entry
+  into the 1P panel's Kart Race handler with the same stack (the 2P handler already pushed 3
+  zeros, EBX = 0); the 1P panel cursor must be 2.
+- The cursor's "skip entry 5" logic can skip index 1 instead: 0x664FC9 / 0x665005 `74 0E` →
+  `66 90` (drop the `[0x1A556F8]` gate) and 0x664FCE / 0x66500A `05` → `01`. The cursor survives
+  menu re-entry.
+- Other ways into Battle exist outside this list (SubMenu 7 "old 2P" panel with [+0x5C]==1 →
+  2P kart; CurrentMenu 0x10 itself).
 
-| addr | original | patched | note |
-|---|---|---|---|
-| 0x664FC9 | `74 0E` | `66 90` | up: drop the `[0x1A556F8]` gate |
-| 0x664FCE | `05` | `01` | up: skip index 1 instead of 5 |
-| 0x665005 | `74 0E` | `66 90` | down: drop gate |
-| 0x66500A | `05` | `01` | down: skip index 1 |
-
-Side effect while patched: entry 5 is no longer skipped when `[0x1A556F8] != 0` (harmless,
-its A-handler returns immediately then). When enabling, also write cursor 0x1D1BBE4 = 0 if
-it is 1 (cursor survives menu re-entry). The 0x6650D9 patch alone is sufficient; the
-cursor skip is cosmetic.
-
-Other ways into Battle exist outside this list (SubMenu 7 "old 2P" panel with
-[+0x5C]==1 → 2P kart; CurrentMenu 0x10 itself). As a belt-and-braces guard the mod can
-also bounce `CurrentMenu == 0x10` back to 1 while online.
-
-## Greying (Q3) — the native flag does nothing visible
+## Greying: the native flag does nothing visible
 
 Drawer FUN_006695C0 (main panel loop at 0x669600..0x6696CE) calls
 FUN_006687A0(alpha, scale, highlight, disabled) with ECX = entry id (0..6),
@@ -102,10 +91,10 @@ disabled flag only selects a third sprite from table 0xC77820
 disabled = -1**, so the flag falls back to the normal sprite. Forcing
 `0x664ED2: 0F 94 C0 → B0 01 90` (mov al,1) would therefore change nothing on screen.
 The only native "dim" is the alpha*0.5 path hard-coded for entry 5 (0x669646..0x66968C,
-uses entry 5's pos/flag directly), not reusable without a code cave. To show 2P as
-locked, draw an overlay from the mod.
+uses entry 5's pos/flag directly), not reusable without a code cave. The mod draws its own
+overlay on the entry instead.
 
-## Entry label drawing (Q4)
+## Entry label drawing
 
 Per entry, FUN_006687A0 (TextLanguage 0x174AFD1 < 2, i.e. Japanese/English):
 1. label sprite: `FUN_00668730` with EDI = sprite index from 0xC77820 table
@@ -115,7 +104,7 @@ Per entry, FUN_006687A0 (TextLanguage 0x174AFD1 < 2, i.e. Japanese/English):
 2. button plate: FUN_00668730 again with EDI = 0x1A/0x1B (0x1C/0x1D for ids 8..18),
    same x/y (0x668FC8..0x66900A).
 
-For TextLanguage >= 2 (FR/ES/DE/IT?) the label is instead drawn from a text atlas by
+For TextLanguage >= 2 (the other languages) the label is instead drawn from a text atlas by
 FUN_0066F160 at (x-159.56, y-12.75, w 325.125, h 25.5) with v = table 0xC77728[id]; the
 texanim trick below does not apply there.
 
@@ -131,11 +120,9 @@ u2, v2, texid, attr):
 | 0x0C | 0xC6A338 | 255,40, 0,0, 0,0,255,40, tex2 |
 | 0x12 | 0xC6A3B0 | 255,40, 0,0, 0,0,255,40, tex3 |
 
-**Hide only the 1P label (toggleable, data-only):** write `sx = sy = 0` (dword 0 at each
-of 0xC6A248, 0xC6A2C0, 0xC6A338, 0xC6A3B0; original dword `FF 00 28 00` = 255|40<<16)
-to get a zero-size sprite; restore `0x002800FF` to undo. The plate (sprites 0x1A/0x1B)
-and the A-handler are untouched, so 1P still works. Medium confidence that a 0-size
-sprite draws nothing (Ninja scales the quad by sx/sy); alternative is setting u2=u1/v2=v1.
+The original first dword of each is `FF 00 28 00` (255 | 40<<16); Ninja scales the quad by
+sx/sy, so `sx = sy = 0` gives a zero-size label while the plate (sprites 0x1A/0x1B) and the
+A-handler are untouched.
 
 **Position/size (640x480 menu space):** final position table at 0xC77B18
 (*0xC77C98, count 7, 16 bytes {x, y, z, angle}):
@@ -154,10 +141,9 @@ During slide-in the live position is lerped each frame by FUN_0068D190 and store
 **0x1A3D678 + 12*i** (float x, y, z): read entry 0 at 0x1A3D678/0x1A3D67C each frame to follow
 the animation. Anim counter dword 0x1A3D670 (0..180); t = counter/180. Label alpha = t
 (t*0.5 while quit-confirm `[0x1AEE2F0]` is up), label scale = 0.9*t, so fully shown the 1P
-label is 255x40 * 0.9 = **229.5 x 36** at anchor (320, 86). The texanim has cx = cy = 0, so
-under Ninja rules the anchor is the sprite's top-left (label spans x 320..549.5,
-y 86..122); the language>=2 text path centres on x instead. Verify the anchor with one
-screenshot before relying on it.
+label is 255x40 * 0.9 = **229.5 x 36** at anchor (320, 86). The texanim has cx = cy = 0; the
+language>=2 text path centres on x. `game::main_menu_1p_label` / `main_menu_2p_label` read the
+live positions for the mod's overlays.
 
 ## Addresses quick list
 
@@ -165,7 +151,7 @@ screenshot before relying on it.
   FUN_00668730 sprite draw; FUN_00669200 panel anim; FUN_00666790 init; FUN_00664B60 entry/setup.
 - Cursor 0x1D1BBE4; P2 pad 0x1DEFDB4; sound fn 0x437260 (ESI = id).
 
-## 2P → Kart Race menu (ROOM BATTLES)
+## Leaving the main menu for a 1P panel entry (`game::leave_main_menu`)
 
 The 1P panel's Kart Race handler is 0x66541F: unless `[0x1DEF428]` or `[0x1DEF4EC]` is set
 (kart unlocked) it buzzes; otherwise 3 pushes, sound 0x8001 (0x665434), 0x664DA0 (main panel
@@ -173,13 +159,12 @@ out), 0x671B80 (header out), `[*0xC77F34+0x88] = 0` (1P), SubMenu = 5. SubMenu 5
 waits for both panels to be idle, then switches on the 1P panel cursor `[0x1D1BC00]`; case 2
 (0x665516) opens the kart menu (CurrentMenu 10).
 
-The mod now patches 0x6650D9 to `90 E9 C5 03 00 00` (jmp 0x6654A4: clean the 3 pushes, return
-0, no sound), holds the main list with SubMenu 0x1C (past the table, the update does nothing)
-while its picker shows, then does the handler's steps itself (+0x40 = entry, 0x664DA0,
-0x671B80, kart +0x88 = 0 or stage panel +0x14 = 0, SubMenu 5). Stage Select is panel entry 1
-(case 0x6654EB: 0x672640, CurrentMenu 3).
+Stage Select is panel entry 1 (case 0x6654EB: 0x672640, CurrentMenu 3).
 
-Patching 0x6650D9 to `90 E9 55 03 00 00` (jmp 0x665434, past the unlock check) sends the 2P entry there, with the
-same stack (the 2P handler already pushed 3 zeros, EBX = 0); the 1P panel cursor must be 2.
-Calling 0x672B10 / CurrentMenu = 10 directly from SubMenu 2 crashes at 0x77D0F1 (sprite draw
-with a null animation, from the kart menu's display 0x670830): the panels never slid out.
+The mod holds the main list with SubMenu 0x1C (past the jump table, so the update does nothing)
+while its picker shows, then does the handler's steps itself: +0x40 = entry, 0x664DA0,
+0x671B80, kart +0x88 = 0 or stage panel (`*0xC77F44`) +0x14 = 0, SubMenu 5. No unlock checks.
+
+Calling 0x672B10 / CurrentMenu = 10 directly from SubMenu 2 crashes at 0x77D0F1 (a sprite draw
+with a null animation, from the kart menu's display 0x670830), because the panels never slid
+out.

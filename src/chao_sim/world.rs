@@ -11,6 +11,9 @@ use super::picker::{Ball, Carried, Fruit, Release, Senses, Signal, Toy, Tree};
 
 /// Life-tick slots (`0x1DC0FFC`, 32 of 0x48): a slot gets its tick every 3 frames in turn.
 const LIFE_SLOTS: usize = 32;
+/// Chao a world holds at most. Past `LIFE_SLOTS`, slot `n` ticks with slot `n % LIFE_SLOTS`,
+/// so each still gets its life tick every 96 frames, as in the game.
+pub const MAX_CHAO: usize = 2 * LIFE_SLOTS;
 
 pub struct World {
     pub garden: Garden,
@@ -21,9 +24,10 @@ pub struct World {
     pub rng: Rng,
     /// The game's motion table, when a player has sent it.
     pub motions: Option<Arc<MotionTable>>,
-    /// The Chao whose life tick ran this frame, and what it changed (`chao::changes::diff`):
-    /// its owner's game ticks it too, so the server doesn't send these back.
-    pub ticked: Option<(usize, Vec<(u16, f32)>)>,
+    /// The Chao whose life tick ran this frame, and what it changed (`chao::changes::diff`)
+    /// in the record its save keeps (`Chao::kept`): its owner's game ticks it too, so the
+    /// server doesn't send these back.
+    pub ticked: Vec<(usize, Vec<(u16, f32)>)>,
     /// The scheduler's counters (`0x1DBED74`, `0x1DBED70`).
     phase: u16,
     slot: u32,
@@ -37,20 +41,20 @@ impl World {
             chao: Vec::new(),
             rng: Rng::new(seed),
             motions: None,
-            ticked: None,
+            ticked: Vec::new(),
             phase: 0,
             slot: 0,
         }
     }
 
-    /// Puts a Chao in the first free slot; its slot, or None when all 32 are taken.
+    /// Puts a Chao in the first free slot; its slot, or None when all `MAX_CHAO` are taken.
     pub fn add(&mut self, mut chao: Chao) -> Option<usize> {
         chao.set_motions(self.motions.clone());
         if let Some(i) = self.chao.iter().position(Option::is_none) {
             self.chao[i] = Some(chao);
             return Some(i);
         }
-        if self.chao.len() >= LIFE_SLOTS {
+        if self.chao.len() >= MAX_CHAO {
             return None;
         }
         self.chao.push(Some(chao));
@@ -79,15 +83,25 @@ impl World {
     /// blockers, and from `around` the rest (players, items) where it stands.
     pub fn frame(&mut self, around: &dyn Around) {
         self.phase += 1;
-        self.ticked = None;
+        self.ticked.clear();
         if self.phase >= 3 {
             self.phase = 0;
-            let slot = (self.slot & 0x1F) as usize;
+            let first = (self.slot & 0x1F) as usize;
             let area = self.area();
-            if let Some(Some(chao)) = self.chao.get_mut(slot) {
-                let before = chao.rec.0.clone();
-                life_tick(&mut chao.rec, area, &mut self.rng);
-                self.ticked = Some((slot, crate::chao::changes::diff(&before, &chao.rec.0)));
+            for slot in (first..self.chao.len()).step_by(LIFE_SLOTS) {
+                if let Some(Some(chao)) = self.chao.get_mut(slot) {
+                    let mut rolls = self.rng.clone();
+                    let before = chao.rec.0.clone();
+                    life_tick(&mut chao.rec, area, &mut self.rng);
+                    let mut diff = crate::chao::changes::diff(&before, &chao.rec.0);
+                    // What its save keeps lives the same tick, with the same rolls.
+                    if let Some(saved) = chao.saved.as_mut() {
+                        let before = saved.0.clone();
+                        life_tick(saved, area, &mut rolls);
+                        diff = crate::chao::changes::diff(&before, &saved.0);
+                    }
+                    self.ticked.push((slot, diff));
+                }
             }
             self.slot = self.slot.wrapping_add(1);
         }
@@ -424,9 +438,44 @@ mod tests {
         assert_eq!(world.add(child()), Some(1));
         world.remove(0);
         assert_eq!(world.add(child()), Some(0));
-        for _ in 2..32 {
+        for _ in 2..MAX_CHAO {
             assert!(world.add(child()).is_some());
         }
         assert_eq!(world.add(child()), None);
+    }
+
+    #[test]
+    fn past_32_chao_each_still_ticks_every_96_frames() {
+        let mut world = World::new(
+            Garden {
+                tris: Vec::new(),
+                grid: vec![1; GRID_CELLS],
+                ledges: Vec::new(),
+                blockers: Vec::new(),
+                toys: Vec::new(),
+                tree_spots: Vec::new(),
+            },
+            0,
+            1,
+        );
+        for _ in 0..40 {
+            world.add(child());
+        }
+        let mut ticks = vec![Vec::new(); 40];
+        for frame in 0..96 * 3 {
+            world.frame(&Alone);
+            for &(slot, _) in &world.ticked {
+                ticks[slot].push(frame);
+            }
+        }
+        for (slot, at) in ticks.iter().enumerate() {
+            assert_eq!(at.len(), 3, "slot {slot}");
+            assert!(
+                at.windows(2).all(|w| w[1] - w[0] == 96),
+                "slot {slot}: {at:?}"
+            );
+        }
+        // Slot 33 ticks with slot 1.
+        assert_eq!(ticks[33], ticks[1]);
     }
 }

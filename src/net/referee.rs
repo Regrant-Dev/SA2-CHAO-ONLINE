@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::chao_host::{IN_CHAO_HANDS, ItemAct, Shared};
 use super::protocol::{
-    Body, GardenItem, ItemId, ItemPlace, MAX_GARDEN_ITEMS, TREE_RECORD, TREE_SLOTS,
+    Body, GardenItem, ItemId, ItemPlace, MAX_GARDEN_ITEMS, PlayerKey, TREE_RECORD, TREE_SLOTS,
 };
 
 type Trees = [[u8; TREE_RECORD]; TREE_SLOTS];
@@ -127,11 +127,25 @@ impl Referee {
             chao.observe(from, body, Instant::now());
         }
         match body {
-            // The server's own garden Chao: only it sends those; the ground is for it alone.
+            // The server's own garden Chao: only it sends those; the ground and what players
+            // bring are for it alone.
             Body::ServerChao { .. }
             | Body::ChaoLive { .. }
             | Body::ChaoTouched { .. }
-            | Body::GardenLand { .. } => false,
+            | Body::GardenLand { .. }
+            | Body::Brought { .. }
+            | Body::HeldChao { .. }
+            | Body::SaveChao { .. }
+            | Body::ChaoLocked { .. } => false,
+            // A Chao locked against its sender (its owner's `ChaoLock`): never to its owner.
+            Body::ChaoChanges { owner, index, .. }
+                if self
+                    .chao
+                    .as_ref()
+                    .is_some_and(|c| c.locked_against(from, (*owner, *index))) =>
+            {
+                false
+            }
             Body::HuntClaim {
                 level,
                 mission,
@@ -503,6 +517,24 @@ impl Referee {
         }
     }
 
+    /// Player `id` joined with key `key` (their Chao are known by it) and name `name`.
+    pub fn joined(&mut self, id: u8, key: PlayerKey, name: &str) {
+        if let Some(chao) = self.chao.as_mut() {
+            chao.joined(id, key, name);
+        }
+    }
+
+    /// The Chao held for players that changed (`session::Host::chao_files`).
+    pub fn chao_files(&mut self) -> Vec<(String, Option<String>)> {
+        self.chao.as_mut().map_or_else(Vec::new, |c| c.files())
+    }
+
+    pub fn load_chao_file(&mut self, name: &str, text: &str) {
+        if let Some(chao) = self.chao.as_mut() {
+            chao.load_file(name, text);
+        }
+    }
+
     /// Player `id` left the lobby: their items went with them, but the server keeps those that
     /// were in no one's save.
     pub fn left(&mut self, id: u8) {
@@ -761,6 +793,52 @@ mod tests {
                 unsaved: false,
             }],
         }
+    }
+
+    #[test]
+    fn changes_to_a_locked_chao_go_only_from_its_owner() {
+        use crate::net::protocol::{ChaoLock, PlayerState};
+        let changes = Body::ChaoChanges {
+            owner: 0,
+            index: 1,
+            changes: vec![(0x20, 3.0)],
+        };
+        let passes = |lock: ChaoLock, from: u8| {
+            let mut r = Referee::new();
+            r.joined(0, [7; 16], "Player1");
+            r.joined(3, [9; 16], "Player2");
+            let mut out = Vec::new();
+            let brought = Body::Brought {
+                awake: true,
+                lock,
+                list: Vec::new(),
+            };
+            assert!(!r.observe(0, &brought, &mut out));
+            let here = Body::PlayerState(PlayerState {
+                time: 0,
+                level: crate::game::LEVEL_CHAO_WORLD,
+                mission: 0,
+                chao_area: 1,
+                character: 0,
+                position: [0.0; 3],
+                rotation: [0; 3],
+                anim: 0,
+                frame: 0.0,
+                flags: 0,
+                room: (0xFF, 0),
+                upgrades: 0,
+                action: 0,
+                status: 0,
+            });
+            for id in [0, 3] {
+                r.observe(id, &here, &mut out);
+            }
+            r.observe(from, &changes, &mut out)
+        };
+        assert!(passes(ChaoLock::Always, 3));
+        assert!(passes(ChaoLock::ThatGarden, 3));
+        assert!(!passes(ChaoLock::Never, 3));
+        assert!(passes(ChaoLock::Never, 0));
     }
 
     fn claim(r: &mut Referee, from: u8) -> Vec<Out> {

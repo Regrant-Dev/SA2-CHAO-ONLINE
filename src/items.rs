@@ -331,9 +331,11 @@ fn chao_with(entry: usize, object: usize) -> Option<usize> {
     }
 }
 
-/// Being used here: held by our player, or a Chao here holds or eats it.
+/// Being used here: held by our player, or a Chao here holds or eats it (not a copy locked
+/// against us: it lets go at once, and we don't claim what it touched).
 fn used_here(entry: usize, object: usize) -> bool {
-    garden::player_held() == object || chao_with(entry, object).is_some()
+    garden::player_held() == object
+        || chao_with(entry, object).is_some_and(|chao| !garden::keeps_off_items(chao))
 }
 
 // --- Game calls -------------------------------------------------------------------------

@@ -31,8 +31,8 @@ Pause the game before typing, since letter keys also move your character.
 | My Chao | The Chao you race and fight with |
 | Chao details | Read your Chao's hidden stats, personality, emotions, alignment and bonds |
 | Save Chao garden now | Save your Chao World data immediately while in a garden |
-| Visit friends | Whether your Chao visit friends' gardens |
-| Visitor 1 / 2 | Which Chao visit: Auto, a Chao you pick, or None |
+| Bring Chao 1-4 | Which of your Chao you bring to a shared garden (4 at most; the rest stay home meanwhile): Auto, a Chao you pick, or None |
+| Others can change my Chao | When what friends do to your Chao counts in your save: Always, While I'm in Chao World, While I'm in that garden, Never |
 | Friends' Chao in races | Friends' Chao fill the other lanes in your Chao Races |
 | Practice karate | Fight a copy of a friend's Chao |
 | Save & Start / Apply / Stop | Connect, reconnect with new settings, or disconnect |
@@ -54,6 +54,10 @@ A server keeps the lobby up so nobody has to host. Everyone joins it with its ad
 - **Windows:** run `sa2co-server.exe` from the release.
 
 Update the server whenever you update the mod.
+
+**Keep the shared gardens:** the server keeps the gardens' trees and items and the Chao players
+left there (`chao/`, one file per player) in the folder `SA2CO_DATA` names, across restarts.
+Docker: mount a folder the container can write at `/data` (`-v /path/to/data:/data`).
 
 **Skins for everyone:** put skin folders (as in `mods/sa2-chao-online/skins/`) in a folder on the
 server and mount it at `/skins` (Docker: add `-v /path/to/skins:/skins:ro`). Everyone who joins
@@ -88,7 +92,6 @@ them. From Stage Select you're taken into their stage.
   finishes after resuming or respawning; an empty HP phase alone does not finish the fight.
   Standard wooden and iron crates stay per player: they can be stepping stones, so a friend
   breaking one cannot remove your route. They respawn normally when you die or restart.
-  Solid kart skins such as Lightning McQueen also work in Route 101/280 and Kart Race.
 
 **Party battles:** while online, the main menu's 2P button becomes **PARTY BATTLES**:
 
@@ -100,11 +103,9 @@ them. From Stage Select you're taken into their stage.
   has the same physical pickups. Retries keep the shared selection and pickup credit.
 
 Tabbing out pauses your game like normal SA2: you stay connected and the others see you
-stand still (the server keeps running the garden's Chao meanwhile). Choose Fullscreen,
-Borderless or Windowed in SA Mod Manager; the mod keeps your display choice. If an earlier
-build left you in a small custom window, select Fullscreen or Borderless again in SA Mod
-Manager before launching with the updated mod. Pausing during a party stage, or in Chao World
-with others around, doesn't stop the game for anyone.
+stand still (the host keeps running the garden's Chao meanwhile). Choose Fullscreen,
+Borderless or Windowed in SA Mod Manager; the mod keeps your display choice. Pausing during a
+party stage, or in Chao World with others around, doesn't stop the game for anyone.
 
 If you die while the online pause menu is open, choose **Resume** to finish the normal death
 and respawn transition. Once a death/restart is pending, the local scene waits behind the
@@ -149,7 +150,7 @@ Pages cover abilities (including luck and intelligence), happiness and evolution
 needs, temperament/personality, bonds with all six characters, appearance and health counters.
 Values refresh while you look. Numbers are exact; gauges show each field's normal range.
 Life counters use game units. Some hidden traits are unused or have limited effects in the
-base game; a larger number isn't always better. Eggs don't have initialized traits yet.
+base game; a larger number isn't always better. Eggs have no traits until they hatch.
 **Raw record** shows every saved byte, including unknown fields; PgUp/PgDn scrolls. Viewing
 any page does not edit, export or save the Chao.
 
@@ -159,29 +160,60 @@ Press again for the next nearest Chao; after the last one it closes. It also clo
 after 6 seconds. Works on friends' Chao too (with their live stats). It doesn't open while
 you're holding something or another balloon is showing.
 
-**Visiting:** when you're in a garden with friends, up to 4 of your Chao from that garden visit
-theirs. Pick them in F9 > Visitor 1 to Visitor 4, or leave them on Auto (your My Chao first).
-A Chao only visits while you're in the garden it lives in, and the same Chao can't fill both
-rows. Visiting Chao show who they belong to over their heads, like "Mason 1" (Mason's visitor 1)
+**Visiting:** when you're in a garden with friends, you each bring up to 4 of your Chao from that
+garden. Pick them in F9 > Bring Chao 1 to 4, or leave them on Auto (your My Chao first,
+then the first ones in your save); set a row to None to bring fewer. Your other Chao and eggs in that garden stay home while it's
+shared: they aren't in the garden, so everyone sees the same Chao. Nothing happens to them, and
+they're untouched in your save (like Chao in a garden you're not in). They come back when you're
+alone in the garden again (about 20 seconds after the last friend leaves), when you go offline,
+or the next time you enter the garden alone.
+A Chao only visits while you're in the garden it lives in, and the same Chao can't fill two
+rows. Visiting Chao show who they belong to over their heads, like "Player1 1" (Player1's visitor 1)
 or "You 2", with the Chao's name if it has one. Eggs and Chao without a tag stay in your game
 only; an egg that hatches can visit right away.
 
 You can pet, hold and feed each other's Chao, and that affects the real Chao in its owner's
-save. Picking one up interrupts petting on the other screens too. Garden items are shared:
+save, unless its owner said no (below). Picking one up interrupts petting on the other screens too. Garden items are shared:
 pick up a friend's fruit and it's yours. The garden ball is
 shared: kick it and it rolls the same way for everyone. Trees drop ripe fruit by themselves for
 only one of you, so fruit doesn't pile up twice as fast; shaking a tree works for everyone.
-With friends in a garden, one player's game runs it (whoever was keeping it already, else the
-lowest player number): every Chao there, the trees and the toys. So everyone's Chao meet, play,
-fight and even have babies together, and whatever happens to your Chao lands in your save. A
-baby made there is laid in that player's garden. If they leave or tab out, someone else takes
-over after a moment.
+With friends in a garden, the host (the dedicated server, or the player hosting) runs every
+Chao there, so everyone's Chao meet, play and fight together, and whatever happens to your Chao
+lands in your save. One player's game keeps the trees and toys (whoever was keeping them
+already, else the lowest player number); if they leave or tab out, someone else takes over
+after a moment.
 
 Everyone sees that player's trees, and planting a seed plants it for everyone. The TV, the radio
 and the jack-in-the-box are shared too: switch one on and it's on for everyone. Whistle and your
 friends' Chao come to you. Visiting eggs show up for everyone (only the owner's egg hatches).
 
-Set **Visit friends** to Off and your Chao go home within a few seconds.
+**Others can change my Chao** (F9, saved in `config.ini` as `OthersChangeChao`, changeable any
+time) decides when what other players do to your Chao is saved:
+
+| Setting | Saved when |
+|---|---|
+| Always (default) | always |
+| While I'm in Chao World | you're anywhere in Chao World: a garden, the lobby, the Kindergarten (and Black Market), races or karate |
+| While I'm in that garden | you're in the garden that Chao is in |
+| Never | never |
+
+When it isn't saved, your Chao is *locked* for them and shows a padlock next to its name. A
+locked Chao still plays with everyone as usual: it comes to their whistle, enjoys being petted
+and held, and gets upset when thrown. None of that reaches your save, and it won't take or eat
+their items. Its own life in the garden is still saved.
+
+Offline counts as being nowhere. A loading screen between two places in Chao World doesn't
+count as leaving (for up to 10 seconds).
+
+**Chao that stay:** on a server, the Chao you bring stay in their garden when you're not there.
+While you're online somewhere else (another garden, a stage) they're awake whenever someone is
+in their garden: they play, eat and grow there, can even evolve, and all of it goes straight
+into your save. When you're offline they sleep where they were left, with a tag like
+"Player1's Chao (asleep)": friends can pick them up and carry them about, nothing else happens to
+them. When you come back into their garden they're yours to run again. Your save always has
+your real Chao: the server only keeps a copy of the ones you bring, updated from your save
+every time you join, and forgets them after a week without you. It knows them by the
+`PlayerKey` the mod writes into your `config.ini` (keep it; updates do).
 
 **Chao Race:** friends' Chao run in the other lanes of your races. In a party, everyone at the
 race entrance races together live.

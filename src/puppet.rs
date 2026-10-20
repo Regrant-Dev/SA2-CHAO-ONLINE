@@ -421,7 +421,7 @@ extern "C" fn display(_object: usize) {
         } else {
             None
         };
-        // Visiting Chao: "Mason 1" (their visitor 1), ours "You 1", plus a name if it has one.
+        // Visiting Chao: "Player1 1" (their visitor 1), ours "You 1", plus a name if it has one.
         if let Some(tags) = &tags {
             let ours = if connected {
                 crate::garden::my_visitors()
@@ -435,12 +435,20 @@ extern "C" fn display(_object: usize) {
                 .into_iter()
                 .map(|(at, owner, index, name)| (at, Some(owner), index, name));
             for (at, owner, index, name) in theirs.chain(ours) {
+                // One the server holds for a player who isn't here: "Player1's Chao (asleep)".
+                let held = owner.and_then(|o| crate::held::label(o, index));
                 let who = owner.map_or_else(|| "You".to_string(), crate::room::name_of);
-                let label = match name {
-                    Some(name) => format!("{who} {}: {name}", index + 1),
-                    None => format!("{who} {}", index + 1),
+                // Locked against us (nothing we do to it reaches its owner's save): a padlock
+                // after the name.
+                let locked = held.as_ref().is_some_and(|h| h.1)
+                    || owner.is_some_and(|o| crate::garden::locked(o, index));
+                let label = match (held, name) {
+                    (Some((held, _)), Some(name)) => format!("{held}: {name}"),
+                    (Some((held, _)), None) => held,
+                    (None, Some(name)) => format!("{who} {}: {name}", index + 1),
+                    (None, None) => format!("{who} {}", index + 1),
                 };
-                tags.draw_scaled(at, CHAO_TAG_HEIGHT, &label, CHAO_TAG_SCALE);
+                tags.draw_tag(at, CHAO_TAG_HEIGHT, &label, CHAO_TAG_SCALE, locked);
             }
         }
         // Puppets blink while their player was just hurt, as characters do: every other two
@@ -1002,6 +1010,18 @@ impl TagProjector {
 
     /// `draw_at`, with the text `scale` times the usual size.
     pub(crate) fn draw_scaled(&self, feet: [f32; 3], height: f32, name: &str, scale: f32) {
+        self.draw_tag(feet, height, name, scale, false);
+    }
+
+    /// `draw_scaled`, with a padlock after the name when `locked`.
+    pub(crate) fn draw_tag(
+        &self,
+        feet: [f32; 3],
+        height: f32,
+        name: &str,
+        scale: f32,
+        locked: bool,
+    ) {
         let head = [feet[0], feet[1] + height, feet[2]];
         let distance = (0..3)
             .map(|i| (head[i] - self.me[i]).powi(2))
@@ -1024,7 +1044,7 @@ impl TagProjector {
         }
         // The 640x480 HUD space is the largest 4:3 area that fits the screen, centred.
         let (sx, sy) = crate::hud::from_virtual(x, y);
-        crate::hud::name_tag(sx, sy, shrink * scale, name);
+        crate::hud::name_tag(sx, sy, shrink * scale, name, locked);
     }
 }
 

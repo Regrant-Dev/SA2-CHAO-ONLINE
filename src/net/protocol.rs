@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -24,6 +24,44 @@ pub const BALL_IN_WATER: u8 = 2;
 pub const CHAO_MOOD: (usize, usize) = (0x12C, 0x2B);
 /// Bytes in a `ChaoLive`.
 pub const CHAO_LIVE_LEN: usize = 2 + 12 + 0x2B + 36;
+/// Record fields the host may write into an owner's save (`SaveChao`), (offset, length): stat
+/// progress, grades, levels and points; type; happiness; age, adult age, life and max life;
+/// the age clock, abilities, alignment and evolution; eyes (an evolution's); the hat worn;
+/// animals seen and parts; the emotion clocks, emotions, needs, personality and illnesses;
+/// the bond clock and the six character bonds; the DNA grade alleles (an evolution raises
+/// one). Everything a Chao's life in a garden changes that the server lives through.
+pub const SAVE_CHAO_FIELDS: [(usize, usize); 11] = [
+    (0x20, 0x28),
+    (0x80, 1),
+    (0x82, 2),
+    (0x86, 8),
+    (0xA4, 0x20),
+    (0xD1, 1),
+    (0xD5, 1),
+    (0x118, 12),
+    (0x126, 0x3A),
+    (0x168, 0x28),
+    (0x494, 0x10),
+];
+
+/// Whether `len` bytes at `at` lie inside one of `SAVE_CHAO_FIELDS`.
+pub fn save_field(at: usize, len: usize) -> bool {
+    SAVE_CHAO_FIELDS
+        .iter()
+        .any(|&(o, l)| at >= o && at + len <= o + l && len > 0)
+}
+
+/// Chao owner ids `HELD_OWNER..=MAX_CHAO_OWNER`: Chao the host holds for players who aren't
+/// in that garden (asleep: offline; awake: elsewhere), as `HeldChao` names them. Player ids
+/// are below `MAX_PLAYERS`; both fit an `ItemPlace::Chao` byte (owner in the high nibble).
+pub const HELD_OWNER: u8 = 8;
+pub const MAX_CHAO_OWNER: u8 = 15;
+/// Chao one `Brought` carries: each garden's visitor rows.
+pub const MAX_BROUGHT: usize = 3 * MAX_CARRIED_CHAO;
+/// Spans in one `SaveChao`.
+pub const MAX_SAVE_SPANS: usize = 64;
+/// Chao one `ChaoLocked` names: every player's brought rows and every held id.
+pub const MAX_CHAO_LOCKED: usize = 2 * MAX_PLAYERS * MAX_CARRIED_CHAO;
 
 /// `GardenLand` parts: at most this many bytes each, this many parts.
 pub const LAND_PART: usize = 16 * 1024;
@@ -76,6 +114,9 @@ pub const STATUS_STILL: u8 = 8;
 
 /// Identifies the exact game build (PE TimeDateStamp + SizeOfImage).
 pub type GameBuild = [u8; 8];
+/// A player's own random key (config.ini `PlayerKey`), made once and kept: the host knows
+/// their Chao by it from one session to the next.
+pub type PlayerKey = [u8; 16];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
@@ -84,6 +125,7 @@ pub enum Message {
         mod_version: String,
         game_build: GameBuild,
         name: String,
+        key: PlayerKey,
     },
     Welcome {
         your_id: u8,
@@ -512,6 +554,157 @@ pub enum Body {
     GardenUnlocks {
         gardens: u8,
     },
+    /// To the host: every Chao the sender brings to the shared gardens (each garden's visitor
+    /// rows, eggs left out), straight from their save, whichever garden they're in; on
+    /// connecting, on entering or leaving a garden and when the set changes. `awake`: the
+    /// save is loaded (Chao World opened once), so the host's `SaveChao` reach it; until then
+    /// their Chao sleep like an offline player's.
+    /// `lock`: when others may change their Chao (F9 "Others can change my Chao"); it goes
+    /// again when it changes.
+    Brought {
+        awake: bool,
+        lock: ChaoLock,
+        list: Vec<BroughtChao>,
+    },
+    /// From the host: Chao `owner` (`HELD_OWNER..`) `index` is one it holds for a player who
+    /// isn't in that garden, shown there now; `None`: not any more (its owner came, or it
+    /// made room). Copies follow its `ServerChao`.
+    HeldChao {
+        owner: u8,
+        index: u8,
+        chao: Option<HeldChao>,
+    },
+    /// From the host (0xFF), to a Chao's owner only: what that Chao's life changed while they
+    /// weren't in its garden (they're elsewhere online). Its record bytes, absolute, inside
+    /// `SAVE_CHAO_FIELDS`, for the save slot holding the `nth` copy (0 first, by slot order)
+    /// of the Chao whose `ChaoData::identity` is `identity`.
+    SaveChao {
+        identity: u64,
+        nth: u8,
+        spans: Vec<(u16, Vec<u8>)>,
+    },
+    /// From the host (0xFF), to each player: the Chao locked against them now (their owners'
+    /// `ChaoLock` says no for where those owners are), as (owner, index), present players'
+    /// and held ones alike. Sent when that list changes for them, and on (re)connecting. Their
+    /// game keeps its copies of these from taking their items and undoes what a touch changes
+    /// on them.
+    ChaoLocked {
+        chao: Vec<(u8, u8)>,
+    },
+}
+
+/// One Chao a player brings (`Body::Brought`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BroughtChao {
+    /// Its garden (1..=3) and visitor row there (its `Body::Chao` index when they're in it).
+    pub garden: u8,
+    pub row: u8,
+    /// Earlier save slots holding a Chao of the same `ChaoData::identity`.
+    pub nth: u8,
+    pub data: Box<ChaoData>,
+}
+
+/// A Chao the host holds (`Body::HeldChao`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeldChao {
+    /// The garden it's in (1..=3).
+    pub area: u8,
+    /// Its owner is offline: it sleeps (and only moves when carried).
+    pub asleep: bool,
+    /// Its owner's `ChaoLock` locks it now: nothing others do to it reaches their save.
+    pub locked: bool,
+    /// Its owner's player name.
+    pub name: String,
+    pub data: Box<ChaoData>,
+}
+
+/// When others may change a player's Chao (F9 "Others can change my Chao", `Body::Brought`).
+/// A locked Chao is still seen, carried, thrown and petted by others, but nothing they do
+/// reaches its owner's save (re/chao-garden-sync.md "Locked Chao").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChaoLock {
+    #[default]
+    Always,
+    /// While its owner is anywhere in Chao World (`lock_place`; `AnyGarden` in config.ini
+    /// reads as this too).
+    ChaoWorld,
+    /// While its owner is in the garden it's in.
+    ThatGarden,
+    Never,
+}
+
+impl ChaoLock {
+    pub const ALL: [Self; 4] = [Self::Always, Self::ChaoWorld, Self::ThatGarden, Self::Never];
+
+    /// Its wire value (its place in `ALL`).
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(v)).copied()
+    }
+
+    /// F9 menu text.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::ChaoWorld => "While I'm in Chao World",
+            Self::ThatGarden => "While I'm in that garden",
+            Self::Never => "Never",
+        }
+    }
+
+    /// config.ini value (`OthersChangeChao`).
+    pub fn ini(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::ChaoWorld => "ChaoWorld",
+            Self::ThatGarden => "ThatGarden",
+            Self::Never => "Never",
+        }
+    }
+
+    /// A config.ini value (or the menu's text); anything else is `Always`. The old
+    /// `AnyGarden` is `ChaoWorld`.
+    pub fn parse(text: &str) -> Self {
+        let plain = |t: &str| t.to_ascii_lowercase().replace([' ', '_', '\''], "");
+        let t = plain(text.trim());
+        if t == "anygarden" {
+            return Self::ChaoWorld;
+        }
+        Self::ALL
+            .into_iter()
+            .find(|l| plain(l.ini()) == t || plain(l.label()) == t)
+            .unwrap_or_default()
+    }
+
+    /// Whether a Chao living in garden `chao_area` is locked while its owner is at
+    /// `owner_area` (`lock_place`: a garden 1..=3, `PLACE_CHAO_WORLD` elsewhere in Chao
+    /// World; 0 out of it, or offline).
+    pub fn locks(self, owner_area: u8, chao_area: u8) -> bool {
+        match self {
+            Self::Always => false,
+            Self::ChaoWorld => owner_area == 0,
+            Self::ThatGarden => owner_area == 0 || owner_area != chao_area,
+            Self::Never => true,
+        }
+    }
+}
+
+/// Where an owner counts as being for their Chao's locks when in Chao World (level 90) but
+/// not in a garden: the lobby (ChaoArea 0), the Kindergarten (6, Black Market and all), the
+/// race and karate entrance (5), races (4), the stadium (9), karate (10).
+pub const PLACE_CHAO_WORLD: u8 = 0x10;
+
+/// Where a player at Chao World area `chao_area` (when `in_chao_world`) counts as being for
+/// `ChaoLock::locks`: a garden (1..=3), `PLACE_CHAO_WORLD` anywhere else there, else 0.
+pub fn lock_place(in_chao_world: bool, chao_area: i8) -> u8 {
+    match chao_area {
+        _ if !in_chao_world => 0,
+        1..=3 => chao_area as u8,
+        _ => PLACE_CHAO_WORLD,
+    }
 }
 
 /// `Body::GardenUnlocks` bits: the Hero and Dark Gardens (their bits in the Chao save's flags).
@@ -862,6 +1055,10 @@ mod tag {
     pub const UPGRADE_GOT: u8 = 57;
     pub const GARDEN_UNLOCKS: u8 = 58;
     pub const ITEM_STEER: u8 = 59;
+    pub const BROUGHT: u8 = 60;
+    pub const HELD_CHAO: u8 = 61;
+    pub const SAVE_CHAO: u8 = 62;
+    pub const CHAO_LOCKED: u8 = 63;
 }
 
 /// `GardenChao` lists as `GardenChao` and `ServerChao` carry them.
@@ -948,7 +1145,7 @@ fn write_items(w: &mut Writer, items: &[GardenItem]) {
         let (place, chao) = match i.place {
             ItemPlace::Ground => (0, 0),
             ItemPlace::Player => (1, 0),
-            // Both in one byte: index (< 4) low, owner (< 8) high.
+            // Both in one byte: index (< 4) low, owner (< 16) high.
             ItemPlace::Chao { owner, index } => (2, owner << 4 | index),
             ItemPlace::Busy => (3, 0),
         };
@@ -982,9 +1179,7 @@ fn read_items(r: &mut Reader, area: u8) -> Result<Vec<GardenItem>> {
         let place = match (place & !UNSAVED, chao) {
             (0, _) => ItemPlace::Ground,
             (1, _) => ItemPlace::Player,
-            (2, n)
-                if usize::from(n & 0xF) < MAX_CARRIED_CHAO && usize::from(n >> 4) < MAX_PLAYERS =>
-            {
+            (2, n) if usize::from(n & 0xF) < MAX_CARRIED_CHAO && chao_owner_ok(n >> 4) => {
                 ItemPlace::Chao {
                     owner: n >> 4,
                     index: n & 0xF,
@@ -1038,6 +1233,28 @@ fn player_id(r: &mut Reader) -> Result<u8> {
     }
 }
 
+/// A Chao's owner: a player id, or one the host holds Chao under (`HELD_OWNER..`).
+fn chao_owner(r: &mut Reader) -> Result<u8> {
+    let id = r.u8()?;
+    if chao_owner_ok(id) {
+        Ok(id)
+    } else {
+        Err(WireError::BadValue("chao owner"))
+    }
+}
+
+fn chao_owner_ok(id: u8) -> bool {
+    usize::from(id) < MAX_PLAYERS || (HELD_OWNER..=MAX_CHAO_OWNER).contains(&id)
+}
+
+/// A Chao record off the wire: whole and in range (`ChaoData::validate`).
+fn chao_data(r: &mut Reader) -> Result<Box<ChaoData>> {
+    let chao = ChaoData::from_bytes(r.take(CHAO_SIZE)?).ok_or(WireError::Truncated)?;
+    chao.validate()
+        .map_err(|_| WireError::BadValue("chao data"))?;
+    Ok(Box::new(chao))
+}
+
 fn name(r: &mut Reader) -> Result<String> {
     let s = r.str(MAX_NAME)?;
     if s.is_empty() {
@@ -1056,12 +1273,14 @@ impl Message {
                 mod_version,
                 game_build,
                 name,
+                key,
             } => {
                 w.u8(tag::HELLO)
                     .u16(*protocol)
                     .str(mod_version)
                     .bytes(game_build)
-                    .str(name);
+                    .str(name)
+                    .bytes(key);
             }
             Self::Welcome { your_id, players } => {
                 w.u8(tag::WELCOME).u8(*your_id).u8(players.len() as u8);
@@ -1100,6 +1319,13 @@ impl Message {
                 mod_version: r.str(MAX_VERSION)?,
                 game_build: r.take(8)?.try_into().unwrap(),
                 name: name(&mut r)?,
+                // Older versions send none: they're turned away by their protocol number.
+                key: match r.rest() {
+                    [] => [0; 16],
+                    key => key
+                        .try_into()
+                        .map_err(|_| WireError::BadValue("player key"))?,
+                },
             },
             tag::WELCOME => {
                 let your_id = player_id(&mut r)?;
@@ -1633,6 +1859,47 @@ impl Body {
             Self::GardenUnlocks { gardens } => {
                 w.u8(tag::GARDEN_UNLOCKS).u8(*gardens);
             }
+            Self::Brought { awake, lock, list } => {
+                w.u8(tag::BROUGHT)
+                    .u8(u8::from(*awake))
+                    .u8(lock.to_u8())
+                    .u8(list.len() as u8);
+                for c in list {
+                    w.u8(c.garden).u8(c.row).u8(c.nth).bytes(&c.data.bytes);
+                }
+            }
+            Self::HeldChao { owner, index, chao } => {
+                w.u8(tag::HELD_CHAO)
+                    .u8(*owner)
+                    .u8(*index)
+                    .u8(u8::from(chao.is_some()));
+                if let Some(c) = chao {
+                    w.u8(c.area)
+                        .u8(u8::from(c.asleep))
+                        .u8(u8::from(c.locked))
+                        .str(&c.name)
+                        .bytes(&c.data.bytes);
+                }
+            }
+            Self::SaveChao {
+                identity,
+                nth,
+                spans,
+            } => {
+                w.u8(tag::SAVE_CHAO)
+                    .bytes(&identity.to_le_bytes())
+                    .u8(*nth)
+                    .u8(spans.len() as u8);
+                for (at, bytes) in spans {
+                    w.u16(*at).u8(bytes.len() as u8).bytes(bytes);
+                }
+            }
+            Self::ChaoLocked { chao } => {
+                w.u8(tag::CHAO_LOCKED).u8(chao.len() as u8);
+                for (owner, index) in chao {
+                    w.u8(*owner).u8(*index);
+                }
+            }
             Self::UpgradeGot {
                 level,
                 mission,
@@ -1793,7 +2060,7 @@ impl Body {
                 }
                 let mut sounds = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let (owner, index, call, id) = (player_id(r)?, r.u8()?, r.u8()?, r.u16()?);
+                    let (owner, index, call, id) = (chao_owner(r)?, r.u8()?, r.u8()?, r.u16()?);
                     if usize::from(index) >= MAX_CARRIED_CHAO || call > SOUND_JINGLE {
                         return Err(WireError::BadValue("chao sound"));
                     }
@@ -1818,7 +2085,7 @@ impl Body {
                 if !(1..=3).contains(&area) {
                     return Err(WireError::BadValue("server chao area"));
                 }
-                let owner = player_id(r)?;
+                let owner = chao_owner(r)?;
                 let list = read_garden_chao(r)?;
                 Self::ServerChao { area, owner, list }
             }
@@ -1835,7 +2102,7 @@ impl Body {
                 }
             }
             tag::CHAO_TOUCHED => {
-                let (owner, index) = (player_id(r)?, r.u8()?);
+                let (owner, index) = (chao_owner(r)?, r.u8()?);
                 if usize::from(index) >= MAX_CARRIED_CHAO {
                     return Err(WireError::BadValue("chao touched"));
                 }
@@ -1849,7 +2116,7 @@ impl Body {
                 }
             }
             tag::CHAO_LIVE => {
-                let (owner, index) = (player_id(r)?, r.u8()?);
+                let (owner, index) = (chao_owner(r)?, r.u8()?);
                 if usize::from(index) >= MAX_CARRIED_CHAO {
                     return Err(WireError::BadValue("chao live"));
                 }
@@ -1882,7 +2149,7 @@ impl Body {
                 }
             }
             tag::CHAO_CHANGES => {
-                let (owner, index, count) = (player_id(r)?, r.u8()?, usize::from(r.u8()?));
+                let (owner, index, count) = (chao_owner(r)?, r.u8()?, usize::from(r.u8()?));
                 if usize::from(index) >= MAX_CARRIED_CHAO || count > MAX_CHAO_CHANGES {
                     return Err(WireError::BadValue("chao changes"));
                 }
@@ -1902,7 +2169,7 @@ impl Body {
                 }
             }
             tag::CHAO_HELD => {
-                let (owner, index) = (player_id(r)?, r.u8()?);
+                let (owner, index) = (chao_owner(r)?, r.u8()?);
                 if usize::from(index) >= MAX_CARRIED_CHAO {
                     return Err(WireError::BadValue("chao held"));
                 }
@@ -2451,6 +2718,94 @@ impl Body {
                     data: r.take(len)?.to_vec(),
                 }
             }
+            tag::BROUGHT => {
+                let (awake, lock, count) = (r.u8()?, r.u8()?, usize::from(r.u8()?));
+                let lock = ChaoLock::from_u8(lock).ok_or(WireError::BadValue("brought lock"))?;
+                if awake > 1 || count > MAX_BROUGHT {
+                    return Err(WireError::BadValue("brought"));
+                }
+                let list = (0..count)
+                    .map(|_| {
+                        let (garden, row, nth) = (r.u8()?, r.u8()?, r.u8()?);
+                        if !(1..=3).contains(&garden) || usize::from(row) >= MAX_CARRIED_CHAO {
+                            return Err(WireError::BadValue("brought chao"));
+                        }
+                        Ok(BroughtChao {
+                            garden,
+                            row,
+                            nth,
+                            data: chao_data(r)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::Brought {
+                    awake: awake == 1,
+                    lock,
+                    list,
+                }
+            }
+            tag::HELD_CHAO => {
+                let (owner, index, has) = (r.u8()?, r.u8()?, r.u8()?);
+                if !(HELD_OWNER..=MAX_CHAO_OWNER).contains(&owner)
+                    || usize::from(index) >= MAX_CARRIED_CHAO
+                    || has > 1
+                {
+                    return Err(WireError::BadValue("held chao"));
+                }
+                let chao = if has == 1 {
+                    let (area, asleep, locked) = (r.u8()?, r.u8()?, r.u8()?);
+                    if !(1..=3).contains(&area) || asleep > 1 || locked > 1 {
+                        return Err(WireError::BadValue("held chao"));
+                    }
+                    Some(HeldChao {
+                        area,
+                        asleep: asleep == 1,
+                        locked: locked == 1,
+                        name: name(r)?,
+                        data: chao_data(r)?,
+                    })
+                } else {
+                    None
+                };
+                Self::HeldChao { owner, index, chao }
+            }
+            tag::SAVE_CHAO => {
+                let identity = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
+                let (nth, count) = (r.u8()?, usize::from(r.u8()?));
+                if count > MAX_SAVE_SPANS {
+                    return Err(WireError::BadValue("save chao"));
+                }
+                let spans = (0..count)
+                    .map(|_| {
+                        let (at, len) = (r.u16()?, usize::from(r.u8()?));
+                        if !save_field(usize::from(at), len) {
+                            return Err(WireError::BadValue("save chao field"));
+                        }
+                        Ok((at, r.take(len)?.to_vec()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::SaveChao {
+                    identity,
+                    nth,
+                    spans,
+                }
+            }
+            tag::CHAO_LOCKED => {
+                let count = usize::from(r.u8()?);
+                if count > MAX_CHAO_LOCKED {
+                    return Err(WireError::BadValue("chao locked"));
+                }
+                let chao = (0..count)
+                    .map(|_| {
+                        let (owner, index) = (r.u8()?, r.u8()?);
+                        if owner > MAX_CHAO_OWNER || usize::from(index) >= MAX_CARRIED_CHAO {
+                            return Err(WireError::BadValue("chao locked"));
+                        }
+                        Ok((owner, index))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::ChaoLocked { chao }
+            }
             _ => return Err(WireError::BadTag("body", t)),
         })
     }
@@ -2476,6 +2831,7 @@ mod tests {
                 mod_version: "0.0.1".into(),
                 game_build: [1, 2, 3, 4, 5, 6, 7, 8],
                 name: "Regrant".into(),
+                key: [0xA5; 16],
             },
             Message::Welcome {
                 your_id: 3,
@@ -3043,6 +3399,63 @@ mod tests {
                     character: 0,
                 },
             },
+            Message::Game {
+                from: 3,
+                body: Body::Brought {
+                    awake: true,
+                    lock: ChaoLock::ThatGarden,
+                    list: vec![
+                        BroughtChao {
+                            garden: 1,
+                            row: 0,
+                            nth: 0,
+                            data: Box::new(valid_chao()),
+                        },
+                        BroughtChao {
+                            garden: 3,
+                            row: 1,
+                            nth: 1,
+                            data: Box::new(valid_chao()),
+                        },
+                    ],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::HeldChao {
+                    owner: HELD_OWNER + 2,
+                    index: 3,
+                    chao: Some(HeldChao {
+                        area: 2,
+                        asleep: true,
+                        locked: true,
+                        name: "Player1".into(),
+                        data: Box::new(valid_chao()),
+                    }),
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::HeldChao {
+                    owner: MAX_CHAO_OWNER,
+                    index: 0,
+                    chao: None,
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::SaveChao {
+                    identity: 0x0123_4567_89AB_CDEF,
+                    nth: 1,
+                    spans: vec![(0x80, vec![0x0B]), (0x12C, vec![1, 2, 3])],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::ChaoLocked {
+                    chao: vec![(0, 3), (HELD_OWNER + 1, 0)],
+                },
+            },
         ]
     }
 
@@ -3051,6 +3464,49 @@ mod tests {
         for msg in all_messages() {
             assert_eq!(Message::decode(&msg.encode()), Ok(msg.clone()), "{msg:?}");
         }
+    }
+
+    #[test]
+    fn chao_locks_follow_the_owners_garden() {
+        use ChaoLock::*;
+        // Owner in garden 2, offline/outside (0); the Chao lives in garden 2 or 3.
+        assert!(!Always.locks(0, 2));
+        assert!(!ChaoWorld.locks(3, 2) && ChaoWorld.locks(0, 2));
+        // Anywhere else in Chao World counts too, for "Chao World" but not "that garden".
+        for area in [0, 4, 5, 6, 9, 10] {
+            let place = lock_place(true, area);
+            assert!(
+                !ChaoWorld.locks(place, 2) && ThatGarden.locks(place, 2),
+                "{area}"
+            );
+        }
+        assert_eq!(lock_place(false, 2), 0);
+        assert_eq!(lock_place(true, 2), 2);
+        assert_eq!(ChaoLock::parse("AnyGarden"), ChaoWorld);
+        assert_eq!(ChaoLock::parse("While I'm in Chao World"), ChaoWorld);
+        assert!(!ThatGarden.locks(2, 2) && ThatGarden.locks(3, 2) && ThatGarden.locks(0, 2));
+        assert!(Never.locks(2, 2));
+        for l in ChaoLock::ALL {
+            assert_eq!(ChaoLock::from_u8(l.to_u8()), Some(l));
+            assert_eq!(ChaoLock::parse(l.ini()), l);
+            assert_eq!(ChaoLock::parse(l.label()), l);
+        }
+        assert_eq!(ChaoLock::from_u8(4), None);
+        assert_eq!(ChaoLock::parse("bogus"), Always);
+        // A lock past the known ones doesn't read.
+        let mut bytes = Message::Game {
+            from: 1,
+            body: Body::Brought {
+                awake: false,
+                lock: Never,
+                list: Vec::new(),
+            },
+        }
+        .encode();
+        let at = bytes.len() - 2;
+        assert_eq!(bytes[at], Never.to_u8());
+        bytes[at] = 9;
+        assert!(Message::decode(&bytes).is_err());
     }
 
     #[test]
@@ -3187,6 +3643,115 @@ mod tests {
         }
         .encode();
         assert_eq!(Message::decode(&bad), Err(WireError::BadValue("chao data")));
+    }
+
+    #[test]
+    fn chao_owners_may_be_held_by_the_host_but_players_may_not() {
+        let held = |owner| {
+            Message::Game {
+                from: SERVER,
+                body: Body::ServerChao {
+                    area: 1,
+                    owner,
+                    list: vec![GardenChao::default()],
+                },
+            }
+            .encode()
+        };
+        for owner in [0, 7, HELD_OWNER, MAX_CHAO_OWNER] {
+            assert!(Message::decode(&held(owner)).is_ok(), "{owner}");
+        }
+        assert!(Message::decode(&held(MAX_CHAO_OWNER + 1)).is_err());
+        // Held Chao go in an item's place byte too, and their changes, holds and touches.
+        for body in [
+            Body::ChaoChanges {
+                owner: HELD_OWNER,
+                index: 1,
+                changes: vec![(0x82, 1.0)],
+            },
+            Body::ChaoHeld {
+                owner: MAX_CHAO_OWNER,
+                index: 3,
+                offset: [0.0, 2.0, 1.0],
+            },
+            Body::ServerItems {
+                area: 1,
+                items: vec![GardenItem {
+                    category: 3,
+                    place: ItemPlace::Chao {
+                        owner: MAX_CHAO_OWNER,
+                        index: 3,
+                    },
+                    ..GardenItem::default()
+                }],
+            },
+        ] {
+            let msg = Message::Game { from: 1, body };
+            assert_eq!(Message::decode(&msg.encode()), Ok(msg.clone()), "{msg:?}");
+        }
+        // A player's own fields stay player ids.
+        let bad = Message::Game {
+            from: 1,
+            body: Body::GardenChao {
+                owner: HELD_OWNER,
+                list: Vec::new(),
+            },
+        };
+        assert!(Message::decode(&bad.encode()).is_err());
+        // Only held ids name a held Chao.
+        let bad = Message::Game {
+            from: SERVER,
+            body: Body::HeldChao {
+                owner: 3,
+                index: 0,
+                chao: None,
+            },
+        };
+        assert!(Message::decode(&bad.encode()).is_err());
+        // A locked list names real Chao only.
+        for chao in [
+            vec![(MAX_CHAO_OWNER + 1, 0)],
+            vec![(0, MAX_CARRIED_CHAO as u8)],
+        ] {
+            let bad = Message::Game {
+                from: SERVER,
+                body: Body::ChaoLocked { chao },
+            };
+            assert!(Message::decode(&bad.encode()).is_err());
+        }
+    }
+
+    #[test]
+    fn the_host_writes_only_a_chaos_life_into_a_save() {
+        assert!(save_field(0x80, 1) && save_field(0x12C, 0x2B) && save_field(0x494, 2));
+        // Not its name, garden or DNA (its identity), nor past a field's end.
+        assert!(!save_field(0x12, 7) && !save_field(0x81, 1) && !save_field(0x438, 4));
+        assert!(!save_field(0x86, 9) && !save_field(0x80, 0));
+        let bad = Message::Game {
+            from: SERVER,
+            body: Body::SaveChao {
+                identity: 1,
+                nth: 0,
+                spans: vec![(0x81, vec![2])],
+            },
+        };
+        assert!(Message::decode(&bad.encode()).is_err());
+    }
+
+    #[test]
+    fn an_old_hello_has_no_key_and_is_still_read() {
+        let mut w = Writer::default();
+        w.u8(tag::HELLO)
+            .u16(21)
+            .str("0.0.1")
+            .bytes(&[0; 8])
+            .str("Old");
+        match Message::decode(&w.buf) {
+            Ok(Message::Hello { protocol, key, .. }) => assert_eq!((protocol, key), (21, [0; 16])),
+            other => panic!("{other:?}"),
+        }
+        w.u8(1);
+        assert!(Message::decode(&w.buf).is_err());
     }
 
     #[test]

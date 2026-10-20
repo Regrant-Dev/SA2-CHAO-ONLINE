@@ -8,7 +8,7 @@
 //!   stage records its route (a point every ~50 units, loops from deaths cut out), saved in
 //!   `routes/` and shared with the others. Progress is where we are along that route.
 //! - In a Race room, a position line shows while racing ("2nd of 3"), and finishes are
-//!   announced ("Mason finished 1st: 1:23.45").
+//!   announced ("Player1 finished 1st: 1:23.45").
 
 use std::collections::HashMap;
 use std::path::PathBuf;

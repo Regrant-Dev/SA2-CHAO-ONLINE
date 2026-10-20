@@ -401,7 +401,7 @@ pub fn choose(choice: Choice) -> String {
     }
 }
 
-/// "Sam's party: You, Sam, Alex", while in a party.
+/// "Player2's party: You, Player2, Player3", while in a party.
 pub fn summary() -> Option<String> {
     let r = lock();
     let room = r.room?;

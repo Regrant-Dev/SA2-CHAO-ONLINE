@@ -50,10 +50,10 @@ retrying: `while true; do target/.../fakepeer client 127.0.0.1:43902 fakepeer; s
 |---|---|
 | `FAKEPEER_CHAR=<id>` | Appear as this character instead of copying yours (0 Sonic, 4 Knuckles, ...) |
 | `FAKEPEER_CHAO=<file>[,<file>]` | Bring these `.sa2chao` Chao (hatched only) to gardens, races and karate |
-| `FAKEPEER_ROOM=1` | Create its own room (join it with F9 > Room). Without it, fakepeer copies your state and so is in whatever room you create. |
-| `FAKEPEER_ROOM_PICK=level,mission,char` | Pick this stage every 30 s (reaches you in its room) |
-| `FAKEPEER_RACE_PICK=cat,course,level` | Pick this Chao Race every 30 s (reaches you in its room) |
-| `FAKEPEER_KARATE=1` | 5 s after you reach the karate area (in its room), start a live karate fight against you and replay the recorded fight, or a pretend one (once per run) |
+| `FAKEPEER_ROOM=1` | Create its own party (join it with F9 > Party). Without it, fakepeer copies your state and so is in whatever party you create. |
+| `FAKEPEER_ROOM_PICK=level,mission,char` | Pick this stage every 30 s (reaches you in its party) |
+| `FAKEPEER_RACE_PICK=cat,course,level` | Pick this Chao Race every 30 s (reaches you in its party) |
+| `FAKEPEER_KARATE=1` | 5 s after you reach the karate area (in its party), start a live karate fight against you and replay the recorded fight, or a pretend one (once per run) |
 | `FAKEPEER_KARATE_FILE=<file>` | Where a live fight you lead against fakepeer is recorded (default `target/karate-fight.rec`) |
 
 Rebuild and restart it after any protocol change (`PROTOCOL_VERSION`, docs/protocol.md).
@@ -62,32 +62,32 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
 ## Checklist
 
 - **Lobby:** connect/join/leave toasts; stopping fakepeer shows "left" and play goes on.
-- **Room toasts:** "X created a room", "X joined the room", "X left the room", "X's room closed".
+- **Party toasts:** "X created a party", "X joined the party", "X left the party", "X's party closed".
 - **Puppets:** the fake player appears with a name tag; other characters with `FAKEPEER_CHAR`.
-- **Rooms:** create a room (fakepeer joins by copying you): a stage freezes at load and shows
+- **Parties:** create a party (fakepeer joins by copying you): a stage freezes at load and shows
   "Players: You, fakepeer"; F8, Start or F9 > Start now starts it (3-2-1-GO). With `FAKEPEER_ROOM=1`,
-  its room is listed in F9 > Room and you can join it; stopping fakepeer closes it.
+  its party is listed in F9 > Party and you can join it; stopping fakepeer closes it.
 - **Pause in a synced stage** keeps the stage running; elsewhere pause freezes as normal.
 - **Stage Select:** `FAKEPEER_ROOM=1 FAKEPEER_ROOM_PICK=...`, join it and wait on Stage
-  Select; or create a room and pick a stage (the fakepeer log shows the pick).
+  Select; or create a party and pick a stage (the fakepeer log shows the pick).
 - **Chao visits:** entering a garden brings Chao; visitors appear and are never saved.
 - **Chao Race:** friends' Chao take CPU lanes with labels; `FAKEPEER_ROOM=1
   FAKEPEER_RACE_PICK=...`, join, wait at the race entrance with the course list open; the start
   holds until you press F8; its lane follows your Chao after the gun.
 - **Practice karate** (Battle DLC): F9 > Practice karate `fakepeer's Chao (copy)`, then any
   karate fight.
-- **Live karate, leading:** create a room (fakepeer joins by copying you), go to Karate
+- **Live karate, leading:** create a party (fakepeer joins by copying you), go to Karate
   and pick a fight as usual; it becomes a live fight against fakepeer, holds until you press F8
   ("Opponent: fakepeer"), then runs, and fakepeer records it.
-- **Live karate, following:** `FAKEPEER_ROOM=1 FAKEPEER_KARATE=1`, join its room and wait
+- **Live karate, following:** `FAKEPEER_ROOM=1 FAKEPEER_KARATE=1`, join its party and wait
   at the first karate menu; the fight starts by itself and replays the recorded fight.
 - **Chat:** T, type, Enter; fakepeer answers "heard: ...".
-- **Room battles:** main menu 2P button > Kart Race (fakepeer's kart, no CPU karts) and
+- **Party battles:** main menu 2P button (PARTY BATTLES) > Kart Race (fakepeer's kart, no CPU karts) and
   Treasure Hunt.
 
 These need a second real player (fakepeer only copies your state):
 
-- **Co-op stage** (a room in Co-op mode): enemies, boxes, breakables and rings someone takes are
+- **Co-op stage** (a party in Co-op mode): enemies, boxes, breakables and rings someone takes are
   gone for both; keys and switches open both doors; mech shots show. One passes a checkpoint,
   the other dies and restarts there (log: `coop: checkpoint N passed by a friend`).
 - **Co-op boss:** both hit it; the bar drops for both, and each one's last hit defeats it

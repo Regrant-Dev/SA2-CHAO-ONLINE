@@ -20,8 +20,12 @@ pub(crate) const GAME_MODE: usize = 0x0174_B040;
 pub const GAME_STATE_INGAME: i16 = 16;
 /// `CurrentChaoArea` (SA2Variables.h, `int` at 0x134046C).
 const CURRENT_CHAO_AREA: usize = 0x0134_046C;
-/// `ChaoSlots` (SA2Variables.h, `ChaoData[37]` at 0x19F6EC4). We only touch the first 24.
+/// `ChaoSlots` (SA2Variables.h, `ChaoData[37]` at 0x19F6EC4) in the Chao save's first copy;
+/// the second's are 0xCA6C on (`chao_slot_address`). We only touch the first 24.
 const CHAO_SLOTS: usize = 0x019F_6EC4;
+/// Which of the Chao save's two copies in memory is in use: the second only when this is
+/// exactly 1 (GetSaveData 0x52E440, the garden load 0x531B10, 0x568630 all test `== 1`).
+const CHAO_SAVE_IN_USE: usize = 0x0173_D06C;
 /// `MainCharObj1` (SA2Variables.h, `EntityData1*[8]` at 0x1DEA6C0).
 const MAIN_CHAR_OBJ1: usize = 0x01DE_A6C0;
 /// Per-player `CharObj2` pointers, filled by the player setup at 0x4599C0 (re/characters.md).
@@ -82,6 +86,9 @@ pub const POSE_RACE_CHAO: u8 = 16;
 pub const POSE_KARATE_BUSY: u8 = 32;
 /// `PlayerState::flags`: playing a stage that started together (past its countdown).
 pub const POSE_PLAYING: u8 = 64;
+/// `PlayerState::flags`: between places, loading or setting one up (`between_areas`): where
+/// the state says it is isn't settled yet.
+pub const POSE_LOADING: u8 = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -781,28 +788,97 @@ pub fn chao_save_path() -> Option<&'static std::path::Path> {
     CHAO_SAVE_PATH.get().map(std::path::Path::new)
 }
 
-/// Runs the game's item/checksum write-back and copies the active save region. The old
-/// AL_Save wrapper depends on mounted file descriptors that aren't ready during normal play.
-pub fn chao_save_snapshot() -> Result<Vec<u8>, String> {
-    if !in_garden() || !matches!(game_state(), 16 | 17) || local_entity().is_null() {
-        return Err("enter a Chao garden and finish loading first".into());
+/// `GameMode` (0x174B040): 5 and 10 run a stage through GameState 0x43A780, 0xE the menus,
+/// 4/6/9 load a stage, 7/8 an event, 15/16 the ending (GameModeHandler 0x434160).
+pub fn game_mode() -> i32 {
+    // SAFETY: static int in the game's data section.
+    unsafe { (GAME_MODE as *const i32).read_volatile() }
+}
+
+/// Between places: a load or an event (GameMode other than 5/10 and the menus 0xE), or in a
+/// stage or Chao World area that isn't running yet (GameState not 16/17, in game or paused)
+/// or has no player (an area being torn down or made, as between gardens).
+pub fn between_areas() -> bool {
+    match game_mode() {
+        0xE => false,
+        5 | 10 => !matches!(game_state(), 16 | 17) || local_entity().is_null(),
+        _ => true,
     }
+}
+
+/// How the Chao save can be snapshotted right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaveScope {
+    /// In a loaded garden: the full pre-save pass 0x52F090 (live items/Chao write-back).
+    Garden,
+    /// Anywhere else that isn't loading: only the checksum 0x52EEE0 over the buffer as is.
+    Elsewhere,
+}
+
+/// Where a Chao save snapshot is safe now, if anywhere. Needs the Chao save in memory. In a
+/// garden or stage (GameMode 5/10, Chao World's other areas included) it must be running or
+/// paused (GameState 16/17) with a player; the menus (GameMode 0xE) are safe as is. Loads,
+/// events, endings and the death/restart states are not.
+pub fn chao_save_scope() -> Option<SaveScope> {
     if !chao_in_memory() {
-        return Err("Chao data hasn't loaded yet".into());
+        return None;
     }
+    let running = matches!(game_state(), 16 | 17) && !local_entity().is_null();
+    if in_garden() {
+        return running.then_some(SaveScope::Garden);
+    }
+    match game_mode() {
+        5 | 10 if running => Some(SaveScope::Elsewhere),
+        0xE => Some(SaveScope::Elsewhere),
+        _ => None,
+    }
+}
+
+/// The two copies of the Chao save in memory (0x19F6460, +0xCA6C); `0x173D06C == 1` picks
+/// the second (GetSaveData 0x52E440 returns the active one).
+#[cfg(all(windows, target_arch = "x86"))]
+const CHAO_SAVE_BASE: usize = 0x019F_6460;
+pub const CHAO_SAVE_SIZE: usize = 0xCA6C;
+
+/// Copies the active Chao save region after the game's own write-back/checksum. In a garden
+/// that's the whole pre-save pass 0x52F090; elsewhere the garden's item registry and Chao
+/// objects aren't loaded, so only the checksum 0x52EEE0 runs over the buffer as it is (the
+/// game wrote the garden back into it on leaving). The old AL_Save wrapper depends on mounted
+/// file descriptors that aren't ready during normal play.
+pub fn chao_save_snapshot() -> Result<Vec<u8>, String> {
+    let scope = chao_save_scope().ok_or("wait for Chao World data to finish loading")?;
     #[cfg(all(windows, target_arch = "x86"))]
-    // SAFETY: the game's own pre-save pass and active-buffer getter, called on the game
-    // thread as on garden exits. GetSaveData normalizes the two-copy selector itself.
+    // SAFETY: the game's own pre-save pass, active-buffer getter and checksum, called on the
+    // game thread. GetSaveData normalizes the two-copy selector itself; the checksum is only
+    // run on one of the two static buffers.
     unsafe {
-        std::mem::transmute::<usize, unsafe extern "C" fn()>(0x0052_F090)();
+        if scope == SaveScope::Garden {
+            std::mem::transmute::<usize, unsafe extern "C" fn()>(0x0052_F090)();
+        }
         let base = std::mem::transmute::<usize, unsafe extern "C" fn() -> usize>(0x0052_E440)();
-        if base != 0x019F_6460 && base != 0x019F_6460 + 0xCA6C {
+        if base != CHAO_SAVE_BASE && base != CHAO_SAVE_BASE + CHAO_SAVE_SIZE {
             return Err("the active Chao save buffer is unavailable".into());
         }
-        Ok(std::slice::from_raw_parts(base as *const u8, 0xCA6C).to_vec())
+        if scope == SaveScope::Elsewhere {
+            // 0x52EEE0: usercall ESI = save base; clobbers EAX/ECX/EDX (and calls rand),
+            // restores the x87 control word it changes.
+            std::arch::asm!(
+                "push esi",
+                "mov esi, ecx",
+                "call eax",
+                "pop esi",
+                inout("ecx") base => _,
+                inout("eax") 0x0052_EEE0usize => _,
+                clobber_abi("C"),
+            );
+        }
+        Ok(std::slice::from_raw_parts(base as *const u8, CHAO_SAVE_SIZE).to_vec())
     }
     #[cfg(not(all(windows, target_arch = "x86")))]
-    Err("saving is only available in the game".into())
+    {
+        let _ = scope;
+        Err("saving is only available in the game".into())
+    }
 }
 
 /// Gives player 1 `count` rings the game's way (AddRings 0x44CE10: EAX = player, DX = count;
@@ -824,6 +900,15 @@ pub fn add_rings(count: i16) {
     let _ = count;
 }
 
+/// Save slot `index`'s record in the Chao save in use, the one the game's garden loads its
+/// Chao from and saves (re/chao-details.md "The Chao save checksum"). Every read and write
+/// of our save's Chao goes through here.
+pub fn chao_slot_address(index: usize) -> usize {
+    // SAFETY: the game's static "which Chao save" value.
+    let second = unsafe { (CHAO_SAVE_IN_USE as *const u32).read_volatile() } == 1;
+    CHAO_SLOTS + usize::from(second) * CHAO_SAVE_SIZE + index * CHAO_SIZE
+}
+
 /// Copies one garden slot out of game memory (read-only).
 pub fn read_chao_slot(index: usize) -> Option<ChaoData> {
     if index >= GARDEN_SLOTS {
@@ -834,17 +919,18 @@ pub fn read_chao_slot(index: usize) -> Option<ChaoData> {
     if !chao_in_memory() {
         return saved_chao().get(index).cloned().flatten();
     }
-    let ptr = (CHAO_SLOTS + index * CHAO_SIZE) as *const u8;
-    // SAFETY: ChaoSlots is a static array in the game's data section; index is bounds-checked.
+    let ptr = chao_slot_address(index) as *const u8;
+    // SAFETY: ChaoSlots is a static array in the game's data section (either save copy);
+    // index is bounds-checked.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, CHAO_SIZE) };
     ChaoData::from_bytes(bytes)
 }
 
 /// Any Chao (or egg) in memory: Chao World has loaded the Chao save.
-fn chao_in_memory() -> bool {
+pub fn chao_in_memory() -> bool {
     (0..GARDEN_SLOTS).any(|n| {
         // SAFETY: the `ChaoType` byte of each static slot.
-        unsafe { ((CHAO_SLOTS + n * CHAO_SIZE + 0x80) as *const u8).read_volatile() != 0 }
+        unsafe { ((chao_slot_address(n) + 0x80) as *const u8).read_volatile() != 0 }
     })
 }
 

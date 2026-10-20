@@ -1,4 +1,4 @@
-# Network protocol (v20)
+# Network protocol (v22)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -36,7 +36,7 @@ player: it's left out of `Welcome` and assigns 0..=7). Clients talk only to the 
 
 | tag | message | fields |
 |---|---|---|
-| 1 | Hello | protocol u16, mod_version str≤16, game_build [u8;8], name str 1..10 |
+| 1 | Hello | protocol u16, mod_version str≤16, game_build [u8;8], name str 1..10, key [u8;16] (the player's own random key, config.ini `PlayerKey`, made once by the mod; the host knows their Chao by it from one session to the next. An older Hello without it is still read, and turned away by its protocol number) |
 | 2 | Welcome | your_id u8, count u8 ≤ 8, (id u8, name str)* |
 | 3 | Reject | reason str≤64 |
 | 4 | PeerJoined | id u8, name str |
@@ -49,7 +49,7 @@ Game bodies:
 
 | tag | body | sent | fields |
 |---|---|---|---|
-| 1 | PlayerState | 30 Hz, unreliable | time u32 (sender frame), level i16, mission u8, chao_area i8, character u8, position f32×3 (finite, \|v\| ≤ 1e6), rotation i32×3 (BAMS), anim u16, frame f32 (finite, \|v\| ≤ 1e5), flags u8, room (owner u8, kind u8), upgrades u32 (`CharObj2Base::Upgrades`, for mech upgrade parts), action u8 (EntityData1 action), status u8 (1 on the ground, 2 holding something, 4 just hurt and can't be hurt again yet: its puppet blinks like the character, every other two frames, 8 standing still by the game's own speed: a skin on its puppet stands): action and status drive skins' animations |
+| 1 | PlayerState | 30 Hz, unreliable | time u32 (sender frame), level i16, mission u8, chao_area i8, character u8, position f32×3 (finite, \|v\| ≤ 1e6), rotation i32×3 (BAMS), anim u16, frame f32 (finite, \|v\| ≤ 1e5), flags u8 (128: between places, a load or an area being set up, so `level`/`chao_area` aren't settled yet), room (owner u8, kind u8), upgrades u32 (`CharObj2Base::Upgrades`, for mech upgrade parts), action u8 (EntityData1 action), status u8 (1 on the ground, 2 holding something, 4 just hurt and can't be hurt again yet: its puppet blinks like the character, every other two frames, 8 standing still by the game's own speed: a skin on its puppet stands): action and status drive skins' animations |
 | 2 | Chao | reliable | index u8 (0..=1 garden Chao, 2 = My Chao), 0x800 bytes `ChaoData` (must pass `ChaoData::validate`) |
 | 4 | RoomPick | reliable | level i16 (1..=100), mission u8 (0..=4), character u8 (0..=15): a room player's Stage Select pick |
 | 5 | RacePick | reliable | category u8 (0..=4), course u8 (0..=12), level u8 (0..=11): a room player's race |
@@ -59,7 +59,7 @@ Game bodies:
 | 9 | KarateCheer | reliable | count u8: the member cheered (A) this many times |
 | 10 | StageKills | reliable | level i16 (0..=100), mission u8 (0..=4), count u16 (≤ 0x600), then count × u16 object index (< 0x600): co-op room, these stage objects (`SETObjectData` record indices, re/stage-objects.md) were destroyed. New kills as they happen; the whole list when a room player enters the stage (sent by the room players already in it) |
 | 11 | GardenChao | 30 Hz, unreliable | owner u8, count u8 (≤ 4), then per Chao: index u8 (< 4), position f32×3, rotation_y i32, motion u16, held u8 (0/1), offset f32×3, mood (current state i16, timer i32, length i32), eyes i16, mouth i16, props u8×3 (per attach point 4/11/35: 0 none, else 1 + index into `garden::PROPS`, ≤ 22), drum u8 (size 0..=255, 0 none), cocoon u8 (0 none, 1 + kind 0..=2), book u8 (the picture book in front of it: 0 none, 1 + its mode 0..=3), owner_runs u8 (0/1: from its owner, their game runs it now for a life event, evolving or the end of its life, and everyone follows the owner's for it, the server too): player `owner`'s visiting Chao as they are in the sender's game (re/chao-garden-sync.md). Each player sends their own (that's how the others and the server know they visit); while the server runs the garden everyone's copies follow `ServerChao` instead, else the owner's; offset = where it is relative to the sender while held, in the sender's frame |
-| 12 | ChaoChanges | reliable | owner u8, index u8 (< 4), count u8 (≤ 128), then count × (offset u16 (< 0x800), value f32): the sender's interaction changed `owner`'s visiting Chao; `chao::changes` deltas (or values for animal parts) for the owner to apply to the real one, and for the server to apply to the one it runs. From the server (sender 0xFF): what its AI changed, about once a second, to the owner only |
+| 12 | ChaoChanges | reliable | owner u8, index u8 (< 4), count u8 (≤ 128), then count × (offset u16 (< 0x800), value f32): the sender's interaction changed `owner`'s visiting Chao; `chao::changes` deltas (or values for animal parts) for the owner to apply to the real one, and for the server to apply to the one it runs. From the server (sender 0xFF): what its AI changed, about once a second, to the owner only. For a Chao locked against the sender (its owner's lock, see Brought) the host neither applies nor passes it on, and the owner's game refuses one from another player while its own lock says no |
 | 13 | ChaoHeld | 30 Hz, unreliable | owner u8, index u8 (< 4), offset f32×3: the sender is holding `owner`'s Chao `index`; the game running it (the server, or while it doesn't run the garden the owner's) shows it in their hands |
 | 14 | GardenItems | ~10 Hz, unreliable | area u8 (1..=3), count u8 (≤ 24), then per item: id (origin u8, serial u16), category u8 (2/3/7/9), kind u8, bites u8 (≤ 4), place u8 (bit 0x80: unsaved, in no one's save; then 0 ground, 1 held by the sender, 2 held/eaten by a visiting Chao the sender's game runs (its own, or any while it keeps the garden), 3 in use unseen), chao u8 (place 2: that Chao's owner × 16 + its index (< 4)), position f32×3 (ground/unseen: where; held: offset in the holder's frame): items the sender owns in that garden (src/items.rs) |
 | 15 | ItemClaim | reliable, to the host only | id: the sender picked up (or a Chao in their game took) item `id` and asks to own it. The host's referee answers; it is never passed on |
@@ -70,7 +70,7 @@ Game bodies:
 | 20 | KartPick | reliable | course u8 (0..=2): a room player started a Kart Race |
 | 21 | KartState | 30 Hz unreliable | position f32×3, rotation i32×3, yaw i32, wheel i32, kind u8 (2..=7), accel u8 (0/1, bright exhaust), tilt i32×3 (body tilt sums), frame u16 (the sender's game frame, wrapping; repeats and late ones are dropped, speeds come from it): the sender's kart |
 | 22 | HuntSet | ~1 Hz unreliable | level i16, mission u8, 3 × (kind u8, id u8, position f32×3): the room's treasure hunt pieces |
-| 23 | HuntClaim | reliable, to the host only | level, mission, sig u32, slot u8 (0..=2): we collected this piece. Not passed on |
+| 23 | HuntClaim | reliable, to the host only | level, mission, sig u32, slot u8 (0..=2): the sender collected this piece. Not passed on |
 | 24 | HuntTaken | reliable, from the host | level, mission, sig, slot, player u8: who got the piece first (everyone; a late claimer alone) |
 | 25 | KeyUsed | reliable | level i16, mission u8, key u8 (0/1): co-op room, the sender's stage key went into its keyhole; the others' keys go in too (from the ground), so their doors open |
 | 26 | Shot | ~unreliable, per shot | level i16, mission u8, kind u8 (0 bullet, 1 bazooka), position f32×3, direction f32×3: co-op room, the sender's mech fired; the others fire the same shot |
@@ -93,11 +93,11 @@ Game bodies:
 | 43 | ServerGarden | from the host's referee, every 2 s, reliable | area u8 (1..=3), trees 7 × 8 bytes, then per toy (TV, radio, box) mode u8 (≤ 12) and age u16 (seconds since that jump; 65535 none): the shared garden as the server keeps it (re/chao-garden-items.md 7). The keeper runs these trees (with friends there), the others show copies; a newcomer's toys make jumps younger than a minute |
 | 44 | ServerItems | from the host's referee, every second, reliable | area u8, then items as in GardenItems: items in no one's save whose owner left the garden (ids with serial ≥ 0xF000), in a server Chao's hands too (`ItemPlace::Chao`). A player's item a server Chao takes stays theirs: see `ItemSteer`. Shown as copies by everyone, claimed with ItemClaim like anyone's |
 | 45 | CarriedChao | reliable, on a change and every second | offset f32×3 (from the sender, their frame), has u8 (0/1), then a Chao record (0x800 bytes) if 1: the Chao the sender carries in Chao World outside the gardens (lobby, kindergarten, entrances), or none any more. The others show it in their puppet's hands (`carried.rs`) |
-| 46 | ServerChao | from the host, 30 Hz, unreliable | area u8 (1..=3), owner u8, then the list as in GardenChao (`held` always 0): the host runs shared garden `area`'s Chao (chao_sim, net/chao_host.rs, once two players are there and its ground is known) and these are player `owner`'s as it has them; everyone in the garden follows these (re/chao-garden-sync.md "The server runs the Chao") |
+| 46 | ServerChao | from the host, 30 Hz, unreliable | area u8 (1..=3), owner u8 (a player, or 8..=15 a Chao it holds, see HeldChao), then the list as in GardenChao (`held` always 0; `cocoon` 1 while a held Chao's evolution cocoon is closed): the host runs shared garden `area`'s Chao (chao_sim, net/chao_host.rs, once two players are there and its ground is known) and these are player `owner`'s as it has them; everyone in the garden follows these (re/chao-garden-sync.md "The server runs the Chao") |
 | 47 | GardenLand | to the host, reliable, on entering a garden and on every (re)connect | garden u8 (0 Neutral, 1 Hero, 2 Dark; 3 the Chao motion table), fingerprint u32 (crc32 of the whole), part u8, parts u8 (≤ 64), bytes (≤ 16 KiB): part of `chao_sim::land::Garden::to_bytes` (`SA2LAND4`: ground triangles, cell grid, ledges, blockers, toys, tree spots) or `MotionTable::to_bytes`, read from the sender's game; the host uses what most players agree on |
 | 48 | ChaoLive | from the host (sender 0xFF), 1 Hz, unreliable | owner u8, index u8 (< 4), then 93 bytes: player `owner`'s Chao `index` as the server runs it, the record fields that change as it lives (`CHAO_LIVE_FIELDS`: happiness 0x82 ×2, abilities and alignment 0xA8 ×12, emotions, needs and personality 0x12C ×0x2B, bonds 0x16C ×36), to everyone in the garden but its owner; their copy of it takes them (record and snapshot), so its status balloon shows them |
-| 49 | ChaoTouched | to the host, ~10 Hz while it lasts, unreliable | owner u8, index u8 (< 4), position f32×3, rotation_y i32, motion u16 (what it plays there; the others are shown it), then 0x2B bytes (`CHAO_MOOD`: its emotions, needs and personality, record 0x12C..0x157): the sender's game runs that Chao for a while because they touched it (threw, petted, fed it; holding is `ChaoHeld`), and this is where it is; the server's Chao is kept there, takes that mood (so a beaten Chao stays angry or scared), and goes on from it |
-| 50 | StageRings | reliable | level i16, mission u8, count u16 (≤ 0x600), then count × (record u16 (< 0x600), ring u8 (< 8)): co-op room, rings of ring lines and circles (RINGLINE, RINGCIRC and the Knuckles/Rouge ones; `record` is the group's `SETObjectData` index) were collected; they go for everyone, and each player gets a ring. New ones as they happen; all of them when a room player enters the stage. 46..=49 are left for the garden |
+| 49 | ChaoTouched | to the host, ~10 Hz while it lasts, unreliable | owner u8, index u8 (< 4), position f32×3, rotation_y i32, motion u16 (what it plays there; the others are shown it), then 0x2B bytes (`CHAO_MOOD`: its emotions, needs and personality, record 0x12C..0x157): the sender's game runs that Chao for a while because they touched it (threw, petted, fed it; holding is `ChaoHeld`), and this is where it is; the server's Chao is kept there, takes that mood (so a beaten Chao stays angry or scared; not from a player it's locked against), and goes on from it |
+| 50 | StageRings | reliable | level i16, mission u8, count u16 (≤ 0x600), then count × (record u16 (< 0x600), ring u8 (< 8)): co-op room, rings of ring lines and circles (RINGLINE, RINGCIRC and the Knuckles/Rouge ones; `record` is the group's `SETObjectData` index) were collected; they go for everyone, and each player gets a ring. New ones as they happen; all of them when a room player enters the stage |
 | 51 | LockOn | reliable | level i16, mission u8, gun f32×3, then twice (locked, then fired): count u8 (≤ 32), count × (record u16 (< 0x600), aim f32×3): co-op room, the sender's mech lock-on: the stage objects (SET records) it's locked on to now, and those it just fired its lasers at. Sent when the locked set changes (every 6 frames at most) and on firing. The others draw the cursors and lasers with the game's own marker displays on objects of their own; nothing is hit (the kills come as StageKills) (`lockon.rs`) |
 | 52 | BossClaim | 4 Hz unreliable | level i16, mission u8, term u32: co-op party, the sender is fighting this stage's boss (it has passed its intro there). With term > 0 the sender's game leads the boss. The leader is chosen keeper-style among the fresh fighters (`boss_follow.rs`) |
 | 53 | BossState | 20 Hz unreliable | level i16, mission u8, mode u8, sub u8, counter u8, flags u16, timer u16, position f32×3, rotation i32×3, motion u16, target u8 (player id): co-op party, the leading boss's Data1 state, its motion, and the player it's after. The others' bosses follow it, and run their own mode function while the target is them |
@@ -107,6 +107,10 @@ Game bodies:
 | 57 | UpgradeGot | reliable | level i16, mission u8, index u8 (< 0x1E), character u8, mask u32: co-op party, the sender picked up an upgrade (its flag in the save's upgrade table 0x1DEB300, for that character, giving its CharObj2+0x24 those bits). Everyone sets the flag (kept with their save) and, if they're playing that character, gets the bits now (`coop.rs`) |
 | 58 | GardenUnlocks | reliable | gardens u8 (bits 0x10 Hero Garden, 0x40 Dark Garden): party, the sender's Chao World has these gardens open. Sent when they change and every 10 s while in a party; party players open the same gardens in their own Chao save (`unlocks.rs`) |
 | 59 | ItemSteer | from the host (0xFF) to an item's owner, reliable | area u8, gone u8 (0/1), then one item as in GardenItems: a Chao the server runs has their item; it only borrows it (the item stays in their save and theirs to report): it's now where the item says (in that Chao's hands, `ItemPlace::Chao`, or put down on the ground), with those bites; gone: eaten up or worn, it leaves their save. Their reports don't move it until they show the same place |
+| 60 | Brought | to the host, reliable, on connecting, on entering or leaving a garden and when it changes | awake u8 (0/1: the save is loaded, so SaveChao reach it), lock u8 (when others may change the sender's Chao, F9 "Others can change my Chao": 0 Always, 1 while they're anywhere in Chao World, 2 while they're in the garden that Chao is in, 3 Never; offline counts as in no garden; kept with their Chao), count u8 (≤ 12), count × (garden u8 (1..=3), row u8 (< 4: its visitor row there, its Chao index while they're in it), nth u8 (earlier save slots holding a Chao of the same identity), 0x800 bytes `ChaoData`): every Chao the sender brings to the shared gardens (each garden's visitor rows; eggs left out), from their save, whichever garden they're in. The host keeps them by the sender's key (net/roster.rs): the save wins, so kept ones are updated, moved, dropped or added to match. Not passed on |
+| 61 | HeldChao | from the host (0xFF), reliable, when it changes | owner u8 (8..=15), index u8 (< 4), has u8, then if 1: area u8 (1..=3), asleep u8 (0/1), locked u8 (0/1: its owner's lock keeps what others do to it from their save; sent again when that changes), name str (its owner's), 0x800 bytes `ChaoData`: a Chao the host holds for a player who isn't in that garden is shown there under this owner id (asleep: its owner is offline; awake: online elsewhere), or (has 0) not any more. To everyone but its owner. Copies follow its ServerChao (`held.rs`) |
+| 62 | SaveChao | from the host (0xFF) to a Chao's owner only, reliable, about once a second while it changes | identity u64 (`ChaoData::identity`), nth u8, count u8 (≤ 64), count × (offset u16, len u8, bytes): what that Chao's life changed in a garden its owner isn't in (it lives there while they're online elsewhere), absolute record bytes, each span inside `SAVE_CHAO_FIELDS` (stats, type, happiness, age and life, abilities and evolution, eyes, hat, animals, emotions, needs, personality, illnesses, bonds, DNA grade alleles). The owner's game writes them into the save slot holding the `nth` copy of that identity and has the save written out |
+| 63 | ChaoLocked | from the host (0xFF), reliable, when it changes for that player and on (re)connecting | count u8 (≤ 64), count × (owner u8 (≤ 15), index u8 (< 4)): the Chao locked against the receiver now (see Locked Chao), present players' and held ones; never their own. Their game keeps its copies of these from taking items and undoes what touches change on them |
 
 ## Skins (`net/files.rs`, `skin_sync.rs`)
 
@@ -122,7 +126,7 @@ again, and every model, motion and sound file is still checked when it's loaded.
 downloads, the menus show a progress bar. A new skin's textures are found by the mod loader
 only at start, so new skins (not changed ones) need a restart; the menus say so.
 
-Players announce their skin with SkinWorn. A player wearing an animated or solid skin we have
+Players announce their skin with SkinWorn. A player wearing an animated or solid skin the receiver has
 is drawn with it, animated from their PlayerState (position, action, status, spin ball);
 skins built on a character's skeleton (rigged) show the character to others.
 
@@ -134,11 +138,12 @@ and rotation y are the Chao's, `frame` its race progress), 32 in a live karate f
 Race, 2 = Co-op (the creator's setting; any non-zero kind is a room). A room exists
 while its creator is in it (`room.rs`).
 
-Strings: u8 length + UTF-8, no control characters. Ids must be < 8. Trailing bytes are an error.
+Strings: u8 length + UTF-8, no control characters. Player ids must be < 8; a Chao's owner (in
+ChaoSounds, ServerChao, ChaoLive, ChaoTouched, ChaoChanges, ChaoHeld and `ItemPlace::Chao`) may
+also be 8..=15, a Chao the host holds (HeldChao). Trailing bytes are an error.
 
 `game_build` = PE `TimeDateStamp` + `SizeOfImage` read from the exe header in memory
 (`game::game_build`); the supported build is `E8 1A 60 50 00 C0 3F 02`.
-
 
 ## The host's referee (net/referee.rs)
 
@@ -155,3 +160,58 @@ Co-op messages (`StageKills`, `KeyUsed`, `Shot`, `Switch`, `Checkpoint`, `BossHp
 from players in the receiver's room. BossHp values are at most 1000.
 
 Referee answers are sent with a stand-in `from` (a client ignores messages "from" itself).
+
+## Held Chao (net/roster.rs, net/chao_host.rs, held.rs)
+
+The host keeps what each player brings (`Brought`) by their key, and on the dedicated server in
+`SA2CO_DATA/chao/<key>.txt` (one file per key: name, last seen, lock, then each Chao's garden, row,
+copy number, place and record as a `.sa2chao` in hex; written like `gardens.txt`, dropped a week
+after the player was last online). A Chao is (key, `ChaoData::identity`, nth), never its DNA alone.
+
+In a garden the host runs, the Chao of players who aren't in it are shown under owner ids
+8..=15 (index 0..=3, a player's 4 brought rows; 32 ids in all over the three gardens, so at
+most 32 held Chao are shown at once and the rest wait): the present players' own first, then
+held ones, most recently online first, at most 4 of each player, 32 a garden. A garden runs with one player
+when held Chao wait there (two otherwise).
+- Owner online elsewhere with their save loaded: awake, run as any Chao (life tick included);
+  what changes goes to them as SaveChao. A cocoon that opens evolves it there
+  (`chao_sim::evolve`): its new record goes to everyone (HeldChao) and to its owner (SaveChao).
+  It never dies there: at the end of its life it waits.
+- Owner offline (or their save not loaded): asleep, lying where it was left (motion 0x13, eyes
+  7), out of the server's world; players can carry and throw it (ChaoHeld, ChaoTouched) and it
+  stays where it lands. Nothing else of it changes, and changes sent for it are dropped.
+- Owner comes into its garden: their game has it again (their stream for it, or 5 s); the held
+  copy goes (HeldChao `has` 0) and their game runs it.
+
+## Locked Chao (net/chao_host.rs, garden.rs, protocol `ChaoLock`)
+
+A player's lock (`Brought` lock) says when others' doings are saved to their Chao. Where the
+owner is (`lock_place`): a garden 1..=3, elsewhere in Chao World (level 90: lobby, races,
+Kindergarten, karate, stadium), or nowhere (another level, a menu, offline). Always never locks;
+ChaoWorld locks while the owner is nowhere in Chao World; ThatGarden locks while the owner isn't
+in the Chao's garden; Never always locks. A Chao is never locked against its owner's own ids.
+
+A PlayerState with flag 128 (a load between places) keeps the owner's last place for 10 s, or
+until a settled state says where they are. Disconnecting counts as nowhere at once.
+
+A locked Chao behaves the same for everyone: it minds whoever holds it, whistles or is nearest,
+plays its held reactions, lands upset when thrown and enjoys petting. What changes is what's
+saved. The host:
+- keeps a second, saved record while the Chao's current activity is with a player it's locked
+  against (holder, thrower or the player its senses picked). The brain runs on the live record;
+  the saved one gets only its own life ticks and its owner's changes. When the activity ends
+  the live record is reset to the saved one;
+- sends the saved record in everything that reaches the owner (ChaoChanges, ChaoLive,
+  SaveChao, HeldChao);
+- drops other players' ChaoChanges for it (not applied, not passed on) and the mood of their
+  ChaoTouched (the position still counts);
+- lets it take only its owner's items and the server's;
+- tells each player which Chao are locked against them (`ChaoLocked`).
+
+On the other player's game a copy locked against them (or a held one asleep) never reacts to
+their items (its fruit, animal and seed checks say no) and lets go at once of one it got hold
+of, unbitten. It sends nothing, and each frame its record is put back from the one its brain
+gave it (`ChaoLive`), so its status balloon shows the saved values. Its name tag shows a padlock.
+
+Before the server runs a garden each owner's game runs its own Chao, so their natural life goes
+straight into their save; the only ChaoChanges others send are touches, which a lock drops.

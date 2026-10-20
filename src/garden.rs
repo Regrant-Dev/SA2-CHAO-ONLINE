@@ -19,8 +19,14 @@
 //! real records still take every change). Touching a Chao still plays out at once where you
 //! are, as above, and what it changes goes to its owner and the server. Until the server runs
 //! the garden (the first moment friends meet), each owner's game runs its own as before.
+//!
+//! A Chao locked against us (its owner's `ChaoLock`, the host's `ChaoLocked`) or asleep is
+//! still carried, thrown and petted here, but our copy of it never takes an item (its fruit,
+//! animal and seed checks say no, and anything it got hold of is let go at once, unbitten),
+//! nothing of it is sent, and what a touch changed in its record is put back every frame
+//! (from the server's live fields), so its status balloon shows its real values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -29,8 +35,8 @@ use crate::chao::{self, CHAO_SIZE, ChaoData};
 use crate::game::{self, Vector};
 use crate::log;
 use crate::net::protocol::{
-    CHAO_LIVE_FIELDS, CHAO_LIVE_LEN, CHAO_MOOD, ChaoSound, GardenChao, SOUND_AT, SOUND_HELD,
-    SOUND_JINGLE,
+    CHAO_LIVE_FIELDS, CHAO_LIVE_LEN, CHAO_MOOD, ChaoSound, GardenChao, SAVE_CHAO_FIELDS, SOUND_AT,
+    SOUND_HELD, SOUND_JINGLE,
 };
 
 /// Chao-world object registry: 0x48-byte entries, 0x1200 bytes per category; an entry's record
@@ -66,6 +72,8 @@ const D_HAND_A: usize = 0x5D8;
 const D_HAND_B: usize = 0x5E4;
 /// Hands farther than this from the Chao's position aren't its current ones.
 const HAND_REACH: f32 = 10.0;
+/// A registry entry's partner (the entry it's linked to: a Chao's item, an item's Chao).
+const ENTRY_PARTNER: usize = 0x40;
 /// Mood display (heart, "?", "!", swirl, ...), a small state machine at Data1+0x6EC: i16 current
 /// state (0..=5, function table 0x1353834), i16 requested next (-1 none; 0x53D660 and friends
 /// set it, and the next update switches to it), i32 timer, i32 length. Switching clears the
@@ -393,6 +401,7 @@ pub fn clear() {
         g.live_in.clear();
         g.rebuilt.clear();
     });
+    KEEP_OFF.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// The Chao we brought to this garden: (`Body::Chao` index, save slot).
@@ -469,6 +478,125 @@ pub fn player_left(owner: Option<u8>) {
 /// The sender id the server's Chao streams count as (no player has it).
 pub use crate::net::protocol::SERVER;
 
+/// Chao locked against us (`ChaoLocked`): (owner, index).
+static LOCKED: Mutex<Option<HashSet<(u8, u8)>>> = Mutex::new(None);
+/// Our copies that keep off items now (locked against us, or asleep): their objects, for the
+/// reaction hooks and items.rs.
+static KEEP_OFF: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Network (the host): the Chao locked against us now; disconnected, none.
+pub fn set_locked(chao: Vec<(u8, u8)>) {
+    *LOCKED.lock().unwrap_or_else(|e| e.into_inner()) = Some(chao.into_iter().collect());
+}
+
+/// Whether Chao `owner`/`index` is locked against us (nothing we do to it reaches its owner).
+pub fn locked(owner: u8, index: u8) -> bool {
+    LOCKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|l| l.contains(&(owner, index)))
+}
+
+/// Whether the Chao in registry entry `entry` is a copy of ours that keeps off items (an
+/// item it holds isn't in use here).
+pub fn keeps_off_items(entry: usize) -> bool {
+    // SAFETY: a live registry entry's object pointer.
+    let object = unsafe { ((entry + OBJ_ENTRY) as *const usize).read() };
+    keeps_off(object)
+}
+
+fn keeps_off(object: usize) -> bool {
+    object != 0
+        && KEEP_OFF
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&object)
+}
+
+/// Whether a copy's own AI runs for us now: held by us, hit, or (awake) petted within reach or
+/// offered an item, not one locked against us (it would take the item). Never while its
+/// brain's player holds it.
+fn touches(brain_holds: bool, held_by_us: bool, hit: bool, keep: Keep, near: Near) -> bool {
+    !brain_holds
+        && (held_by_us || hit || (!keep.asleep && ((!keep.locked && near.item) || near.petting)))
+}
+
+/// A copy we keep from changing its owner's Chao: locked against us, asleep.
+#[derive(Clone, Copy, Debug, Default)]
+struct Keep {
+    locked: bool,
+    asleep: bool,
+}
+
+impl Keep {
+    fn any(self) -> bool {
+        self.locked || self.asleep
+    }
+}
+
+/// What our player does near a copy: holds an item, pets it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Near {
+    item: bool,
+    petting: bool,
+}
+
+/// Puts back what changed in `copy`'s life (`SAVE_CHAO_FIELDS`) from `truth`; whether
+/// anything had.
+fn undo_drift(copy: &mut ChaoData, truth: &ChaoData) -> bool {
+    let mut undone = false;
+    for (at, len) in SAVE_CHAO_FIELDS {
+        let (now, was) = (&mut copy.bytes[at..at + len], &truth.bytes[at..at + len]);
+        if now != was {
+            now.copy_from_slice(was);
+            undone = true;
+        }
+    }
+    undone
+}
+
+/// Registry categories of the items a Chao holds or eats: animals and drives, fruit, seeds,
+/// hats.
+const HELD_ITEM_CATEGORIES: [usize; 4] = [2, 3, 7, 9];
+/// Unlinks an object from its partner, both ways (EAX = object; its entry `+0x3C`): flags
+/// `+6`, partner `+0x40` and `+0xC` cleared. The reactions dispatcher `0x53DB10` does it to a
+/// Chao a reaction takes over (0x53DC1E).
+#[cfg(target_arch = "x86")]
+const UNLINK: usize = 0x0053_0690;
+
+/// Our copy `object` lets go of any item it holds or eats: unlinked, the fruit's eaten mode
+/// (`0x545C20`) finds no Chao (`0x56D170`) and lies down again with its bites (a bite needs
+/// the Chao's eat command and 181 frames of it); an animal is free again.
+///
+/// # Safety
+/// Game thread; `object` is a live Chao copy of ours.
+unsafe fn let_go_of_items(object: usize) -> bool {
+    let Some((entry, _)) = crate::registry::entries(crate::registry::CHAO)
+        .into_iter()
+        .find(|&(_, o)| o == object)
+    else {
+        return false;
+    };
+    // SAFETY: a live Chao entry's partner pointer.
+    let partner = unsafe { ((entry + ENTRY_PARTNER) as *const usize).read() };
+    if partner == 0 || !HELD_ITEM_CATEGORIES.contains(&crate::registry::category_of(partner)) {
+        return false;
+    }
+    #[cfg(target_arch = "x86")]
+    // SAFETY: the game's own unlink on a live object with its entry (checked above); it
+    // touches only the two entries and keeps ESI.
+    unsafe {
+        std::arch::asm!(
+            "call {f}",
+            f = in(reg) UNLINK,
+            inout("eax") object => _,
+            clobber_abi("C"),
+        );
+    }
+    true
+}
+
 /// The garden area the server last sent its Chao for, and when.
 static SERVER_BRAIN: Mutex<Option<(u8, Instant)>> = Mutex::new(None);
 /// When `server_runs` was last asked; a longer gap than `PAUSE_GAP` is our game standing still.
@@ -477,7 +605,7 @@ const PAUSE_GAP: Duration = Duration::from_millis(500);
 
 /// Whether the server runs our garden's Chao now (it sends them): everyone's follow it. Else
 /// each owner's game runs their own. Trees and toys stay the keeper's (keeper.rs).
-fn server_runs() -> bool {
+pub fn server_runs() -> bool {
     let area = game::current_chao_area();
     let mut brain = SERVER_BRAIN.lock().unwrap_or_else(|e| e.into_inner());
     // Our game stood still (tabbed out, paused): its messages wait unread meanwhile, so that
@@ -514,9 +642,11 @@ pub fn received(from: u8, owner: u8, list: Vec<GardenChao>) {
     } else {
         from == owner
     };
+    // The server's held Chao (its owner isn't here) are heard from the server.
+    let held = from == SERVER && owner >= crate::net::protocol::HELD_OWNER;
     with(|g| {
         for c in list {
-            if from == owner {
+            if from == owner || held {
                 g.heard.insert((owner, c.index), now);
             }
             let Some(m) = g.mirrors.get_mut(&(owner, c.index)) else {
@@ -536,6 +666,22 @@ pub fn received(from: u8, owner: u8, list: Vec<GardenChao>) {
                 };
                 m.target = Some((c, now, from));
             }
+        }
+    });
+}
+
+/// Chao `owner`/`index` (one the server held) isn't here any more: its copy goes now, as if
+/// its owner had left (once we let go of it).
+pub fn send_home(owner: u8, index: u8) {
+    let Some(long_ago) = Instant::now().checked_sub(PAUSED_LEFT * 2) else {
+        return;
+    };
+    with(|g| {
+        if let Some(m) = g.mirrors.get_mut(&(owner, index))
+            && !m.own
+        {
+            m.since = long_ago;
+            g.heard.insert((owner, index), long_ago);
         }
     });
 }
@@ -1372,8 +1518,9 @@ pub fn rotate(v: [f32; 3], angle: i32) -> [f32; 3] {
     [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]
 }
 
+/// Save slot `slot`'s record in the save in use (the one the garden loaded its Chao from).
 fn record_of(slot: usize) -> usize {
-    CHAO_SLOTS + slot * CHAO_SIZE
+    game::chao_slot_address(slot)
 }
 
 /// The registry entry of the Chao in save slot `slot`, if it's in this garden.
@@ -1741,6 +1888,12 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
     let player = game::player_position();
     let petter = game::local_player().map(|p| (p.position, p.action));
     let me = crate::keeper::me();
+    let locked = LOCKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    let mut keep_off = Vec::new();
     let mut gone = Vec::new();
     for (&(owner, index), m) in &mut g.mirrors {
         // SAFETY: our visitor's live object (cleared when we leave the garden), on the game thread.
@@ -1777,6 +1930,20 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
             let flags = (d + D_FLAGS) as *mut u32;
             if !m.own {
                 hold_life(record, m.snapshot.as_deref_mut());
+            }
+            // Locked against us or asleep: it takes nothing of ours (or anyone's) here, even
+            // running its own AI (an owner who sends nothing, a touch).
+            let keep = Keep {
+                locked: !m.own && locked.contains(&(owner, index)),
+                asleep: crate::held::asleep(owner, index),
+            };
+            if keep.any() {
+                keep_off.push(m.object);
+                if let_go_of_items(m.object) {
+                    log!(
+                        "garden: player {owner}'s Chao {index} is locked against us; it let go of an item"
+                    );
+                }
             }
 
             if !m.driven {
@@ -1821,15 +1988,26 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
             if interrupted {
                 log!("garden: shared pickup interrupted local reaction for Chao {owner}:{index}");
             }
-            let touched = !brain_holds
-                && (held_by_us
-                    || status & STATUS_HIT != 0
-                    || holding_item_near(here)
-                    || petting_near(here, petter));
+            // A sleeping Chao (its owner is offline) is only carried and thrown; one locked
+            // against us isn't offered items.
+            let near = Near {
+                item: holding_item_near(here),
+                petting: petting_near(here, petter),
+            };
+            let touched = touches(
+                brain_holds,
+                held_by_us,
+                status & STATUS_HIT != 0,
+                keep,
+                near,
+            );
 
             // Only an item this Chao holds or eats keeps an interaction going. Fruit lying
             // nearby must not keep its AI independent of the server indefinitely.
-            let busy = !brain_holds && m.local_until.is_some() && crate::items::chao_busy(m.object);
+            let busy = !brain_holds
+                && m.local_until.is_some()
+                && !keep.any()
+                && crate::items::chao_busy(m.object);
             if touched || busy {
                 if m.local_until.is_none() {
                     log!(
@@ -1849,8 +2027,23 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
 
             // What our touching changed goes to the owner and the server. Changes the game makes
             // on its own (moods drifting over time) happen in the brain's game too and are only
-            // forwarded while we touch it, a few seconds at a time.
-            if let Some(before) = m.snapshot.as_mut() {
+            // forwarded while we touch it, a few seconds at a time. Kept from its owner (locked,
+            // asleep): nothing goes, and the record is put back as its brain has it.
+            if let Some(before) = m.snapshot.as_mut()
+                && keep.any()
+            {
+                let mut after = (record as *const ChaoData).read();
+                if undo_drift(&mut after, before) {
+                    for (at, len) in SAVE_CHAO_FIELDS {
+                        // SAFETY: inside the copy's 0x800-byte record (fields end below 0x4A4).
+                        std::ptr::copy_nonoverlapping(
+                            after.bytes[at..].as_ptr(),
+                            (record + at) as *mut u8,
+                            len,
+                        );
+                    }
+                }
+            } else if let Some(before) = m.snapshot.as_mut() {
                 let after = (record as *const ChaoData).read();
                 if local {
                     let diff = chao::changes::diff(before, &after);
@@ -1901,6 +2094,7 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
         g.heard.remove(&key);
         g.left.push(key);
     }
+    *KEEP_OFF.lock().unwrap_or_else(|e| e.into_inner()) = keep_off;
 }
 
 /// Changes to our Chao (our save's), and holds of the ones our game runs: shown in the friend's
@@ -2173,13 +2367,13 @@ pub fn received_live(owner: u8, index: u8, bytes: Vec<u8>) {
 /// The server's live fields on our copies of friends' Chao (what their status balloon shows):
 /// in the copy's record, and in its snapshot so a touch doesn't send them back as ours. On our
 /// own, only its emotions and needs (into our save). Not while we touch one (its own AI runs
-/// then).
+/// then), unless it's locked against us (what we do to it is undone anyway).
 fn live_frame(g: &mut Garden) {
     for (owner, index, bytes) in std::mem::take(&mut g.live_in) {
         let Some(m) = g.mirrors.get_mut(&(owner, index)) else {
             continue;
         };
-        if m.local_until.is_some() || bytes.len() != CHAO_LIVE_LEN {
+        if (m.local_until.is_some() && !locked(owner, index)) || bytes.len() != CHAO_LIVE_LEN {
             continue;
         }
         // Ours: our save takes only its emotions and needs (`CHAO_MOOD`); the rest comes as
@@ -2287,6 +2481,16 @@ const HAT_CLEARS: [(usize, [u8; 7]); 2] = [
 /// the Chao's record (5.2). Visitors don't.
 const HAT_WEAR_CALL: usize = 0x0053_DB87;
 const WEAR_HAT_CHECK: usize = 0x0056_91B0;
+/// The same dispatcher's item checks (ESI = Chao object, EAX 1 when it reacts): a seed it
+/// touches (0x567560 → carry it, 0x567640), fruit it sees or is offered (0x560640, collision
+/// 0x83 → go to it, 0x5606D0, then eat 0x5607C0), an animal or drive (0x566BC0 → 0x566C40,
+/// absorb 0x566DF0). A copy that keeps off items (locked against us, asleep) skips them.
+const SEED_CHECK_CALL: usize = 0x0053_DB95;
+const SEED_CHECK: usize = 0x0056_7560;
+const FRUIT_CHECK_CALL: usize = 0x0053_DBA3;
+const FRUIT_CHECK: usize = 0x0056_0640;
+const ANIMAL_CHECK_CALL: usize = 0x0053_DBB1;
+const ANIMAL_CHECK: usize = 0x0056_6BC0;
 /// The garden's life tick (0x5363D0 calls it at 0x53640F for one Chao every few frames; ESI =
 /// Chao object): emotions, lifespan, and for a child its evolution and, in the Hero and Dark
 /// gardens, its alignment. It runs on visitor copies too, and in their owner's game on the real
@@ -2458,6 +2662,9 @@ pub fn install() {
         (HAT_DROP_CALLS[0], drop, DROP_HAT),
         (HAT_DROP_CALLS[1], drop, DROP_HAT),
         (HAT_WEAR_CALL, thunk(wear_hat_thunk), WEAR_HAT_CHECK),
+        (SEED_CHECK_CALL, thunk(seed_check_thunk), SEED_CHECK),
+        (FRUIT_CHECK_CALL, thunk(fruit_check_thunk), FRUIT_CHECK),
+        (ANIMAL_CHECK_CALL, thunk(animal_check_thunk), ANIMAL_CHECK),
         (LIFE_TICK_CALL, thunk(life_tick_thunk), LIFE_TICK),
         (AI_TICK_CALL, thunk(ai_tick_thunk), AI_TICK),
     ];
@@ -2736,6 +2943,48 @@ unsafe extern "C" fn wear_hat_thunk() {
 
 #[cfg(not(target_arch = "x86"))]
 unsafe extern "C" fn wear_hat_thunk() {}
+
+/// Whether Chao `object` may react to an item: not a copy of ours that keeps off them.
+#[cfg(target_arch = "x86")]
+extern "C" fn may_take_items(object: usize) -> u32 {
+    u32::from(!std::panic::catch_unwind(|| keeps_off(object)).unwrap_or(false))
+}
+
+/// An item check (`$check`) only for Chao that may take items; else "no reaction" (EAX 0).
+#[cfg(target_arch = "x86")]
+macro_rules! item_check_thunk {
+    ($name:ident, $check:expr) => {
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "push esi",
+                "call {may}",
+                "add esp, 4",
+                "test eax, eax",
+                "jz 2f",
+                "push {check}",
+                "ret",
+                "2:",
+                "ret",
+                may = sym may_take_items,
+                check = const $check,
+            )
+        }
+    };
+}
+
+#[cfg(target_arch = "x86")]
+item_check_thunk!(seed_check_thunk, SEED_CHECK);
+#[cfg(target_arch = "x86")]
+item_check_thunk!(fruit_check_thunk, FRUIT_CHECK);
+#[cfg(target_arch = "x86")]
+item_check_thunk!(animal_check_thunk, ANIMAL_CHECK);
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn seed_check_thunk() {}
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn fruit_check_thunk() {}
+#[cfg(not(target_arch = "x86"))]
+unsafe extern "C" fn animal_check_thunk() {}
 
 #[cfg(target_arch = "x86")]
 extern "C" fn life_tick_before(object: usize) {
@@ -3282,9 +3531,9 @@ extern "C" fn held_main(object: usize) {
 mod tests {
     use super::{
         ACTION_PET, CHAO_SIZE, CHAO_SLOTS, ChaoData, D_POSITION, D_ROTATION_Y, DELETE_OBJECT, Held,
-        LOOK_FORM_LEN, Mirror, OBJ_DATA1, OBJ_MAIN, PLAYER_ROOM, SAVE_COPY_SIZE, Vector,
-        follow_position, in_save, look, object_pose, petting_near, rotate, shared_hold, step_aside,
-        velocity_between,
+        Keep, LOOK_FORM_LEN, Mirror, Near, OBJ_DATA1, OBJ_MAIN, PLAYER_ROOM, SAVE_COPY_SIZE,
+        Vector, follow_position, in_save, locked, look, object_pose, petting_near, rotate,
+        set_locked, shared_hold, step_aside, touches, undo_drift, velocity_between,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -3482,5 +3731,68 @@ mod tests {
                 assert!((back[i] - v[i]).abs() < 1e-3, "{angle:#x}: {back:?}");
             }
         }
+    }
+    #[test]
+    fn a_chao_locked_against_us_is_touched_but_never_offered_items() {
+        let open = Keep::default();
+        let locked = Keep {
+            locked: true,
+            asleep: false,
+        };
+        let asleep = Keep {
+            locked: false,
+            asleep: true,
+        };
+        let item = Near {
+            item: true,
+            petting: false,
+        };
+        let pet = Near {
+            item: false,
+            petting: true,
+        };
+        // An item held out to it: only an open one reacts.
+        assert!(touches(false, false, false, open, item));
+        assert!(!touches(false, false, false, locked, item));
+        assert!(!touches(false, false, false, asleep, item));
+        // Petting: a locked one still reacts (it's undone); a sleeping one doesn't wake.
+        assert!(touches(false, false, false, locked, pet));
+        assert!(!touches(false, false, false, asleep, pet));
+        // Held or hit: any, unless its brain's player holds it.
+        assert!(touches(false, true, false, locked, Near::default()));
+        assert!(touches(false, false, true, asleep, Near::default()));
+        assert!(!touches(true, false, true, open, item));
+    }
+
+    #[test]
+    fn what_a_touch_changes_on_a_locked_copy_is_put_back() {
+        let mut truth = ChaoData {
+            bytes: [0; CHAO_SIZE],
+        };
+        truth.bytes[0x82] = 10; // happiness
+        truth.bytes[0x12D] = 40; // an emotion
+        truth.bytes[0x12] = 7; // its name: not a life field
+        let mut copy = truth.clone();
+        assert!(!undo_drift(&mut copy, &truth));
+        // Petted and fed here: happier, a stat up, a bond, a new mood, an animal's part.
+        copy.bytes[0x82] = 12;
+        copy.bytes[0x20] = 3;
+        copy.bytes[0x16D] = 9;
+        copy.bytes[0x12D] = 200;
+        copy.bytes[0x11C] = 4;
+        copy.bytes[0x12] = 8;
+        assert!(undo_drift(&mut copy, &truth));
+        let mut want = truth.clone();
+        want.bytes[0x12] = 8;
+        assert_eq!(copy, want);
+    }
+
+    #[test]
+    fn the_hosts_list_says_which_chao_are_locked() {
+        set_locked(vec![(0, 1), (9, 0)]);
+        assert!(locked(0, 1) && locked(9, 0));
+        assert!(!locked(0, 0) && !locked(3, 1));
+        set_locked(Vec::new());
+        assert!(!locked(0, 1));
     }
 }

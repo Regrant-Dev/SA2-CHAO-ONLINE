@@ -11,7 +11,12 @@
 //! character instead of copying yours (tests drawing other characters).
 //!
 //! Set FAKEPEER_CHAO to a comma-separated list of .sa2chao files (e.g. F9 > Export my Chao) and it
-//! brings those Chao (up to 2) to the shared garden whenever someone connects.
+//! brings those Chao (up to 4) to the shared garden whenever someone connects. It also tells the
+//! host it brings them (`Brought`, each to its own garden), so once it quits (Ctrl+C) they stay
+//! there asleep, and while it's away from their garden they're awake (it prints the host's
+//! `SaveChao` for them). Its player key is FAKEPEER_KEY (32 hex digits), or one made from its
+//! name: run it again with the same one and the host knows its Chao. FAKEPEER_LOCK (Always,
+//! ChaoWorld, ThatGarden, Never; default Always) is its "Others can change my Chao".
 //!
 //! Set FAKEPEER_ITEMS=1 to have it own a copy of each of your garden items (tests item hand-offs).
 //! Picking one up then puts a real extra item in your save, so it's off by default.
@@ -42,10 +47,12 @@ use std::time::{Duration, Instant};
 
 use sa2_chao_online::chao::file;
 use sa2_chao_online::game::KNOWN_GAME_BUILD;
+use sa2_chao_online::net::protocol::ChaoLock;
 use sa2_chao_online::net::protocol::{
-    Body, GardenChao, GardenItem, ItemId, ItemPlace, KarateFighter, KarateState, MAX_CARRIED_CHAO,
-    MAX_CHAT, Message, PlayerState, RACE_PROGRESS_UNKNOWN,
+    Body, BroughtChao, GardenChao, GardenItem, ItemId, ItemPlace, KarateFighter, KarateState,
+    MAX_CARRIED_CHAO, MAX_CHAT, Message, PlayerState, RACE_PROGRESS_UNKNOWN,
 };
+use sa2_chao_online::net::roster::key_from_hex;
 use sa2_chao_online::net::session::{Client, Event, Host, Identity, Session};
 use sa2_chao_online::net::udp::Endpoint;
 
@@ -56,10 +63,24 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: fakepeer host [port] [name] | fakepeer client <ip:port> [name]";
     let now = Instant::now();
-    let identity = |name: Option<&String>| Identity {
-        name: name.cloned().unwrap_or_else(|| "fakepeer".into()),
-        mod_version: env!("CARGO_PKG_VERSION").into(),
-        game_build: KNOWN_GAME_BUILD,
+    let identity = |name: Option<&String>| {
+        let name = name.cloned().unwrap_or_else(|| "fakepeer".into());
+        let key = std::env::var("FAKEPEER_KEY")
+            .ok()
+            .and_then(|k| key_from_hex(k.trim()))
+            .unwrap_or_else(|| {
+                let mut key = [0x5A; 16];
+                for (k, b) in key.iter_mut().zip(name.bytes()) {
+                    *k = b;
+                }
+                key
+            });
+        Identity {
+            name,
+            mod_version: env!("CARGO_PKG_VERSION").into(),
+            game_build: KNOWN_GAME_BUILD,
+            key,
+        }
     };
 
     let mut session = match args.first().map(String::as_str) {
@@ -94,7 +115,12 @@ fn main() {
         })
         .take(MAX_CARRIED_CHAO)
         .collect();
-    println!("bringing {} chao", chao.len());
+    let lock = ChaoLock::parse(&std::env::var("FAKEPEER_LOCK").unwrap_or_default());
+    println!(
+        "bringing {} chao; others may change them: {}",
+        chao.len(),
+        lock.label()
+    );
     let mut send_chao = false;
     let character: Option<u8> = std::env::var("FAKEPEER_CHAR")
         .ok()
@@ -391,6 +417,29 @@ fn main() {
                 };
                 session.send(body, true, now);
             }
+            // Each in its own garden, in the rows it has here (copy numbers by file order).
+            let list = chao
+                .iter()
+                .enumerate()
+                .map(|(row, c)| BroughtChao {
+                    garden: c.garden(),
+                    row: row as u8,
+                    nth: chao[..row]
+                        .iter()
+                        .filter(|o| o.identity() == c.identity())
+                        .count() as u8,
+                    data: Box::new(c.clone()),
+                })
+                .collect();
+            session.send(
+                Body::Brought {
+                    awake: true,
+                    lock,
+                    list,
+                },
+                true,
+                now,
+            );
         }
         if session.my_id().is_some() && now.duration_since(last_pick) >= Duration::from_secs(30) {
             last_pick = now;

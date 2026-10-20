@@ -22,7 +22,7 @@ get an analysable **local copy** (keep it in `re/bin/`, which is git-ignored, an
   then `tools/rebuild_exe.py <game>/sonic2app.exe <mod folder>/sonic2app.text.bin
   re/bin/sonic2app.dumped.exe`. Reinstall the normal build and delete the dump afterwards.
   The dump includes the Mod Loader's code patches, which doesn't matter for analysis.
-- **Steamless** (`--keepbind`): the unwrapped copy used for the early notes has SHA-256
+- **Steamless** (`--keepbind`): the unwrapped copy has SHA-256
   `c95c01434f1e8be2ef9472ff2cffb605354aeea1c95e36d5cfa1aa3b7a5c0386`.
 
 The game itself keeps running the original exe.

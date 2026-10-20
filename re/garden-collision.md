@@ -1,6 +1,6 @@
 # Chao garden collision meshes (LandTable → triangles)
 
-How the engine turns `objLandTableNeut/Hero/Dark` into the triangles that `0x48C5E0` ray-casts for Chao movement (re/chao-ai.md §5.2/§5.3), and what the three gardens contain. All layouts derived from the dumped exe (sha256 `d1ac8ed9…`) via REA; data read from `Data_DLL_orig.dll` with the stdlib extractor `garden_col.py` (lives in the session scratchpad, not in the repo).
+How the engine turns `objLandTableNeut/Hero/Dark` into the triangles that `0x48C5E0` ray-casts for Chao movement (re/chao-ai.md §5.2/§5.3), and what the three gardens contain. Layouts come from the dumped exe (sha256 `d1ac8ed9…`) via REA; data was read from `Data_DLL_orig.dll`.
 
 ## 1. Pipeline
 
@@ -90,14 +90,14 @@ Highest solid floor (XZ-projected, highest hit) at sample points:
 
 Pool floors sit 4.5–5.5 below the surface, consistent with the swim depth test (`y ≤ surface − 2.1`).
 
-## 6. Recipe for the server
+## 6. Rebuilding the ground (server, `chao_sim::land`)
 
 1. Parse PE, find the export, read LandTable `+0`, `+2`, `+0x10`.
 2. For `i` in `[max(+2,0), count)`: take COL if `flags & 0x2003`; walk `COL+0x10` with identity, `T·Rz·Ry·Rx·S`, children + child siblings (not root siblings), eval flags ignored.
 3. Triangulate strips with the parity rule above; tag each triangle with its COL flags (water = `& 0x2002`).
 4. Ray-cast as in §4 (v0 within 220 cull, two-sided, unnormalized-normal threshold 1e-4 on the ray axis).
 
-## 6b. Grid against the LandTable (2026-10-19, `chao_sim::land` tests)
+## 6b. Grid against the LandTable (`chao_sim::land` tests)
 
 Cell middles probed from y = 60 and 180, highest floor hit:
 
@@ -110,7 +110,7 @@ Cell middles probed from y = 60 and 180, highest floor hit:
 - Hero's 31 "water" cells around (0..25, 5..45) and (−35..−5, 85..115) sit over solid floor at y = 0 (flags `0x40000021`), above the −1.5 water: a Chao sent there walks.
 - Hero's land cells at x −5..15, z −125..−25 and Dark's cell (15, −105) have only the water polygon under them: open water along the shore, not missing ground (§7: the gardens register no dynamic collision). A Chao sent there swims. Reversing the Y rotation changed nothing, so it isn't a transform error.
 
-## 7. Dynamic collision and normals (2026-10-19)
+## 7. Dynamic collision and normals
 
 ### 7.1 Dynamic list mechanics
 
@@ -130,9 +130,9 @@ Example caller: the Chao **Entrance** elevator `0x558510` (`ALO_EntranceElevator
 - Direct callers of `0x47D6B0`: 99 sites, `0x4A6CAB..0x78D7ED`. All 20 whose function names a source file or model (16 in `0x4A6CAB..0x4E455F`, 4 in `0x5AE517..0x5BB061`) are stage/boss objects (`stg05_pumpkin`, `stg06_mountain`, `stg07_coalmine`, `stg14_highway`, `stg17_Mission`, `stg30_FinalRush`, `stg34_CannonsCore`, `stg42_sonicvsshadow2`, `BossGolem`); the others sit in the same stage-object ranges or at `0x5C349A` and above, outside the Chao/garden code. The only one in the Chao code is `0x55862A` (Entrance elevator, not a garden). It takes register arguments, so there are no indirect callers.
 - Garden constructors (Neutral `0x54C7B0`; Hero `0x54D210`, no Ghidra function; Dark contains `0x54B74D`) load the LandTable (`0x47BD30`), then `0x54B190` (SET file `set_chao_neut/hero/dark.bin`, + `_s`/`_u`) with `0x487E40(objlist, set)`: Neutral list `0x121C8B0`, Hero `0x121AE90` (14 types at `0x121ADB0`, 0x10 B each). Then fixed creators `0x57D4C0`, `0x57D2E0`, `0x549490`, `0x530B80`, `0x531B10`, `0x52EB70`, `0x531E10`, `0x52F2A0`, `0x57E4F0`, `0x55D6B0` and `0x55CB90`/`0x580890` (N) or `0x580F30` (H), and finally `0x56B040` (`WaterManagerExecutor`, display only: table `0x1313D40` N / `0x1313A48` H of Data_DLL exports such as `object_gneut_nc_water_nc_water`).
 - Hero SET types: HASIRA `0x5A7A60`, HASIRAKAKE `0x5A7AA0` (decor + CCL via `0x47E520`), HANAAKA/HANAMURA/KUSA A–C/TOWER `0x5A7AE0..0x5A7BD0` (decor: model ptr at task+0x40, main `0x5B4250`/`0x6089D0`), C_SPHERE/C_CYL/C_CUBE/WALL_PLANE `0x6E5400/0x6E5470/0x6E54E0/0x6E5550` (invisible CCL shapes via `0x47E520`, data `0xB14570..0xB14600`), LOBBY `0x55AB90`, C_CLIMB `0x55AB20`. None registers land collision; CCL shapes are not read by `0x797E10`.
-- So in all three gardens Chao ground = the LandTable alone. **Recipe: nothing to collect at runtime**; §6 stays complete. (A runtime collector, if ever needed elsewhere: walk `*0x1A5A2E0`, `s16 *0x19459D4` entries `{flags, obj, task}`, skip dead tasks as in `0x47D160`, triangulate `obj` exactly like a COL root.)
+- So in all three gardens the Chao ground is the LandTable alone, and nothing has to be collected at runtime. (Elsewhere, a runtime collector would walk `*0x1A5A2E0`, `s16 *0x19459D4` entries `{flags, obj, task}`, skip dead tasks as in `0x47D160`, and triangulate `obj` exactly like a COL root.)
 
-**The §6b "crossing" is open water.** All COLs (also the visual block, by sphere) at those cells: Hero (5, −105), (5, −125), (15, −75): water −1.5 over pool floor −6.5 (COL #69 `0x20000001`), nothing else; Dark (15, −105): water −1.0 over floor −6.0, with land at y 0.0 (COL #72 `0x40000021`) 10 units west, so that cell straddles the shore. The test's "highest hit" counts water, while `0x797E10` keeps water out of the floor slot, so the game's floor there is the pool floor, `W+0xDC` = surface, and a Chao sent there swims. The grid (10-unit cells) is just coarse at these shores; treat them as water or let the swim logic handle them.
+**The §6b "crossing" is open water.** All COLs (also the visual block, by sphere) at those cells: Hero (5, −105), (5, −125), (15, −75): water −1.5 over pool floor −6.5 (COL #69 `0x20000001`), nothing else; Dark (15, −105): water −1.0 over floor −6.0, with land at y 0.0 (COL #72 `0x40000021`) 10 units west, so that cell straddles the shore. The test's "highest hit" counts water, while `0x797E10` keeps water out of the floor slot, so the game's floor there is the pool floor, `W+0xDC` = surface, and a Chao sent there swims. The grid (10-unit cells) is coarse at these shores; the swim logic handles them.
 
 ### 7.3 Triangle normal sign
 
@@ -140,10 +140,10 @@ Example caller: the Chao **Entrance** elevator `0x558510` (`ALO_EntranceElevator
 - **Call sites** in `0x48C5E0`: `0x48C7A8` (Z-line), `0x48CA22` (X-line), `0x48CC7C` (Y-line). Each: `EBX = ESI = tri+0x18` (v0, `0x48C689`, `MOV ESI,EBX` at `0x48C7A6`/`0x48CA20`/`0x48CC7A`), `EDX = tri+0x24` (v1, `0x48C6FD`/`0x48C96E`/`0x48CBD4`), `ECX = tri+0x30` (v2, `0x48C702`/`0x48C974`/`0x48CBDA`), `EAX` = out.
 - **`0x48AF70`** (ESI = P, EDX = A, ECX = B, EAX = out): `a = A − P`, `b = P − B`, `out = −(a × b)` component-wise (x87, `DE E8+i` = FSUBP ST(i)−ST0, `DE E0+i` = FSUBRP ST0−ST(i); checked by emulating the instruction sequence numerically) ⇒ **`out = (A − P) × (B − P)` = (v1 − v0) × (v2 − v0)**.
 - **No flip anywhere:** `0x48C5E0` normalises it (`0x77F3A0`, (0,1,0) if length 0) and stores it at slot+0x14 unchanged (FCHS at `0x48C7E4`/`0x48C7FF` etc. only touch the plane constant and hit coordinate). `0x797E10` copies whole slots (8 dwords). `0x796B20` reads `W+0x144` (normal.y) raw for `> 0.78`; `0x796CA0` takes the branch by the sign of the normal along the slot axis (−X slot: `−n.x < −0.2` = facing the Chao → push if `r − d > 0`; `> 0.2` = facing away → the `d + r < 8.0` branch), so a reversed winding would change wall behaviour.
-- **Verdict:** land.rs `unit(cross(v1 − v0, v2 − v0))` with the `(t + flip) & 1` strip rule and quad `(b, d, c)` **matches the game**. Nothing to change. Cross-check: every Hero floor/water sampled above has n.y = +1 and the underside of the platform at (−5..5, −75) has n.y = −1.
+- land.rs `unit(cross(v1 − v0, v2 − v0))` with the `(t + flip) & 1` strip rule and quad `(b, d, c)` **matches the game**. Cross-check: every Hero floor/water sampled above has n.y = +1 and the underside of the platform at (−5..5, −75) has n.y = −1.
 
-## Open questions
-- Which candidates the Chao actually sees: the cache is built around the **players** (`0x47D160`, range 400, list max 0x80/0x400/0xC0). Checked over the grid's valid area (x −150..150, z −200..150, y 0 player): Neutral and Dark keep every collision COL wherever the player stands (margin −90 / −14); **Hero can drop COL #76** when the player is near (150, −200) (margin +34), so a Chao near #76 would then lose that geometry. Not verified at runtime; the server should probably ignore this culling.
+## Unknowns
+- Which candidates the Chao actually sees: the cache is built around the **players** (`0x47D160`, range 400, list max 0x80/0x400/0xC0). Checked over the grid's valid area (x −150..150, z −200..150, y 0 player): Neutral and Dark keep every collision COL wherever the player stands (margin −90 / −14); **Hero can drop COL #76** when the player is near (150, −200) (margin +34), so a Chao near #76 would then lose that geometry. Not verified at runtime.
 - `0x4974F0` allocator: Y-bucketing (`0x19EDC00` table, 0x100 dwords, cleared per node) and pool exhaustion behaviour (returns 0 → `0x48B610` aborts the node) not traced.
 - COL flag bits other than 1/2/0x2000/0x8000000/0x10000000 (e.g. `0x20`, `0x80`, `0x1000`, `0x400000`, `0x20000000`, `0x40000000`) — likely surface/sound/camera types; their consumers were not traced. `0xCB`/`0xCC` "climbable" signals in chao-ai §5.6 come from objects, not these flags (unverified).
 - `0x48C5E0` slot fields +8/+0xC (atan2 angles) and the slot "+4 = COL flags" interpretation feeding `0x797E10`'s water test were read from the decompile only.
@@ -152,7 +152,7 @@ Example caller: the Chao **Entrance** elevator `0x558510` (`ALO_EntranceElevator
 - `0x47D7F0` (hands out an NJS_OBJECT for dynamic collision, used by stage objects e.g. `0x5B3470`) and the `0x194A208` one-shot rebuild key in `0x48BE80` were not traced; neither matters in the gardens (§7.2).
 - `0x780310` (distance used by `0x796CA0`) not decoded, so the exact push distance for back-facing walls (the `d + r < 8.0` branch) is unverified.
 
-## 8. Climb ledges (C_CLIMB) and touch tests (2026-10-19)
+## 8. Climb ledges (C_CLIMB) and touch tests
 
 ### 8.1 C_CLIMB object (`0x55AB20`, one function for all three gardens)
 
@@ -188,7 +188,7 @@ Example caller: the Chao **Entrance** elevator `0x558510` (`ALO_EntranceElevator
 - **`0x486760(obj, kind)`**: needs `ci+4 & 1`; walks the slots from the cursor (`0x4860C0`, reset by a new kind / `0x54B1F0`), stops at byte1 `0xFF`, returns the first slot whose other task's entry[byte1] byte0 == `kind` (and other task/Data1/ci non-null). Callers then require `slot+4 != 0`.
 - **`0x54B1F0(ECX = own index, EDX = obj, push kind)`** → `0x486880`: same, but also needs slot byte0 == own index (the walk step passes 1 → Chao entry 1), returns the other task or 0.
 
-**Touch test for the server** (per frame, per Chao): `S = P + (0, 2, 0)`, `r = 1.5`; touched if any box satisfies the XZ and Y conditions above. Then the existing rules apply (chao-ai §5.5/§5.7: wall bit `W+0x40 & 0x4000` from the LandTable walls **and** a 0xCB touch → climb `0x562EB0`).
+**Touch test** (per frame, per Chao): `S = P + (0, 2, 0)`, `r = 1.5`; touched if any box satisfies the XZ and Y conditions above. Then the existing rules apply (chao-ai §5.5/§5.7: wall bit `W+0x40 & 0x4000` from the LandTable walls **and** a 0xCB touch → climb `0x562EB0`).
 
 ### 8.3 SET files and where they live in memory
 
@@ -198,11 +198,11 @@ Example caller: the Chao **Entrance** elevator `0x558510` (`ALO_EntranceElevator
 - **Object lists** (`{u32 count, ptr}` → 0x10-B types `{u8, u8 list, u16 flags, f32 dist, ptr main, ptr name}`): Neutral `0x121C8B0` (12, C_CLIMB = **6** "C CLIMB"), Hero `0x121AE90` (14, C_CLIMB = **13**), Dark `0x125B4F0` (18, C_CLIMB = **13**). All flags 0 except Hero KUSA C (1, dist 250000).
 - **Spawn** (`0x4883D0`, status records `0x1DDE280 + 0x10·i`, filled by `0x488930`: `+0` count, `+2` flags (`0x8000` live, bit 0 spawned, bit 1 = record carries its own copy at `+0xC`), `+4` task, `+8` SET entry, `+0xC` keep distance): `Data1+8/+0xC/+0x10 = (s32) rotX/Y/Z`, `+0x14..+0x1C = pos`, `+0x20..+0x28 = scale` (`0x48859E..0x4885D8`), `task+0x30` = record.
 
-**Recipe for the mod (live memory, in a garden):** read `hdr = *0x1DDE274`, `n = *(u32*)hdr`, `e = *0x1DDE278`, `list = *0x1DDE268`; climb index = 6 if `list == 0x121C8B0`, else 13 (`0x121AE90`, `0x125B4F0`); for `k < n` with `(*(u16*)(e+0x20k) & 0x7FFF) == idx` send `{pos = f32[3] @+8, rotY = s16 @+4, half = f32[3] @+0x14 + 10}`. The live tasks are only spawned within 400 units of the player, so don't rely on them (if wanted: record `+4` task → `+0x34` Data1 → `+0x2C` ci → `+0xC` entry with the final half-extents at `+0x14..+0x1C`).
+**Reading the C_CLIMB boxes from live memory (in a garden):** read `hdr = *0x1DDE274`, `n = *(u32*)hdr`, `e = *0x1DDE278`, `list = *0x1DDE268`; climb index = 6 if `list == 0x121C8B0`, else 13 (`0x121AE90`, `0x125B4F0`); for `k < n` with `(*(u16*)(e+0x20k) & 0x7FFF) == idx` send `{pos = f32[3] @+8, rotY = s16 @+4, half = f32[3] @+0x14 + 10}`. The live tasks are only spawned within 400 units of the player, so they don't cover every box (from a task: record `+4` task → `+0x34` Data1 → `+0x2C` ci → `+0xC` entry with the final half-extents at `+0x14..+0x1C`).
 
 ### 8.4 Other 0xCB / 0xCC sources in the gardens
 
-Scanned the exe for 0x30-B entries with byte0 0xCB/0xCC and every SET type's `0x47E520` table:
+From a scan of the exe for 0x30-B entries with byte0 0xCB/0xCC and every SET type's `0x47E520` table:
 
 | Garden | Object (main) | Table | Kind / shape | Geometry (local) | Solid to Chao? |
 |---|---|---|---|---|---|
@@ -217,11 +217,11 @@ Scanned the exe for 0x30-B entries with byte0 0xCB/0xCC and every SET type's `0x
 
 - All on list 4, flags `+4 = 0` (HASIRAKAKE `0x200`). Capsule test `0x484460`: segment `centre ± b·axis(local Y)`, touch if distance < a + r. Box half-extents here are fixed (no scale+10; their mains don't call `0x6E53C0`).
 - No 0xCB/0xCC in Neutral's SET types. C_SPHERE/C_CYL/C_CUBE/WALL_PLANE (`0xB14570..`), LOBBY/ENTRANCE (`0x1305F00`), C_CUBE2 (`0x13060E0`), KIRIKABU/KUWA/KUSA/SKULL (`0x8A1980`) all have kind 0.
-- Instances (merged index): Hero `_u#2` HASIRA, `_u#6`/`_u#8` HASIRAKAKE; Dark FENCE S `_u#32..34, 36..38`, FENCE L `_u#35`, HAKA A `_u#10, 23`, HAKA B `_u#22, 24, 26, 27`. These are already solid to the Chao in-game (pushed out), which the server doesn't model either. They are object colliders, not part of the LandTable: the Chao is pushed out by them and also turns away on the 0xCC signal (chao-ai §5.3).
+- Instances (merged index): Hero `_u#2` HASIRA, `_u#6`/`_u#8` HASIRAKAKE; Dark FENCE S `_u#32..34, 36..38`, FENCE L `_u#35`, HAKA A `_u#10, 23`, HAKA B `_u#22, 24, 26, 27`. They are object colliders, not part of the LandTable: the Chao is pushed out by them and also turns away on the 0xCC signal (chao-ai §5.3). The server gets them as blockers in `GardenLand` (`chao_sim::land`).
 
 ### 8.5 C_CLIMB entries (from `resource/gd_PC/set_chao_*_s.bin`; none in `_u`)
 
-Half = scale + 10. ry = SET rotY. Script: `climb/climb_dump.py`, `climb/climb_check.py` (scratchpad).
+Half = scale + 10. ry = SET rotY.
 
 Neutral (type 6; all `rx = 0x0056` ≈ 0.5°, ignored):
 
@@ -263,7 +263,7 @@ Dark (type 13):
 **Pond-edge check** (LandTable floors at local `(0, ±(hz+4))` with the rotation above): in all 22 boxes one side is the pool and the other land, with the long axis (local X) along the shore — Hero/Dark: local −z = water (−1.5 / −1.0 over floor −6.5 / −6.0), +z = land ≈ 0; Neutral: +z = water (−2.0 over −7.0), −z = land ≈ 0.1. The consistent pattern over 22 different angles also confirms the rotation sign. Exceptions: Hero `_s#5` (flat 64×4×84 slab, top y 0, water on both ±z ends, land 13.0 at its centre: a shallow ramp/island edge) and Hero `_s#6` (land side is a 33.8 cliff top, so this one only lets a Chao start a climb that `0x562EB0` ends after 30 frames / 2.5 rise).
 - Hero/Dark boxes top out at −1.0 (0.5 above Hero's water, level with Dark's), so a Chao on land (sphere bottom = y + 0.5 ≥ 0.5) never touches them: they only fire for a Chao in the water. Neutral boxes reach 6.1, so they also fire for a Chao walking on the shore.
 
-### 8.6 Open points
+### 8.6 Unknowns
 
 - `0x25F02A0` (pushed as the base matrix in `0x483E90`/`0x47F320`) assumed identity (consistent with 8.5's check; not read at runtime).
 - The Chao's sphere centre uses its full Data1 matrix (`0x47F020`); `(0,2,0)` assumes rotX/rotZ ≈ 0.

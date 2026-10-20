@@ -1,31 +1,6 @@
-# Kart racing: entry, start hold, progress, finish and kart drawing (for room races)
+# Kart racing: entry, start, progress, finish and kart drawing
 
-## Skin rendering correction (2026-10-19, REA VM/Ghidra)
-
-Rechecked 0x61C6C0 in REA from `kart_61c6c0.bin`: native cdecl ObjectMaster display,
-model pointers in work +0x34/+0x38, texture list +0x3C, wheel/effect flag +0x40. Wheel
-node writes at 0x61CA99..0x61CAEB must be disabled for custom models. The body call
-at 0x61CB2F is `0x42EB30(model, 0x42D650)` with two stack arguments. The same display
-handles story courses (0/1) and minigame courses; its story branches update native effect
-state, so keep the full native display rather than redraw only the body ourselves.
-
-The mod previously replaced only level-71 car work, left borrowed skin pointers there,
-advertised no skin while driving, and ignored remote skin selections. It now distinguishes
-rendering (levels 70 and 71) from party-race rules (71 only). A wrapper on the local car's
-original display borrows only supported solid `kart=on` skin models, calls the native
-display, then restores all four fields and the renderer texture-list pointer with Drop
-guards. The skin cache remains locked for that call, preventing eviction. Switching Off or
-an unavailable texture list immediately draws the original car. No native type table,
-physics or CPU model is changed. Shared SkinWorn messages remain active in driving;
-remote kart display borrows the skin for that peer and falls back to the native kart.
-
-The character-display hook exits early in kart stages, before reading former character
-objects/CharObj2. Restarts recreate car objects; each new original display is wrapped once.
-Tests cover stage eligibility and restoration on unwind. Unit/lint/build checks do not
-replace an in-game Route 101/280, race, skin switch and remote-view retest.
-
-Steam `sonic2app.exe`, image base 0x400000. Everything was read from the objdump listing of
-`re/bin/sonic2app.dumped.exe` (no runtime tests yet). The kart code is `..\..\src\Cart\ModeMain\*.c`,
+Steam `sonic2app.exe`, image base 0x400000. The kart code is `..\..\src\Cart\ModeMain\*.c`,
 at **0x619000..0x626FFF**. Most of its data (models, kart tables, per-type parameters) comes from
 the data DLL: the code looks the names up with `GetProcAddress(*(*(*0x1AF0220)), "name")`
 (import 0x8730D4). Examples: `specialInfo`, `exModels`, `exParam`, `cartData`.
@@ -60,7 +35,7 @@ Short names used below:
   only difference is the 2P flags `0x174AFDE`/`0x174AFE0` = 1 and the player count
   `0x1DD946C` = 2.
 - The story courses (types 0/1, level 70) can't be selected on level 71, and they are time
-  trials without rivals. Use level 71 courses 0..2 for room races.
+  trials without rivals. Room races use level 71 courses 0..2.
 
 ### Kart menu (CurrentMenu 0x1D7BB10 == **10**)
 - Update function **0x672C60**, called from the menu switch 0x666270 (case 10).
@@ -98,29 +73,26 @@ Short names used below:
 - Other menus that start a kart race: 0x68C760 (CurrentMenu 11, the download-course menu,
   0x68CB2C) writes the same set with course 3.
 
-### Recipe A: start a 1P kart race from the kart menu (recommended)
-Preconditions: CurrentMenu == 10, `k = *0xC77F34 != 0`, the panel is idle (`k+8 == 0`), and
-the SubMenu is the course list (5). Any idle state probably works.
+### Starting a race from the kart menu (`kart.rs`)
+With CurrentMenu == 10, `k = *0xC77F34 != 0`, the panel idle (`k+8 == 0`) and the SubMenu on
+the course list (5):
 1. Write `k+0x34` = driver index (0..5, menu order above), `k+0x39 = 0` (normal kart; special
-   karts swap that character's models, see 4.3), `k+0x54` = course 0..2, `k+0x88 = 0` (1P).
-   For safety write `0x1748B94 = 0` so the character override isn't used.
-2. Copy the A-press: `call 0x673AE0` and `call 0x672C10` (both no-arg; optional, they close the
+   karts swap that character's models, see 4.1), `k+0x54` = course 0..2, `k+0x88 = 0` (1P),
+   and `0x1748B94 = 0` so the character override isn't used.
+2. Do what the A-press does: `call 0x673AE0` and `call 0x672C10` (both no-arg; they close the
    panels), then `[0x1A559E8]=4`, `[*0xC77F44]=0`, `[*0xC77F44+0x14]=0` and `SubMenu=0xB`.
 3. The game does the rest next frame (0x673414).
-Confidence: high for the globals and SubMenu flow. Medium for skipping 0x673AE0/0x672C10.
 
-### Recipe B: from Stage Select (same as `room::go`)
-Do what `go()` does with `level = 71`, `mission = 0`, `character = the kart driver's
-character`, plus these kart bytes before NextGameMode:
+### Starting from elsewhere
+The level init reads only CurrentLevel, 0x174B070, 0x174AFDE, CurrentCharacter (0x1934B80, via
+0x43D880) and 0x174B021. So a race also starts from a stage-load path (as `room::go` does) with
+`level = 71`, `mission = 0`, `character = the driver's character`, plus before NextGameMode:
 - `0x174B070 = course (0..2)`
 - `0x174B021 = character (u8, no 0x80)`
 - `0x174AFDE = 0x174AFE0 = 0`
-- `0x1DEB320/31E/31F = 0` and `0x1DEB321 = 1` (meaning unknown; copied from 0x673532)
-- Optionally `MENU_RETURN 0x1A559E8 = 4`. Afterwards the menus then return to the kart menu
-  instead of Stage Select.
-
-The level init reads only CurrentLevel, 0x174B070, 0x174AFDE, CurrentCharacter (0x1934B80, via
-0x43D880) and 0x174B021. Confidence: medium-high (not run).
+- `0x1DEB320/31E/31F = 0` and `0x1DEB321 = 1` (meaning unknown; as 0x673532 does)
+- Optionally `MENU_RETURN 0x1A559E8 = 4`: the menus then return to the kart menu instead of
+  Stage Select.
 
 ### What the level spawns (mini race)
 - **0x61AE20(story)** creates the cars. It is called from 0x61B060 with `0x1D970F8`.
@@ -184,26 +156,15 @@ The level init reads only CurrentLevel, 0x174B070, 0x174AFDE, CurrentCharacter (
 - The GATE SET object (0x6245A0) shows the lights from `3 - 0x1D96D00` and plays the beeps:
   sound 0x18, and 0x19 for GO.
 
-### Recipe: hold the kart start until the room says go
-Every frame while holding (game thread, player 0's entry as above):
-```
-if entry_fn == 0x620DF0 && *(u32*)0xEF5AA0 != 0:
-    st = *(i32*)(entry+0x14); t = *(u32*)(entry+8)
-    if st == 2 && t > 0x166: *(u32*)(entry+8) = 0x166   ; kart on the grid, camera behind it, no light yet
-    (alternative: if st == 1 && t > 0x12A: write 0x12A   ; parks the end of the fly-by)
-```
-- The checks use `==`, and the dispatcher increments the timer after the call. Clamping to 2
-  below the trigger means the trigger value is never seen.
-- Release by no longer clamping, on the same network tick for everyone. Lights follow at
-  +1 s, +2 s and GO at +3 s (0x1E0), the same on every client.
-- 0xEF5AA0 stays 1 the whole time, so nobody can move and the clock stays 0.
-- Alternative (cruder): leave the camera alone and keep writing `*(u32*)0xEF5AA0 = 1` after
-  GO. The lights would already say GO.
-- Don't patch the `call 0x623CC0` at 0x621003. Camera state 3 would run with the race still
-  frozen.
-
-Confidence: high for the flag, GO and camera thresholds. Medium-high for the camera-entry
-address maths (read from 0x4EBC50/0x4EE528, not run).
+### Holding the start
+- While `0xEF5AA0` is set nobody can move and the clock stays 0.
+- The camera's checks use `==`, and the dispatcher increments the timer after the call, so
+  clamping the timer below a trigger keeps that step from ever happening: with player 0's entry
+  in state 2, clamping `entry+8` to 0x166 holds the kart on the grid with the camera behind it
+  and no light yet (state 1 at 0x12A parks the end of the fly-by). Releasing the clamp on the
+  same tick everywhere gives lights at +1 s, +2 s and GO at +3 s on every client.
+- Patching out the `call 0x623CC0` at 0x621003 doesn't hold the start properly: camera state 3
+  then runs with the race still frozen.
 
 ---
 
@@ -271,36 +232,29 @@ address maths (read from 0x4EBC50/0x4EE528, not run).
 - Cars after goal: `+0xC4/+0xC8` are clamped to 3. Humans switch to AI (0x61D4B0) and keep
   driving.
 
-### Recipes
-- **Live position** for the network: send `(lap = w+0xC4, gate = w+0xBC, f, N)` or just the
-  game's score above. Also send `ent+0x14` position and `ent+0x08..0x10` rotation. The
-  room-wide ranking = sort by score (laps first).
-- **Finish:**
-  - The local player finished on the first frame where `car[0]` work `+0xC4 >= 3`
-    (equivalently `0x1AEDEE8` went 0→1 with no other cars racing).
-  - **Finish time = `*(u32*)0x1D94428` frames** (frozen from then on). Display copy is in
-    0x1D94420..22.
-  - Lap splits are in 0x1D94430.. (3 bytes each).
-- **Holding the goal screen** until the room's results are in: clamp `*(u32*)0x1A36C30` to
-  <= 0x12A each frame (the exit test is `== 0x12C`, and 60/200 still happen). Release to let
-  the game leave.
-- **Showing the room rank on the HUD** (optional): after the manager's main runs and before
-  display, write the room rank into `car[0]` `w+0xC0`.
+### Live position, finish and goal screen
+- The game's own score above (laps first, then gate, then distance to the next gate) gives a
+  room-wide ranking.
+- The local player finished on the first frame where `car[0]` work `+0xC4 >= 3`.
+- **Finish time = `*(u32*)0x1D94428` frames** (frozen from then on). Display copy in
+  0x1D94420..22; lap splits in 0x1D94430.. (3 bytes each).
+- **Holding the goal screen:** clamping `*(u32*)0x1A36C30` to <= 0x12A each frame keeps the game
+  from leaving (the exit test is `== 0x12C`; the 60/200 steps still happen). `kart.rs` holds it
+  this way while the others still race.
+- The HUD rank comes from `car[0]` `w+0xC0`, written by the manager each frame.
 
-### CPU rivals (hide them; don't delete them)
+### CPU rivals
 - The cars are `car[1..5]`, with `w+0x44 == 0`.
-- **Don't null them or spawn fewer cars.** For example, patching `mov ebp,6` at 0x61AE7A
+- **They can't be nulled or spawned fewer.** For example, patching `mov ebp,6` at 0x61AE7A
   (`BD 06 00 00 00`) to 1 would crash: the GATE object calls **0x6232B0**, which reads
   `car[0..5]->+0x38->+0xC4` with **no null checks**. 0x61C333 (2P results) does too.
-- Recommended, once after spawn (when `car[5] != 0`), for each CPU car:
-  - Set `MainSub (+0x10)` to a no-op. This means no AI and no collision, because collision is
+- In a room race the mod disables them once after spawn (when `car[5] != 0`):
+  - `MainSub (+0x10)` set to a no-op. This means no AI and no collision, because collision is
     re-added each frame by 0x47E750 at the end of main.
-  - Set `DisplaySub (+0x14)` to a no-op. +0x2C already returns for CPUs.
-  - Move `ent+0x14` to e.g. y = -100000.
+  - `DisplaySub (+0x14)` set to a no-op. +0x2C already returns for CPUs.
+  - `ent+0x14` moved far below the course.
   - Set `w+0xC4 = -10` so they always rank last and never reach 3 laps. The manager then only
     ends the race when the local player finishes, so each player ends their own race.
-- Confidence: high for the crash risk and the 1P "any car finishes" rule. Medium that stubbing
-  main fully removes collision.
 
 ---
 
@@ -318,8 +272,8 @@ address maths (read from 0x4EBC50/0x4EE528, not run).
   texlist export `texlist_cartData_cartSpecial`, and `kartExModel`.
 - Level 70 loads only its own story kart (`tailsBig` / `rougeBig`).
 - A **special kart** (`0x174B021 & 0x80`, 0x620160) overwrites that character's type entry
-  with `exModels` + `texlist_kartExModel_cartSpecial`. A puppet of the same character would
-  then also show the special kart. Prefer normal karts in rooms.
+  with `exModels` + `texlist_kartExModel_cartSpecial`, so every kart of that character then
+  shows the special kart. Room races use normal karts.
 
 ### 4.2 Display 0x61C6C0 (`cdecl void(ObjectMaster*)`)
 1. Skips the car when farther than 5000 units from camera `0x1DD92B0[*0x1DD92A0]`.
@@ -330,55 +284,36 @@ address maths (read from 0x4EBC50/0x4EE528, not run).
    - `rotZ(w+0x10)`, `rotX(w+0x08)`, `rotY(w+0x68 + w+0x0C - 0x8000)`
    - `rotZ(w+0x104+w+0xF8)`, `rotX(w+0xFC+w+0xF0)`, `rotY(w+0x100+w+0xF4)`
 6. **Wheels:** if type 2..7 and `w+0x40`, three nodes `m->child`, `->sibling` and
-   `->sibling->sibling` get `ang.x (+0x14) = w+0xD4` and evalflag bit 2 cleared.
+   `->sibling->sibling` get `ang.x (+0x14) = w+0xD4` and evalflag bit 2 cleared (0x61CA99..
+   0x61CAEB; custom models need these writes skipped).
 7. Draw: `translate(0,-1,0)`, `m = 0x61EFE0(obj) ? w+0x38 : w+0x34`, `call 0x42D340`,
-   `0x42EB30(m, 0x42D650)`. Then matrix pop.
+   `0x42EB30(m, 0x42D650)` (at 0x61CB2F, two stack arguments). Then matrix pop.
 8. If course >= 2 and `w+0x40`: exhaust/effect sprites 0x61ECF0. Then 0x61E810 (an empty
    matrix push/pop).
 
 If `w+0x44 == 0` (a CPU car), the display first copies `ent+0x14..0x1C` into `w+0x14..0x1C`.
+The same display handles the story courses (0/1), whose branches update native effect state,
+so it is called whole rather than reimplemented. It reads only `w`, `ent`, the camera and
+globals, and writes 0xEF789C only for players.
 
-### 4.3 Puppet recipe (reuse the game's display)
-Per remote player:
-- A zeroed 0x30-byte entity `e`.
-- A zeroed 0x2F8-byte work `w`.
-- A fake 0x50-byte ObjectMaster with `+0x34 = e` and `+0x38 = w`.
-
-Fill once:
-- `w+0x48 = type` (2..7 from the remote character via 0x100A238)
-- `w+0x34/+0x38/+0x3C/+0x40` from the type table above
-- `w+0x44 = 0`
-- `w+0x70 = -1`
-
-Fill every frame from the network:
-- `e+0x14..0x1C` position (the display copies it)
-- `w+0x08/+0x0C/+0x10` rotation
-- `w+0x68` yaw extra
-- `w+0xD4` wheel angle (or advance locally by speed)
-- optionally `w+0xF0..+0x104` tilt
-
-Then, from your own display task, call `0x61C6C0(&fake)`.
-- The near/far switch, culling, wheel animation and texlist all come for free.
-- The shared model's wheel nodes are rewritten on every draw, so many puppets of one type are
+### 4.3 How the mod draws other players' karts
+Per remote player: a zeroed 0x30-byte entity `e`, a zeroed 0x2F8-byte work `w`, and a 0x50-byte
+ObjectMaster with `+0x34 = e` and `+0x38 = w`.
+- Once: `w+0x48 = type` (from the remote character via 0x100A238), `w+0x34/+0x38/+0x3C/+0x40`
+  from the type table, `w+0x44 = 0`, `w+0x70 = -1`.
+- Every frame from the network: `e+0x14..0x1C` position (the display copies it), `w+0x08/+0x0C/
+  +0x10` rotation, `w+0x68` extra yaw, `w+0xD4` wheel angle, `w+0xF0..+0x104` tilt, `w+0x114`
+  accelerator.
+- Then `0x61C6C0(&object)`: near/far switch, culling, wheel animation and texlist come with it.
+  The shared model's wheel nodes are rewritten on every draw, so many karts of one type are
   fine.
-- If 0x61ECF0's effects misbehave on a zeroed work, set `w+0x40 = 0`. You lose the wheel spin
-  and the effects.
 
-Hand-drawn alternative: the transform sequence above, then
-`[*0x2670544+0x20] = texlist; call 0x42D340; 0x42EB30(model, 0x42D650)`.
-
-### 4.4 State to send per player (~30 bytes at 10-20 Hz)
-- Position `ent+0x14` (3 floats).
-- Rotation `ent+0x08/0x0C/0x10` (BAMS; Y is the heading).
-- `w+0x68`.
-- `w+0xD4` (or speed `|w+0x7C..0x84|`).
-- Kart type.
-- Progress: lap `+0xC4`, gate `+0xBC`, score.
-- Finished flag + time.
-
-Confidence: high for the display transform, model/texlist fields and wheel nodes. Medium that
-calling 0x61C6C0 on a fake object is side-effect free (it reads only `w`, `ent`, the camera and
-globals, and writes 0xEF789C only for players).
+### 4.4 Skins on karts
+In levels 70 and 71 a wrapper around a car's display swaps in a `kart=on` skin's model and
+texlist (work +0x34/+0x38/+0x3C, +0x40 cleared), calls the native display, then restores all four
+fields and the renderer texlist pointer. A skin that's off or has no texture list draws the
+original car. Restarts recreate the car objects, and each new display is wrapped once. Remote
+karts use that player's worn skin. The character-display hook does nothing in kart stages.
 
 ---
 

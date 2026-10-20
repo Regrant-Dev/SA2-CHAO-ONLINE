@@ -14,7 +14,7 @@ use crate::chao_details::{self, View as ChaoView};
 use crate::hud;
 use crate::input::{self, Hotkey};
 use crate::karate;
-use crate::net::protocol::MAX_CARRIED_CHAO;
+use crate::net::protocol::{ChaoLock, MAX_CARRIED_CHAO};
 use crate::online;
 use crate::puppet;
 use crate::race;
@@ -62,9 +62,10 @@ enum Row {
     MyChao,
     ChaoDetails,
     SaveChao,
-    Visits,
-    /// Visitor 1 or 2: which Chao visits (Auto, a save slot, or None).
+    /// Visitor 1..4: which Chao we bring (Auto, a save slot, or None).
     Visitor(usize),
+    /// When others may change our Chao (`ChaoLock`).
+    Lock,
     StartStop,
     Apply,
     StartNow,
@@ -73,7 +74,7 @@ enum Row {
 /// Rows shown right now: "Start now" first while held at a start, then the connection and
 /// play settings, then actions, and connecting/stopping at the bottom. `mode` (index into
 /// `MODES`) picks the address row: Host address only when joining, Port only when hosting.
-fn rows(mode: usize, visits: usize) -> Vec<Row> {
+fn rows(mode: usize) -> Vec<Row> {
     let mut rows = Vec::new();
     if together::is_holding() || race::is_holding() || crate::karate_live::is_holding() {
         rows.push(Row::StartNow);
@@ -102,10 +103,9 @@ fn rows(mode: usize, visits: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([Row::MyChao, Row::ChaoDetails, Row::SaveChao, Row::Visits]);
-    if visits != 0 {
-        rows.extend((0..MAX_CARRIED_CHAO).map(Row::Visitor));
-    }
+    rows.extend([Row::MyChao, Row::ChaoDetails, Row::SaveChao]);
+    rows.extend((0..online::BRING_CHAO).map(Row::Visitor));
+    rows.push(Row::Lock);
     rows.extend([Row::Race, Row::Karate]);
     if online::status().is_some() {
         rows.extend([Row::Apply, Row::StartStop]);
@@ -134,10 +134,10 @@ pub struct Settings {
     pub chao_race: bool,
     /// Save slot of "My Chao" (-1 = the first hatched one).
     pub my_chao: i32,
-    /// Visit friends: 0 off, 1 on (index into `online::VISIT_MODES`).
-    pub visits: usize,
-    /// Visitor 1 and 2: a save slot, `online::VISITOR_AUTO` or `online::VISITOR_NONE`.
+    /// Visitor 1..4: a save slot, `online::VISITOR_AUTO` or `online::VISITOR_NONE`.
     pub visitors: [i32; MAX_CARRIED_CHAO],
+    /// When others may change our Chao.
+    pub lock: ChaoLock,
     /// Mode of rooms we create.
     pub room_mode: room::Mode,
     /// Our skin's id (`skins::list`), empty for none.
@@ -149,6 +149,8 @@ pub struct Settings {
     /// The party-stage enemy, boss and lock-on hooks (`coop::stage_sync`): Off is a safety
     /// switch if one of them misbehaves.
     pub stage_sync: bool,
+    /// Our player key as the file has it (online.rs makes and keeps it).
+    pub player_key: String,
 }
 
 impl Settings {
@@ -162,13 +164,14 @@ impl Settings {
             name_tags: true,
             chao_race: true,
             my_chao: -1,
-            visits: 1,
             visitors: [online::VISITOR_AUTO; MAX_CARRIED_CHAO],
+            lock: ChaoLock::Always,
             room_mode: room::Mode::Race,
             skin: String::new(),
             voice_volume: 100,
             game_volume: 100,
             stage_sync: true,
+            player_key: String::new(),
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -188,7 +191,8 @@ impl Settings {
                 "host" if !v.is_empty() => s.host = v,
                 "port" if !v.is_empty() => s.port = v,
                 "mychao" => s.my_chao = v.parse().unwrap_or(-1),
-                "visitwith" => s.visits = online::parse_visits(&v),
+                // Older files' `VisitWith` (visits on/off) is dropped: online, we always bring.
+                "otherschangechao" => s.lock = ChaoLock::parse(&v),
                 k if k.starts_with("visitor") => {
                     if let Some(i) = k["visitor".len()..]
                         .parse::<usize>()
@@ -201,6 +205,7 @@ impl Settings {
                 }
                 "roommode" => s.room_mode = room::Mode::parse(&v),
                 "skin" => s.skin = v.to_ascii_lowercase(),
+                "playerkey" => s.player_key = v,
                 "gamevolume" => s.game_volume = v.parse::<u32>().map_or(100, |p| p.min(100)),
                 "skinvoicevolume" => {
                     s.voice_volume = v.parse::<u32>().map_or(100, |p| p.min(voice::MAX_VOLUME))
@@ -233,7 +238,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\nVisitWith={}\n{}RoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -241,17 +246,21 @@ impl Settings {
             if self.name_tags { "On" } else { "Off" },
             if self.chao_race { "On" } else { "Off" },
             self.my_chao,
-            ["Off", "On"][self.visits.min(1)],
             self.visitors
                 .iter()
                 .enumerate()
                 .map(|(i, v)| format!("Visitor{}={v}\n", i + 1))
                 .collect::<String>(),
+            self.lock.ini(),
             self.room_mode.ini(),
             self.skin,
             self.voice_volume,
             self.game_volume,
             if self.stage_sync { "On" } else { "Off" },
+            // Kept as it is (online.rs made it): the server knows our Chao by it.
+            online::known_key()
+                .map(|k| crate::net::roster::key_hex(&k))
+                .unwrap_or_else(|| self.player_key.clone()),
         )
     }
 }
@@ -314,13 +323,14 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         name_tags: true,
         chao_race: true,
         my_chao: -1,
-        visits: 1,
         visitors: [-1; MAX_CARRIED_CHAO],
+        lock: ChaoLock::Always,
         room_mode: crate::room::Mode::Race,
         skin: String::new(),
         voice_volume: 100,
         game_volume: 100,
         stage_sync: true,
+        player_key: String::new(),
     },
     message: String::new(),
     keys: Vec::new(),
@@ -393,7 +403,7 @@ pub fn on_frame() {
         m.open = false;
         return;
     }
-    let rows = rows(m.settings.mode, m.settings.visits);
+    let rows = rows(m.settings.mode);
     m.row = m.row.min(rows.len() - 1);
     if m.pressed(VK_UP) {
         m.row = (m.row + rows.len() - 1) % rows.len();
@@ -438,7 +448,7 @@ pub fn on_frame() {
         }
         Row::Visitor(i) if left || right => {
             // Auto, then each hatched Chao no other row has picked, then None.
-            let others: Vec<i32> = (0..MAX_CARRIED_CHAO)
+            let others: Vec<i32> = (0..online::BRING_CHAO)
                 .filter(|&j| j != i)
                 .map(|j| m.settings.visitors[j])
                 .collect();
@@ -462,10 +472,12 @@ pub fn on_frame() {
                 m.settings.to_ini(),
             );
         }
-        Row::Visits if left || right => {
-            let n = online::VISIT_MODES.len();
-            m.settings.visits = (m.settings.visits + if left { n - 1 } else { 1 }) % n;
-            online::set_visits(m.settings.visits);
+        Row::Lock if left || right => {
+            let all = ChaoLock::ALL;
+            let at = all.iter().position(|l| *l == m.settings.lock).unwrap_or(0);
+            let n = all.len();
+            m.settings.lock = all[(at + if left { n - 1 } else { 1 }) % n];
+            online::set_lock(m.settings.lock);
             let _ = fs::write(
                 Path::new(online::mod_path()).join("config.ini"),
                 m.settings.to_ini(),
@@ -926,7 +938,7 @@ fn draw(m: &Menu, rows: &[Row]) {
                 }
             }
             Row::Visitor(i) => format!(
-                "  Visitor {}: < {} >",
+                "Bring Chao {}: < {} >",
                 i + 1,
                 visitor_label(*i, m.settings.visitors[*i])
             ),
@@ -936,10 +948,7 @@ fn draw(m: &Menu, rows: &[Row]) {
             ),
             Row::ChaoDetails => "[ Chao details: stats, personality, bonds & more ]".into(),
             Row::SaveChao => "[ Save Chao garden now ] (autosaves every 5 min)".into(),
-            Row::Visits => format!(
-                "Visit friends: < {} >",
-                online::VISIT_MODES[m.settings.visits.min(1)]
-            ),
+            Row::Lock => format!("Others can change my Chao: < {} >", m.settings.lock.label()),
             Row::KarateOpponent => {
                 let options = online::karate_opponents();
                 let current = crate::karate_live::opponent();
@@ -1015,7 +1024,7 @@ fn draw(m: &Menu, rows: &[Row]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, typed};
+    use super::{ChaoLock, Settings, typed};
 
     #[test]
     fn settings_round_trip_through_config_ini() {
@@ -1027,28 +1036,50 @@ mod tests {
             name_tags: false,
             chao_race: false,
             my_chao: 5,
-            visits: 1,
             visitors: [3, -2, -1, 7],
+            lock: ChaoLock::ThatGarden,
             room_mode: crate::room::Mode::Coop,
             skin: "race_car".into(),
             voice_volume: 70,
             game_volume: 60,
             stage_sync: false,
+            player_key: "00112233445566778899aabbccddeeff".into(),
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.
         let c = crate::online::parse_config(&s.to_ini()).unwrap();
         assert_eq!(c.name, "Regrant");
         assert_eq!(c.room_mode, crate::room::Mode::Coop);
+        assert_eq!(
+            c.key,
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+                0xEE, 0xFF
+            ])
+        );
     }
 
     #[test]
     fn reads_old_online_ini() {
-        let s = Settings::parse("mode = client\nname = Bob\nhost = 1.2.3.4:5\n");
+        let s = Settings::parse("mode = client\nname = Player1\nhost = 1.2.3.4:5\n");
         assert_eq!(
             (s.mode, s.name.as_str(), s.host.as_str()),
-            (2, "Bob", "1.2.3.4:5")
+            (2, "Player1", "1.2.3.4:5")
         );
+    }
+
+    #[test]
+    fn old_visit_key_is_dropped_and_the_lock_is_kept() {
+        let s = Settings::parse("[Multiplayer]\nVisitWith=Off\nOthersChangeChao=AnyGarden\n");
+        // `AnyGarden` reads as ChaoWorld.
+        assert_eq!(s.lock, ChaoLock::ChaoWorld);
+        assert!(!s.to_ini().contains("VisitWith"));
+        assert!(s.to_ini().contains("OthersChangeChao=ChaoWorld\n"));
+        assert_eq!(Settings::parse("VisitWith=On").lock, ChaoLock::Always);
+        // Every visitor row is a row of the menu, and the lock after them.
+        let rows = super::rows(0);
+        let at = rows.iter().position(|r| *r == super::Row::Lock).unwrap();
+        assert_eq!(rows[at - 4..at], [0, 1, 2, 3].map(super::Row::Visitor));
     }
 
     #[test]

@@ -18,6 +18,8 @@ mod off {
     pub const TYPE: usize = 0x80;
     pub const GARDEN: usize = 0x81;
     pub const HAPPINESS: usize = 0x82;
+    pub const DNA: usize = 0x438;
+    pub const DNA_LEN: usize = 0xA4;
 }
 
 /// Number of stats stored per Chao (swim, fly, run, power, stamina, luck, intelligence, unknown).
@@ -89,6 +91,22 @@ impl ChaoData {
 
     fn i16_at(&self, at: usize) -> i16 {
         i16::from_le_bytes([self.bytes[at], self.bytes[at + 1]])
+    }
+
+    /// Which Chao this is, as far as its DNA tells (FNV-1a 64 over the DNA block `0x438`,
+    /// 0xA4 bytes, re/chao-ai.md "DNA block"), leaving out the bytes the game changes over a
+    /// life: the hatch markers `DNA[0]`, `DNA[1]` (`0x551DA0`), the grade alleles
+    /// `+0x5C..0x6C` (evolution raises one, `0x551780`) and the personality alleles
+    /// `+0x74..0x8E` (rebirth writes them back, `0x551560`). Two copies of one Chao hash the
+    /// same: online, a Chao is its owner's key, this and its place among those copies.
+    pub fn identity(&self) -> u64 {
+        let dna = &self.bytes[off::DNA..off::DNA + off::DNA_LEN];
+        [&dna[2..0x5C], &dna[0x6C..0x74], &dna[0x8E..]]
+            .into_iter()
+            .flatten()
+            .fold(0xCBF2_9CE4_8422_2325, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+            })
     }
 
     /// Checks that the fields we rely on are in range. Data from files or the
@@ -582,5 +600,29 @@ mod tests {
     #[test]
     fn crc32_known_value() {
         assert_eq!(file::crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn identity_follows_the_dna_but_not_what_a_life_changes() {
+        let mut a = sample();
+        for (i, b) in a.bytes[off::DNA..off::DNA + off::DNA_LEN]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = i as u8;
+        }
+        let id = a.identity();
+        // Hatching, evolving (a grade allele) and rebirth (personality) keep it.
+        let mut b = a.clone();
+        b.bytes[off::DNA] = 1;
+        b.bytes[off::DNA + 1] = 0;
+        b.bytes[off::DNA + 0x5C] += 1;
+        b.bytes[off::DNA + 0x74] = 9;
+        // So do the record's other fields.
+        b.bytes[off::HAPPINESS] = 50;
+        assert_eq!(b.identity(), id);
+        // Another Chao's DNA (its colour alleles, say) doesn't.
+        b.bytes[off::DNA + 0x94] ^= 1;
+        assert_ne!(b.identity(), id);
     }
 }

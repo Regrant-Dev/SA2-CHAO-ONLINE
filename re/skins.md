@@ -1,14 +1,8 @@
-# Kart skins: where kart models and textures come from (2026-10-17, objdump + Data_DLL)
+# Skins: models, textures and how characters and karts are drawn
 
-Read from the objdump listing of `re/bin/sonic2app.dumped.exe` and the game's
-`resource/gd_PC/DLL/Win32/Data_DLL_orig.dll` (the mod loader renames the real one), with the key
-functions decompiled in REA (Ghidra, raw-binary slices at each function's address):
-- the table copy 0x61FFE0;
-- the texture setup 0x6200A0, decompiled only up to its first out-of-slice call;
-- the loader 0x44C350;
-- the kart display 0x61C6C0.
-
-Not run in game yet.
+Sources: the disassembly of `re/bin/sonic2app.dumped.exe`, decompiled functions in REA, the
+game's `resource/gd_PC/DLL/Win32/Data_DLL_orig.dll` (the mod loader renames the real one), and
+the game's model, motion and texture files.
 
 ## The kart type table (KART_TYPES 0x1D96F70, 8 entries x 0x1C)
 Filled at kart race setup by **0x61FFE0**: it copies the Data_DLL export `specialInfo` (8 x 0x1C)
@@ -44,10 +38,9 @@ Texture setup 0x6200A0 (REA) picks the texlist by 0x1D970FC:
   (attr into +4, texaddr into +8), and names are never compared. A skin's texture order must
   match its model's texture ids.
 - **Release: 0x77F9F0**, cdecl (NJS_TEXLIST*).
-- New file names: the HelperFunctions slot `ReplaceFile(src, dst)` (already a placeholder in
-  src/modloader.rs) can map `resource\gd_PC\PRS\<SKIN>.pak` to a file in our skins folder. Then
-  `LoadTextureList("<SKIN>")` finds it. Unconfirmed: whether ReplaceFile accepts a source path
-  that doesn't exist in the game. If it doesn't, put the .pak in a mod's own gd_PC/PRS/ folder.
+- The mod copies a skin's texture pack to `<mod>/textures/SKIN_<ID>/`, where the mod loader looks
+  for texture packs, and loads it with `LoadTextureList("SKIN_<ID>")` into its own NJS_TEXLIST
+  sized from `skin.ini`'s texture count.
 
 ## Model format: Ninja chunk models
 Kart models are NJS_OBJECT trees whose models are **NJS_CNK_MODEL** (0x18 bytes: vlist*,
@@ -62,9 +55,9 @@ root+0x2C, then +0x30 siblings, and clears eval flag 2 on each. It also draws th
 (0x61ECF0). **With wheels = 0, nothing in the model is touched:** safe for any node layout, but
 no exhaust.
 
-## .sa2mdl (SA Tools ModelFile), from memory: verify before coding
-- u64 header: "SA2MDL" in the low 6 bytes (0x4C444D324153), version in the top byte (3 current).
-- u32 +8: root NJS_OBJECT offset. u32 +0xC: metadata offset (labels/author/etc, ignore).
+## .sa2mdl (SA Tools ModelFile)
+- u64 header: "SA2MDL" in the low 6 bytes (0x4C444D324153), version in the top byte (3).
+- u32 +8: root NJS_OBJECT offset. u32 +0xC: metadata offset (labels/author/etc).
 - Pointers inside are file offsets (written with image base 0); 0 = null.
 - Relocate by adding the buffer base to:
   - NJS_OBJECT (0x34): +4 model, +0x2C child, +0x30 sibling. Everything else is inline:
@@ -72,25 +65,17 @@ no exhaust.
   - NJS_CNK_MODEL (0x18): +0 vlist, +4 plist. The vlist and plist are self-contained chunk
     streams with no pointers. Texture ids in the plist index the current texlist, so the
     skin's archive order must match the model's texture ids.
-- Walk the tree once and relocate each node and model only once (guard with a visited set,
-  because models can be shared).
+- Models can be shared between nodes, so each node and model is relocated only once.
 
-## Recipe
-1. Init: for each `skins/<name>/` with `kart.sa2mdl` + `<name>.pak` (+ texture count), register
-   ReplaceFile(`resource\gd_PC\PRS\SKIN_<NAME>.pak` -> that file).
-2. Kart race start (game thread, first frame of in_kart_race):
-   - read the .sa2mdl into a leaked/pinned buffer and relocate it;
-   - allocate an NJS_TEXLIST with N entries and LoadTextureList("SKIN_<NAME>", &tl);
-   - build a private entry {kind, far = root, near = root, &tl, 0, 0, wheels 0}.
-3. Drawing:
-   - remote karts with that skin: src/kart.rs writes the private entry's fields into its fake
-     work (+0x34/+0x38/+0x3C/+0x40 = 0);
-   - our own kart: write the same into our car's work each frame.
-   - Never write into KART_TYPES itself; the CPU karts use it.
-4. Race end (in_kart_race false): FreeTexList(&tl) (0x77F9F0), then free the model buffer once
-   nothing draws it.
+## Kart skin drawing
+- A kart skin is an entry {kind, far = root, near = root, &texlist, 0, 0, wheels 0}, built at
+  kart race start from the skin's relocated model and its texture list.
+- Remote karts (src/kart.rs) and the local kart get the entry's fields written into their car
+  work (+0x34/+0x38/+0x3C, +0x40 = 0). KART_TYPES itself is left alone, because the CPU karts
+  use it.
+- With wheels = 0 the display touches no node, so any node layout works.
 
-## Character skeletons (2026-10-17, from the game's `gd_PC/*mdl.prs`, tools/prs.py)
+## Character skeletons (the game's `gd_PC/*mdl.prs`, tools/prs.py)
 Character model files are PRS-compressed, **big-endian** model lists: `(i32 model number,
 u32 file offset)` pairs ending at -1; objects and chunk models (NJS_OBJECT 0x34,
 NJS_CNK_MODEL 0x18: vlist, plist, centre, radius) with offsets from the file start. The
@@ -103,13 +88,12 @@ Biggest node trees per file (nodes, model number):
 - Eggman: 46 nodes (230/527). Mechs/walkers: 33 nodes (Tails 293/464, Eggman 248/463,
   Chao walkers 442/450, 465/473).
 
-So one bone mapping onto the humanoid tree serves nine characters. The converter should read
-the target skeleton from the player's own game files when it converts (no game data in the
-repo).
+So one bone mapping onto the humanoid tree serves nine characters. The converters read the
+target skeleton from the player's own game files (the repo holds no game data).
 
-## Following Sonic exactly (2026-10-17, REA on a slice of 0x720090 + objdump + sonicmtn/plcommtn parsed offline)
+## Following Sonic's display and motions
 
-### Sonic's display 0x720090 (ObjectMaster +0x14), the body's matrix chain (REA-confirmed)
+### Sonic's display 0x720090 (ObjectMaster +0x14), the body's matrix chain
 e1 = obj+0x34 (EntityData1), co2 = obj+0x40. Before drawing: bone callback 0x1A55834 (0x71EAA0,
 0x71F5E0 if co2+1, Amy 0x71F040, Metal 0x71FBE0), texlist `*(*(0x2670544)+0x20) = co2+0x394`.
 1. push matrix (copy current 0x30 bytes, 0x1A557FC += 0x30, not past 0x2670588).
@@ -131,7 +115,7 @@ e1 = obj+0x34 (EntityData1), co2 = obj+0x40. Before drawing: bone callback 0x1A5
    co2+3 != 0xC and (co2+0x360 & 0x11): model AnimInfo[30] (ModelNum 6, the ball) and anim = 30.
    DrawMotion 0x780870(model, co2+0x184) with ECX = motion (the double AnimInfo lookup).
 7. pop; shoes/upgrades after (co2+0x24 & 0x40008 bits, models 0x1DE96EC / 0x1DE9944).
-So the skin's chain is right as is (translate, Z, X, 0x8000 - Y), apart from action 0x33, the
+A skin drawn with translate, Z, X, 0x8000 - Y matches the body, apart from action 0x33, the
 anim-11 lean and e1's scale.
 
 ### DrawMotion 0x780870 and the motion format
@@ -164,11 +148,11 @@ model 65 (the alternate body).
   their side axis). A car facing +Z needs the 90° turn, and a flip about its own X (its side
   axis) matches the ball's roll.
 - Full turns elsewhere: motion 117 (64 frames) node 4 ±X full turn; 102/103 node 4; plcom 51/52
-  (10 frames, node 4, large spans): likely tricks. Anims 104-111 (8 x 17 frames, mode 13),
-  121-124 / 145-148 (mode 13) and 157-168 (mode 9, return to 129) are Sonic-only sets: likely
-  the board/grind lean directions and board tricks (not confirmed by name).
+  (10 frames, node 4, large spans), probably tricks. Anims 104-111 (8 x 17 frames, mode 13),
+  121-124 / 145-148 (mode 13) and 157-168 (mode 9, return to 129) are Sonic-only sets, probably
+  the board/grind lean directions and board tricks.
 
-## Big the Cat cameo (2026-10-17, objdump + REA slices `re/bin/big_4f5ef0.bin`, `bigdisp_4f6040.bin`)
+## Big the Cat cameo (REA slices `re/bin/big_4f5ef0.bin`, `bigdisp_4f6040.bin`)
 
 **The object.** SET object "BIG THE CAT", main **0x4F61E0** (state table 0x4F62C4). It is in
 about 50 stage object lists, so most stages have it.
@@ -195,7 +179,7 @@ about 50 stage object lists, so most stages have it.
   that node's frame.
 - Polygon chunks are materials **0x13 and 0x17** (diffuse + ambient (+ specular): a size of 4
   or 6 u16), tiny texture ids (0x08) and strips 0x41.
-- skins.rs's checker only accepts material 0x11, so either rewrite these or extend the checker.
+- The mod's model checker (skins.rs) accepts only material 0x11, so these must be rewritten as 0x11.
 
 **Motions.** The table at 0x1521D70 is 15 entries × 16 bytes; +0 is an NJS_MOTION* with type 3
 (position + angle), 17 to 120 frames. These are the cameo poses: normal, fishing, dancing and
@@ -231,20 +215,14 @@ GVRTs, in texlist order:
 `tools/gvm.py <prs> <dir>` exports them as PNGs (CMPR/DXT1, RGB5A3, RGB565, I4/I8/IA8,
 ARGB8888). Or load the archive in game by name with 0x44C510("E_BIGTEX").
 
-**Recipe for a Big-over-Knuckles skin:**
-1. The converter reads Big's 73 nodes from the player's exe and the Knuckles tree from
-   `knuckmdl.prs` (big-endian, model 142 or 169).
-2. Map Big's mesh nodes to Knuckles' nodes by the labels above.
-3. Move each mesh's vertices from Big's bind frame (world) into the mapped Knuckles node's bind
-   frame. Big's arms hang down, so align each limb segment's direction first.
-4. Rewrite materials 0x13/0x17 as 0x11.
-5. Write the result as a model on Knuckles' tree, with the 6 textures as a PNG pack
-   (`tools/gvm.py`).
-6. At runtime, alternatively, take the textures straight from the game with
-   `0x44C510("E_BIGTEX")` and skip the PNGs.
+**Big on Knuckles' tree:** Big's mesh nodes map onto Knuckles' nodes (`knuckmdl.prs`, model 142
+or 169) by the labels above. Each mesh's vertices move from Big's bind frame (world) into the
+mapped Knuckles node's bind frame; Big's arms hang down, so each limb segment's direction has to
+be aligned first. The textures can come from the PNG export or straight from the game with
+`0x44C510("E_BIGTEX")`.
 
-## Rigged skins: the humanoid tree, body slots, and what a replacement must keep (2026-10-17)
-From the game files (tools/charskel.py, tools/prs.py) and the objdump listing; not run in game.
+## Rigged skins: the humanoid tree, body slots, and what a replacement must keep
+From the game files (tools/charskel.py, tools/prs.py) and the disassembly.
 
 **Node evaluation** (object draw 0x42EBDD; rotation dispatch 0x4277B0): child = parent x T x R x S.
 Unless flag 1, translate by pos; unless flag 2, rotate (flag 0x20 clear: Z(ang.z), then
@@ -292,13 +270,13 @@ Knuckles' proportions differ (head joint at 6.78, hands at y ~4.1, z +/-2.5), wi
     and 49-64).
   - Knuckles 142: 143:2, 144:31, 145:43, 146:50, 147:52, 149:44, 150:14, 151:24, 152:61, 153:42,
     154:55, 155:36, 156:48, 157:46, 158:60, 159:41, 160:48, 167:33.
-- **Generic rule for the mod.** When it replaces a body, every slot that pointed at node *i* of the
-  old tree must point at node *i* of the new one. The mod can find these at run time by matching
-  pointers, so no per-character list is needed.
+- **Replacing a body.** Every slot that pointed at node *i* of the old tree must point at node *i*
+  of the new one. These slots can be found at run time by matching pointers, so no per-character
+  list is needed.
 - **Mouths.** Sonic's display temporarily replaces the mesh of slot 21's child (node 49) for mouth
   shapes (0x7204C8: slot 21, or slot 86 for Shadow). Knuckles' does the same through slot 156,
-  node 48 (0x72F3D0, co2+0x3E4). So a skin should leave nodes 47 and 49 without a mesh and put the
-  head mesh on node 44 (clearing its hide flag in our copy).
+  node 48 (0x72F3D0, co2+0x3E4). So a skin must leave nodes 47 and 49 without a mesh and put the
+  head mesh on node 44 (clearing its hide flag in the skin's copy).
 
 **Meshes and weights.**
 - Every node's mesh is drawn in that node's space after its transform; the chunk vertices go into
@@ -308,15 +286,15 @@ Knuckles' proportions differ (head joint at 6.78, hands at y ~4.1, z +/-2.5), wi
   node's strips then use vertices an earlier node transformed. So unweighted, rigid meshes are
   fully supported.
 - Sonic also uses `0x2C` (VN_NF) blocks with weight status in flag bits 0-1 (0 start, 1 middle,
-  2 end) for smooth skinning. Flag 0x80 appears on most non-first blocks; its meaning wasn't
-  checked, and flag 0 with an offset also occurs.
+  2 end) for smooth skinning. Flag 0x80 appears on most non-first blocks and is masked off by the
+  vertex code (see "Weighted vertices"); flag 0 with an offset also occurs.
 - Buffer offsets seen go up to 421 (Knuckles: 370 + 51).
 - Polygon chunks: 0x11/0x13/0x17 materials, tiny texture ids, 0x40/0x41 strips.
-- **Converter recipe:** one `0x29` block per node, flags 0, each node's vertices at a distinct
-  offset (total under ~500). Each node's strips may use its own vertices and those of earlier nodes
-  in depth-first order (put a joint's bridging triangles on the child).
+- A rigid converted model uses one `0x29` block per node, flags 0, each node's vertices at a
+  distinct offset (total under ~500). Each node's strips may use its own vertices and those of
+  earlier nodes in depth-first order, so a joint's bridging triangles go on the child.
 
-### Hiding the character (2026-10-18, REA on the dumped exe)
+### Hiding the character
 
 **Everything the game draws ends in two renderer entries.** The renderer is a C++ object at
 `*0x1A557C0` (set by 0x423DBB; its first word is its function table). Of the table's entries,
@@ -357,7 +335,7 @@ in its place.
 pass in `0x25EFEE0`. Sonic's +0x1C (0x720B50) draws a model at the player from a distance
 (0x7983F0 culls under 50 units). All of them run hidden while a skin is on.
 
-**The shadow pass** (0x46FD10, REA 2026-10-19). Shadows are a shadow map. The pass sets the
+**The shadow pass** (0x46FD10). Shadows are a shadow map. The pass sets the
 shader mode to 4 through 0x41B1F0 (mode -> program: 4 = SonicVS/PS_ShadowGen, program 11 of
 the 13 that 0x4248B0 loads into the shader object `*0x1A557BC` + 0x648; 0x424050 selects
 one). It locks that mode (`0x1A55709` = 1), then for each of the 6 object lists 0x46FB00
@@ -373,13 +351,14 @@ and turn, so the light's view is one below the top at DrawMotion. The stack top 
 begins is the camera's: drawn from there, nothing lands in the shadow map.
 - **Culling.** DrawMotion's node draw 0x42E660, when `0x25F02D8` & 0x100, tests the model's
   sphere (0x42F640, against the current projection: in this pass the light's) unless its radius
-  is 0.0 (compared with 0x8AF004), and skips the draw if it's out. Our converters gave skin
-  models a radius of 10000 ("never culled"), which this test can cull. The mod now sets every
-  skin model's radius to 0 when it loads one. A rigged skin's own root goes as it is. Hiding the
-whole call (the first try) also drops the shadow laid on the ground.
+  is 0.0 (compared with 0x8AF004), and skips the draw if it's out. A large radius does not
+  prevent this, so the mod sets every skin model's radius to 0 when it loads one. A rigged skin's
+  own root goes as it is.
+- Skipping the whole +0x2C call would also drop the shadow laid on the ground, which is why only
+  its DrawMotion is replaced.
 
 **Separate objects.** The jump ball is a JumpAura object per frame (re/spin-ball.md), drawn by
-its own display 0x756960 (+0x1C). The hook there skips our player's balls (data +1 == 0)
+its own display 0x756960 (+0x1C). The hook there skips the local player's balls (data +1 == 0)
 while a skin is on.
 
 **Character displays** (the init writes ObjectMaster +0x14). Body slots come from AnimInfo;
@@ -396,7 +375,7 @@ the alternates have the same tree.
 Eggman's 46 nodes: hips 1, torso 25/26, neck 27, head joint 36 (mesh 38), legs 7-14
 (right, z -) and 16-23, shoulder joints 28/39, arms 29-33 (left, z +) and 40-45.
 
-### Weighted vertices (2026-10-18, REA: 0x42D190, 0x42ED60, 0x42E440)
+### Weighted vertices (0x42D190, 0x42ED60, 0x42E440)
 0x42D190 runs a model's vertex list: per block, h1 = type | flags << 8 | words << 16 and
 h2 = offset | count << 16; the slot base is buffer + offset * 32 (`*0x25EFE48`, 0x40000 bytes
 allocated at 0x43502E: 8192 slots). The 0x1000 stored at 0x25EFE4C is never read.
@@ -478,22 +457,16 @@ The game's own voice banks are in `resource/gd_PC/MLT`.
   0x450000..0x478000 (shared player helpers: pick up, pet, tree) and 0x710000..0x760000 (the
   characters' mains and actions). Cutscene, Omochao and story voices come from elsewhere.
 
-### Cutscene voice protection (2026-10-19)
+### Voices in cutscenes
 
-Sonic dialogue was reported silent while wearing SpongeBob. Previously `MUTE` depended only
-on a loaded skin voice set, including while an event retained the previous player/skin.
-All three mute hooks now check live mode/state/control before filtering any call, so a
-transition earlier than the next OnFrame cannot swallow the first scene line.
+`GameModeHandler` 0x434160: mode 5 runs 0x43A780 (stage states); mode 7 loads `EVENT` (string
+0x8B7674) and mode 8 runs it; modes 15/16 load/run `ENDING` (0x8B76D8). The mod's voice hooks
+only replace voices in mode 5, state 16, with `ControllerEnabled[0]` (0x174AFFF) non-zero, checked
+live on each call. So cutscenes, events and input-locked scripted intros keep their own voices.
+The per-frame voice player uses the same conditions; on entering a scene or pause it clears
+pending events and movement history and stops any skin WAV that is playing.
 
-REA of `GameModeHandler` `0x434160` confirms mode 5 runs `0x43A780` (stage states); mode 7
-loads `EVENT` (string `0x8B7674`) and mode 8 runs it; modes 15/16 load/run `ENDING`
-(`0x8B76D8`). Skin replacements require mode 5, state 16 and `ControllerEnabled[0]`
-(`0x174AFFF`) nonzero. This also leaves input-locked scripted intros within a stage alone.
-The per-frame voice player uses the same conditions, clears pending events and movement
-history, and stops PlaySound before dropping an active skin WAV on entering a scene/pause.
-Only gameplay resumes skin voices. The reported Sonic/SpongeBob scene needs an in-game retest.
-
-## Hurt blink (2026-10-18, REA)
+## Hurt blink
 
 After a hit a character can't be hurt again for a while: EntityData1 +6 (u16) counts it down.
 The character's display (Sonic's family 0x720090) skips the body while +6 has bit 2 (`(+6 & 2)
@@ -504,23 +477,21 @@ check around the body it draws into the shadow map, so the shadow blinks too.
   is drawn by the character's display, which already skips it. The skin's shadow is drawn inside
   the shadow display's own body draw (hide.rs `replacing`), so it blinks with it already.
 - Puppets: the sender's `PlayerState` status has 4 while +6 is nonzero; puppets (skinned or not)
-  aren't drawn on blink frames of our own beat (puppet.rs), with the same 0x174B009 rule. Puppets
+  aren't drawn on the local game's blink frames (puppet.rs), with the same 0x174B009 rule. Puppets
   have no shadows.
 
-## Walking in place (2026-10-18)
+## Animated skins' movement
 
-Animated skins chose idle/walk/run from how far the character's position moved between draws.
-The position also moves while the character stands (pushed back by the ground on a slope or a
-wall, carried by a platform), and that kept skins walking in place now and then. The game's own
+The character's position also moves while it stands (pushed back by the ground on a slope or a
+wall, carried by a platform), so position change is not a reliable walk signal. The game's own
 movement goes by CharObj2 +0x64 (3 f32: forward, up, sideways speed in the character's frame;
 0x45B610 compares +0x64 with the physics speeds at +0xE8.., a hit sets it to the knock-back,
-0x46C340), so the skin now goes by its forward and sideways part. Puppets: the sender's status has
-8 when that speed is under 0.05 on the ground, and their skin stands; moving, it still goes by
-their position. The animator also steps once per game frame (`Animator::step_once`, the skins'
-frame count), however many times it's drawn.
+0x46C340). Animated skins choose idle/walk/run from its forward and sideways part. For puppets,
+the sender's status has 8 when that speed is under 0.05 on the ground, and their skin stands;
+moving, it goes by their position. The animator steps once per game frame
+(`Animator::step_once`), however many times it's drawn.
 
-
-## Boards and rails (2026-10-18, REA + objdump)
+## Boards and rails
 
 Sonic's family (Sonic, Shadow, Amy, Metal Sonic) share one action table: Sonic's main 0x717840
 switches on the action (0..0x57) through 0x7197B4, its action step through 0x71E1A0.
@@ -533,46 +504,31 @@ switches on the action (0..0x57) through 0x7197B4, its action step through 0x71E
   and 0x46D140, which moves the player along a path (CharObj2 +0xB8, distance +0x30, 0x4905A0).
 - An animated skin rides there (`ride_role`): its `ride=` / `grind=` animation if it has one,
   else it stands (idle), never runs. Puppets the same, from the `PlayerState` character and
-  action. Not checked: 0x45/0x46/0x49 (next to the rail ones; ground/air movement handlers) and
-  the other "carried along" moves (pulleys, rockets, swing poles, light dash): in the air they
-  play jump/fall as before.
+  action. Other "carried along" moves (pulleys, rockets, swing poles, light dash) play jump/fall
+  in the air.
 
-## Texture records (2026-10-18, REA)
+## Texture records
 
-Live test: the garden's walls and floor were drawn with the worn skin's (Master Chief's)
-textures after moving through Chao World and switching skins there.
 - A texture list's entries point (+8) at the game's texture records (`NJS_TEXMEMLIST`), shared
   by global index and counted: 0x44C510 (the loader, through the mod loader's texture pack hook)
   fills a list; 0x77F9F0 releases one: per entry it lowers the record's count (+0x10) and its
   texture info's (+0xC, count +0x24); at 0 it releases the D3D texture and clears the info (+0
   = -1) and the record (+0 = 0, +8 = -1, +0xC = 0), which the next load can then take.
-- The game frees its textures between scenes (Chao World's areas too) and the next scene's take
-  the records. The skins code then released its old list if its records looked loaded
-  (`texlist_ok`: record and texture info set), which by then they were: with the new area's
-  textures. That release counted down and freed the garden's own textures; Chief's, loaded
-  next, took their records, and the garden's lists still pointed there.
-- Fix: a list's records are remembered as loaded (`texlist_signature`: record, +0, +8, +0xC),
-  and the list is only drawn with or released while they still match (`texlist_ours`). A list
-  whose records went to other textures is dropped without releasing anything. Switching skins
-  mid-scene keeps the old list until it's dropped the same safe way.
-- Also: in the same scene, textures that look gone aren't loaded again for 300 frames
-  (`RELOAD_AFTER`); a guard, not the cause here (the log showed no reload after the tab-outs).
+- The game frees its textures between scenes (Chao World's areas too), and the next scene's
+  textures take the records. Releasing a list after that would count down and free the new
+  scene's textures, which then get taken by the next load while the scene's own lists still
+  point there (the garden drawn with a skin's textures).
+- So the mod remembers a list's records as loaded (`texlist_signature`: record, +0, +8, +0xC)
+  together with the level, stage run and Chao World area, and only draws with or releases the
+  list while all of these still match (`texlist_ours`). A list from another scene is dropped
+  without releasing anything. Switching skins mid-scene keeps the old list until it's dropped
+  the same way.
+- In the same scene, textures that look gone aren't loaded again for 300 frames
+  (`RELOAD_AFTER`).
 
-### Switching skins after garden changes (2026-10-19)
-
-- Live report: Ganondorf's cape showed SpongeBob textures; all clients crashed while switching
-  skins. The local dump at 05:31:43 UTC faults at `0x835022` while traversing the native audio
-  object list (invalid vtable `0x3B8CB26F`). The log ends loading Master Chief, the seventh
-  different model after the six-entry cache filled. This points at eviction/lifetime handling,
-  but does not prove the texture issue and audio corruption share a cause.
-- A record signature alone does not establish ownership across scenes: addresses and texture
-  records can be reused when returning to the same garden. `texlist_ours` now requires the
-  original level/run/area as well; old references are never released against the new scene.
-- Skin lists/entries now live in Rust-owned stable boxes. REA verifies `0x44C350` takes
-  ECX = archive and EDX = caller-owned NJS_TEXLIST, copying exactly the requested entries.
-  Validate the pack count against `skin.ini` before that call. This avoids retaining and later
-  freeing a game-heap list through `0x44C510`/the native allocator. Current-scene record releases
-  still use `0x77F9F0`, which clears the references but does not free the caller's list.
-- Replacing a list also clears `LAST_DRAWN` before dropping its storage. Previously a shadow
-  pose from the last frame could still point at that allocation. The updated build needs the
-  original garden-change / seven-skin switching reproduction before calling this crash solved.
+### Skin texture lists
+- Skin texture lists and entries live in memory owned by the mod. 0x44C350 takes ECX = archive and
+  EDX = a caller-owned NJS_TEXLIST and fills exactly the entries the list has, so the pack's
+  texture count is checked against `skin.ini` before the call. 0x77F9F0 releases a list's records
+  but does not free the list itself.
+- Replacing a list clears `LAST_DRAWN` (the last shadow pose) before freeing its storage.

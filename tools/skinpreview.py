@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Renders a converted skin the way the game draws it, to check a conversion without the game.
 
-    tools/skinpreview.py skins/big_anim out.png [--motion 1] [--frames 0,5,10]
+    tools/skinpreview.py skins/my_skin out.png [--motion 1] [--frames 0,5,10]
     tools/skinpreview.py skins/my_rigged out.png --model model_eggman.sa2mdl \
         --game-motion "<gd_PC>/eggmtn.prs" --motion 2 --frames 0,10,20
 

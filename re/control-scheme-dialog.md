@@ -1,6 +1,6 @@
 # "Reboot to change the control scheme." dialog (SA2 Steam, sonic2app.exe)
 
-Static analysis only (REA/Ghidra + objdump listing). Image base 0x400000.
+Image base 0x400000.
 
 ## Message/text objects
 
@@ -36,7 +36,7 @@ GameLoop and elsewhere). Fields:
 Update/draw function: `0x40A8F0` (`__stdcall`, arg = object), called every frame
 from GameLoop `0x433EE0` at `0x433FCB`.
 
-## Q1: detection and how it opens / blocks
+## Detection, opening and blocking
 
 States 0 and 1 (`0x40A915`, `0x40A9CD`): every 61 frames:
 
@@ -71,13 +71,12 @@ esi = `*0x1A55904` (text) and edi = cursor. After 30 frames reads buttons
 **Blocking**: `0x40AD30` returns 1 when `0x1A55944 != 0` and state in {2,3,4}.
 GameLoop: `0x433F74 call 0x40AD30; test eax,eax; jne 0x433F9D` -> skips
 `GameModeHandler 0x434160` entirely (which runs `GameStateHandler 0x43A780`
-and thus objects/players). So per static code the whole game mode logic is
-skipped while the dialog is up, not just input. (The report that the stage
-timer keeps running is not explained by this path; verify at runtime.)
+and thus objects/players). The whole game mode logic is skipped while the dialog
+is up, not just input.
 `0x411AE0` (returns state != 0) is also used by `0x43B1D6`/`0x43B1EE`/`0x665119...`
 to divert to `0x411B30` (forces state 2) in some menu transitions.
 
-## Q2: button paths (state 4)
+## Button paths (state 4)
 
 - Confirm (0x04) with cursor=1, **"Reboot now"** (`0x40ACA8`): play sound 0x8001,
   `ShellExecuteW(0,"open","Launcher.exe","-r",0,SW_SHOWNORMAL)` (`0x40ACC0` pushes
@@ -88,22 +87,21 @@ to divert to `0x411B30` (forces state 2) in some menu transitions.
   clears `0x174AFD9`, resumes sound), sound 0x8009, `+0x7C = 0`,
   state = (+0x70 ? 1 : 0). Nothing input-related is changed: no device rebind.
 
-## Q3: recommended mod fix
+## Suppressing the dialog (`game::block_reboot_dialog`, `close_reboot_dialog`)
 
-**Patch (runtime-toggleable, 1 byte each):** turn the two `je` that skip arming into
-unconditional jumps, so the poll still runs (device list stays refreshed and the
-change edge is consumed) but `+0x7C` is never set:
+While online, the mod turns the two `je` that skip arming into unconditional jumps, so the poll
+still runs (the device list stays refreshed and the change edge is consumed) but `+0x7C` is
+never set:
 
 | VA         | file off | original | patched |
 |------------|----------|----------|---------|
 | `0x40A93E` | 0x9D3E   | `74 03`  | `EB 03` |
 | `0x40A9F8` | 0x9DF8   | `74 03`  | `EB 03` |
 
-(Equivalent: NOP `89 75 7C` -> `90 90 90` at 0x40A940 / 0x40A9FA.)
-Write with VirtualProtect while online, restore `74` when offline. Toggling is
-safe at any time because no persistent state is left armed.
+(Equivalent: NOP `89 75 7C` -> `90 90 90` at 0x40A940 / 0x40A9FA.) Offline the original bytes
+are restored. Toggling is safe at any time because no persistent state is left armed.
 
-If enabling while the dialog is already open (state 4), also close it like "later":
+A dialog already open (state 4) is closed the way "Reboot later" does it, minus the sound:
 ```
 obj = *(u32*)0x1AF19F0
 if obj && *(u32*)(obj+0x64) == 4 {
@@ -112,19 +110,12 @@ if obj && *(u32*)(obj+0x64) == 4 {
     *(u32*)(obj+0x64) = (*(u32*)(obj+0x70) != 0) ? 1 : 0;
 }
 ```
-This also works as a no-patch per-frame alternative (run before GameLoop; the
-dialog sets state 4 inside 0x40A8F0 and only blocks from the next GameLoop's
-0x40AD30 check). It does exactly what "Reboot later" does minus the sound.
-(The vtbl[0x16C] call made on entering state 4 has no counterpart in "later"
-either.)
+The dialog sets state 4 inside 0x40A8F0 and only blocks from the next GameLoop's 0x40AD30
+check. The vtbl[0x16C] call made on entering state 4 has no counterpart in "later" either.
 
 ### Side effects
-- Same as choosing "Reboot later": the game does nothing else on a device
-  change. `0x864A00` itself rebuilds Magic's XInput device list on each poll, so
-  the low-level list is current; whether the per-player pad mapping follows a
-  newly connected pad without restart is not confirmed statically (test).
-- Only XInput connected-count changes trigger this; keyboard/DInput don't.
-- Patch also suppresses the dialog in menus (not only in stages).
-
-Confidence: high for detection/state machine/patch sites; medium for
-"input rebinding after change" behaviour.
+- Same as choosing "Reboot later": the game does nothing else on a device change. `0x864A00`
+  rebuilds the XInput device list on each poll, so the low-level list stays current; whether the
+  per-player pad mapping follows a newly connected pad without a restart is not established.
+- Only XInput connected-count changes trigger the dialog; keyboard/DInput don't.
+- The patch also suppresses the dialog in menus, not only in stages.

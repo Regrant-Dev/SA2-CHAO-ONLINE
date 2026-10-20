@@ -1,6 +1,4 @@
-# Spin ball / jump aura (Sonic family) — 2026-10-14
-
-Found with objdump and Ghidra; confirmed in game (puppets draw it).
+# Spin ball / jump aura (Sonic family)
 
 ## Summary
 The blue spin ball is **not drawn by Sonic's display**. It is a separate short-lived effect object,
@@ -40,7 +38,7 @@ Copies the collision center, sets count = 1, scale = 1.2, then chooses the model
 The texture is random: `rand() (0x7A89D8) / 32768 > 0.5` → `textures + 0xC` (entry 1, "s_ball_b"), else entry 0 ("s_ball_a").
 S_EFFTEX textures array 0xA089C0 (39 entries: s_ball_a, s_ball_b, s_dash01, ...).
 Finally sets **obj+0x1C (delayed/translucent display) = 0x756960**.
-(In the header, `co2+3` values 8 and 0xC select Amy and Metal Sonic. characters.md lists Metal Sonic as 9, so the 0xC case is unresolved.)
+(`co2+3` == 8 selects Amy and 0xC selects Metal Sonic's model. characters.md lists Metal Sonic's character ID as 9, so what `co2+3` holds is not the character ID.)
 
 ## Lifetime
 - main 0x756AA0 (Jump): `if age > 0: scale -= 0.3`; `age++`; once the old age is above 2, sets main = FreeObject 0x46F720 and +0x1C = 0.
@@ -88,12 +86,11 @@ co2+0x284/+0x290 (0x77FC30 = vector length, 0x77F3A0 = normalize). Anim 0x31–0
 SpinDashAura 0x756040 (init 0x7562A0, spawned in the spin-charge action at 0x718022), HomingAura 0x756520,
 JumpDashAura 0x756C90 / 0x757040 (spawned from 0x720E1E). All use the same JUMPEFFECT model and EFFTEX.
 
-## Recommended puppet implementation
-The puppet needs the remote Action (or a "jump aura" bit = `Action == 6`, optionally a bounce bit = `Action == 69`).
-Anim 65/66/100 + Status 0x400 is only an approximation.
-Per puppet, keep the last 3 ball centers (world) with a random texture index (0/1) per frame, and draw the ball scales 1.2/0.9/0.6
-(newest first) while the aura bit was set on that frame. Draw from the puppet's delayed display (obj+0x1C) if possible,
-otherwise at the end of the normal display, **after popping the puppet's own matrix** (the ball uses world coordinates and no rotation):
+## Drawing the ball for another player (puppets)
+The sender sets a "ball" flag for Sonic, Shadow, Amy and Metal Sonic in actions 3..6, 13 and 69. For each puppet the mod keeps
+the last 3 ball centers (world) with a texture index (0/1) per frame and draws them at scales 1.2/0.9/0.6
+(newest first), after popping the puppet's own matrix (the ball uses world coordinates and no rotation).
+Shadow and Metal Sonic puppets use Shadow's model slot 84 and texlist 0xA08D94; the others use slot 19 and 0xA08B94.
 ```
 static TL: [u32;2];                       // NJS_TEXLIST {textures, count}
 TL = [*(0xA08B94 as *u32) + 12*tex, 1];   // Sonic S_EFFTEX; Shadow: 0xA08D94 + model *0x1DE98C4
@@ -105,9 +102,11 @@ push matrix; 0x427470(EAX=*0x1A557FC, cx,cy,cz) [caller pops 12]
 pop matrix
 *(0x25EFFCC as *u8) = 1; call 0x42A870;
 ```
-center = remote pos + RotZ(rot.z)·RotX(rot.x)·(0, 5.4, 0). Alternatively, inside the puppet's rotated matrix: translate(0, 5.4, 0) and then scale(1.2).
-An alternative that may be simpler: spawn the game's own effect with `0x755EA0(EDI=0x756AA0)` + init. This **does not work** directly for puppets,
-because the init reads player index → `0x1DEA6C0[i]` collision and `0x1DE9600[i]` co2, and the display requires `0x1DEA6C0[i] != 0`. You can instead
-fill the 0x24-byte data yourself after 0x755EA0 (set +1 = local player index 0 so the "player exists" check passes, +2 = 0, +4..+C = center,
-+0x10 = model, +0x14/+0x18 = texlist, +0x1C = 1.2) and set obj+0x1C = 0x756960. The game's main then makes the trail by itself.
-EDI is a register argument, so this needs a small asm stub.
+center = remote pos + RotZ(rot.z)·RotX(rot.x)·(0, 5.4, 0).
+
+Spawning the game's own effect with `0x755EA0(EDI=0x756AA0)` + init does not work for a puppet as is:
+the init reads the player index → `0x1DEA6C0[i]` collision and `0x1DE9600[i]` co2, and the display requires
+`0x1DEA6C0[i] != 0`. Filling the 0x24-byte data directly after 0x755EA0 (+1 = local player index 0 so the
+"player exists" check passes, +2 = 0, +4..+C = center, +0x10 = model, +0x14/+0x18 = texlist, +0x1C = 1.2)
+and setting obj+0x1C = 0x756960 gets around this; the game's main then makes the trail. EDI is a register
+argument, so that needs a small asm stub.

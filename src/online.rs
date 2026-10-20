@@ -23,8 +23,8 @@ use crate::hud;
 use crate::log;
 use crate::net::files::SkinStore;
 use crate::net::protocol::{
-    Body, CHAO_SLOTS, GardenChao, MAX_CARRIED_CHAO, MY_CHAO_INDEX, PlayerState, STATUS_GROUNDED,
-    STATUS_HOLDING,
+    Body, BroughtChao, CHAO_SLOTS, ChaoLock, GardenChao, HELD_OWNER, MAX_CARRIED_CHAO,
+    MY_CHAO_INDEX, PlayerKey, PlayerState, STATUS_GROUNDED, STATUS_HOLDING,
 };
 use crate::net::session::{Client, Event, Host, Identity, Session};
 use crate::net::udp::Endpoint;
@@ -72,12 +72,14 @@ pub struct Config {
     pub chao_race: bool,
     /// "My Chao": save slot of the Chao for races and karate (-1 = the first hatched one).
     pub my_chao: i32,
-    /// Visit friends: 0 off, 1 on (index into `VISIT_MODES`).
-    pub visits: usize,
+    /// When others may change our Chao (`OthersChangeChao`).
+    pub lock: ChaoLock,
     /// Visitors 1..=4: a save slot, `VISITOR_AUTO` or `VISITOR_NONE`.
     pub visitors: [i32; MAX_CARRIED_CHAO],
     /// Mode of rooms we create.
     pub room_mode: crate::room::Mode,
+    /// Our player key (`PlayerKey`, 32 hex digits), once made.
+    pub key: Option<PlayerKey>,
 }
 
 /// Parses `key = value` lines; `;` and `#` start comments.
@@ -137,9 +139,11 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         name,
         name_tags,
         my_chao: get("mychao").trim().parse().unwrap_or(-1),
-        visits: parse_visits(get("visitwith")),
+        // Older files' `VisitWith` (visits on/off) is ignored: online, we always bring.
+        lock: ChaoLock::parse(get("otherschangechao")),
         visitors: std::array::from_fn(|i| parse_visitor(get(&format!("visitor{}", i + 1)))),
         room_mode: crate::room::Mode::parse(get("roommode")),
+        key: crate::net::roster::key_from_hex(get("playerkey").trim()),
         chao_race: !matches!(
             get("chaorace").to_ascii_lowercase().as_str(),
             "off" | "0" | "false" | "no"
@@ -236,7 +240,14 @@ struct Online {
     skins: SkinSync,
     /// Our skin as last told to the others, and when.
     skin_sent: Option<(String, Instant)>,
+    /// What we bring as last sent to the host (`Brought`: awake, then garden, row, copy
+    /// number and identity of each); `None` sends it again.
+    brought: Option<BroughtSeen>,
 }
+
+/// What a `Brought` said: our save loaded, our lock, then each Chao's garden, row, copy number
+/// and identity.
+type BroughtSeen = (bool, ChaoLock, Vec<(u8, u8, u8, u64)>);
 
 /// Our skin goes out again this often (for players who joined since).
 const SKIN_WORN_EVERY: Duration = Duration::from_secs(10);
@@ -295,7 +306,7 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
     puppet::set_name_tags(config.name_tags);
     crate::race::set_enabled(config.chao_race);
     set_my_chao(config.my_chao);
-    set_visits(config.visits);
+    set_lock(config.lock);
     for (i, slot) in config.visitors.into_iter().enumerate() {
         set_visitor(i, slot);
     }
@@ -304,6 +315,7 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
         name: config.name.clone(),
         mod_version: env!("CARGO_PKG_VERSION").into(),
         game_build: game::game_build(),
+        key: config.key.unwrap_or_else(player_key),
     };
     let now = Instant::now();
     let (session, rejoin) = match config.mode {
@@ -344,7 +356,65 @@ fn start(config: &Config) -> Result<Option<Online>, String> {
         rejoin,
         skins: SkinSync::new(skins_dir()),
         skin_sent: None,
+        brought: None,
     }))
+}
+
+static KEY: OnceLock<PlayerKey> = OnceLock::new();
+
+/// Our player key, if it has been read or made yet (for writing config.ini again).
+pub fn known_key() -> Option<PlayerKey> {
+    KEY.get().copied()
+}
+
+/// Our player key (config.ini `PlayerKey`): the host knows our Chao by it from one session to
+/// the next. Made once, at random, and written to config.ini (which updates never replace).
+pub fn player_key() -> PlayerKey {
+    *KEY.get_or_init(|| {
+        let dir = Path::new(mod_path());
+        let config = dir.join("config.ini");
+        let text = ["config.ini", "online.ini"]
+            .iter()
+            .find_map(|f| fs::read_to_string(dir.join(f)).ok());
+        if let Some(key) = text
+            .as_deref()
+            .and_then(|t| parse_config(t).ok())
+            .and_then(|c| c.key)
+        {
+            return key;
+        }
+        let key = new_key();
+        let mut text = text.unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "PlayerKey={}\n",
+            crate::net::roster::key_hex(&key)
+        ));
+        match fs::write(&config, text) {
+            Ok(()) => log!("online: made our player key (config.ini PlayerKey)"),
+            Err(e) => log!("online: can't write our player key to config.ini: {e}"),
+        }
+        key
+    })
+}
+
+/// 128 random bits (the standard library's hasher keys come from the system's randomness).
+fn new_key() -> PlayerKey {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut key = [0; 16];
+    for (i, half) in key.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_usize(i);
+        h.write_u128(nanos);
+        h.write_u32(std::process::id());
+        half.copy_from_slice(&h.finish().to_le_bytes());
+    }
+    key
 }
 
 /// Stops multiplayer (if running), telling the others we left.
@@ -527,11 +597,14 @@ fn pump(online: &mut Online, now: Instant) {
                 }
                 online.skin_sent = None;
                 online.resend_chao = true;
+                online.brought = None;
                 RESEND_MY_CHAO.store(true, Ordering::Relaxed);
             }
             Event::Disconnected { reason } => {
                 log!("online: disconnected: {reason}");
                 online.remote.clear();
+                crate::held::clear();
+                crate::garden::set_locked(Vec::new());
                 online.skins.stop();
                 crate::garden::player_left(None);
                 // A different version won't get any better by retrying.
@@ -741,7 +814,50 @@ fn pump(online: &mut Online, now: Instant) {
             Event::Game {
                 body: Body::ServerChao { area, owner, list },
                 ..
-            } => crate::garden::received_server(area, owner, list),
+            } => {
+                // A held Chao's stream: only for the ones the host told us of.
+                let list = if owner >= HELD_OWNER {
+                    crate::held::received_state(area, owner, list)
+                } else {
+                    list
+                };
+                crate::garden::received_server(area, owner, list);
+            }
+            Event::Game {
+                from,
+                body: Body::HeldChao { owner, index, chao },
+            } => {
+                if from == crate::garden::SERVER {
+                    crate::held::received(owner, index, chao);
+                }
+            }
+            Event::Game {
+                from,
+                body:
+                    Body::SaveChao {
+                        identity,
+                        nth,
+                        spans,
+                    },
+            } => {
+                if from == crate::garden::SERVER {
+                    crate::held::received_save(identity, nth, spans);
+                }
+            }
+            // To the host only.
+            Event::Game {
+                body: Body::Brought { .. },
+                ..
+            } => {}
+            // The Chao locked against us (only the host says so).
+            Event::Game {
+                from,
+                body: Body::ChaoLocked { chao },
+            } => {
+                if from == crate::garden::SERVER {
+                    crate::garden::set_locked(chao);
+                }
+            }
             Event::Game {
                 from,
                 body:
@@ -935,10 +1051,14 @@ fn pump(online: &mut Online, now: Instant) {
                     },
             } => {
                 // Changes to our own Chao, from the server (it runs the garden) or someone in our
-                // garden (they touched it): to our save.
+                // garden (they touched it): to our save. Not someone else's while our lock says
+                // no (the host drops those too).
                 let me = online.session.my_id();
                 let server = from == crate::garden::SERVER && game::in_garden();
-                if Some(owner) == me && (server || in_my_garden(online, from)) {
+                let area = game::current_chao_area().clamp(0, 3) as u8;
+                if Some(owner) == me
+                    && (server || (in_my_garden(online, from) && !lock().locks(area, area)))
+                {
                     crate::garden::received_changes(owner, index, changes);
                 }
             }
@@ -1207,9 +1327,19 @@ pub fn on_frame() {
     let mut guard = ONLINE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(online) = guard.as_mut() else {
         room::update(None, Vec::new());
+        crate::bring::set_friend_gardens(0);
         return;
     };
     let now = Instant::now();
+
+    // Gardens others are in (bit = area): ours there show only the Chao we bring (bring.rs).
+    let friend_gardens = online
+        .remote
+        .values()
+        .filter_map(|r| r.latest)
+        .filter(|s| s.level == game::LEVEL_CHAO_WORLD && (1..=3).contains(&s.chao_area))
+        .fold(0u8, |mask, s| mask | 1 << s.chao_area);
+    crate::bring::set_friend_gardens(friend_gardens);
 
     // Rooms: everyone's room, from their latest state.
     let others = online
@@ -1313,19 +1443,49 @@ pub fn on_frame() {
     if let Some(body) = crate::carried::on_frame(outside, &carriers) {
         online.session.send(body, true, now);
     }
+    if RESEND_BROUGHT.swap(false, Ordering::Relaxed) {
+        online.brought = None;
+    }
     if garden != online.garden || RESEND_GARDEN_CHAO.swap(false, Ordering::Relaxed) {
+        // Into or out of a garden, the save has its Chao as they are now: the host's held ones
+        // start from that.
         online.garden = garden;
         online.resend_chao = true;
+        online.brought = None;
     }
+    // What we bring to every garden, for the host to keep (and show while we're elsewhere).
+    if online.session.my_id().is_some()
+        && (online.brought.is_none() || online.frame.is_multiple_of(BROUGHT_EVERY_FRAMES))
+    {
+        let (awake, list) = brought_now();
+        let lock = lock();
+        let seen = (
+            awake,
+            lock,
+            list.iter()
+                .map(|c| (c.garden, c.row, c.nth, c.data.identity()))
+                .collect(),
+        );
+        if online.brought.as_ref() != Some(&seen) {
+            log!(
+                "online: bringing {} Chao in all to the shared gardens (others may change them: {}){}",
+                list.len(),
+                lock.ini(),
+                if awake { "" } else { " (save not loaded yet)" }
+            );
+            online.brought = Some(seen);
+            online
+                .session
+                .send(Body::Brought { awake, lock, list }, true, now);
+        }
+    }
+    crate::held::on_frame(garden);
     if online.resend_chao && garden > 0 && online.session.my_id().is_some() {
         online.resend_chao = false;
         // Sent in full just below: look changes count from here.
         online.sent_looks.clear();
         // Each visitor keeps its row number as its index (friends see "Regrant 2").
-        let rows = match VISITS.load(Ordering::Relaxed) {
-            VISITS_OFF => [const { None }; MAX_CARRIED_CHAO],
-            _ => carried_chao(garden),
-        };
+        let rows = carried_chao(garden);
         let mine: Vec<(usize, (usize, ChaoData))> = rows
             .into_iter()
             .enumerate()
@@ -1828,7 +1988,12 @@ pub fn on_frame() {
             flags: me.map_or(0, |m| m.flags)
                 | together::flags()
                 | crate::race::flags()
-                | crate::karate_live::flags(),
+                | crate::karate_live::flags()
+                | if game::between_areas() {
+                    game::POSE_LOADING
+                } else {
+                    0
+                },
             room: room::wire(),
             upgrades: me.map_or(0, |m| m.upgrades),
             action: me.map_or(0, |m| m.action),
@@ -1929,17 +2094,23 @@ pub fn set_my_chao(slot: i32) {
     RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
 }
 
-/// Visit friends: whether our Chao (up to 4 from the garden we're in) visit the others in it.
-pub const VISIT_MODES: [&str; 2] = ["Off (they stay home)", "On (up to 4 Chao from this garden)"];
-const VISITS_OFF: u8 = 0;
-const VISITS_ON: u8 = 1;
-static VISITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(VISITS_ON);
+/// Chao each player brings to a shared garden: every visitor row (`MAX_CARRIED_CHAO`, F9
+/// Visitor 1..4). The rest of theirs there stay home meanwhile (bring.rs).
+pub const BRING_CHAO: usize = MAX_CARRIED_CHAO;
 
-/// F9 / config: visits on or off (index into `VISIT_MODES`).
-pub fn set_visits(mode: usize) {
-    VISITS.store(mode.min(VISIT_MODES.len() - 1) as u8, Ordering::Relaxed);
-    // Takes effect right away: visiting Chao leave (or come) without re-entering the garden.
-    RESEND_GARDEN_CHAO.store(true, Ordering::Relaxed);
+/// When others may change our Chao (`ChaoLock::to_u8`).
+static LOCK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static RESEND_BROUGHT: AtomicBool = AtomicBool::new(false);
+
+/// F9 / config: when others may change our Chao. The host hears of it at once (`Brought`).
+pub fn set_lock(lock: ChaoLock) {
+    LOCK.store(lock.to_u8(), Ordering::Relaxed);
+    RESEND_BROUGHT.store(true, Ordering::Relaxed);
+}
+
+/// When others may change our Chao.
+pub fn lock() -> ChaoLock {
+    ChaoLock::from_u8(LOCK.load(Ordering::Relaxed)).unwrap_or_default()
 }
 
 static RESEND_GARDEN_CHAO: AtomicBool = AtomicBool::new(false);
@@ -1985,14 +2156,6 @@ pub fn parse_visitor(text: &str) -> i32 {
     }
 }
 
-/// Parses a `VisitWith` value ("Off" or "On"; older "Garden" and "MyChao" mean On).
-pub fn parse_visits(text: &str) -> usize {
-    match text.trim().to_ascii_lowercase().replace(' ', "").as_str() {
-        "off" | "none" => usize::from(VISITS_OFF),
-        _ => usize::from(VISITS_ON),
-    }
-}
-
 static MY_CHAO_SLOT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static RESEND_MY_CHAO: AtomicBool = AtomicBool::new(true);
 
@@ -2024,6 +2187,34 @@ pub fn karate_opponents() -> Vec<(Option<u8>, String)> {
     out
 }
 
+/// How often what we bring is looked at again (frames).
+const BROUGHT_EVERY_FRAMES: u32 = 120;
+
+/// What we bring to the shared gardens (`Body::Brought`): each garden's visitor rows (eggs
+/// stay out: the host holds only hatched Chao), with their copy numbers; and whether our save
+/// is loaded, so the host's changes to them reach it.
+fn brought_now() -> (bool, Vec<BroughtChao>) {
+    let awake = game::chao_in_memory();
+    let slots: Vec<Option<ChaoData>> = (0..game::GARDEN_SLOTS)
+        .map(|slot| game::read_chao_slot(slot).filter(|c| !c.is_empty()))
+        .collect();
+    let mut list = Vec::new();
+    for garden in 1..=3u8 {
+        for (row, pick) in carried_chao(i32::from(garden)).into_iter().enumerate() {
+            let Some((slot, chao)) = pick.filter(|(_, c)| c.chao_type() != chao::TYPE_EGG) else {
+                continue;
+            };
+            list.push(BroughtChao {
+                garden,
+                row: row as u8,
+                nth: crate::held::nth_of(&slots, slot),
+                data: Box::new(chao),
+            });
+        }
+    }
+    (awake, list)
+}
+
 /// Our visitors from `garden` (hatched Chao and eggs), by visitor row (save slot and Chao).
 fn carried_chao(garden: i32) -> [Option<(usize, ChaoData)>; MAX_CARRIED_CHAO] {
     // Only Chao living in this garden can visit from it (their real ones are here to follow).
@@ -2034,10 +2225,28 @@ fn carried_chao(garden: i32) -> [Option<(usize, ChaoData)>; MAX_CARRIED_CHAO] {
         .filter(|(_, c)| i32::from(c.garden()) == garden)
         .collect();
     here.sort_by_key(|(slot, _)| (Some(*slot) != mine, *slot));
-    let picks = VISITORS.each_ref().map(|v| v.load(Ordering::Relaxed));
+    let picks = bring_rows(VISITORS.each_ref().map(|v| v.load(Ordering::Relaxed)));
     let slots: Vec<usize> = here.iter().map(|(slot, _)| *slot).collect();
     pick_visitors(&slots, picks)
         .map(|slot| slot.and_then(|slot| here.iter().find(|(s, _)| *s == slot).cloned()))
+}
+
+/// The visitor rows that are used: the first `BRING_CHAO` (all of them now); any others bring
+/// nobody.
+fn bring_rows(mut picks: [i32; MAX_CARRIED_CHAO]) -> [i32; MAX_CARRIED_CHAO] {
+    for pick in picks.iter_mut().skip(BRING_CHAO) {
+        *pick = VISITOR_NONE;
+    }
+    picks
+}
+
+/// The save slots of the Chao (and eggs) we bring to `garden`.
+pub fn brought_slots(garden: i32) -> Vec<usize> {
+    carried_chao(garden)
+        .into_iter()
+        .flatten()
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 /// What the visitor rows come to in the garden we're in (None outside a garden).
@@ -2170,6 +2379,21 @@ mod tests {
             [Some(3), Some(0), Some(1), Some(6)]
         );
         assert_eq!(tidy_visitors([2, 2, 5, 2]), [2, auto, 5, auto]);
+        // Four are brought: every row counts; Auto takes the first four nobody chose.
+        assert_eq!(BRING_CHAO, 4);
+        assert_eq!(
+            pick_visitors(&[3, 0, 1, 6, 2], bring_rows([auto; 4])),
+            [Some(3), Some(0), Some(1), Some(6)]
+        );
+        assert_eq!(
+            pick_visitors(&[3, 0, 1, 6, 2], bring_rows([6, auto, 1, auto])),
+            [Some(6), Some(3), Some(1), Some(0)]
+        );
+        assert_eq!(
+            pick_visitors(&[3, 0, 1, 6, 2], bring_rows([auto, none, 2, auto])),
+            [Some(3), None, Some(2), Some(0)]
+        );
+        assert_eq!(bring_rows([1, none, 4, auto]), [1, none, 4, auto]);
         assert_eq!(parse_visitor("None"), none);
         assert_eq!(parse_visitor(" 4 "), 4);
         assert_eq!(parse_visitor("99"), auto);
@@ -2185,9 +2409,10 @@ mod tests {
                 name_tags: true,
                 chao_race: true,
                 my_chao: -1,
-                visits: 1,
+                lock: ChaoLock::Always,
                 visitors: [VISITOR_AUTO; MAX_CARRIED_CHAO],
                 room_mode: crate::room::Mode::Race,
+                key: None,
             }
         );
     }
@@ -2203,11 +2428,16 @@ mod tests {
                 name_tags: true,
                 chao_race: true,
                 my_chao: -1,
-                visits: 1,
+                lock: ChaoLock::Always,
                 visitors: [VISITOR_AUTO; MAX_CARRIED_CHAO],
                 room_mode: crate::room::Mode::Race,
+                key: None,
             }
         );
+        // Our key, as made once (a bad one is as none: a new one is made).
+        let c = parse_config("PlayerKey = 000102030405060708090a0b0c0d0e0f").unwrap();
+        assert_eq!(c.key, Some(std::array::from_fn(|i| i as u8)));
+        assert_eq!(parse_config("PlayerKey = 12zz").unwrap().key, None);
         let c = parse_config("MODE=client\nhost=10.0.0.5:27015").unwrap();
         assert_eq!(
             c.mode,
@@ -2246,6 +2476,18 @@ mod tests {
         );
         let c = parse_config("[Multiplayer]\nMode=Host\nPort=4000\n").unwrap();
         assert_eq!(c.mode, Mode::Host { port: 4000 });
+    }
+
+    #[test]
+    fn old_visit_key_is_ignored_and_the_lock_is_read() {
+        let c = parse_config("VisitWith=Off\nVisitor3=5\nOthersChangeChao=ThatGarden\n").unwrap();
+        assert_eq!(c.lock, ChaoLock::ThatGarden);
+        assert_eq!(c.visitors, [VISITOR_AUTO, VISITOR_AUTO, 5, VISITOR_AUTO]);
+        assert_eq!(
+            parse_config("OthersChangeChao = never").unwrap().lock,
+            ChaoLock::Never
+        );
+        assert_eq!(parse_config("").unwrap().lock, ChaoLock::Always);
     }
 
     #[test]

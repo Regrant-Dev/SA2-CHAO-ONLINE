@@ -1,23 +1,23 @@
 # Chao AI (garden)
 
-What a garden Chao thinks and does, for rebuilding it in Rust on the server. Mapped 2026-10-19 with
-REA on the dumped exe (sha256 d1ac8ed9…) by a mapping workflow: one core mapper, six section mappers,
-then one skeptical verifier per section that re-read the claims in REA and fixed or demoted what
-didn't hold. Builds on `chao.md`, `chao-garden-sync.md`, `chao-garden-items.md` and
-`chao-details.md` (cited, not repeated). Scope: garden Chao only (not races, karate, kindergarten
-classes, evolution).
+What a garden Chao thinks and does; the server's Chao simulation (`src/chao_sim/`) follows it.
+Addresses are for the dumped exe (sha256 d1ac8ed9…). Builds on `chao.md`, `chao-garden-sync.md`,
+`chao-garden-items.md` and `chao-details.md` (cited, not repeated). Scope: garden Chao only (not
+races, karate, kindergarten classes, evolution).
+
+Most behaviour routines have no Ghidra function object (`batch_decompile` reports "No procedure
+exists"), so they are decoded from raw bytes (REA `read_bytes`); constants are read the same way.
 
 Notation: `obj` ObjectMaster, `D` = Data1 (`obj+0x34`, 0x1D74 bytes), `W` = MOVE_WORK (`obj+0x38`),
 `rec` = save record (`D+0x5C`). BAMS: 0x10000 = 360°. Garden id `*0x134046C` (1 Neutral, 2 Hero, 3 Dark).
 
 Contents: 0 groundwork · 1 update and picker · 2A/2B behaviours · 3 emotions and needs ·
-4 stats, aging, personality · 5 movement · 6 interactions · behaviour table · open questions ·
-verification log.
+4 stats, aging, personality · 5 movement · 6 interactions · behaviour table · unknowns ·
+7 perception.
 
 ## 0. Groundwork
 
-The core mapper's starting point, kept as an index. It was not verified on its own: where a later
-section's "Corrections to the groundwork" disagrees, the later section is right.
+An index of the fields and helpers. The later sections give the exact behaviour.
 
 ### Fields the AI uses
 
@@ -73,7 +73,7 @@ section's "Corrections to the groundwork" disagrees, the later section is right.
 | rec+0xB0 | f32 | alignment | `0x59B900` |
 | rec+0xC0 | f32 | evolution progress (> 1.0 → cocoon) | `0x562800` |
 | rec+0x118 | u32 | animals learned → animal play `0x11C4BE0` | `0x5A2F10` |
-| rec+0x12A | u16 | once-latch for swim/run need changes | `0x561920`, `0x5A3000` |
+| rec+0x12A | u16 | need-period counter of the life tick; behaviours also use it as a once-per-period latch (§3.1) | `0x535957`, `0x536420`, `0x5A3000` |
 | rec+0x12C..0x133 | u8[8] | emotion bytes, index 0..7 of `0x54E930` | `0x54E930`, #16–#21 |
 | rec+0x134..0x148 | u16[11] | needs SLEEPY..THIRSTY, index 8..18 of `0x54E930` | `0x54E930` |
 | rec+0x14A.. | i8 | personality, index 19+ of `0x54E930`; AI reads 0x14A, 0x14B, 0x14C, 0x155 | `0x5626D0`, `0x5A1240`, `0x59F860`, `0x5A0B10` |
@@ -133,7 +133,7 @@ Notation as in `chao-garden-sync.md`: `obj` ObjectMaster, `D = obj+0x34` (Data1,
 
 All score comparisons in the picker are strict (`score > best`, FCOMPP + `TEST AH,5; JP`, for example `0x54EADB`), so a tie keeps the earlier candidate. Every "best < 1" gate is `FLD1; FCOMP best; TEST AH,0x41; JNP skip` (for example `0x562530`): the candidate runs only while best < 1.0.
 
-### 1.1 AI tick `0x53DC40` (EAX = obj), verified instruction by instruction
+### 1.1 AI tick `0x53DC40` (EAX = obj)
 ```
 if !(D+0xA0 & 0x10) return                                   // 0x53DC4E
 if (D+0xA0 & 0x2000) {                                       // "frozen think" path, 0x53DC56
@@ -159,7 +159,7 @@ if (D+0xA0 & 0x2000) {                                       // "frozen think" p
 }
 pop = 0x53D9B0; if it returns 0 (no next entry) -> AL_SetBehavior(0x565BE0, -1)   // 0x53DC8E..0x53DD36
 ```
-Return codes: 0 = keep running, 1 = done (pop), 2 = ask the picker, 3 = reset. **Correction to the draft:** a frame limit that is still running does not block the return code. When `D+0x47C[i] > 0` the counter is decremented and the return value is still handled. Only the frame on which the counter reaches 0 forces a pop and ignores `ret` (`0x53DCDE..0x53DCFF`).
+Return codes: 0 = keep running, 1 = done (pop), 2 = ask the picker, 3 = reset. A frame limit that is still running does not block the return code. When `D+0x47C[i] > 0` the counter is decremented and the return value is still handled. Only the frame on which the counter reaches 0 forces a pop and ignores `ret` (`0x53DCDE..0x53DCFF`).
 
 ### 1.2 Behaviour stack
 | Fn | Convention | Effect |
@@ -180,7 +180,7 @@ Current behaviour = `D+0x43C[D+0x438]` (read the same way at `0x53DB25`).
 |---|---|---|
 | `D+0x1D4` | lonely chooser branch B allowed only when 0 | `0x5A04DD` load, test at `0x5A067B` (assembly-checked) |
 | `D+0x1DC` | lonely chooser branch A allowed only when 0 | `0x5A04F2` (assembly-checked; `0x53E0C0` touches only EAX) |
-| `D+0x1F4` | toy cooldown: the toy chooser needs 0. The horse ride (`0x598F40` mode 3, when `--D+0x1C0 ≤ 0`) sets it to `1800 − trunc(r·−1801)` = `1800 + trunc(r·1801)` (1800..3600, `0x906268` = −1801.0, FPU truncate), then `D+0xA0 \|= 2` and `AL_SetBehavior(0x598E90,-1)`, then returns 1, so the tick pops the fresh queue and settles (`0x565BE0`); the dismount never runs | `0x599B6A`; `0x599166..0x5991E5` (re-checked) |
+| `D+0x1F4` | toy cooldown: the toy chooser needs 0. The horse ride (`0x598F40` mode 3, when `--D+0x1C0 ≤ 0`) sets it to `1800 − trunc(r·−1801)` = `1800 + trunc(r·1801)` (1800..3600, `0x906268` = −1801.0, FPU truncate), then `D+0xA0 \|= 2` and `AL_SetBehavior(0x598E90,-1)`, then returns 1, so the tick pops the fresh queue and settles (`0x565BE0`); the dismount never runs | `0x599B6A`; `0x599166..0x5991E5` |
 | `D+0x20C` | when non-zero, forces the hunger chooser into its "look for fruit" branch | `0x59EB09` |
 | `D+0x210` | drowsy cooldown. Rewritten on EVERY picker run, whatever the gate: `trunc(600 + 2400*0.5*((10000-SLEEPY)/10000 + r))`, giving 600..3000 frames | `0x54EA3C..0x54EACA` (`0x1312E5C`=600, `0x1312E60`=2400, `0x904E98`=0.5, `0x904F50`=10000.0, FPU control `OR 0xC00` = truncate) |
 
@@ -199,14 +199,14 @@ Current behaviour = `D+0x43C[D+0x438]` (read the same way at `0x53DB25`).
 | water `0x561630` | If held (`D+4 & 0x8000`), clears `D+0x1B4` bit 0x1 and returns 0. Water surface `W+0xDC` by area `*0x134046C`: 1 → -2.2 (`0x905C50`), 2 → -1.5 (`0x9055D0`), 3 → -1.0 (`0xB087CC`), else -10000.0 (`0x905B6C`). In water when `D.y + 2.0 (0x904F78) < surface`. | First frame in water (`D+0x1B4 & 1` clear): sets bit 0x1, plays sound id `0x1020` via `0x4372E0` (ESI=&pos, push 0,0,0) if `*0x134046C == *0x134062C`, then `AL_SetBehavior(0x562330,-1)`. Every frame in water: if `W+4 < 0`, `W+4 *= 0.1` (`0x905030`); `D+0x1B4 |= 4`; returns 1. Out of water: `D+0x1B4 &= ~5`, returns 0. | `0x561643..0x56173C` |
 | whistle `0x5637B0` | `*(u8*)*0x1DEA6C0 == 0x2A` and squared 3D distance (player `+0x14..0x1C` vs `D+0x14..0x1C`) < 10000.0 (`0x905664`) | `0x5634D0` only if the i8 `bond[c].like` (`rec+0x16C+c*6`, c=`0x53E0C0`) > 50; returns 1 either way | `0x5637B1..0x56381C` |
 | ball `0x563B70` | `*0x1DBE574 != 0` (ball in mode 1 with speed > 0.4, `0x55D373`); TEDIOUS `rec+0x13C > 4000`; `0x77FBD0(D+0x14, (*0x1DBE570)->D+0x14) < 50.0` (`0x905048`) | TEDIOUS = clamp(TEDIOUS − 2000, 0, 10000), then `0x563830` | `0x563B70..0x563BE7` |
-| hat `0x5691B0` | cur ∉ {0x5607C0, 0x54EF10, 0x569240}; `0x486760(obj,0x93)` hit with other obj (`+4`) ≠ NULL; if that obj has an ALW entry (`+0x3C`), entry `+6 & 2` (Chao-held) must be clear | `W+0x54..0x5C = other D+0x14..0x1C`; `AL_SetBehavior(0x569240,-1)`; returns 1 | `0x5691B0..0x569236` (re-checked) |
-| `0x567560` | cur ∉ {0x54EF10, 0x5607C0, 0x567640}; `rec+0x3C` ×1 if area `*0x134046C` is 6 or 10..11, else ×3, must be ≥ u16 `*0x1312D6E` (=150, unsigned `JB`); no mutual partner (ALW `+0x40`, partner `+0x40 == entry`); `0x486760(obj,0x85)` other obj ≠ NULL; `0x5304D0(EAX=other obj) == 0`; no Chao-held test | `W+0x54..0x5C = other pos`; `AL_SetBehavior(0x567640,-1)`; returns 1 | `0x567560..0x567630`, `0x1312D6E` (re-checked) |
-| fruit `0x560640` | cur ∉ {0x5607C0, 0x54EF10, 0x5606D0}; touch kind 0x83, other obj ≠ NULL, not Chao-held (skipped if no ALW entry) | `W+0x54..0x5C = fruit pos`; `AL_SetBehavior(0x5606D0,-1)`; returns 1 | `0x560640..0x5606C6` (re-checked) |
-| animal `0x566BC0` | cur ∉ {0x566DF0, 0x566C40}; touch kind 0x87, other obj ≠ NULL, not Chao-held (skipped if no ALW entry) | `W+0x54..0x5C = animal pos`; `AL_SetBehavior(0x566C40,-1)`; returns 1 | `0x566BC0..0x566C3F` (re-checked) |
-| `0x564760` | cur != 0x5647B0; `0x486760(obj,0xA2)` with other obj (`+4`) ≠ NULL | `AL_SetBehavior(0x5647B0, 500)` (no target pos); returns 1 | `0x564760..0x5647AF` (re-checked) |
-| held `0x566720` | cur ∉ {0x566670, 0x5660A0, 0x5662B0, 0x566300, 0x566580}; Status `D+4 & 0x8000` | `W+0x1C = (*0x1DEA6C0)+0xC + D+0xC − 0xFA0` (player rotY + own rotY − 4000); `a = 0x7969B0(EAX=obj, ECX=0)`; `W+0x18 = 0xC000` if \|s16(D+0xC − a)\| < 0x4000, else `0x4000`; `W+0x0..0x14` (6 floats) = 0.0; `AL_SetBehavior(0x566670,-1)`; then `0x565B50(obj)` (cdecl); returns 1 | `0x566720..0x566806` (re-checked) |
-| pet `0x564C10` | cur ∉ {0x5648A0, 0x54FCF0, 0x59FCA0, 0x59F970, 0x59FA50}; `D+4 & 1`; `0x54B1F0(2)` (ECX=1, EDX=obj) ≠ 0 | `AL_SetBehavior(0x5648A0,-1)`; returns 1 | `0x564C10..0x564C7C` (re-checked) |
-| hit `0x563D30` | cur ∉ {0x563EB0, 0x568D30, 0x568F60}; `D+4 & 4`; `atk = 0x486800(obj,1)` then `+4`. `D+4 &= ~4` once the cur and flag tests pass, even when atk is NULL; nothing is cleared while cur is excluded | `n` = normalise (`0x77F3A0`) of (atk.x − x, ?, atk.z − z) (y slot never written). `W+0 = −n.x·0.8` (`0x905230`), `W+4 = 1.5` (`0x1283DDC`), `W+8 = −n.z·0.8`. `AL_SetBehavior(0x563EB0,-1)`. Hat drop if `rec+0xD5 ≠ 0`: first free slot (u16 == 0xFFFF) among 24×0x14 at `0x19F6460 + (*0x173D06C==1)·0xCA6C + 0x4D8`; none free → keeps the hat; else `0x54A540(hat, &D+0x14, random BAMS trunc(r·360·182.044), W, slot)`, `rec+0xD5 = 0`. Returns 1 | `0x563D30..0x563EAB` (re-checked) |
+| hat `0x5691B0` | cur ∉ {0x5607C0, 0x54EF10, 0x569240}; `0x486760(obj,0x93)` hit with other obj (`+4`) ≠ NULL; if that obj has an ALW entry (`+0x3C`), entry `+6 & 2` (Chao-held) must be clear | `W+0x54..0x5C = other D+0x14..0x1C`; `AL_SetBehavior(0x569240,-1)`; returns 1 | `0x5691B0..0x569236` |
+| `0x567560` | cur ∉ {0x54EF10, 0x5607C0, 0x567640}; `rec+0x3C` ×1 if area `*0x134046C` is 6 or 10..11, else ×3, must be ≥ u16 `*0x1312D6E` (=150, unsigned `JB`); no mutual partner (ALW `+0x40`, partner `+0x40 == entry`); `0x486760(obj,0x85)` other obj ≠ NULL; `0x5304D0(EAX=other obj) == 0`; no Chao-held test | `W+0x54..0x5C = other pos`; `AL_SetBehavior(0x567640,-1)`; returns 1 | `0x567560..0x567630`, `0x1312D6E` |
+| fruit `0x560640` | cur ∉ {0x5607C0, 0x54EF10, 0x5606D0}; touch kind 0x83, other obj ≠ NULL, not Chao-held (skipped if no ALW entry) | `W+0x54..0x5C = fruit pos`; `AL_SetBehavior(0x5606D0,-1)`; returns 1 | `0x560640..0x5606C6` |
+| animal `0x566BC0` | cur ∉ {0x566DF0, 0x566C40}; touch kind 0x87, other obj ≠ NULL, not Chao-held (skipped if no ALW entry) | `W+0x54..0x5C = animal pos`; `AL_SetBehavior(0x566C40,-1)`; returns 1 | `0x566BC0..0x566C3F` |
+| `0x564760` | cur != 0x5647B0; `0x486760(obj,0xA2)` with other obj (`+4`) ≠ NULL | `AL_SetBehavior(0x5647B0, 500)` (no target pos); returns 1 | `0x564760..0x5647AF` |
+| held `0x566720` | cur ∉ {0x566670, 0x5660A0, 0x5662B0, 0x566300, 0x566580}; Status `D+4 & 0x8000` | `W+0x1C = (*0x1DEA6C0)+0xC + D+0xC − 0xFA0` (player rotY + own rotY − 4000); `a = 0x7969B0(EAX=obj, ECX=0)`; `W+0x18 = 0xC000` if \|s16(D+0xC − a)\| < 0x4000, else `0x4000`; `W+0x0..0x14` (6 floats) = 0.0; `AL_SetBehavior(0x566670,-1)`; then `0x565B50(obj)` (cdecl); returns 1 | `0x566720..0x566806` |
+| pet `0x564C10` | cur ∉ {0x5648A0, 0x54FCF0, 0x59FCA0, 0x59F970, 0x59FA50}; `D+4 & 1`; `0x54B1F0(2)` (ECX=1, EDX=obj) ≠ 0 | `AL_SetBehavior(0x5648A0,-1)`; returns 1 | `0x564C10..0x564C7C` |
+| hit `0x563D30` | cur ∉ {0x563EB0, 0x568D30, 0x568F60}; `D+4 & 4`; `atk = 0x486800(obj,1)` then `+4`. `D+4 &= ~4` once the cur and flag tests pass, even when atk is NULL; nothing is cleared while cur is excluded | `n` = normalise (`0x77F3A0`) of (atk.x − x, ?, atk.z − z) (y slot never written). `W+0 = −n.x·0.8` (`0x905230`), `W+4 = 1.5` (`0x1283DDC`), `W+8 = −n.z·0.8`. `AL_SetBehavior(0x563EB0,-1)`. Hat drop if `rec+0xD5 ≠ 0`: first free slot (u16 == 0xFFFF) among 24×0x14 at `0x19F6460 + (*0x173D06C==1)·0xCA6C + 0x4D8`; none free → keeps the hat; else `0x54A540(hat, &D+0x14, random BAMS trunc(r·360·182.044), W, slot)`, `rec+0xD5 = 0`. Returns 1 | `0x563D30..0x563EAB` |
 
 ### 1.5 Picker `0x562A80` (EAX=obj); runs only when the behaviour returned 2 and `D+0x1CC == 0`
 1. `best = 0.2` (`0x1312DF4`, `0x562A81`). `0x590C70` refreshes perception (EBX=obj; this is its only caller, `0x562A99`). Then `D+0x1CC = D+0x1CE = 0` (`0x562AAA`).
@@ -219,7 +219,7 @@ Shared scoring helpers (assembly-checked):
 - `f8(v,t)` = same with 200 (u16 `0x1312C80`). `0x562490`.
 - jitter: `s = s*0.4 + r*(1−0.4)*s`, so `s*(0.4+0.6r)`. `0x5624D0` (ESI = &s; 0.4 at `0x1312DF0`).
 
-Needs (u16, 0..10000) are named after the debug labels in record order `0x134..0x148`: SLEEPY, SLPDPTH, HUNGER, BREED, TEDIOUS, LONELY, TIRE, STRESS, NOURISH, CONDITN, THIRSTY (mapping by order only, see open questions).
+Needs (u16, 0..10000) are named after the debug labels in record order `0x134..0x148`: SLEEPY, SLPDPTH, HUNGER, BREED, TEDIOUS, LONELY, TIRE, STRESS, NOURISH, CONDITN, THIRSTY (mapping by order only; the label table has no xrefs).
 
 | # | Candidate | Gate | Score | Installs | Side effects |
 |---|---|---|---|---|---|
@@ -272,22 +272,20 @@ Default `0x562D20` (bytes at `0x562D20..0x562D4F`, not a Ghidra function): `if (
 
 ## 2A. Behaviour routines (part A)
 
-Method: Ghidra has no functions at most of these entries, so each routine was read as raw bytes from the REA session (`read_bytes`, sha256 d1ac8ed9…) and decoded instruction by instruction. Constants come from REA reads of the referenced data addresses. Verifier note: rows marked (V) were re-decoded and re-checked by the verifier. Everything else is the drafter's decode and was not contradicted.
+### 2A.0 Conventions and helpers these routines rely on
 
-### 2A.0 Conventions and helpers these routines rely on (new or corrected)
-
-- **Behaviour signature (V):** `int fn(ObjectMaster* obj)`, cdecl. The AI tick `0x53DC40` runs only when `D+0xA0 & 0x10` (`0x53DC4E`). It has **two paths**:
+- **Behaviour signature:** `int fn(ObjectMaster* obj)`, cdecl. The AI tick `0x53DC40` runs only when `D+0xA0 & 0x10` (`0x53DC4E`). It has **two paths**:
   - **Normal path (`D+0xA0 & 0x2000` clear, the garden case; CreateChao clears 0x2000, see chao-garden-sync.md):**
     1. Think timers `0x562C00`, then interrupts `0x53DB10`, then the current slot's fn. An empty slot counts as return 1 (`0x53DCC7`).
     2. **Frame limit:** if `D+0x47C[idx] > 0`, it is decremented. When it reaches 0 the entry is popped, whatever the routine returned (`0x53DCD2`–`0x53DCFA`).
     3. Return **2** runs the picker `0x562A80`, but only when `word D+0x1CC == 0`. It then always calls `0x562C50(EAX = D+0x1CC)` (`0x53DCFC`–`0x53DD1F`).
     4. Return **1** pops the entry (`0x53DC83`). Return **3** resets to `0x565BE0` (`0x53DD28`). Any other value (0, a pointer, …) does nothing.
   - **`D+0xA0 & 0x2000` set:** no think timers and no frame-limit countdown. Only return 1 (pop) and return 3 (reset) are handled. **Return 2 is ignored** (`0x53DC5F`–`0x53DC95`).
-- **The "stack" is a FIFO queue (V).** `D+0x434` is the count, `D+0x438` the read index, `D+0x43C[16]` the fns and `D+0x47C[16]` the frame limits.
+- **The "stack" is a FIFO queue.** `D+0x434` is the count, `D+0x438` the read index, `D+0x43C[16]` the fns and `D+0x47C[16]` the frame limits.
   - **Pop `0x53D9B0`:** clears mode `D+0x1B6`, `D+0x1B8`, `D+0x1C0` and `D+0x1C4`. Sets `D+0x1C8 = 3600`, saves the popped fn in `D+0x430`, decrements the count and increments the index. Returns 0 when the next slot is null. On that return the tick calls `SetBehavior(0x565BE0)` (`0x53DD2D`).
   - **SetBehavior `0x53D890(EAX=obj, push fn, push limit)`:** clears the same fields and sets `D+0x1C8 = 3600`. Saves the current fn in `D+0x430`, clears all 16 slots and puts fn in slot 0 (count 1, index 0, limit = arg). Then zeroes `D+0x41C`, sends mailbox 3 to a mutual ALW partner, and tail-calls cleanup `0x53D760`.
   - **Push `0x53D970(EAX=obj, EDX=fn)`:** appends at `slot[count]` with limit −1, but only when count < 15.
-- **`0x53DA00` "resume previous" (V):** swaps the current slot with `D+0x430`. Zeroes mode, `D+0x1B8`, `D+0x1C0`, `D+0x1C4`, **`D+0x41C`** and `D+0x1BC`, and sets `D+0x1C8 = 3600`. Sends mailbox 3 to a mutual partner and runs `0x53D760`. `0x562D50` uses it to hand control back to the walk it interrupted. The resumed walk starts again at mode 0 with `W+0x54` unchanged.
+- **`0x53DA00` "resume previous":** swaps the current slot with `D+0x430`. Zeroes mode, `D+0x1B8`, `D+0x1C0`, `D+0x1C4`, **`D+0x41C`** and `D+0x1BC`, and sets `D+0x1C8 = 3600`. Sends mailbox 3 to a mutual partner and runs `0x53D760`. `0x562D50` uses it to hand control back to the walk it interrupted. The resumed walk starts again at mode 0 with `W+0x54` unchanged.
 - **Motion table fields used:**
   - `D+0xAE` = posture (MotionTable+2) = entry +6 copied to `D+0xAE` when a motion starts (not when a link begins): 0 standing, 1 sitting, 2 lying, 3 on the belly (crawl/trip), 4/5 other (chao-garden-sync.md, MotionTable timing).
   - `D+0xB0` = current motion id.
@@ -299,47 +297,47 @@ Method: Ghidra has no functions at most of these entries, so each routine was re
   - +0x0..8 velocity.
   - +0xC/+0x14 horizontal drive, set from facing (`sin/cos(D+0xC)·speed`).
   - +0x10 vertical force, set to `−W+0x48·k`.
-  - +0x1C bearing to target (BAMS); `0x530510` writes it (V).
+  - +0x1C bearing to target (BAMS); `0x530510` writes it.
   - +0x13C reference Y.
-  - +0x140..0x148 a vector; the walk step computes `0·x + y + 0·z` of it and compares that with 0.7 (`0x5A30E8`–`0x5A311C`) (V).
+  - +0x140..0x148 a vector; the walk step computes `0·x + y + 0·z` of it and compares that with 0.7 (`0x5A30E8`–`0x5A311C`).
   - +0x40 flags: 0x400 on ground, 0x4000 wall.
-- **`0x796910(EAX=obj, push maxTurn)`:** turns `D+0xC` toward `W+0x54`. Returns |remaining difference|. `0x56B500` treats a value < 0xB6 as facing (V, `0x56B54A`).
-- **`0x530510(EAX=obj, push rate)` (V):** target = `entry(+0x3C)→+0x44→+0x3C` object. Writes `W+0x1C = 0x54B0A0(...)`, turns `D+0xC` via `0x446960` and returns the |difference|.
-- **`0x530580(ECX=obj)` (V):** distance (`0x77FBD0`) to that target. With no link it returns **0.0** (distance from the Chao to itself; the −1.0 `0xB087CC` path at `0x5305B6` needs a null saved ECX, see §2B `0x567FA0`).
+- **`0x796910(EAX=obj, push maxTurn)`:** turns `D+0xC` toward `W+0x54`. Returns |remaining difference|. `0x56B500` treats a value < 0xB6 as facing (`0x56B54A`).
+- **`0x530510(EAX=obj, push rate)`:** target = `entry(+0x3C)→+0x44→+0x3C` object. Writes `W+0x1C = 0x54B0A0(...)`, turns `D+0xC` via `0x446960` and returns the |difference|.
+- **`0x530580(ECX=obj)`:** distance (`0x77FBD0`) to that target. With no link it returns **0.0** (distance from the Chao to itself; the −1.0 `0xB087CC` path at `0x5305B6` needs a null saved ECX, see §2B `0x567FA0`).
 - **`0x54B0E0(EAX=obj, push f)`:** moves the position directly by `facing·f` (no physics).
-- **ALW links and mailbox (V):** ALW entry = `obj+0x3C`; the partner pointer is entry+0x40.
+- **ALW links and mailbox:** ALW entry = `obj+0x3C`; the partner pointer is entry+0x40.
   - `0x530730(EAX=obj, EDX=msg)` writes msg into the partner entry's +0x34, only when the link is mutual.
   - `0x530710` reads and clears your own +0x34.
   - `0x5306D0` returns the mutual partner entry. `0x5306F0(EAX, push cat)` does the same but also requires partner word +0 == cat.
   - `0x530640` links both ways. Both +0xC get the same link id from the counter `0x1A5B5EC` (mod 256).
   - `0x530690` unlinks: clears own +0x6 and +0x40 and sets +0xC = −1. When the link is mutual it also clears the partner's +0x6 and +0x40. The partner's +0xC is set to −1 either way.
-  - `0x5304F0` sets the target (+0x44), not re-verified.
-- **`rec+0x12A` once-latch (V).** `rec = D+0x5C`. `0x536420(EAX=obj)` returns 1 and sets the word to 1 only when it was 0, otherwise it returns 0. The eat bite calls it (`0x560E3F`). The walk step (`0x5A3151`–`0x5A3161`) and the sleep tick (`0x54EC7C`–`0x54EC8C`) **inline the same check-and-set** instead of calling it. Who clears it is unknown (open question).
+  - `0x5304F0` sets the target (+0x44).
+- **`rec+0x12A` once-latch.** `rec = D+0x5C`. `0x536420(EAX=obj)` returns 1 and sets the word to 1 only when it was 0, otherwise it returns 0. The eat bite calls it (`0x560E3F`). The walk step (`0x5A3151`–`0x5A3161`) and the sleep tick (`0x54EC7C`–`0x54EC8C`) **inline the same check-and-set** instead of calling it. The life tick resets the word to 0 at each need period (§3.1).
 - **`0x56CFB0` (ESI=chao, ECX=item):** links to the item, sets partner flag +6 |= 2, sets `D+0xA0 |= 0xC00`, holds the item.
-- **`0x56CFF0(ECX=chao)` (V):** returns 0 unless `entry+0x40` is set and links back (`0x56D008`–`0x56D01C`, `0x56D163`). Otherwise it positions the item at the hand nodes `D+0x5D8/0x5E4` and returns 1 (`0x56D152`).
-- `0x565BC0` (cdecl obj): if the balloon `*0x1AED28C` belongs to this Chao, sets its mode byte to 6 (meaning unknown). The eat tail at `0x561350` sets it to 7 and clears the global (V).
-- **`AddHappiness 0x536320(ESI=obj, EDI=delta, push f)` (V):**
+- **`0x56CFF0(ECX=chao)`:** returns 0 unless `entry+0x40` is set and links back (`0x56D008`–`0x56D01C`, `0x56D163`). Otherwise it positions the item at the hand nodes `D+0x5D8/0x5E4` and returns 1 (`0x56D152`).
+- `0x565BC0` (cdecl obj): if the balloon `*0x1AED28C` belongs to this Chao, sets its mode byte to 6 (meaning unknown). The eat tail at `0x561350` sets it to 7 and clears the global.
+- **`AddHappiness 0x536320(ESI=obj, EDI=delta, push f)`:**
   1. `rec+0x82 += delta`, clamped −100..100 (`0x536326`–`0x536345`).
   2. If `*0x1DE9600` is non-null and its byte +1 ≤ 8, calls `0x536260(±f)`. The sign comes from the table at `0x5363B8`/`0x5363AC`, indexed by that byte (`0x53634C`–`0x53637E`).
   3. Calls `0x53E120`.
 - Wall-hit kinds: `0x486760(obj,0xCB)` = climbable hit (C_CLIMB boxes). `0x54B1F0(ECX=1, EDX=obj, push 0xCC)` = obstacle signal (Hero HASIRA/HASIRAKAKE, Dark fences and graves). Both: garden-collision.md §8.
 - Sound `0x4372E0` / `0x437590` (EDI id, ESI &pos, 3 pushes) plays only when `*0x134046C == *0x134062C`. Ids are raw.
-- **Random ranges:** the code uses `a − trunc(r·k)` with k negative, r = rand()/32768 (`0x904E90` = 2^-15), and FPU control word |0xC00 (truncate). With k = −(n+1) that gives an integer uniform in **a..a+n**. Ranges below use that form; the verified k constants are given where they matter.
+- **Random ranges:** the code uses `a − trunc(r·k)` with k negative, r = rand()/32768 (`0x904E90` = 2^-15), and FPU control word |0xC00 (truncate). With k = −(n+1) that gives an integer uniform in **a..a+n**. Ranges below use that form; the k constants are given where they matter.
 
 ### 2A.1 Walking and movement
 
 | Routine | Start (mode 0) | Per frame | Ends |
 |---|---|---|---|
-| `0x562D20` wander (V) | If `*0x1A1693C` > 0, `0x534F80(EAX=0x1A1693C, EDI=&W+0x54, push count)` picks a destination. Then `0x5A3650` (`0x562D44`) | – | returns 0. `0x5A3650` has already replaced it |
-| `0x5A3650` install walk (V) | Run points `p = rec+0x3C`, ×3 unless `*0x134046C` is 6, 10 or 11 (`0x5A3650`–`0x5A3671`). p<150 (`0x1312D6E`): `Set(0x55C430)` + push `0x5A3280`. p<2000 (`0x1312D70`): `Set(0x55C3C0)` + push `0x5A3380`. p<4000 (`0x1312D72`): `Set(0x55C3C0)` + push `0x5A3460`. Otherwise `Set(0x55C3C0)` + push `0x5A3580`. All frame limits −1. Pushes are skipped when count ≥ 15 | – | – |
+| `0x562D20` wander | If `*0x1A1693C` > 0, `0x534F80(EAX=0x1A1693C, EDI=&W+0x54, push count)` picks a destination. Then `0x5A3650` (`0x562D44`) | – | returns 0. `0x5A3650` has already replaced it |
+| `0x5A3650` install walk | Run points `p = rec+0x3C`, ×3 unless `*0x134046C` is 6, 10 or 11 (`0x5A3650`–`0x5A3671`). p<150 (`0x1312D6E`): `Set(0x55C430)` + push `0x5A3280`. p<2000 (`0x1312D70`): `Set(0x55C3C0)` + push `0x5A3380`. p<4000 (`0x1312D72`): `Set(0x55C3C0)` + push `0x5A3460`. Otherwise `Set(0x55C3C0)` + push `0x5A3580`. All frame limits −1. Pushes are skipped when count ≥ 15 | – | – |
 | `0x55C3C0` stand-up prelude A | posture `D+0xAE`: 1 → motion 0x30 blend 40; 2 → 0x26 blend 40; 3 → 0x26 blend 35; other → return 1 at once (`0x55C3E9`) | – | end pulse → 1 |
 | `0x55C430` stand-up prelude B | posture 0 → 0x2F blend 40; 2 → 0x2A blend 40; 3 → 0x2A blend 35; other → 1 (`0x55C459`) | – | end pulse → 1 |
-| `0x5A3280` slow walk (V) | motion 0x73 (a crawl, posture 3; inferred from the posture data) | When `D+0x30 % 120 == 0` and r<**0.3** (`0x9050C8`): sound 0x6014 if r<0.5, else 0x6015. On ground: drive = facing·**0.038** (`0x1312C6C`). `D+0xB8` is not set | tail-calls `0x5A3000` |
-| `0x5A3380` walk (V) | motion 0x64 | When `D+0x1C0 % 85 == 1` (value before the increment) and r<**0.03** (`0x905000`) → `SetBehavior(0x562D50)`. Drive **0.055** (`0x1312C68`). `D+0xB8 = |v|·16` (`0x9052D0`) | `0x5A3000` |
-| `0x5A3460` jog (V) | motion 0x65 | When `D+0x1C0 % 100 == 0` and r<**0.02** (`0x9054C0`) → `0x562D50`. Drive `0.028 + 7e-6·p` (`0x1312D74`, `0x1312D78`; p scaled as above). `D+0xB8 = |v|·14` (`0x9052E0`) | `0x5A3000` |
+| `0x5A3280` slow walk | motion 0x73 (a crawl, posture 3; inferred from the posture data) | When `D+0x30 % 120 == 0` and r<**0.3** (`0x9050C8`): sound 0x6014 if r<0.5, else 0x6015. On ground: drive = facing·**0.038** (`0x1312C6C`). `D+0xB8` is not set | tail-calls `0x5A3000` |
+| `0x5A3380` walk | motion 0x64 | When `D+0x1C0 % 85 == 1` (value before the increment) and r<**0.03** (`0x905000`) → `SetBehavior(0x562D50)`. Drive **0.055** (`0x1312C68`). `D+0xB8 = |v|·16` (`0x9052D0`) | `0x5A3000` |
+| `0x5A3460` jog | motion 0x65 | When `D+0x1C0 % 100 == 0` and r<**0.02** (`0x9054C0`) → `0x562D50`. Drive `0.028 + 7e-6·p` (`0x1312D74`, `0x1312D78`; p scaled as above). `D+0xB8 = |v|·14` (`0x9052E0`) | `0x5A3000` |
 | `0x5A3580` run | motion 0x66 | Drive `0.028 + 7e-6·p`. `D+0xB8 = |v|·14` | `0x5A3000` |
 
-**Walk step `0x5A3000` (ESI=obj) (V)**, run every frame by the four walks:
+**Walk step `0x5A3000` (ESI=obj)**, run every frame by the four walks:
 1. If `dx²+dz²` to `W+0x54` < **36.0** (`0x8AE5DC`) → return 1 (`0x5A3029`). The walks have **no timeout**.
 2. Wall bit `W+0x40&0x4000`: if `0x486760(obj,0xCB)` returns a hit with +4≠0 → `SetBehavior(0x562EB0)` and `D.y(D+0x18) += 0.1` (`0x905030`). Otherwise → `SetBehavior(0x56B740)` (`0x5A3040`–`0x5A308D`).
 3. `D+0x6` (u16) is incremented. When its old value is > 30, `0x54B1F0(0xCC)` is checked; a hit → `0x56B740` (`0x5A3090`–`0x5A30C7`). Nothing here resets `D+0x6`.
@@ -356,22 +354,22 @@ The walk keeps running after it calls SetBehavior in steps 2, 3, 5 and 6, so the
 
 | Routine | Start | Per frame | Ends |
 |---|---|---|---|
-| `0x5A0F40` hop (V) | eyes 1, mouth 2, motion 0x8A. v = facing·**0.4** (`0x904EB0`), vy = **0.35** (`0xA3D28C`). Mode 1 | `W+0x10 = −g(W+0x48)·0.45` (`0x905398`) | on ground → `SetBehavior(0x562D20)` (re-wander) (`0x5A0F68`) |
+| `0x5A0F40` hop | eyes 1, mouth 2, motion 0x8A. v = facing·**0.4** (`0x904EB0`), vy = **0.35** (`0xA3D28C`). Mode 1 | `W+0x10 = −g(W+0x48)·0.45` (`0x905398`) | on ground → `SetBehavior(0x562D20)` (re-wander) (`0x5A0F68`) |
 | `0x5630C0` glide | eyes 5, motion 0x82 blend 15, v = facing·0.4, vy = 0.35. `D+0x1C0` = 300..600 | `0x796910(0x100)`. Drive = facing·0.05 − v·0.1. `W+0x10 = −g·0.95` while `D+0x1C0` > 0, then `−g·0.92`. If `D.y > 100` → clamp to 100.0 (`0xC5D234`) | on ground → `0x562D20` |
-| `0x56B740` wall bump (V) | motion 0x64 blend 15. r<0.5 → mode 1, turning `+0x16C`/frame; otherwise mode 2, turning `−0x16C`/frame (±2°). Count `D+0x1C0 = 45 + trunc(46r)` = 45..90 (`0x905A68` = −46) | rotate `D+0xC`. `D+0xB8 = 1.6` (`0x1708AA4`) | count done → 1. The queue now holds nothing, so reset follows |
-| `0x56B860` turn around (V, **new**) | motion 0x64 blend 15. 50/50 direction ±0x16C/frame. Count fixed **90** (`0x56B937`), i.e. 180° | rotate. `D+0xB8 = 1.6` | count done → 1. Caller unknown |
-| `0x56B960` random turn (**not** "toward bed") (V) | motion 0x64 blend 15. ±2°/frame, 50/50. Count = trunc(r·91) = 0..90 (`0x905A60` = 91.0), stored as u16 | same | 1 |
-| `0x56B500` face target (V) | motion 0x64 blend 15. `D+0x1C0 = 60` (unused) | `0x796910(0x200)` on every frame, including the first | returns 1 once the angle error < 0xB6 (≈1°) (`0x56B54A`) |
-| `0x56B6C0` face ALW target (V) | motion 0x64 blend 15. Count 90, mode 1 | while count > 0: `0x530510(0x200)`. `D+0xB8 = 1.6` | count exhausted → 1 |
-| `0x56B560` walk to `W+0x54` (V) | mode 0, every frame: eyes 4 (`0x53A4B0` EDX=4) and `D+0x1C8 = 1800` (the timeout restarts). The first 32 frames it stands still. When the `D+0x1C0` old value > 30: motion 0x73 if run pts (scaled) < 150, else 0x64 (no blend), `D+0xB8 = 1.5` (`0x1283DDC`) | `0x796910(0x180)`. Drive 0.055·0.8 (`0x905230`) = **0.044**, on ground or not. `D+0x1C8−−` | 3-D distance (`0x7968A0`) < **4.0** (`0x104DD30`) → 1. Distance < 0.0 → reset (cannot fire). `D+0x1C8` ≤ 0 (1800 frames) → `SetBehavior(0x565BE0)` |
-| `0x56BA80` walk to ALW target (V) | as `0x56B560`, but always motion 0x64 | `0x530510(0x180)`, drive 0.044. Distance from `0x530580` | < 4.0 → 1. With no link `0x530580` returns 0.0, so the walk ends (→1) on its first walking frame (frame 33); the < 0.0 reset (`0x56BB0F`) cannot fire. Timeout 1800 → reset |
-| `0x56B480` "notice" (**not** movement) (V) | emotion ball `0x53D660(DL=1, push 180)`. `D+0x1C8 = 1800`. Mode 1 | count `D+0x1C0` up; `D+0x1C8−−` | returns 1 on the 122nd mode-1 frame (old count > 120, `0x56B4A3`). `D+0x1C8` ≤ 0 → reset |
+| `0x56B740` wall bump | motion 0x64 blend 15. r<0.5 → mode 1, turning `+0x16C`/frame; otherwise mode 2, turning `−0x16C`/frame (±2°). Count `D+0x1C0 = 45 + trunc(46r)` = 45..90 (`0x905A68` = −46) | rotate `D+0xC`. `D+0xB8 = 1.6` (`0x1708AA4`) | count done → 1. The queue now holds nothing, so reset follows |
+| `0x56B860` turn around | motion 0x64 blend 15. 50/50 direction ±0x16C/frame. Count fixed **90** (`0x56B937`), i.e. 180° | rotate. `D+0xB8 = 1.6` | count done → 1. Caller unknown |
+| `0x56B960` random turn | motion 0x64 blend 15. ±2°/frame, 50/50. Count = trunc(r·91) = 0..90 (`0x905A60` = 91.0), stored as u16 | same | 1 |
+| `0x56B500` face target | motion 0x64 blend 15. `D+0x1C0 = 60` (unused) | `0x796910(0x200)` on every frame, including the first | returns 1 once the angle error < 0xB6 (≈1°) (`0x56B54A`) |
+| `0x56B6C0` face ALW target | motion 0x64 blend 15. Count 90, mode 1 | while count > 0: `0x530510(0x200)`. `D+0xB8 = 1.6` | count exhausted → 1 |
+| `0x56B560` walk to `W+0x54` | mode 0, every frame: eyes 4 (`0x53A4B0` EDX=4) and `D+0x1C8 = 1800` (the timeout restarts). The first 32 frames it stands still. When the `D+0x1C0` old value > 30: motion 0x73 if run pts (scaled) < 150, else 0x64 (no blend), `D+0xB8 = 1.5` (`0x1283DDC`) | `0x796910(0x180)`. Drive 0.055·0.8 (`0x905230`) = **0.044**, on ground or not. `D+0x1C8−−` | 3-D distance (`0x7968A0`) < **4.0** (`0x104DD30`) → 1. Distance < 0.0 → reset (cannot fire). `D+0x1C8` ≤ 0 (1800 frames) → `SetBehavior(0x565BE0)` |
+| `0x56BA80` walk to ALW target | as `0x56B560`, but always motion 0x64 | `0x530510(0x180)`, drive 0.044. Distance from `0x530580` | < 4.0 → 1. With no link `0x530580` returns 0.0, so the walk ends (→1) on its first walking frame (frame 33); the < 0.0 reset (`0x56BB0F`) cannot fire. Timeout 1800 → reset |
+| `0x56B480` "notice" (**not** movement) | emotion ball `0x53D660(DL=1, push 180)`. `D+0x1C8 = 1800`. Mode 1 | count `D+0x1C0` up; `D+0x1C8−−` | returns 1 on the 122nd mode-1 frame (old count > 120, `0x56B4A3`). `D+0x1C8` ≤ 0 → reset |
 | `0x56BBA0` press toy switch | motion 0xBE | on ground: v·=0.9 | after 61 frames: `0x55A920` signal **0xAF**, radius 3.5 (`0x16AFE94`), 10 frames, at facing·3 / y+1 → 1 (`0x56BC77`). 0xAF switches an off toy on (chao-garden-sync.md, Toys) |
-| `0x562D50` interrupting idle (V) | motion 0x9F blend 15, `D+0x1C0 = 0`, mode 1 | One counter `D+0x1C0` runs through modes 1–2 and is never reset. Mode 1: at count 40 → sound 0x100A. When the old count > 60 → icon 5 for 240 frames, eyes 1, mode 2. In modes 0/1 on ground: drive = facing·0.055. Mode 2: when the old count > 300 (about frame 302 of the behaviour) → motion 0xA0 blend 15, mode 3 | mode 3, end pulse → **`0x53DA00`**, which resumes the interrupted behaviour (`0x562E88`). Always returns 0 |
-| `0x565BE0` reset/settle (V) | posture 1..3 → motion 0x3E blend 35. Otherwise (no blend): r<**0.15** (`0x165DFD8`) → motion 3 + icon 3 for 180 frames + sound 0x601C; r<0.5 (`0x165DFD4`) → motion 0; r<0.6 (`0x8AF048`) → 0xEE; r<0.7 (`0x109DFF0`) → 0xEF; else motion 1. Then eyes 0, mouth 0. `D+0x1C0 = 60 + trunc(121r)` = 60..180 (`0x905A20` = −121) | on ground: v·=0.8 (`0x905230`) | → 2 after N+1 frames (61..181) (`0x565DB3`) |
+| `0x562D50` interrupting idle | motion 0x9F blend 15, `D+0x1C0 = 0`, mode 1 | One counter `D+0x1C0` runs through modes 1–2 and is never reset. Mode 1: at count 40 → sound 0x100A. When the old count > 60 → icon 5 for 240 frames, eyes 1, mode 2. In modes 0/1 on ground: drive = facing·0.055. Mode 2: when the old count > 300 (about frame 302 of the behaviour) → motion 0xA0 blend 15, mode 3 | mode 3, end pulse → **`0x53DA00`**, which resumes the interrupted behaviour (`0x562E88`). Always returns 0 |
+| `0x565BE0` reset/settle | posture 1..3 → motion 0x3E blend 35. Otherwise (no blend): r<**0.15** (`0x165DFD8`) → motion 3 + icon 3 for 180 frames + sound 0x601C; r<0.5 (`0x165DFD4`) → motion 0; r<0.6 (`0x8AF048`) → 0xEE; r<0.7 (`0x109DFF0`) → 0xEF; else motion 1. Then eyes 0, mouth 0. `D+0x1C0 = 60 + trunc(121r)` = 60..180 (`0x905A20` = −121) | on ground: v·=0.8 (`0x905230`) | → 2 after N+1 frames (61..181) (`0x565DB3`) |
 
 ### 2A.2 Illness (`rec+0x15A+i < 0` → `0x11C9BF4[i]`, table read via REA)
-Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops. A "cycle roll" either ends the behaviour (→1) or bumps the cycle count `D+0x1C4` and goes back to mode 0. None of these routines change needs or stats. Illnesses 0, 1, 2 and 4 test the motion bit `&8`, not `&1`. (re-decoded 2026-10-19)
+Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops. A "cycle roll" either ends the behaviour (→1) or bumps the cycle count `D+0x1C4` and goes back to mode 0. None of these routines change needs or stats. Illnesses 0, 1, 2 and 4 test the motion bit `&8`, not `&1`.
 
 | i | Routine | Motion (posture 1..3 / other) | Face | Exit and cadence |
 |---|---|---|---|---|
@@ -383,20 +381,20 @@ Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops
 | 5 | `0x59A5A0` | 0x5E / 0xA3 | eyes 1/3, mouth 8; sound 0x6022 (r<0.3) or 0x6023 at the start of every cycle | 60-frame tick with r<0.3: r<0.4 → 1, cycles>10 → 1, else restart |
 
 ### 2A.3 Sleep
-- **`0x54EE10` go to bed (V):**
+- **`0x54EE10` go to bed:**
   1. `SetBehavior(0x54EF10)`.
   2. Requires the tree list (`D+0x12AC` ≠ 0) and the nearest index `D+0x12BC` ≥ 0. The entry is at `D+0x12C0 + idx·0x1C`.
   3. Requires **r > 0.5 + 0.003·(s8)rec+0x14C** (`0x904E98`, `0x905838`), entry float +8 < **30.0** (`0x905090`), and tree `obj(+0x18)→+0x3C→+0x34` byte +0x31 equal to **3 or 5**.
   4. If all hold: `0x5304F0`, `SetBehavior(0x56BA80)`, push `0x56B960`, push `0x54EF10` (`0x54EE10`–`0x54EF04`). The Chao walks to the tree, turns at random, then sleeps.
-- **Sleep tick `0x54EC70` (ESI=obj) (V)**, gated by the inline `rec+0x12A` latch. The phase is held in `D+0x1B8`:
+- **Sleep tick `0x54EC70` (ESI=obj)**, gated by the inline `rec+0x12A` latch. The phase is held in `D+0x1B8`:
   - Phase 0: SLPDPTH(`rec+0x136`) **+1500** (`0x1312D9E`); phase++ when ≥ 10000.
   - Phase 1: SLEEPY(`rec+0x134`) **−1500** (`0x1312D9C`) and TIRE(`rec+0x140`) **−trunc((300 + (s8)rec+0x151)·300/300)** = −(300 + rec+0x151) (`0x1312DBE`, magic `0x1B4E81B5` >>5). Phase++ when SLEEPY = 0.
   - Phase 2 (stays): SLEEPY −1500 and SLPDPTH **−3500** (`0x1312DA0`).
   - All values clamped 0..10000.
-- **Wake test `0x54EC40` (V):** SLEEPY < 1000 **and** SLPDPTH < **2000** (`0x1312DA2`).
-- **`0x54EF10` sleeping** (17 modes, jump table `0x54F750` (V)). Every mode except 16 runs the sleep tick. Sounds play only in the active garden; the rand rolls happen regardless.
-  - Mode 0 (V): posture 0 → motion 0x25, mode 1. Posture 1 with TIRE > **7000** and r<0.5 → `SetBehavior(0x54F7A0)`. Otherwise → mode 2. Every branch zeroes `D+0x41C`.
-  - Mode 1 (V): end pulse → mode 2.
+- **Wake test `0x54EC40`:** SLEEPY < 1000 **and** SLPDPTH < **2000** (`0x1312DA2`).
+- **`0x54EF10` sleeping** (17 modes, jump table `0x54F750`). Every mode except 16 runs the sleep tick. Sounds play only in the active garden; the rand rolls happen regardless.
+  - Mode 0: posture 0 → motion 0x25, mode 1. Posture 1 with TIRE > **7000** and r<0.5 → `SetBehavior(0x54F7A0)`. Otherwise → mode 2. Every branch zeroes `D+0x41C`.
+  - Mode 1: end pulse → mode 2.
   - Mode 2: choose a pose. `D+0x41C` = 1 (motion 0x1B blend 40) when (f32)p14C > r·100, else 2 (0x12 blend 40). Later visits play 0x1C or 0x13 with no blend. Eyes 7, duration −1; timer 1000, mode 3, and it falls into mode 3 the same frame.
   - Mode 3: snore every 120 frames.
     - Pose 1: r<0.5 → 0x6008 (r<0.8) or 0x6009.
@@ -404,13 +402,13 @@ Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops
     - When the timer expires: r<**0.3** (f32 `0x145D484`) → motion 0x18, mode 4; r<0.6 (f32 `0x8AF048`) → motion 0x34 (mode 6) or 0x37 (mode 8), 50/50; r<0.9 (double `0x904E28` = 0.8999999761581421) → count 2..5 = 2 − trunc(r·−4.0) (`0x905D68`) pulses, then motion 0x22 (mode 10) or 0x1F (mode 12), 50/50; else stay. Then 25% → sound 0x600F/0x6011.
     - Wake test → mode 15.
   - Modes 4, 6, 8: 1000 frames or wake → motion 0x1A / 0x36 / 0x39 → modes 5 / 7 / 9.
-  - Modes 10, 12: the pulse count runs out or wake → 0x24 / 0x21 → modes 11 / 13. Mode 12 checked (V, `0x54F673`).
-  - Modes 5, 7, 9, 13 (shared handler `0x54F52B`) and 11 (`0x54F649`) (V): end pulse → mode 2.
-  - Mode 14 (`0x54F023`) (V): only runs the sleep tick. No path that sets mode 14 was seen.
-  - Mode 15 (V): motion 0x1E blend 40, eyes 1, mouth 3, mode 16.
-  - Mode 16 (V): pulse 0x8 → clears `D+0x1CC/0x1CE` and returns **1** (`0x54F726`) without the sleep tick.
+  - Modes 10, 12: the pulse count runs out or wake → 0x24 / 0x21 → modes 11 / 13. Mode 12 checked (`0x54F673`).
+  - Modes 5, 7, 9, 13 (shared handler `0x54F52B`) and 11 (`0x54F649`): end pulse → mode 2.
+  - Mode 14 (`0x54F023`): only runs the sleep tick. No path that sets mode 14 was seen.
+  - Mode 15: motion 0x1E blend 40, eyes 1, mouth 3, mode 16.
+  - Mode 16: pulse 0x8 → clears `D+0x1CC/0x1CE` and returns **1** (`0x54F726`) without the sleep tick.
 - **`0x54F7A0` sit-and-nod.** Mode 0: r < TIRE·0.0001 (`0x905FB0`) → motion 0x14 (mode 1); else 0x16 (mode 2) and count 3..12 = trunc(r·10+3) (`0x904F48`, `0x904DD8`). Eyes 7. Mode 2: every end pulse counts down; at 0 → motion 0x17 and a new count. Either mode: wake test → motion 0x3E and return 1 (mode 2 also clears `D+0x1CC/0x1CE`). Sleep tick every frame (`0x54F96E`).
-- **`0x54FCF0` deep sleep (V).**
+- **`0x54FCF0` deep sleep.**
   - Mode 0: posture 1 → motion 0x3F, 2 → 0x12, else 0 (no blend). Eyes 9; r<0.3 (`0x9050C8`) → mouth 8; icon 5 for 360 frames; mode 1.
   - Icon cadence: `D+0x1C0` counts up and the icon is re-issued when the old value > 400, so **every 402 frames** (`0x54FD9F`).
   - **SLPDPTH −2 every frame, no latch** (`0x54FDCA`–`0x54FDF4`). At 0 → 1 (`0x54FE06`).
@@ -427,22 +425,22 @@ Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops
 ### 2A.4 Food and drink
 - **`0x59E8C0` beg (player holds fruit).** Motion 0x76 blend 10, eyes 4, mouth 3/2 (unless the mouth is 1). Each frame: player-1 (`*0x1DEA6C0`) 3-D distance² < **100** → 1. More than 1000 frames → 1. Otherwise `0x796AB0(ECX=0, 0x120)` and drive 0.055.
 - **`0x59EA00`:** motion 0x18E blend 25, eyes 4, mouth 3/2, waits 180..300 → 1.
-- **`0x5614D0` go eat (V).**
+- **`0x5614D0` go eat.**
   - Takes the nearest entry of list 2 (`D+0xF10`; index +0x14, entries 0x1C bytes at +0x18), then its object `+0x18→+0x3C→+0x3C` (the fruit's ALW entry).
-  - If that entry's +0x40 partner is non-null and is not our entry → returns the **fruit entry pointer** (a no-op value), so it retries every frame (`0x561533`→`0x56162C`).
-  - Otherwise: our entry +0x44 = fruit, `SetBehavior(0x55C3C0)`, push `0x56B480`, `0x56BA80`, `0x5613C0`, `0x5607C0`; returns 0.
+  - If that entry's +0x40 partner is non-null and is not its own entry → returns the **fruit entry pointer** (a no-op value), so it retries every frame (`0x561533`→`0x56162C`).
+  - Otherwise: its own entry +0x44 = fruit, `SetBehavior(0x55C3C0)`, push `0x56B480`, `0x56BA80`, `0x5613C0`, `0x5607C0`; returns 0.
   - No fruit → 1 (`0x561627`).
 - **`0x5613C0` pick up.** Motion 0xBC, sound 0x1001, timeout `D+0x1C8 = 1800`. On the end pulse, if the fruit is free or ours: `0x56CFB0` grabs it. It returns 1 on that same end-pulse frame whether or not it took the fruit; its mode 2 is unreachable. Timeout → **3** (`0x5614B5`).
-- **`0x5607C0` eat** (14 modes, jump table `0x561374` (V)).
-  - **Tail `0x561197` (V), every frame:** if `0x56CFF0` returns 1 (still holding) → return 0.
-  - Otherwise, if our mailbox (read and cleared) == **6**:
+- **`0x5607C0` eat** (14 modes, jump table `0x561374`).
+  - **Tail `0x561197`, every frame:** if `0x56CFF0` returns 1 (still holding) → return 0.
+  - Otherwise, if its mailbox (read and cleared) == **6**:
     - `AddHappiness(−1, 0.1 [0x1312D18], sign via 0x536260)`;
     - `rec+0x12D = min(200, rec+0x12D+200)` and `rec+0x12E` likewise (both effectively 200);
     - if the balloon `*0x1AED28C` belongs to this Chao, its mode byte is set to 7 and the global is cleared.
   - Then → **1** (`0x5611A6`–`0x561360`).
   - Mode 0: motion 0xA9, `D+0x1C4` = 100..399.
   - Mode 1 (end pulse): if rec+0x150<0 and rec+0x14A<0 and HUNGER ≤ 5000 → mode 4. Otherwise r≤0.5 → mode 4, r>0.5 → motion 0xB4 (mode 2).
-  - **Dislike test (V)** on the fruit kind `fruitD1+8`, using jump table `0x5613AC` for kinds 5..9:
+  - **Dislike test** on the fruit kind `fruitD1+8`, using jump table `0x5613AC` for kinds 5..9:
     - kind 5 if `0x535390` (dark adult);
     - kind 6 if `0x535360` (hero adult);
     - kind 7 if rec+0x157 ∈ {2,4};
@@ -451,9 +449,9 @@ Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops
     - A dislike → mode 9, `AddHappiness(−1, 0.1 [0x1312D14])` (`0x560905`–`0x560A34`), sound 0x603A.
   - Mode 2: waits 120 frames, then the end pulse → motion 0xB6, eyes 4, sound 0x6039, mode 3. Mode 3: waits 60 frames, then the end pulse → mode 4.
   - Mode 4: p150 ≤ 50 and HUNGER ≤ 8000 → motion 0xAF + sound 0x603B. Otherwise 0xB3 + sound 0x603C. Then mode 6. The style `D+0x41C` is chosen on the first visit only and reused on later visits.
-  - **Mode 6, bite loop `0x560BC0` (V):**
+  - **Mode 6, bite loop `0x560BC0`:**
     1. Every frame, `0x530730(EDX=2)` messages the fruit.
-    2. If our mailbox (read and cleared) == **4** (fruit finished). Quirk: any other value, including **6**, is read and discarded here, so a fruit taken while chewing ends the meal with no penalty (the tail's mailbox-6 branch sees an empty mailbox): motion 0xA5 (`0x793D30`, blend 60), `D+0x1C4 = 180 + trunc(200r)` = 180..379 (`0x9051D8` = 200), mode 11, unlink `0x530690`, `0x565BC0`, eyes 4, mouth 2, sound 0x6042; then the tail runs.
+    2. If its mailbox (read and cleared) == **4** (fruit finished). Quirk: any other value, including **6**, is read and discarded here, so a fruit taken while chewing ends the meal with no penalty (the tail's mailbox-6 branch sees an empty mailbox): motion 0xA5 (`0x793D30`, blend 60), `D+0x1C4 = 180 + trunc(200r)` = 180..379 (`0x9051D8` = 200), mode 11, unlink `0x530690`, `0x565BC0`, eyes 4, mouth 2, sound 0x6042; then the tail runs.
     3. Otherwise `D+0x1C4−−`. While it is > 0 → the need change (step 5).
     4. When it reaches 0:
        - p150 > 50 and r<**0.4** (`0x904EB0`) → motion 0xB7, mode 5, count `2 + trunc(5r)` = 2..6 (`0x905010`), sound 0x603D, eyes 1.
@@ -464,17 +462,17 @@ Common pattern: mode 0 picks the motion (blend 40), eyes and mouth. Mode 1 loops
   - Mode 7: when the pause runs out, r<0.65 → motion 0xAD (mode 8); otherwise it swaps 0xB0↔0xB1 (blend 25) with a new pause.
   - Mode 8: back to mode 4 with a new chew budget 180..579.
   - Modes 9/10 (full or disliked): motion 0xBA. Past frame 4 the fruit is thrown with v = (sin, 0.7, cos)(rot+0x71C7)·0.3, then `0x565B90` and unlink (`0x561119`–`0x561120`).
-  - **Modes 11–13 (post-meal 0xA6/0xA5/0x52) are unreachable (V):** both mode-11 entry points unlink just before jumping to the tail (`0x560C52`, `0x561120`). `0x56CFF0` then returns 0, the mailbox was already cleared, and the tail returns 1 on the same frame.
+  - **Modes 11–13 (post-meal 0xA6/0xA5/0x52) are unreachable:** both mode-11 entry points unlink just before jumping to the tail (`0x560C52`, `0x561120`). `0x56CFF0` then returns 0, the mailbox was already cleared, and the tail returns 1 on the same frame.
 - **`0x59ED60` hungry** (jump table `0x59EF2C`). Posture 1 → motion 0x5E, else 0xA3. Eyes 3 on both paths. Posture 1: count 180 down, then wait for the motion end (`&1`). Other postures: wait for the motion end. Then mode 3 returns 1 when its old count is > 60 (`0x59EE6A`, i.e. 61 frames); on that frame it clears `D+0x1CC/0x1CE` and sets **`D+0x20C = trunc(1200 + 0.5·10800·(r + (10000−HUNGER)/10000))`** (V: `0x59EE8C`–`0x59EF18`; ints `0x1312E3C` = 1200, `0x1312E40` = 10800; `0x904F50` = 10000.0; `0x904E98` = 0.5) → 1.
 - **`0x59EF40` starving.** Eyes 1, mouth 6, motion 0x1DC blend 20, 240..440 frames (240+trunc(201r), `0x905A00`). Effect `0x6ED270` at two body nodes on 4 frames out of every 8. When `D+0x30 % 60 == 0`, 50% → sound 0x6003. At the end, the same `D+0x20C` formula → 1.
-- **`0x5A1020` thirsty (V).** Picks a destination from the list at `*0x1A1E95C` (`0x534F80`). Plays sound 0x6043, or 0x6044 only when r == 0.0 exactly (`0x904E00`). Then `0x5A3650`. Returns 0.
+- **`0x5A1020` thirsty.** Picks a destination from the list at `*0x1A1E95C` (`0x534F80`). Plays sound 0x6043, or 0x6044 only when r == 0.0 exactly (`0x904E00`). Then `0x5A3650`. Returns 0.
 
 ### 2A.5 Performances and watchers (signals from `0x55A920`)
 These loop until `0x486880(obj,1,kind)` stops returning a hit with +4≠0, then return 1. The chooser creates the signal after `SetBehavior`, at `pos + facing·8` (`0x905008`) with radius **20.0** (`0x8AE6C4`):
-- **0xA5** (skill A): `1800 + trunc(2401r)` = 1800..4200 frames (`0x907E78` = −2401; `0x59D57F`) (V).
-- **0xA6** (skill B): also **1800..4200**, radius 20 (`0x59C801`–`0x59C84E`) (V; resolves the drafter's open question).
-- **0xA7** (skill C): `1500 + trunc(1801r)` = 1500..3300 (`0x906268` = −1801; `0x59BA15`) (V). Non-dark animal-10 trick: `1200 + trunc(1201r)` = 1200..2400 (`0x907E80`; `0x59BB1B`–`0x59BB3D`) (V).
-- **0xA8** (dark animal-10 trick): 1800..3600 (`0x59BAB4`–`0x59BAE2`) (V). Chosen when `rec+0x118 & 0x400` and **alignment `rec+0xB0` < −0.5** (`0xE9923C`, `0x59BA70`–`0x59BA83`). Otherwise the non-dark `0x59B0E0` is used.
+- **0xA5** (skill A): `1800 + trunc(2401r)` = 1800..4200 frames (`0x907E78` = −2401; `0x59D57F`).
+- **0xA6** (skill B): also **1800..4200**, radius 20 (`0x59C801`–`0x59C84E`).
+- **0xA7** (skill C): `1500 + trunc(1801r)` = 1500..3300 (`0x906268` = −1801; `0x59BA15`). Non-dark animal-10 trick: `1200 + trunc(1201r)` = 1200..2400 (`0x907E80`; `0x59BB1B`–`0x59BB3D`).
+- **0xA8** (dark animal-10 trick): 1800..3600 (`0x59BAB4`–`0x59BAE2`). Chosen when `rec+0x118 & 0x400` and **alignment `rec+0xB0` < −0.5** (`0xE9923C`, `0x59BA70`–`0x59BA83`). Otherwise the non-dark `0x59B0E0` is used.
 
 | Routine | Motions | Attachments (node, model) | Sounds and cadence |
 |---|---|---|---|
@@ -487,7 +485,7 @@ These loop until `0x486880(obj,1,kind)` stops returning a hit with +4≠0, then 
 | A6 `0x59E120` | 0x169 (the 50% roll is unused) | special model `D+0x650 = 0x11C830C`, `+0x654` AL_TOY texlist, `+0x65C = 1.0` | every 180 frames, 50% → 0x4010 |
 | A7 `0x59E500` | 0x170 ↔ 0x16F, alternating every 60..120 frames | 4, `0x11C9AE4` | 0x4011 at frame 30 of 0x16F |
 
-All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The verifier did not re-decode this table.)
+All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1).
 
 - **Skill B** (eyes 4; new motion on pulse 0x8):
   - B0 `0x59C870`: 0x171/0x173/0x175/0x177 at r<0.25/0.5/0.75/else.
@@ -496,7 +494,7 @@ All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The v
   - B3 `0x59CB20`: 0x184, then 10% per end pulse → 0x185.
   - B4 `0x59CBF0`: 0x138 → (r<0.3) 0x13A → 0x13B×1 → 0x13C → 0x13D → 0x138, counted by end pulses.
 - **Skill C** (`0x11C9BD4`): eyes 4, motion 0x121, on pulse 0x8 → 0x121/0x125. Mouth 3/2 every 30 frames.
-  - Level (`0x59B900`) = (bit 0 of `rec+0x162` ? 0 : −1) + count of bits 1..4 set, so −1..4, and it indexes the table at `0x11C9BD4` = {`0x59A740`, `0x59A8A0`, `0x59AA30`, `0x59ABC0`, `0x59AD50`, `0x59AD50`, …} directly. Level 4 (bits 0..4 all set) **does** reach `0x59AD50` (re-read 2026-10-19; an earlier correction called it unreachable).
+  - Level (`0x59B900`) = (bit 0 of `rec+0x162` ? 0 : −1) + count of bits 1..4 set, so −1..4, and it indexes the table at `0x11C9BD4` = {`0x59A740`, `0x59A8A0`, `0x59AA30`, `0x59ABC0`, `0x59AD50`, `0x59AD50`, …} directly. Level 4 (bits 0..4 all set) **does** reach `0x59AD50`.
   - Every 241 frames a voice from `0x11C414C` = {0x607E, 0x6079, 0x607A, 0x607B} via `0x437590`. The index is 0 / trunc(r·1.99) / r·2.99 / r·3.99 for levels 1–4.
   - `0x59AD50` (level 4) alternates modes 1/2 (every 241/451 frames) and plays the special voice `0x11C415C` = 0x6080 (30% / 30%). It also ends if `0x54B1F0(0xA7)` finds nothing (`0x59AEA3`).
 - **Animal-10 trick** (only when `rec+0x162` bits 0..4 are all clear and `rec+0x118 & 0x400`):
@@ -515,7 +513,7 @@ All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The v
 ### 2A.6 Animal plays (`0x11C4BE0[n]` when `rec+0x118` bit n is set; table read via REA)
 | n | Routine | Behaviour |
 |---|---|---|
-| 0 | `0x5A2BF0` (V) | motion 0x71. Position (`D+0x14/+0x1C`) += facing·**0.15** (`0x9058A8`) every frame. Count `120 + trunc(61r)` = 120..180 (`0x905F10`) end pulses → 1 |
+| 0 | `0x5A2BF0` | motion 0x71. Position (`D+0x14/+0x1C`) += facing·**0.15** (`0x9058A8`) every frame. Count `120 + trunc(61r)` = 120..180 (`0x905F10`) end pulses → 1 |
 | 1 | `0x5A2B10` | motion 0x141. Position += (facing−90°)·0.05/frame (sideways), 500..800 frames |
 | 3 | `0x5A2860` | motion 0x135, 4..7 end pulses |
 | 4 | `0x5A1F10` | motion 0x118, 2..4 end pulses |
@@ -524,25 +522,13 @@ All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The v
 | 7 | `0x5A2E40` | 70%, with the nearest tree < **40** and state 3 or 5: target the tree, `Set(0x56BA80)`, push `0x56B6C0`, push `0x5A2DA0` (motion 0x120 for 300..500 frames). Otherwise → 1 |
 | 8 | `0x5A2010` | 0x11A for 120..220 frames. Then r<0.4 → 1. Else r<0.4 → 0x11C + sound 0x6087, which waits for the hold pulse (`&8`) and then plays 0x11A for 160..280; else 0x11A again for 160..280 |
 | 9 | `0x5A2460` | 0x3A/0x3C (50%), 600..900 frames |
-| 11 | `0x5A29C0` (V) | `Set(0x55C430)` + push **`0x5A2910`**, returns 0. `0x5A2910` (V): motion 0x136 (no blend), count `4 + trunc(3.99999r)` = 4..7 (`0x905A10`) end pulses → 1 |
+| 11 | `0x5A29C0` | `Set(0x55C430)` + push **`0x5A2910`**, returns 0. `0x5A2910`: motion 0x136 (no blend), count `4 + trunc(3.99999r)` = 4..7 (`0x905A10`) end pulses → 1 |
 | 12 | `0x5A25D0` | motion 1 for 120..240 frames. Then sound 0x1013, effect `0x6CC4E0` 3 units behind and 0.2 up, signal **0x97** (radius 5.0 `0xB5D210`, 60 frames) at that point; 120..240 more frames → 1 |
 | 13 | `0x5A2A10` | 0x132, end pulse, then 4..7 end pulses moving facing·0.1/frame |
 
-### 2A.7 Corrections to the groundwork
-- `0x53DC40`: return 2 and the frame limits only work when `D+0xA0 & 0x2000` is clear. The "stack" is a FIFO queue (index `D+0x438` moves forward), not a LIFO.
-- `0x5A3650`: **every** walk at run ≥150 is preceded by `0x55C3C0`. The `0x5A3460`/`0x5A3580` installs at `0x5A3735`/`0x5A3749` also call `0x53D890(0x55C3C0)` first.
-- `0x56B960` is a random 0–180° turn, not "toward bed". `0x56B860` is a fixed 180° turn (new).
-- `0x56B480` is a 2 s "notice" icon wait, not movement.
-- `0x56B500` and `0x56B6C0` only turn to face a target.
-- `0x56BBA0` switches a toy on (signal 0xAF).
-- `0x562D50` resumes the interrupted behaviour via `0x53DA00`; it is not chosen as a fresh behaviour.
-- `0x5614D0` busy-waits (non-1/2/3 return) while another Chao is linked to the fruit.
-- New behaviours **`0x5A2910`** and **`0x56B860`**. New helpers: `0x53D9B0`, `0x53DA00`, `0x54EC40`, `0x54EC70`, `0x536420`, `0x536320`, `0x56CFB0`/`0x56CFF0`, `0x530510`/`0x530580`, `0x54B0E0`, `0x5306D0`/`0x5306F0`/`0x530710`/`0x530730`.
-
-
 ## 2B. Behaviour routines (part B)
 
-**Method.** Most of these functions have no Ghidra function object, so `procedure_assembly` and `batch_decompile` fail on them (verified: `batch_decompile(0x5648A0)` returns "No procedure exists"). Their bytes were read with REA `read_bytes` from the dumped exe (sha256 d1ac8ed9…) and disassembled offline. Where Ghidra has the function (`0x565DC0`, `0x53A4B0`, `0x53A5A0`, `0x54A690`, `0x54A730`, `0x53D660`), `batch_decompile` was used. Jump tables and float constants were read with `read_bytes`. Nothing was annotated in REA.
+Where Ghidra has the function (`0x565DC0`, `0x53A4B0`, `0x53A5A0`, `0x54A690`, `0x54A730`, `0x53D660`), the notes come from its decompiler; everything else is decoded from bytes.
 
 **Conventions.**
 - `r` = `rand()/32768` (`0x7A89D8` × `0x904E90` = 1/32768).
@@ -555,7 +541,7 @@ All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The v
 - **End** = return 1 (pop). Return 0 = continue.
 - "Motion end" means the bit tested in `D+0xAC`; the code uses either `&1` or `&8` (both noted). `&8` fires only for play-mode-3 (hold) motions, see §2A.0.
 - Need names follow the debug labels: `rec+0x134` SLEEPY, `0x136` SLPDPTH, `0x138` HUNGER, `0x13A` BREED, `0x13C` TEDIOUS, `0x13E` LONELY, `0x140` TIRE, `0x142` STRESS, `0x146` CONDITN, `0x148` THIRSTY. All are clamped 0..10000 (`cmp eax,0x2710`). Emotion bytes `0x12C..0x133` are clamped 0..200 (`cmp eax,0xC8`).
-- **Latch** = `if (u16 rec+0x12A==0) { rec+0x12A=1; <effects> }` (e.g. `0x5A1C52..0x5A1C62`, `0x59F6C9..0x59F6D5`). The latch means "apply once until something clears rec+0x12A" (clearer unknown).
+- **Latch** = `if (u16 rec+0x12A==0) { rec+0x12A=1; <effects> }` (e.g. `0x5A1C52..0x5A1C62`, `0x59F6C9..0x59F6D5`). The latch means "apply once per need period"; the life tick resets rec+0x12A (§3.1).
 - **Posture** = `D+0xAE` (MotionTable +2, see chao-garden-sync §2) = entry +6 copied to `D+0xAE` when a motion starts (not when a link begins): 0 standing, 1 sitting, 2 lying, 3 on the belly (crawl/trip), 4/5 other. Many behaviours pick their animation by it.
 - **Stat ×3 rule**: stat points `rec+0x38+2i` are multiplied by 3 unless `*0x134046C` is 6, 10 or 11 (`0x562340..0x56236A`, `0x561B04..0x561B26`, `0x563407..0x563432`, `0x563A30..0x563A59`).
 - **Walk drive**: on ground (`W+0x40&0x400`) the code writes `W+0xC = sin(rotY)·s`, `W+0x14 = cos(rotY)·s` (sin/cos `0x42AAB0`/`0x42AC30`, e.g. `0x5A0AD2..0x5A0AFF`).
@@ -564,18 +550,18 @@ All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The v
   - Animal: no window. Facing with no touch, or a Chao-held item, ends at once.
 - `rec+0x118` is the "animals absorbed" bitmask (`|= 1<<animal id`, chao-garden-items §1.3). Tests below on `rec+0x118` bits therefore mean "has absorbed animal N".
 
-### Corrections to the groundwork
-- **"0x5585B0 newborn" is really `0x5685B0`.** The hatch code does `push -1` (`0x57AE60`), `push 0x5685B0` (`0x57AE62`), `call 0x53D890` (`0x57AE67`). Verified from bytes.
+### Hatching, release and holding
+- **Newborn is `0x5685B0`.** The hatch code does `push -1` (`0x57AE60`), `push 0x5685B0` (`0x57AE62`), `call 0x53D890` (`0x57AE67`).
 - **`0x53D720` and `0x564320` are picked by `*0x174AFFE`, not by flight/landing** (`0x565DC0`, decompiled + bytes). On release (Status `0x8000` clear):
   - `*0x174AFFE==0` (`0x565E3E`): build `(W+0, 0, W+8)`, normalise it if its length > 0 (`0x77FC30`/`0x77F3A0`), `D+0x18 += 2.0` (`0x904F78`), velocity `W = (nx·0.2, 0.87, nz·0.2)` (`0x904E60`, `0x128C454`=0.87f), `AL_SetBehavior(0x53D720)` (`0x565E8A`). This path does **not** set `D+0xA0|=8`.
   - flag set: if the player action list (`*0x1DE9600+4`, count `+0xC`) contains 0x14 → zero W, `W+0x18=0`, `AL_SetBehavior(0x565BE0)` (put down), `D+0xA0|=8`. Otherwise `W+0x18=0`, `AL_SetBehavior(0x564320)` (`0x565EFD`), `D+0xA0|=8` (`0x565F16`).
-  - Only `0x564320` applies the throw penalties (`0x56451A`). chao-garden-sync §3 labels these "0x564320 dropped / 0x53D720 thrown". `*0x174AFFE` is written by game-mode code (`0x43A80B..`, `0x519A52..`); probably "player control on" (unconfirmed).
-- `0x5A03B0` is not an approach: it is a 201-frame motion (below). `0x5A0490` is a bond tick, not movement. *(Not re-checked.)*
+  - Only `0x564320` applies the throw penalties (`0x56451A`). chao-garden-sync §3 labels these "0x564320 dropped / 0x53D720 thrown". `*0x174AFFE` is written by game-mode code (`0x43A80B..`, `0x519A52..`); it looks like "player control on".
+- `0x5A03B0` is not an approach: it is a 201-frame motion (below). `0x5A0490` is a bond tick, not movement.
 - `0x5634D0` (whistle) does not walk: no walk drive is written; it turns with `0x796AB0(0, 0x300)` (`0x563660`) and then installs `0x563250` (`0x563779`), which walks to the player.
-- `0x599210`, `0x599400`, `0x5995F0` and `0x599770` are installed by the toy picker with `AL_SetBehavior` (`0x599BDF..0x599C38`). Each acts on its first tick by replacing itself with a chain, or Ends when there is no toy. *(Not re-checked.)*
+- `0x599210`, `0x599400`, `0x5995F0` and `0x599770` are installed by the toy picker with `AL_SetBehavior` (`0x599BDF..0x599C38`). Each acts on its first tick by replacing itself with a chain, or Ends when there is no toy.
 - `0x5647B0` never returns 1 by itself (both exits `xor eax,eax`, `0x564878`). It ends through the 500-frame stack limit pushed by its interrupt `0x564760` (`push 0x1F4` at `0x564793`).
 - While held **and on the release frame**, `0x565DC0` writes `rec+0x132 = min(old+200, 200)` unconditionally at entry (`0x565DE1..0x565E07`). Since the byte is ≥ 0, this always sets it to 200.
-- **Held mood drift is driven by HUNGER, not bond** (`0x565DC0`, missing from chao-garden-sync §3): while held, `cnt` (`D+0x1C4`) counts up; when the old value > 600 (every 601 frames) it is reset to 0 and, checked in this order on the current behaviour:
+- **Held mood drift is driven by HUNGER, not bond** (`0x565DC0`): while held, `cnt` (`D+0x1C4`) counts up; when the old value > 600 (every 601 frames) it is reset to 0 and, checked in this order on the current behaviour:
   - HUNGER (`rec+0x138`) > 9999, current = `0x566300` (dislike) and `1 ≤ *0x134046C ≤ 3` → `0x46E5E0` (player drops it, if `*0x1DEA6C0`), `0x565B90`, `AL_SetBehavior(0x565BE0)` (the Chao jumps out).
   - HUNGER > 8000 and current = `0x5662B0` (neutral) → `AL_SetBehavior(0x566300)`.
   - HUNGER > 5000 and current = `0x5660A0` (like) → `AL_SetBehavior(0x5662B0)`.
@@ -590,14 +576,12 @@ All skill A routines start with eyes 4 and mouth 3 (A5: eyes 1, mouth 1). (The v
 | `0x5A2530` (20) | Motion 0x187; timer 300+trunc(200r) (`0x5A256C`) | End at timer 0 |
 | `0x5A2DA0` | Motion 0x120; timer 300+trunc(200r) (`0x5A2DC5`) | End at timer 0. Installed by `0x5A2E40` (animal play 7): nearest perceived tree (list 3 @`D+0x12A8`, entry stride 0x1C, dist at +8, object at +0x18) with dist < 40 (`0x8AE63C`=40.0f), r > 0.3 (70%, `0x5A2E90`, `test ah,0x41`) and tree `Data1+0x31` ∈ {3,5} (`0x5A2EBE..0x5A2ECA`). Then `0x5304F0` target, `AL_SetBehavior(0x56BA80,−1)`, push `0x56B6C0`, push `0x5A2DA0` (`0x5A2ED3..0x5A2EF7`). Any failed check → `0x5A2E40` returns 1 (`0x5A2F01`). |
 
-(Rows other than `0x5A2DA0`/`0x5A2E40` were not re-checked by the verifier.)
-
 ### Toy skills (picked by `0x55E7A0`)
 Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4D`, `0x55DEED`, `0x55E70D`, `0x55DB4D`); drum and book set Eyes 4 only with r<0.5.
 | Fn | Start | Run / end |
 |---|---|---|
 | `0x55DDE0` skill 0 | Motion 0x14A; attach model `0x12FA174` to node 11 (`0x5669B0`) | 600+trunc(200r) frames → End (`0x55DE40`) |
-| `0x55E3E0` skill 1 drum | Motion 0x14F; r<0.5 Eyes 4. Drum: `D+0x660=0x12FD9DC`, `+0x664=0x1366AFC`, `+0x668=0.0` (`0x8AF004`=0.0f, verified), `+0x66C=1.0` (`0x55E4F9..0x55E519`); timer 300+trunc(100r) (`0x905F20`=−101); mode 1 | mode 1: timer → r<0.2 End (`0x55E59B`); else r<0.5 Eyes 4, Motion 0x150, mode 2. mode 2: on motion `&8` → Motion 0x14F, r<0.5 Eyes 4, timer 380+trunc(180r) (`0x905F18`=−181), mode 1 (`0x55E40C..0x55E4AC`) |
+| `0x55E3E0` skill 1 drum | Motion 0x14F; r<0.5 Eyes 4. Drum: `D+0x660=0x12FD9DC`, `+0x664=0x1366AFC`, `+0x668=0.0` (`0x8AF004`=0.0f), `+0x66C=1.0` (`0x55E4F9..0x55E519`); timer 300+trunc(100r) (`0x905F20`=−101); mode 1 | mode 1: timer → r<0.2 End (`0x55E59B`); else r<0.5 Eyes 4, Motion 0x150, mode 2. mode 2: on motion `&8` → Motion 0x14F, r<0.5 Eyes 4, timer 380+trunc(180r) (`0x905F18`=−181), mode 1 (`0x55E40C..0x55E4AC`) |
 | `0x55E210` skill 2 book | `[[D+0x2C]+0xC]+0x32 |= 0x70` (`0x55E2CD`); Motion 0x151; r<0.5 Eyes 4 (`0x55E2F6..0x55E30D`); timer 300+trunc(100r); create book `0x55E180` (EBX=obj) | mode 1: timer → r<0.3: book mode byte = 4 (closing), End (`0x55E3A8`); else book mode = 2, Motion 0x153, mode 2. mode 2: on motion `&8` → Motion 0x152, timer 120+trunc(180r), mode 1 |
 | `0x55E600` skill 4 | Motion 0x148; attach `0x12F8364` to node 4 | on motion `&8`: r<0.2 End; else Motion 0x148 (r<0.6) or 0x149 (`0x55E688..0x55E6BA`) |
 | `0x55DD10` skill 5 | Motion 0x14E; attach `0x12FBC5C` to node 11 | 600+trunc(200r) → End |
@@ -606,14 +590,14 @@ Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4
 | `0x55DB10` skill 9 bubbles | Motion 0x146; attach `0x12FE33C` to node 4 and `0x12FE574` to node 11 (`0x55DB52..0x55DB6F`) | timer++. When old timer > 60 and new timer %10==0 and r<0.4 (`0x904EB0`): blow a bubble `0x55DA10` at hand node `D+0x510+0xD4..0xDC` + 0.5·dir(`+0x104..0x10C`), y +0.05, speed s = 0.2+0.1r (`0x904E60`, `0x905030`), each axis +0.1r (`0x55DB7B..0x55DCAA`). On motion `&8`: r<0.25 (`0x904EB8`) End, else Motion 0x146 and timer 0 (`0x55DCB4..0x55DCFD`) |
 
 ### TV, radio, horse, box
-- **`0x599210` go to TV** (toy kind 2). Uses the nearest perceived toy (list 4 @`D+0x1640`). `0x55C4A0(EBX=&out)` gives the viewing spot; End if 0. Own ALW `+0x44` = TV entry; `W+0x54..5C` = spot. `AL_SetBehavior(0x55C3C0)`, then push `0x56B480`, `0x56BA80`, `0x56BBA0`, `0x56B560`, `0x56B6C0`, `0x598890` (inline pushes `0x5992CD..0x5993C2`). *(Not re-checked.)*
-- **`0x599400` go to radio** (kind 3). Same, with spot from `0x57C7A0` and last entry `0x598B90`. *(Not re-checked.)*
-- **`0x40AD80`** (kinds 4/5/6) is `mov eax,1` (REA `inspect_native_instruction`). It Ends at once. *(Not re-checked.)*
+- **`0x599210` go to TV** (toy kind 2). Uses the nearest perceived toy (list 4 @`D+0x1640`). `0x55C4A0(EBX=&out)` gives the viewing spot; End if 0. Own ALW `+0x44` = TV entry; `W+0x54..5C` = spot. `AL_SetBehavior(0x55C3C0)`, then push `0x56B480`, `0x56BA80`, `0x56BBA0`, `0x56B560`, `0x56B6C0`, `0x598890` (inline pushes `0x5992CD..0x5993C2`).
+- **`0x599400` go to radio** (kind 3). Same, with spot from `0x57C7A0` and last entry `0x598B90`.
+- **`0x40AD80`** (kinds 4/5/6) is `mov eax,1` (REA `inspect_native_instruction`). It Ends at once.
 - **`0x598890` watch TV**, `0x598B90` radio (identical code; the signal kind differs).
   - mode 0 (`0x598925..0x598ABF`): Motion r<0.3 → 0x3E, r<0.7 → 0x3F, else 0x1CB (`0x145D484`=0.3f, `0x109DFF0`=0.7f). If `rec+0x118&0x200` (animal 9 absorbed) and r<0.3 and current motion (`D+0xB0`) is not 0x3A/0x3C → Motion 0x3A (r<0.5) or 0x3C. Eyes 4 (r<0.5) or default `D+0x694`. Mouth 3 (r<0.5) or default `D+0x69E`. Timer 300+trunc(300r) (`0x905A08`); mode 1, and it falls into mode 1 the same frame.
   - mode 1: timer−− → mode 0 (re-pick next frame). The signal check comes after the pose timer. Every frame clears `0x19468A0/A4`, sets `0x19468A8/AC = −1`, then `0x486880(obj,1,0xC9)` (radio 0xCA). With no hit or hit `+4==0` (toy off) → Motion 0x23D, timer 120+trunc(90r) (`0x906260`=−91), mode 2 (`0x598AD5..0x598B78`).
   - mode 2: timer → toy cooldown `D+0x1F4 = 1800+trunc(1800r)` (`0x906268`=−1801), End (`0x5988BE..0x598918`).
-- **`0x5995F0` go to horse** (kind 7). Ends if the horse's ALW partner is someone else. `W+0x54` = horse pos; `0x530640` links. `AL_SetBehavior(0x55C3C0)`, then push `0x56B480`, `0x56B560`, `0x56B500`, `0x598F40` (`0x599680..0x59973A`). *(Not re-checked.)*
+- **`0x5995F0` go to horse** (kind 7). Ends if the horse's ALW partner is someone else. `W+0x54` = horse pos; `0x530640` links. `AL_SetBehavior(0x55C3C0)`, then push `0x56B480`, `0x56B560`, `0x56B500`, `0x598F40` (`0x599680..0x59973A`).
 - **`0x598F40` ride horse** (jump table `0x5991FC`: `0x598F68` / `0x599041` / `0x599112` / `0x599166`).
   - mode 0: Motion 0x84; Eyes 4 or default (`0x598FB2`); Mouth 3 (`0x598FDE`) or `0x53A600`. `0x54A690` sets collision bits `|=0x70`. Hop: `W = (sin·0.08, 0.65, cos·0.08)` (`0x904F90`=0.08, `0xC71F38`=0.65; `0x598FF4..0x599037`); mode 1.
   - mode 1: once `vy<0` (`0x599041`: 0.0 vs `W+4`): blend 30 Motion 0x158; `D+0xA0&=~2`; timer 29; mode 2.
@@ -622,7 +606,7 @@ Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4
   - Every frame while the link is mutual: in modes 1–3, rotY approaches the horse rotation by 0x400 (`0x446960`, `0x5990B2..0x5990BD`); in modes 2–3, pos += 0.1·(horse − pos). A broken link → `AL_SetBehavior(0x565BE0)` and End (same pop as mode 3).
   - Horse main `0x580BC0`: off → mode 1, motion 3 for 1800 frames, then motion 4 and mode 0. A non-mutual link while rocking → stop (motion 4), unlink, mode 0.
 - **`0x598E90` after horse** (`0x598E90..0x598F33`). While mode==0 (never incremented): MotionSet 0x84; `W = (sin(rotY+0x4000)·0.3, [0xDF21B4]=0.8, cos(rotY+0x4000)·0.3)` (`0x9050C8`=0.3); collision `|=0x70`. Returns `(W+0x40>>10)&1`, i.e. Ends when the on-ground bit 0x400 is set (`0x598F23..0x598F2C`). The velocity is rewritten every frame, so if it starts in the air it rises forever (vy 0.8). Unreached from the ride (above).
-- **`0x599770` go to box** (kind 8). ALW `+0x44` = box. `AL_SetBehavior(0x55C3C0)`, then push `0x56B480`, `0x56BA80`, `0x56BBA0`, `0x565BE0` (`0x5997D7..0x599890`). No box behaviour of its own. *(Not re-checked.)*
+- **`0x599770` go to box** (kind 8). ALW `+0x44` = box. `AL_SetBehavior(0x55C3C0)`, then push `0x56B480`, `0x56BA80`, `0x56BBA0`, `0x565BE0` (`0x5997D7..0x599890`). No box behaviour of its own.
 
 ### Moods and emotions
 - **`0x5A1BA0` rest (tired).**
@@ -662,15 +646,15 @@ Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4
   - mode 2 (1800, `0x1312CD0`=1800) → evolution `0x568630`, then `0x56CF40`.
   - mode 3 (900, `0x1312CD4`=900) → `0x568D10` (cocoon byte = 4) and a jingle: type 20..22 → `0x12BEEBC` (`0x568E6D`); else `0x535360` → `0x12BF2D4` (`0x568E89`); else `0x535390` → `0x12BF6EC` (`0x568EA5`).
   - mode 4 (900, `0x1312CD8`) → mode 5. mode 5 (100, `0x1312CDC`) → `0x54A6C0` + `0x54A6F0` (restore), End.
-  - All waits compare unsigned (`jbe`). (Only the limit constants were re-checked.)
+  - All waits compare unsigned (`jbe`).
 - **`0x568F60` death / rebirth** (jump table `0x569180`).
   - mode 0: untouchable (`0x54A690`, `0x54A730`); Eyes 3 (`0x568FA0`); Mouth 4; Icon(5,300). Posture 0 → 0x2F; 1 → 0x3E; 2 → 0x2A; 3 → 0x3E blend 45.
   - mode 1 (>200): cocoon `0x568CD0(obj, 0x568F30()?1:2)`. `0x568F30` = happiness `(i16)rec+0x82` > 50 (`0x1312CEC`=50, signed) && STRESS `rec+0x142` < 700 (`0x1312CEE`=700, unsigned) (`0x568F30..0x568F5E`).
   - mode 2 (>1800): `D+0xA0 &= ~0x200, ~0x100000, ~0x80000` (`0x569080..0x56909A`). If `0x568F30` (`0x5690A4`) → `0x568570` (`rec+0x8E++`, `0x551560(&DNA)`, `0x5307F0` unregister, egg `0x57B9C0(0,rec,0,&pos,2)`) and mode 5. Otherwise jingle `0x12F5944` (`0x443480`) and mode 3. Counters reset; `D+0xA0 &= ~0x200` again.
-  - mode 3 (>900, `0x1312CD4`) → `0x568D10`, mode 4. mode 4 (> `[0x1312CD8]`+30 = 930) → `0x550620` (`0x569136`; drafted as memset rec 0x4DC + MainSub = `0x46F720`, not re-checked).
+  - mode 3 (>900, `0x1312CD4`) → `0x568D10`, mode 4. mode 4 (> `[0x1312CD8]`+30 = 930) → `0x550620` (`0x569136`; apparently clears the 0x4DC-byte record and sets MainSub = `0x46F720`).
   - mode 5 (>900) → `0x568D10`, mode 6. mode 6 (>930) → MainSub = `0x46F720` (`0x569170`; rec kept for the egg).
-- **`0x5685B0` newborn** (corrected address). Blend 15 Motion 0xCE; Ends on motion `&1` (`0x5685B0..0x5685EE`). *(Body not re-checked; the address is.)*
-- **`0x59BB50` breed (caller)** (jump table `0x59BF08`). Every frame `D+0x3C=1`. *(Not re-checked except Eyes 4 at `0x59BBF1`.)*
+- **`0x5685B0` newborn**. Blend 15 Motion 0xCE; Ends on motion `&1` (`0x5685B0..0x5685EE`).
+- **`0x59BB50` breed (caller)** (jump table `0x59BF08`). Every frame `D+0x3C=1`.
   - mode 0: `0x54A690`; `0x5AAF60` (child effect task, main `0x5AAE20`); `D+0x40` = `0x55A920(obj, 0xAB, r=30.0 (0x89E4DC), frames 9000−120)` (`0x59BB85..0x59BBB5`).
   - mode 1: blend 15 Motion 0x3E; Eyes 4; Icon(4, 8700).
   - mode 2: timer++. At 4500 → BREED=0; at > 9000 → End. Mailbox `0x530710` == 1 and mutual Chao partner → target = partner pos, Motion 0x30, mode 3, signal task deleted (`D+0x40` MainSub=`0x46F720`).
@@ -687,14 +671,14 @@ Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4
   - mode 5: each motion `&1` timer++ → End when ≥ cnt (`0x59C375..0x59C396`).
 
 ### Dark-adult mischief and lonely
-- **`0x5A1460` mischief A.** Blend 20 Motion 0x203; Eyes 10 (`0x5A14AB`); Mouth 9 if current mouth == 1, else 4; timer 180+trunc(300r). Every 150 frames r<0.5 → Snd 0x6065 (r<0.33), 0x6066 (<0.66) or 0x6068. timer−− (`add [timer],-1; jne`): End exactly when it reaches 0. *(Only eyes and the end test re-checked.)*
+- **`0x5A1460` mischief A.** Blend 20 Motion 0x203; Eyes 10 (`0x5A14AB`); Mouth 9 if current mouth == 1, else 4; timer 180+trunc(300r). Every 150 frames r<0.5 → Snd 0x6065 (r<0.33), 0x6066 (<0.66) or 0x6068. timer−− (`add [timer],-1; jne`): End exactly when it reaches 0.
 - **`0x5A18A0` mischief follow-up (pester player).** Eyes 10 at `0x5A18E8`; cuts and the far test checked from bytes.
   - mode 0: blend 10 Motion 0x7D; Eyes 10; Mouth 9/4. End if `rec+0x12D` < 10.
   - Each frame: Latch (no effect); timer++ > 1000 → End.
   - Player dist² < 25: `rec+0x12D −= 10`. `AL_SetBehavior` of 0x5A1600 (r<0.35f, `0xA3D28C`), 0x5A1780 (<0.7f, `0x109DFF0`), 0x5A1680 (<0.9, `0x904E28`) or 0x5A1700, then push 0x5A18A0. With r<0.6, a second rand picks Snd 0x606F/0x6070/0x6071/0x6072 at cuts 0.25/0.5/0.75.
   - After the near branch: player dist² > 100.0 (`0x904E30`) → `AL_SetBehavior(0x5A1460)` with no follow-up.
   - `0x796AB0(player 0, 0x120)`; walk drive s=0.055 (`0x1312C68`) (`0x5A1939..0x5A1B8C`).
-- **`0x5A1700`, and new `0x5A1600` / `0x5A1680` / `0x5A1780`.** Blend 20 Motion 0x1BB / 0x1B9 / 0x1C3 / 0x1BD; Eyes 10 (`0x5A1743`, `0x5A1643`, `0x5A16C3`, `0x5A17C3`); Mouth 9/4; End on motion `&1`.
+- **`0x5A1700`, `0x5A1600` / `0x5A1680` / `0x5A1780`.** Blend 20 Motion 0x1BB / 0x1B9 / 0x1C3 / 0x1BD; Eyes 10 (`0x5A1743`, `0x5A1643`, `0x5A16C3`, `0x5A17C3`); Mouth 9/4; End on motion `&1`.
 - **`0x5A1800` dislike.** Blend 20 Motion 0x1BF; Eyes 1 (`0x5A1842`; the id comes from EDX left over from `0x5A1831`); Mouth 4; Snd 0x6069; End on motion `&1`.
 - **`0x5A03B0`.** Alignment `rec+0xB0` > 0.5f (strictly) → blend 20 Motion 0x18C + Snd 0x6091 (vol 0); else 0x18D. Eyes 4 (`0x5A0440`); Mouth 3; 201 frames → End (`0x5A03D3..0x5A047D`).
 - **`0x5A0490`.** `0x53E280(ECX=obj)` (bond counter for the current character c = `0x53E0C0`: 1..5 by character, 0 with no player), then End. `0x53E280`: `bond+4 += 1` capped 0xFFFF; `bond+2 = 2·⌊v/3⌋` (magic `0x55555556`, then `add eax,eax`), not ×2/3.
@@ -748,7 +732,7 @@ Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4
   - `0x796910(0x120)`.
   - When below the surface (`D+0x18` vs `W+0xDC` − 2.1, `0x906C10`): thrust = swim·1e-6 + 0.0025 (`0x1312D88`, `0x1312D84`); y += 0.1 (`0x905030`) clamped to surface−2.1; `W+0x10 = −W+0x48·…`; `W+0xC = sin·thrust − W+0·0.05`, `W+0x14 = cos·thrust − W+8·0.05` (`0x9050D8`=0.05) (`0x561C5B..0x561D11`).
   - Latch {THIRSTY −600 (`0x1312DE0`), TEDIOUS −100 (`0x1312DB2`), TIRE +100 (`0x1312DC6`)}; `0x437590` sound 0x101F (pushes 1, −25, 0x5A) every frame, outside the latch (`0x561D15..0x561DEB`).
-- **`0x561920` float step** (used by `0x562160`). Leaving water → `0x562D20`. Rise 0.02/frame; `a.xz = sin·0.0 − v·0.05` (`0x904E00` = 0.0; confirmed). Latch {THIRSTY −600, TEDIOUS −100, TIRE −100}; sound 0x1021 via `0x437590` every frame. *(Only the drag and the sound re-checked.)*
+- **`0x561920` float step** (used by `0x562160`). Leaving water → `0x562D20`. Rise 0.02/frame; `a.xz = sin·0.0 − v·0.05` (`0x904E00` = 0.0). Latch {THIRSTY −600, TEDIOUS −100, TIRE −100}; sound 0x1021 via `0x437590` every frame.
 - **`0x561E00`.** Eyes 1 (`0x561E28`, EDX=EBP). If the default mouth `D+0x69E` is 1: r<0.25 → Mouth 9. Otherwise Mouth 6/8/0xB/4 at cuts 0.25/0.5/0.75. Motion 0x8E. Every 120 frames r<0.2 → Snd 0x6024. Latch {THIRSTY −6000}. Then step `0x561AF0`. EBP = 1 at the eyes call (eyes 1, duration −1).
 - **`0x561FB0` / `0x562040` / `0x5620D0`.** r<0.2 → Eyes 1; r<0.4 → Eyes 4 (`0x562010`, `0x5620A0`, `0x562130` call with EDX=4). Motion 0x94 / 0x91 / 0x92. Then step `0x561AF0`.
 - **`0x562160` float** (jump table `0x562314`).
@@ -781,17 +765,17 @@ Skills 0, 4, 5, 6, 7 and 9 set Eyes 4 at start (`0x55DE1D`, `0x55E637`, `0x55DD4
   - `0x796910(0x180)`; drive s = run·7e-6 + 0.028 (`0x1312D78`, `0x1312D74`; ×3 rule). Latch {TIRE +300 (`0x1312DC2`), TEDIOUS −100 (`0x1312DB0`)}.
   - End if timer > 3000 (`0xBB8`), TEDIOUS < 1000 or TIRE > 7000 (`0x1B58`) (`0x563B1A..0x563B60`). On every End: own ALW entry `+6=0`, `+0xC=−1`, `+0x40=0` (`0x5639F2..0x563A06`).
 - **`0x569240` put on hat.** Grab template with kind 0x93; on success `0x46E5E0`, `0x56CFB0`, `AL_SetBehavior(0x569340)`, then push `0x569430` if `rec+0x118&0x10000` (animal 16 absorbed) and no hat (`rec+0xD5==0`); otherwise push `0x569550` (`0x5692C0..0x569315`).
-- **New `0x569340`.** Blend 35 Motion 0xBE; Icon(3,120); Snd 0x601C; 120+trunc(60r) = 120..180 frames → End. Ends early if the item is lost. *(Not re-checked.)*
+- **`0x569340`.** Blend 35 Motion 0xBE; Icon(3,120); Snd 0x601C; 120+trunc(60r) = 120..180 frames → End. Ends early if the item is lost.
 - **New `0x569430` wear hat.** Motion 0xC7; Icon(1,120). Mode 1, on motion `&8`: `rec+0xD5` = hat `Data1+8`; free the hat record; delete the hat; Motion 0xC8. It never advances the mode, so mode 2 is unreachable; it ends through `0x56CFF0` once the hat is gone.
-- **New `0x569550` toss hat.** Motion 0xC9. On motion `&1`: hat `W = (sin(rot+0x71C7)·0.3, 0.7, cos·0.3)`; unlink; End. *(Not re-checked.)*
-- **`0x5606D0` approach fruit.** Grab template with kind 0x83, next `0x5607C0`, plus `0x5659E0` balloon. On timeout Snd 0x6037. Interrupt `0x560640` (not while eating, sleeping or already approaching). *(Not re-checked.)*
-- **`0x566C40` approach animal/drive.** Grab template with kind 0x87 and tolerance 0x71C, no timer: no hit when facing → End. Next `0x566DF0`. Interrupt `0x566BC0`. *(Not re-checked.)*
-- **`0x566DF0` absorb.** *(Not re-checked.)*
+- **`0x569550` toss hat.** Motion 0xC9. On motion `&1`: hat `W = (sin(rot+0x71C7)·0.3, 0.7, cos·0.3)`; unlink; End.
+- **`0x5606D0` approach fruit.** Grab template with kind 0x83, next `0x5607C0`, plus `0x5659E0` balloon. On timeout Snd 0x6037. Interrupt `0x560640` (not while eating, sleeping or already approaching).
+- **`0x566C40` approach animal/drive.** Grab template with kind 0x87 and tolerance 0x71C, no timer: no hit when facing → End. Next `0x566DF0`. Interrupt `0x566BC0`.
+- **`0x566DF0` absorb.**
   - mode 0: Motion 0xCB; cnt = 90+trunc(200r); Snd 0x1004; effect task `0x470C00(2, 0x566CF0)`; balloon.
   - mode 1: item lost → End. On motion `&1`: Motion 0xCC, Snd 0x1005, particles, then the effects in chao-garden-items §1.3.
   - mode 2: End on motion `&8`.
 - **`0x5647B0` 0xA2 reaction** (`0x5647B0..0x56489E`). Interrupt `0x564760`: current ≠ `0x5647B0` and `0x486760(obj, 0xA2)` hit with `+4≠0` → `AL_SetBehavior(0x5647B0, 0x1F4)`. Start: Motion 0x238 (no blend); **Eyes 1** (`0x5647D9..0x5647E1`); Mouth 8; Icon(5,300); Snd 0x6029 (r<0.5) or 0x606D. Every frame on ground (`W+0x40&0x400`) all three velocity components `W+0/4/8` × 0.9 (`0x904E28`). Always returns 0; ends at the 500-frame limit.
-- **`0x566670` held dispatcher.** *(Not re-checked.)*
+- **`0x566670` held dispatcher.**
   - SLPDPTH > 500 → `0x566580`.
   - Otherwise by bond like: > 50 → `0x5660A0`; < −50 → `0x566300`; else `0x5662B0`. If `rec+0x132` < 10 → `0x536320(+1, ±0.0333)` (`0x1312D38`).
   - Then `D+0xA0&=~8` and `0x565DC0`.
@@ -837,7 +821,7 @@ Everything here lives in the Chao save record (`rec` = `Data1+0x5C`), in the blo
 | `rec+0x128` (u16) condition counter | `u16[0x1312DEC]` = 80, so every **81** ticks (7776 frames) | `0x535DE2..0x535DF9` |
 | `rec+0x168` (**i32**, signed `JL`) bond counter | `0x53E2D0` is tail-called at the end of every gated life tick (`0x535E6A` / `0x535E7D`). Constant `u16[0x1312DEA]` = 10, so every **11** ticks. | `0x53E2D0..0x53E2FC` |
 
-**Correction to the groundwork (`rec+0x12A`).** This field is the need-period counter above, not a dedicated swim/run latch. Behaviours use it as a once-per-need-period latch: if the word is 0, the behaviour sets it to 1 and applies its own need changes. The helper is `0x536420` (EAX = obj), which returns 1 once; eat calls it at `0x560E3F`. Inline copies of the same check are at `0x54EC7C`, `0x561A13`, `0x561D1B`, `0x561F42`, `0x563AA3`, `0x59F6C4`, `0x5A193F`, `0x5A1C52` and `0x5A3151`. A reimplementation must reproduce three side effects:
+**`rec+0x12A` as a latch.** This field is the need-period counter above. Behaviours use it as a once-per-need-period latch: if the word is 0, the behaviour sets it to 1 and applies its own need changes. The helper is `0x536420` (EAX = obj), which returns 1 once; eat calls it at `0x560E3F`. Inline copies of the same check are at `0x54EC7C`, `0x561A13`, `0x561D1B`, `0x561F42`, `0x563AA3`, `0x59F6C4`, `0x5A193F`, `0x5A1C52` and `0x5A3151`. A reimplementation must reproduce three side effects:
 - The word is 0 only between a need tick and the next life tick, a window of at most 96 frames. A behaviour that is not running in that window gets no change for that period.
 - Within one period, only the first latch user that sees 0 applies its change.
 - Setting 0→1 moves the next need tick one life tick earlier (10 ticks instead of 11).
@@ -853,7 +837,7 @@ The names are the native debug labels, in order at `0x12E5BF0..0x12E5CA8` (see `
 | `0x134` | SLEEPY | `+= trunc( trunc(90*(300+p[0x14D])/300) * (TIRE*6e-5 + 1.0) )`. The doubles are `0x905A88` = 5.9999998e-5 and `0x904DC0` = 1.0, and the float→int is `0x8287C0` (`0x535964..0x5359E6`). | − sleep helper phases 1/2: −1500 per need tick (`0x54ED34`, `0x54ECC6`) | Drowsy `0x54F980` while 6000 < S < 9000 and `D+0x210 == 0` (`0x54E970`, consts `0x1312E64/68/6C`). Bed `0x54EE10` when S > 8000 and not under the water surface (`0x54EBA0`, `0x1312E84`). Wake check: S < 1000 **and** SLPDPTH < 2000 (`0x54EC40`, `0x1312DA2`). |
 | `0x136` | SLPDPTH | none | + sleep phase 0: +1500 per need tick until ≥ 10000, then phase 1 (`0x54EDBD..0x54EE05`). − phase 2: −3500 per need tick (`0x54ECFA`). − deep sleep `0x54FCF0` and held-sleepy `0x566580`: **−2 per frame**; deep sleep returns 1 at 0 (`0x54FDDD`, `0x54FDFE`, `0x56662B`). | > 500: deep sleep `0x54FCF0` (picker `0x54EB20`, score 0.5+0.5·f16). Petting goes to sleep when > 500 (`0x564958`). Holding goes to held-sleepy when > 500 (`0x566681`). Spawn goes straight to sleeping when > 0 (`0x531DA3`). |
 | `0x138` | HUNGER | `+= trunc(70*(300+p[0x150])/300)` (`0x5359DF..0x535A31`) | − eating: −2400 (`u16[0x1312DA6]`) per need tick (`0x560E52..0x560E7C`). At HUNGER == 0, eat sets its mode to 9 (`0x560EB3..0x560EC6`). | Picker `0x59EB00`. Fruit path: 0.99·f16(H,5000). No-fruit path (only when `D+0x20C==0` and r<0.6): 0.85·f16(H,5500) → `0x59ED60`; H ≥ 9901 → `0x59EF40` at score 1.0. Held for more than 600 frames (`0x565FA5`): H ≥ 10000 → wriggles free; > 8000 → dislike pose; > 5000 → neutral pose (`0x565FC5..0x56606F`). |
-| `0x13A` | BREED | Adults only, type byte `rec+0x80` in 3..19: `+= trunc(12*(300+p[0x14F])/300)` (`0x535A38..0x535A91`) | + heart fruit +10000 (`add eax,0x2710` at `0x545D67`). Set to 0 at `0x56293C`; the "garden has ≥ 8 Chao" condition is not re-verified. Set to 0 after mating (`0x59BC3B`, `0x59BD9B`, `0x59C1D8`). | > 9999 → breed `0x59BB50` via `0x562880` (score 1.0) |
+| `0x13A` | BREED | Adults only, type byte `rec+0x80` in 3..19: `+= trunc(12*(300+p[0x14F])/300)` (`0x535A38..0x535A91`) | + heart fruit +10000 (`add eax,0x2710` at `0x545D67`). Set to 0 at `0x56293C` when the garden has ≥ 8 Chao. Set to 0 after mating (`0x59BC3B`, `0x59BD9B`, `0x59C1D8`). | > 9999 → breed `0x59BB50` via `0x562880` (score 1.0) |
 | `0x13C` | TEDIOUS | `+= trunc(60*(300+p[0x14A])/300)`, then `+= trunc(30*(300+p[0x14C])/300)`, then `+= trunc(30*(300−p[0x155])/300)`: three separately clamped adds (`0x535A98..0x535B88`). Then, if > 9999 and r < 0.1 (double `0x905030`), it is **set to 6000** (`0x535B95..0x535BD3`). | − toy chosen −5000 (`0x599C53`). − play/skill/song chosen −5000 (`0x5A11F3`). − skill choosers −4000 (`0x59C587`, `0x59D2A0`). − ball interrupt −2000 (`0x563BB6`). − ball chase −100 (`u16[0x1312DB0]`) per need tick (`0x563AF3`). − walk step −100 per need tick (`0x5A3172`). − swim helper `0x561920` −100 per need tick (`0x561A68`). | Toy `0x599B60` and play `0x5A10B0`: 0.99·f16(T,2000). Ball interrupt `0x563B70` needs a ball (`*0x1DBE574 != 0`), T > 4000 and distance < 50.0 (`0x563B85`, `0x563BA2`). Ball chase ends when T < 1000 (`0x563B47`). |
 | `0x13E` | LONELY | `+= trunc(60*(300−p[0x14E])/300)` (`0x535BD7..0x535C23`) | − skill choosers −4000 / −3000 (`0x59C5B7`, `0x59C607`, `0x59D2D0`, `0x59D320`). − near player −6000 when byte `0x12C` > 140 (`0x5A0905`) or > 180 (`0x5A09D9`). | Picker `0x5A04A0`: 0.99·f16(L,1000) → `0x5A03B0`/`0x5A1800`; 0.99·f16(L,5000) → `0x5A0960`. The bond gates are in §1/§6. |
 | `0x140` | TIRE | `+= trunc(10*(300−p[0x14F])/300)` (`0x535C2A..0x535C76`) | + walk step +300 (`0x5A3240`). + ball chase +300 (`u16[0x1312DC2]`, `0x563ABF`). + `0x59F5F0` +900 (`0x59F6E6`). + swim helper `0x561AF0` +100 (`0x561D98`). All are per need tick. − eat −2400 (`0x560E86`). − sleep phase 1 `−trunc(300*(300+p[0x151])/300)` (`0x54ED4A..0x54ED9C`). − rest `0x5A1BA0` `−trunc(100*(300+p[0x151])/300)` (`0x5A1C6C`). − swim helper `0x561920` −100 (`0x561A9C`). | Rest: TIRE > 2000 + round((6000−2000)·(p[0x14A]−p[0x155]+200)/400), score 0.99·f16(TIRE, threshold) (`0x5626D0`, `0x1312EAC`=2000, `0x1312EB0`=6000, `0x1312EB4`=0.99). Sleeping runs sub-behaviour `0x54F7A0` (50%) when T > 7000 (`0x54EF52`). Ball chase ends when T > 7000 (`0x563B59`). Rest ends when T < 100 (`0x5A1C17`). |
@@ -892,7 +876,7 @@ The latch block (TIRE −, CONDITN +) runs on every mode-1 frame, not only at ti
 | `0x130` | −4(300+p155)/300 | −4 | `0x535807..0x535852` |
 | `0x131` | −4(300+p151)/300 | −4 | `0x535858..0x5358AA` |
 | `0x132` | −4(300+p14A)/300, −4(300+p156)/300 | −8 | `0x5358B0..0x535946` |
-| `0x133` | not touched by the tick; drafter's scan found no garden write | – | scan of `0x530000..0x5B0000` (not re-run) |
+| `0x133` | not touched by the tick; no garden write found | – | scan of `0x530000..0x5B0000` |
 
 **Event changes.** Each change is clamped to 0..200.
 
@@ -915,7 +899,7 @@ Eat "message 6" means the ALW entry (`obj+0x3C`) word `+0x34` == 6, which is cle
 ### 3.4 Happiness, bonds and illness
 
 - **Happiness `rec+0x82`** (−100..100) is changed only by the AddHappiness helper `0x536320`, at the interaction sites listed in `chao-garden-items.md` §1.2. The life tick `0x5353C0` never writes `+0x82` (full listing read).
-- **Bond tick `0x53E2D0`** (every 11 life ticks: counter `rec+0x168`, body runs when the old value ≥ u16 `0x1312DEA` = 10, then resets to 0): for each of the 6 character bonds, the u16 at `rec+0x16E + k*6` (bond+2) gets `+= u16[0x1312D6C]` = **16**, capped at 50000 (`0xC350`) (`0x53E2F5..0x53E32B`). The same +16 / cap 50000 is applied to 20 u16 entries at `rec+0x1A6 + j*0x1C` (`0x53E32D..0x53E34F`). (Re-checked; 150 is the neighbouring word `0x1312D6E`, not this add.) `0x53E280` (called by the `0x5A0490` follow-up; AddHappiness calls `0x53E120`) does `bond+4 += 1` capped 0xFFFF and `bond+2 = 2·⌊v/3⌋` (magic `0x55555556`, `add eax,eax`), not ×2/3 (§2B). The lonely chooser's `bond+2` > 300 / > 100 (`0x5A04A0`) was not re-checked.
+- **Bond tick `0x53E2D0`** (every 11 life ticks: counter `rec+0x168`, body runs when the old value ≥ u16 `0x1312DEA` = 10, then resets to 0): for each of the 6 character bonds, the u16 at `rec+0x16E + k*6` (bond+2) gets `+= u16[0x1312D6C]` = **16**, capped at 50000 (`0xC350`) (`0x53E2F5..0x53E32B`). The same +16 / cap 50000 is applied to 20 u16 entries at `rec+0x1A6 + j*0x1C` (`0x53E32D..0x53E34F`). (Re-checked; 150 is the neighbouring word `0x1312D6E`, not this add.) `0x53E280` (called by the `0x5A0490` follow-up; AddHappiness calls `0x53E120`) does `bond+4 += 1` capped 0xFFFF and `bond+2 = 2·⌊v/3⌋` (magic `0x55555556`, `add eax,eax`), not ×2/3 (§2B). The lonely chooser tests `bond+2` > 300 / > 100 (`0x5A04A0`).
 - **Condition slots `rec+0x15A..0x15F`** (i8): each moves 1 toward 0 every condition period, 81 life ticks (`0x535DFD..0x535E73`).
   - New illness: once per age period, if r < 1/6000 (double `0x905A90` = 1.6667e-4), pick `idx = trunc(r·5.9999)` from a second rand (double `0x9054F8` = 5.99990). If `idx != 3` and slot `rec+0x15A+idx` is 0, set it to −100 (`0x9C`) (`0x535510..0x535587`).
   - A negative slot makes illness behaviour `idx` choosable (picker `0x599CB0`, groundwork).
@@ -934,7 +918,7 @@ Eat "message 6" means the ALW entry (`obj+0x3C`) word `+0x34` == 6, which is cle
 - CONDITN = 0 (`0x5513D3`).
 - NOURISH = trunc(r·5000) (double `0x9054F0` = 5000, `0x5513EA..0x5513FD`).
 - THIRSTY = 3000 − trunc(r·(−6000)) = 3000 + trunc(r·6000) (double `0x9054E8` = −6000, `0x551427..0x551442`).
-- The low byte of SLEEPY (`rec+0x134`) is set to 0 (`0x551643`, `mov byte [esi+0x10],0` with ESI = rec+0x124); the high byte is left as is. `0x5513C0` does not write `+0x10`. (Re-checked.)
+- The low byte of SLEEPY (`rec+0x134`) is set to 0 (`0x551643`, `mov byte [esi+0x10],0` with ESI = rec+0x124); the high byte is left as is. `0x5513C0` does not write `+0x10`.
 
 `0x5513C0` also writes words at `rec+0x14A..0x158`. `0x55164C..0x55168F` then overwrites bytes `0x14A..0x156` with personality values `(gene−2)*40`. Callers of `0x5513C0`: `0x551647`, `0x551FCC`.
 
@@ -952,11 +936,11 @@ Scope: what changes the save record (`rec` = `Data1+0x5C`) over a Chao's life, o
 | Progress per item | `progress[i] += table[kind][i]`. Fruit gives `value/4` per bite, plus the remainder on the last bite. Tables: `0x8A6240` (animals and drives) and `0x8A6448` (fruit). | `chao-garden-items.md` §1.1/§1.4, `0x535F00` |
 | Level up | When progress > 99 and level < 99: `progress -= 100`, `level++`, `points[i] += 3*grade[i] + 11 + rand0..4`, capped at 4000. At level 99, progress is capped at 99. | `0x535F00`, `0x535E90` (`chao-garden-items.md`) |
 | Stat-up display copy | Copies progress `rec+0x20+i` → `Data1+0x60+i`, level `rec+0x30+i` → `Data1+0x70+i` and points `rec+0x38+2i` → `Data1+0x78+2i`, for i = 0..7. These are the old values, kept for the stat-up display. | `0x536040..0x5360FB` |
-| Fruit bite side effects | Life `+3` (`0x1312D00`=3). Max life `+5` (cap 9999) for children only: adults skip `0x5362D0`. Evolution `+0.005` (child, f32 `0x1312CF4`) or `+0.00125` (adult, f32 `0x1312CF8`). | `0x545790`, `0x5362D0` (`chao-garden-items.md`); the f32 values were re-read |
+| Fruit bite side effects | Life `+3` (`0x1312D00`=3). Max life `+5` (cap 9999) for children only: adults skip `0x5362D0`. Evolution `+0.005` (child, f32 `0x1312CF4`) or `+0.00125` (adult, f32 `0x1312CF8`). | `0x545790`, `0x5362D0` (`chao-garden-items.md`) |
 | Exercise (needs only) | Walk step `0x5A3000`: TEDIOUS `0x13C -= 100` (`u16 0x1312DB0`), TIRE `0x140 += 300` (`0x1312DC2`). Swim `0x561920`: THIRSTY `0x148 -= 600` (`0x1312DE0`), TEDIOUS `-= 100` (`0x1312DB2`), TIRE `-= 100` (`0x1312DC8`). All results are clamped to 0..10000. Each runs only when `rec+0x12A == 0` and then sets it to 1. | `0x5A3146..0x5A3273`, `0x561A08..0x561ABF` |
 | Fly points as an AI input | Reads fly points `u16 rec+0x3A`. They are multiplied by 3 unless `CurrentChaoArea` is 6 or 10..11. If the result is < 400 (`0x190`), climb `0x5A0F40` runs. Otherwise climb runs when rand < 0.6 (double `0x905268`) and fly `0x5630C0` runs when rand ≥ 0.6. When `0x535010()==9`, climb always runs. This path runs only when the ground flag `0x400` is clear. | `0x5A31C8..0x5A322B` |
 
-**Correction to the groundwork:** `rec+0x12A` isn't a dedicated once-latch. It is the needs-tick counter of the life tick (`rec+0x124+6`). It is incremented every life tick, compared with `u16 0x1312DE6`=10 at `0x535957`, and reset to 0 at `0x53596D`. Walk and swim therefore apply their need changes at most once in the 96-frame window after a needs tick, while the counter is still 0. They then set it to 1, so the next needs tick comes one life tick early.
+`rec+0x12A` is the needs-tick counter of the life tick (`rec+0x124+6`). It is incremented every life tick, compared with `u16 0x1312DE6`=10 at `0x535957`, and reset to 0 at `0x53596D`. Walk and swim therefore apply their need changes at most once in the 96-frame window after a needs tick, while the counter is still 0. They then set it to 1, so the next needs tick comes one life tick early.
 
 **Grades** (`rec+0x28+i`) are set from DNA in `0x551DA0` (§4.3). Rebirth keeps them (`0x551560` never writes `rec+0x28..0x2F`). Evolution raises one by 1 (`0x551780`, see "Evolution (0x568630)").
 
@@ -1146,16 +1130,16 @@ Only caller: cocoon `0x568D30` mode 2 (`0x568E04`: `EAX=obj; CALL 0x568630; MOVZ
 | 8 | `rec+0x157` ∈ {0, 5} | `0x5609A9` |
 | 9 | `rec+0x157` ∈ {1, 3} | `0x560A15..0x560A2B` |
 
-A disliked fruit sets mode 9 and calls `AddHappiness 0x536320` with EDI = −1 and pushed f32 `−0.1` (`0x1312D14`=0.1, negated with FCHS) (`0x56092C..0x560946`, `0x560979..`). `AddHappiness` applies the float to alignment with a sign that depends on the local player's character (`chao-garden-items.md` §1.1), so the alignment change is ∓0.1, not a fixed −0.1. No reader of `0x158` or `0x159` was found. The hero/dark checks `0x535390`/`0x535360` were cited from the call sites only; their bodies were not re-read.
+A disliked fruit sets mode 9 and calls `AddHappiness 0x536320` with EDI = −1 and pushed f32 `−0.1` (`0x1312D14`=0.1, negated with FCHS) (`0x56092C..0x560946`, `0x560979..`). `AddHappiness` applies the float to alignment with a sign that depends on the local player's character (`chao-garden-items.md` §1.1), so the alignment change is ∓0.1, not a fixed −0.1. No reader of `0x158` or `0x159` was found.
 
 
 ## 5. Movement and pathing
 
-Everything here was read with REA from the dumped exe and re-checked by a verifier. Notation follows `chao-garden-sync.md`: `D` = Data1, `W` = `obj+0x38` (MOVE_WORK), `rec` = save record (`D+0x5C`). "BAMS" means 0x10000 = 360°. Garden id = `*0x134046C` (1 Neutral, 2 Hero, 3 Dark). Stat scaling "×3" means `u16 rec+X * 3` everywhere except areas 6, 10, 11 (raw).
+Notation follows `chao-garden-sync.md`: `D` = Data1, `W` = `obj+0x38` (MOVE_WORK), `rec` = save record (`D+0x5C`). "BAMS" means 0x10000 = 360°. Garden id = `*0x134046C` (1 Neutral, 2 Hero, 3 Dark). Stat scaling "×3" means `u16 rec+X * 3` everywhere except areas 6, 10, 11 (raw).
 
-### 5.1 Short version for the server
+### 5.1 Summary
 - **No pathfinding.** A Chao picks a target point and steers at it in a straight line, turning a fixed number of BAMS per frame. It reacts to obstacles only when it hits them: a wall makes it spin in place, a climbable edge (collision kind 0xCB) makes it climb, a steep slope or a drop makes it hop.
-- **Where it can go comes from a 10×10-unit cell grid.** Each garden has a grid baked into the exe (`0x1362130` N, `0x1363530` H, `0x1364930` D; 32 cols × 40 rows of `int`, 0x1400 bytes each). At garden load the cells are put into lists by value (`0x534EF0`, called only from `0x52B030`). Wandering only targets cells with value **1** (land). Water tests use value **9**. This is pure data: the server can copy the 3×5120 bytes.
+- **Where it can go comes from a 10×10-unit cell grid.** Each garden has a grid baked into the exe (`0x1362130` N, `0x1363530` H, `0x1364930` D; 32 cols × 40 rows of `int`, 0x1400 bytes each). At garden load the cells are put into lists by value (`0x534EF0`, called only from `0x52B030`). Wandering only targets cells with value **1** (land). Water tests use value **9**. This is pure data (3×5120 bytes); the server reads the same grids (`src/chao_sim/land.rs`).
 - **Physical movement uses the real level collision.** The engine ray-casts the garden LandTable's triangles (`objLandTableNeut/Hero/Dark`, from the Chao data DLL) on ±X/±Y/±Z every frame (`0x797E10`). That gives floor height, wall push-out and wall-hit flags. To reproduce walking exactly the server needs those meshes; to reproduce only *where Chao choose to go*, the grid is enough.
 - **Water is a fixed height per garden, not geometry.** Neutral −2.2 (AI check `0x561630`) or −2.0 (physics `0x53DF00`), Hero −1.5, Dark −1.0.
 
@@ -1202,13 +1186,13 @@ MOVE_WORK init: `0x7966D0` allocates 0x270 bytes (4-byte 0x12345678 header), `W`
 ### 5.3 Collision and terrain data the Chao queries
 | Data | Where it comes from | Read by | Notes |
 |---|---|---|---|
-| **LandTable triangles** | Garden constructor: `PUSH "objLandTableNeut"` (`0x12DD80C`) at `0x54C7F4`, `GetProcAddress` via `[0x8730D4]` at `0x54C7FA`, `[0x1A5A2D8] = 1`, then call `0x47BD30` at `0x54C80F` (Neutral ctor `0x54C7B0`); Hero `PUSH "objLandTableHero"` (`0x12DBB0C`) at `0x54D22D` → `0x47BD30` at `0x54D247`; Dark `PUSH "objLandTableDark"` (`0x12E0A94`) at `0x54B74D` → `0x47BD30` at `0x54B767` (re-checked) | `0x797E10` → `0x47CD60` → `0x48C5E0` | `0x47CD60(x, y+3, z, 1.0)` builds a candidate list (max 1024, count `0x1DE9484`, buffer `*0x1A5A2DC`, 12-byte entries `{flags, COL*, int}`). **Dynamic list first** (`0x1A5A2D0`, count `0x1A5A2C8`): kept if distance < model radius × **min** of the 3 scales (or radius alone if `*COL & 4`) + 1 + 30; entries with `0x10000000` use their object matrix; water entries (`&0x2002`) ignore Y. **Landtable list second**, only if `*0x171CAAC == 1 && *0x19459DC != 0` (`0x1A5A2D4`, count `0x1A5A2CC`, stride 0x20): kept if flags `+0x1C & 0x2003` and distance − 1 < entry radius `+0xC`. `0x797E10` re-checks entries whose `+8 != 0` against radius × **max** scale, then calls `0x48C5E0(EDX=entry, EDI=local buffer)` per entry (`0x798095`). `0x48C5E0` clears the 6 slot flags and sets each slot's `+0x10` to pos ± 220. It finds the node in `*0x1A5A400` whose `+8 == EDX` and tests only triangles whose first vertex is within **220** (cumulative dx², +dz², +dy² ≤ 48400; `0x905B90` f32 48400, `0x905B98` 220.0) (re-checked). How `0x797E10` merges the per-entry buffers after `0x79809A` is not traced. |
+| **LandTable triangles** | Garden constructor: `PUSH "objLandTableNeut"` (`0x12DD80C`) at `0x54C7F4`, `GetProcAddress` via `[0x8730D4]` at `0x54C7FA`, `[0x1A5A2D8] = 1`, then call `0x47BD30` at `0x54C80F` (Neutral ctor `0x54C7B0`); Hero `PUSH "objLandTableHero"` (`0x12DBB0C`) at `0x54D22D` → `0x47BD30` at `0x54D247`; Dark `PUSH "objLandTableDark"` (`0x12E0A94`) at `0x54B74D` → `0x47BD30` at `0x54B767` | `0x797E10` → `0x47CD60` → `0x48C5E0` | `0x47CD60(x, y+3, z, 1.0)` builds a candidate list (max 1024, count `0x1DE9484`, buffer `*0x1A5A2DC`, 12-byte entries `{flags, COL*, int}`). **Dynamic list first** (`0x1A5A2D0`, count `0x1A5A2C8`): kept if distance < model radius × **min** of the 3 scales (or radius alone if `*COL & 4`) + 1 + 30; entries with `0x10000000` use their object matrix; water entries (`&0x2002`) ignore Y. **Landtable list second**, only if `*0x171CAAC == 1 && *0x19459DC != 0` (`0x1A5A2D4`, count `0x1A5A2CC`, stride 0x20): kept if flags `+0x1C & 0x2003` and distance − 1 < entry radius `+0xC`. `0x797E10` re-checks entries whose `+8 != 0` against radius × **max** scale, then calls `0x48C5E0(EDX=entry, EDI=local buffer)` per entry (`0x798095`). `0x48C5E0` clears the 6 slot flags and sets each slot's `+0x10` to pos ± 220. It finds the node in `*0x1A5A400` whose `+8 == EDX` and tests only triangles whose first vertex is within **220** (cumulative dx², +dz², +dy² ≤ 48400; `0x905B90` f32 48400, `0x905B98` 220.0). How `0x797E10` merges the per-entry buffers after `0x79809A` is not traced. |
 | Water polygons | COL flags `& 0x2002` | `0x797E10` | Excluded from the +X, floor and ceiling slots (not from −X, −Z, +Z). A water hit on the floor ray sets `W+0xDC = hitY`, `W+0x40 |= 0x2000`; a water hit on the ceiling ray also sets `W+0xDC` to the **floor** ray's hit Y (`local_13c`). The value is then overwritten by `0x53DF00`. |
 | **Water level** | Hard-coded | `0x561630`, `0x53DF00` | `0x561630`: N `0xC00CCCCD` = **−2.2**, H `0xBFC00000` = **−1.5**, D `*0xB087CC` = **−1.0**, other areas `0xC61C4000` = −10000. `0x53DF00`: N −2.0, H −1.5, D −1.0. Interrupts run before behaviours in the AI tick, so Neutral behaviours see −2.2. |
 | **Cell grid** | Static: `0x1362130` (N), `0x1363530` (H), `0x1364930` (D), 32 cols × 40 rows `int` | `0x535010(EAX=&pos)` | Valid only for `x∈[−150,150]` and `z∈[−200,150]` (inclusive). `col = ftol(x·0.1 + 100) − 84` (`0x53508F`), `row = ftol(z·0.1 + 100) − 80` (`0x53509F`); index `row·32 + col`. Constants: −150 `0x905640` (f32), 150 `0x9050F8`, −200 `0x9051F0`, 0.1 `0x905030`, 100 `0x904E30` (doubles). Out of range it returns EAX holding the FNSTSW status in AX (C0/C2 or TOP bits set) and the input pointer's high half, so never 1 or 9. Cell (c,r) covers `x ∈ [(c−16)·10, +10)`, `z ∈ [(r−20)·10, +10)`. All non-zero cells lie in rows 2..31, cols 1..29. |
 | Cell lists | `0x534EF0`: memsets `0x1A15938` (0x10040 bytes); for each cell with v ∈ 1..15 appends `{col,row}` to list v at `0x1A15938 + v·0x1004` (`+0` count, `+4+i·8` col, `+8+i·8` row) | `0x534F80` | List 1 = `0x1A1693C` (land), list 8 = `0x1A1D958`, list 9 = `0x1A1E95C` (water). |
 | Random point in a list | `0x534F80(EAX=list, push count, EDI=&out)` | `0x562D20`, `0x561740`, `0x5A1020` | `i = ftol(rand/32768 · (count − 1e-5))`; `x = (rand/32768 + col − 16)·10`, `z = (rand/32768 + row − 20)·10`. **Y is not written.** Returns 1. |
-| Heightmap (mode 1 only) | `0x1DBE66C` u16 grid | `0x53DD50` (only caller `0x53DF75`, in `0x53DF00`: u16 `D+0xA4` 0 → `0x53DFC3`, 1 → heightmap, 2 → `0x798300`/`0x53E3E0`) | x,z clamped to ±200. Index = `ftol(x+200) + ftol(z+200)` with **no row stride** (`0x53DDE3`). Heights = (u16 & 0x3FFF)·0.04 − 100 from words i, i+1, i+2, interpolated with `0x8294A0` (modf) and written to `[out+4]`. If `D.y` ≤ height: `D+4 |= 1`, `W+0x40 |= 0x400` (`0x53DF8D..0x53DFA2`). CreateChao zeroes Data1 (memset 0x1D74 at `0x5502A8`) and neither `0x5501D0` nor `0x53DA80` writes `D+0xA4`, so garden Chao start in mode 0 (other callees not checked). (Re-checked.) |
+| Heightmap (mode 1 only) | `0x1DBE66C` u16 grid | `0x53DD50` (only caller `0x53DF75`, in `0x53DF00`: u16 `D+0xA4` 0 → `0x53DFC3`, 1 → heightmap, 2 → `0x798300`/`0x53E3E0`) | x,z clamped to ±200. Index = `ftol(x+200) + ftol(z+200)` with **no row stride** (`0x53DDE3`). Heights = (u16 & 0x3FFF)·0.04 − 100 from words i, i+1, i+2, interpolated with `0x8294A0` (modf) and written to `[out+4]`. If `D.y` ≤ height: `D+4 |= 1`, `W+0x40 |= 0x400` (`0x53DF8D..0x53DFA2`). CreateChao zeroes Data1 (memset 0x1D74 at `0x5502A8`) and neither `0x5501D0` nor `0x53DA80` writes `D+0xA4`, so garden Chao start in mode 0 (other callees not checked). |
 | Object signals | collision kinds | `0x486760(obj, 0xCB)` at `0x5A3051`, `0x561B98`; `0x54B1F0(ECX=1, EDX=obj, push 0xCC)` at `0x5A30AD` | 0xCB touch with `ret != 0 && *(ret+4) != 0` → climb. 0xCC nearby → turn away. Sources and touch test: garden-collision.md §8 (0xCB = C_CLIMB boxes, a pure trigger; 0xCC = Hero pillars and Dark fences/graves, §8.4: solid to the Chao and a turn-away trigger, but object colliders, **not in the LandTable**). |
 
 Grid contents (value counts, decoded from REA bytes; 0 = not walkable / outside):
@@ -1225,11 +1209,11 @@ Only the meaning of 1 (wander targets) and 9 (water tests) is established from c
 | Routine | Address | Target |
 |---|---|---|
 | Wander | `0x562D20` (`[ESP+8]` = obj) | If list-1 count > 0: `0x534F80(list1, count, EDI=&W+0x54)`; then always `0x5A3650` (ESI=obj). Returns 0. |
-| Go to water | `0x5A1020` | If list-9 count > 0: random point in a water cell → `W+0x54`. If this area is active: sound 0x6043, or 0x6044 only when r == 0.0 exactly (`0x904E00` = 0.0, `0x5A1057..0x5A1086`). Then installs the walk via `0x5A3650` (ESI=obj, `0x5A109F`). Returns 0. (Re-checked.) |
+| Go to water | `0x5A1020` | If list-9 count > 0: random point in a water cell → `W+0x54`. If this area is active: sound 0x6043, or 0x6044 only when r == 0.0 exactly (`0x904E00` = 0.0, `0x5A1057..0x5A1086`). Then installs the walk via `0x5A3650` (ESI=obj, `0x5A109F`). Returns 0. |
 | Swim target | `0x561740` (EAX=obj) | If `rec+0x148 < 100`: random land cell (list 1) if any, else the target is left as it was; Y and `W+0x1C` not written. Else: random heading, distance `(0.3 + 0.7r)·60` (18..60), repeated until `0x535010 == 9`, 100 tries in all (1+99), else x=z=0, y = own y. Writes `W+0x54..0x5C` (y = current y) and `W+0x1C`. |
 | Fixed objects | `0x56BA80`, `0x56B6C0` | Steer at the ALW-linked object via `0x530510` (angle `0x54B0A0`, approach `0x446960`); distance from `0x530580` (calls `0x77FBD0`). |
 
-**Grid lookups** (read 2026-10-19; grid vs LandTable in garden-collision.md §6b/§7). `0x535010` (EAX = &pos): only for x in −150..=150 and z in −200..=150 (outside, it returns the FPU status word, a junk non-zero value); col = `ftol(…) − 0x54`, row = `ftol(…) − 0x50`, i.e. col = x/10 + 16, row = z/10 + 20; value = `grid[row·32 + col]` of the garden `*0x134046C` (1 → `0x1362130`, 2 → `0x1363530`, 3 → `0x1364930`; other areas 0). `0x534F80` (EAX = list, EDI = out, push count): random entry (`+4 + i·8` col, `+8 + i·8` row), then `x = (col − 16 + r)·10`, `z = (row − 20 + r)·10` (r = rand·3.0517578e−05); y not written.
+**Grid lookups** (grid vs LandTable in garden-collision.md §6b/§7). `0x535010` (EAX = &pos): only for x in −150..=150 and z in −200..=150 (outside, it returns the FPU status word, a junk non-zero value); col = `ftol(…) − 0x54`, row = `ftol(…) − 0x50`, i.e. col = x/10 + 16, row = z/10 + 20; value = `grid[row·32 + col]` of the garden `*0x134046C` (1 → `0x1362130`, 2 → `0x1363530`, 3 → `0x1364930`; other areas 0). `0x534F80` (EAX = list, EDI = out, push count): random entry (`+4 + i·8` col, `+8 + i·8` row), then `x = (col − 16 + r)·10`, `z = (row − 20 + r)·10` (r = rand·3.0517578e−05); y not written.
 
 ### 5.5 Walking
 **Installer `0x5A3650` (ESI=obj).** `run = rec+0x3C` (×3 rule; compared as u16 `AX`). The prelude is set with `AL_SetBehavior` (clears the stack) and the walk is pushed with frame limit −1 (manual push for the first two tiers, `0x53D970` for the last two):
@@ -1255,7 +1239,7 @@ Only the meaning of 1 (wander targets) and 9 (water tests) is established from c
 - **Preludes (stand-up transitions).** Read posture `u16 D+0xAE` (MotionTable +2). Mode 0 starts a blend with `0x793D30`, sets mode 1; mode 1 returns 1 (pop to the walk) once `D+0xAC & 1`.
   - `0x55C3C0`: posture 1 → motion **0x30**, posture 2 → **0x26** (both blend 0x28), posture 3 → 0x26 (blend 0x23); posture 0 or ≥ 4 → returns 1 at once.
   - `0x55C430`: posture 0 → **0x2F**, posture 2 → **0x2A** (both blend 0x28), posture 3 → 0x2A (blend 0x23); posture 1 or ≥ 4 → returns 1 at once.
-- **Turn helper `0x796910(rate)`** (EAX=obj): `W+0x1C = atan2(target − pos)` (`0x859B6A`); `D+0xC` moves toward it by at most `rate` BAMS (snaps when |diff| ≤ rate; stored as u16); returns the remaining |diff| (s16). `0x796AB0(rate)` is the same toward player `[0x1DEA6C0 + ECX*4]` (angle from `0x7969B0`; ECX = player index, the whistle passes 0). (Re-checked.)
+- **Turn helper `0x796910(rate)`** (EAX=obj): `W+0x1C = atan2(target − pos)` (`0x859B6A`); `D+0xC` moves toward it by at most `rate` BAMS (snaps when |diff| ≤ rate; stored as u16); returns the remaining |diff| (s16). `0x796AB0(rate)` is the same toward player `[0x1DEA6C0 + ECX*4]` (angle from `0x7969B0`; ECX = player index, the whistle passes 0).
 
 ### 5.6 Obstacles, slopes, ledges and falling
 | Behaviour | Address | Trigger | Effect | Ends |
@@ -1290,7 +1274,7 @@ There is no separate falling state: a Chao that walks off an edge is caught by s
   - Every frame, if area active: `0x437590(EDI=0x101F, ESI=&pos, 1, −25, 0x5A)` (sound).
 - **Variants.**
   - `0x561E00` (swim < 300): mode 0: eyes 1 (EBP = 1, duration −1); mouth: if `D+0x69E == 1`, 25% → 9 (else none); otherwise r < 0.25 → 6, r < `*0x165DFD4` → 8, r < 0.75 → 0xB, else 4; motion 0x8E; mode 1. Every 120 frames of `D+0x30`, 20%, active area: sound. Once-latch `rec+0x148 −= 10·600 = 6000`. Then `0x561AF0`.
-  - `0x561FB0`: motion 0x94 (`0x56201D`). `0x562040`: motion 0x91 (`0x5620AD`). `0x5620D0`: motion 0x92 (`0x56213D`). Set once in mode 0 via `0x793C40` (no blend); then step `0x561AF0` every frame, return 0. (Labels, not functions; re-checked.)
+  - `0x561FB0`: motion 0x94 (`0x56201D`). `0x562040`: motion 0x91 (`0x5620AD`). `0x5620D0`: motion 0x92 (`0x56213D`). Set once in mode 0 via `0x793C40` (no blend); then step `0x561AF0` every frame, return 0. (Labels, not functions.)
   - `0x562160` (float): cases fall through (mode 1 → 2 detail in §2B). 0: motion 0x9A blend 20 (`0x793D30(0x14)`), mode 1. 1: `D+0x1C0++`, old > 30 → eyes, mouth 2, sound if active, mode 2. 2: on `D+0xAC & 1`: eyes with chance, motion 0x96, `D+0x1C0 = 600 − trunc(r·−601)` (600..1200), mode 3. 3: count down; old < 1 → `0x562330`. Every frame `0x561920`.
   - `0x561920` (float movement): walked out uses `D+0x1B4 & **1**` clear and on ground → `0x562D20`. `D+0x1C4++`. While `y ≤ surface − 2.1`: rise 0.02/frame clamped, `a.y = −g − v.y·0.05`, `a.xz = sin·0.0 − v·0.05` (`0x904E00` = 0.0; no propulsion). Once-latch: `0x148 −= 600`, `0x13C −= 100`, `0x140 −= *0x1312DC8` (100). Sound 0x1021 `0x437590(1, 0, 0x78)` every frame if active.
 - **Leaving.** (a) swim target on land when `rec+0x148 < 100` (`0x561740`); the Chao walks out once the water interrupt clears bit 0x4 and it is on ground (`0x561AF0` → `0x562D20`); (b) climbs out at a 0xCB edge (`0x561AF0` → `0x562EB0`, only while `rec+0x148 < 1000`); (c) any interrupt.
@@ -1301,8 +1285,8 @@ There is no separate falling state: a Chao that walks off an edge is caught by s
 | `0x56B480` | notice pause | Mode 0: icon 1 for 180 frames (`0x53D660`), `D+0x1C8 = 1800`, `D+0x1C0 = D+0x1C4 = 0`. Mode 1: `D+0x1C0++`, old > 120 → return 1. Every frame `D+0x1C8--`; ≤ 0 → `0x565BE0`. |
 | `0x56B500` | face target | Mode 0: motion 0x64 blend 15, `D+0x1C0 = 60`. Each frame `0x796910(0x200)`; returns 1 when the remaining diff < 0xB6 (≈1°). |
 | `0x56B560` | walk to `W+0x54` | Mode 0: eyes (4), `D+0x1C8 = 1800` (every mode-0 frame); after `D+0x1C0` old > 30: motion 0x73 (run×3 < 150) or 0x64, `D+0xB8 = 1.5` (`*0x1283DDC`), mode 1. Mode 1: `0x796910(0x180)`, `a.xz = dir·0.055·0.8 = 0.044` (`0x905230`; no on-ground check). 3D distance `0x7968A0` < 0.0 (`*0x8AF004`) → `0x565BE0` (cannot fire); < 4.0 (`*0x104DD30`) → return 1. Every frame `D+0x1C8--`; ≤ 0 → `0x565BE0`. |
-| `0x56B6C0` | face linked object | Mode 0: motion 0x64 blend 15 (`0x793D30`), `D+0x1C0 = 90`, mode 1. Mode 1: `D+0x1C0--`; while the old value > 0, `0x530510(0x200)`; at 0 → return 1 (pop). `D+0xB8 = 1.6` (`*0x1708AA4`) on every non-returning frame (`0x56B6C0..0x56B73D`). (Re-checked.) |
-| `0x56B960` | random spin | Like `0x56B740`, but `ftol(91r)` frames stored as u16 (0..90; 91.0 at `0x905A60`). (Only the constant re-checked.) |
+| `0x56B6C0` | face linked object | Mode 0: motion 0x64 blend 15 (`0x793D30`), `D+0x1C0 = 90`, mode 1. Mode 1: `D+0x1C0--`; while the old value > 0, `0x530510(0x200)`; at 0 → return 1 (pop). `D+0xB8 = 1.6` (`*0x1708AA4`) on every non-returning frame (`0x56B6C0..0x56B73D`). |
+| `0x56B960` | random spin | Like `0x56B740`, but `ftol(91r)` frames stored as u16 (0..90; 91.0 at `0x905A60`). |
 | `0x56BA80` | walk to linked object | Same layout as `0x56B560`: steers with `0x530510(0x180)`, accel 0.044, distance from `0x530580`; < 0.0 → `0x565BE0` (cannot fire: with no link `0x530580` returns 0.0, so the walk returns 1 on frame 33); < 4.0 → return 1; motion always 0x64; `D+0xB8 = 1.5`; 1800-frame timeout. |
 | `0x56BBA0` | press switch | Mode 0: motion 0xBE (`0x793C40`), `D+0x1C0 = 0`. Mode 1: `D+0x1C0++`; when old > 60: emits signal 0xAF via `0x55A920` (EBX = 10 frames, radius `*0x16AFE94`) at pos + (sin·`0x904DD8`, `0x904DC0`, cos·`0x904DD8`) and returns 1. Otherwise, on ground, `v ×= 0.9` on all three axes (`0x904E28`). Signal 0xAF switches TV/radio/box on (chao-garden-sync, Toys). |
 
@@ -1316,7 +1300,7 @@ There is no separate falling state: a Chao that walks off an edge is caught by s
 
 Stat scaling (×3 in gardens, raw in areas 6/10/11) is identical in all three gardens (`0x5A3650`, `0x5A3000`, `0x562330`, `0x561AF0`).
 
-### 5.10 Corrections to the groundwork
+### 5.10 Notes
 - `D+4 & 1` is the **on-ground bit**: cleared at `0x798300` and `0x53E048`, set at `0x796B20` and in `0x53DF00` together with `W+0x40 |= 0x400` (`0x53DF90`). It has no "pettable/touched" meaning; the pet check `0x564C10` just requires the Chao to be on the ground.
 - `0x562D50` is the stumble/fall-over behaviour, not an idle.
 - `0x56B960` is a random spin in place, not "toward bed".
@@ -1324,15 +1308,15 @@ Stat scaling (×3 in gardens, raw in areas 6/10/11) is identical in all three ga
 - `0x55C3C0`/`0x55C430` are posture (stand-up) transitions.
 - `0x5A1020` walks to a random **water cell** (list 9).
 - Neutral water level differs between the AI check (−2.2, `0x561630`) and physics (−2.0, `0x53DF00`).
-- Pond floors vary. Where the pond-bed COLs carry the water bits, `0x797E10` keeps them out of the floor slot, so there is no floor for the physics and a Chao is held up only by its strokes. But some ponds do have solid floors: earlier simulation runs reached y −5 to −7 on pond bottoms, and garden-collision.md §7.2 finds a solid pool floor (COL #69 `0x20000001`, −6.5 Hero / −6.0 Dark) under some shore cells. Which ponds are which is open. Pond edges are walls, and climbing out needs a 0xCB (C_CLIMB) touch (garden-collision.md §8).
-- Verifier corrections to the first draft: posture→motion mapping of both preludes was swapped; swim timeout is ≈300 frames (double increment); swim wall 0.2% branch only when `rec+0x148 ≥ 1000`; `0x5A3000`/`0x561AF0` do not return after `AL_SetBehavior`; stumble checks use `D+0x1C0` with `%85 == 1` / `%100 == 0`; `0x47CD60` uses min scale for the dynamic list and the entry radius for the landtable list.
+- Pond floors vary. Where the pond-bed COLs carry the water bits, `0x797E10` keeps them out of the floor slot, so there is no floor for the physics and a Chao is held up only by its strokes. But some ponds do have solid floors: garden-collision.md §7.2 finds a solid pool floor (COL #69 `0x20000001`, −6.5 Hero / −6.0 Dark) under some shore cells. Which ponds have a solid floor is not mapped. Pond edges are walls, and climbing out needs a 0xCB (C_CLIMB) touch (garden-collision.md §8).
+- The preludes map postures to motions as in §2A.1; the swim timeout is ≈300 frames (the counter is incremented twice per frame); the swim wall 0.2% branch runs only when `rec+0x148 ≥ 1000`; `0x5A3000`/`0x561AF0` keep running after `AL_SetBehavior`; stumble checks use `D+0x1C0` with `%85 == 1` / `%100 == 0`; `0x47CD60` uses the min scale for the dynamic list and the entry radius for the landtable list.
 
 
 ## 6. Interactions
 
 Scope: what a garden Chao decides and changes when it deals with fruit, toys, trees/seeds, other Chao and the player. Item-side effects (fruit bite stats, GrowStats, AddHappiness, bonds, animal parts, item objects/registry) are already in `chao-garden-items.md` §1–§3 and are cited, not repeated. Held-Chao mechanics are in `chao-garden-sync.md` §3.
 
-**Method note.** Most behaviour routines below are not Ghidra functions (e.g. `0x5607C0`, `0x5648A0`, `0x567640` report "No procedure exists"), so they were read as raw bytes with REA `read_bytes` and decoded locally; pseudocode was used only where REA has a function. Constants were read with `read_bytes`. Notation as in the groundwork: `D`=Data1, `W`=`obj+0x38`, `rec`=`D+0x5C`. Need fields: SLEEPY `0x134`, SLPDPTH `0x136`, HUNGER `0x138`, BREED `0x13A`, TEDIOUS `0x13C`, LONELY `0x13E`, TIRE `0x140`, THIRSTY `0x148` (labels per `chao-details.md`). `r` = `rand()/32768` (`0x904E90` = 1/32768). "jitter" = `0x5624D0` (s·(0.4+0.6r)). `f16(v,t)=(v−t)/(10000−t)` (`0x562440`), `f8(v,t)=(v−t)/(200−t)` (`0x562490`). All need/emotion writes clamp to 0..10000 (u16 needs) or 0..200 (emotion bytes).
+Notation as in the groundwork: `D`=Data1, `W`=`obj+0x38`, `rec`=`D+0x5C`. Need fields: SLEEPY `0x134`, SLPDPTH `0x136`, HUNGER `0x138`, BREED `0x13A`, TEDIOUS `0x13C`, LONELY `0x13E`, TIRE `0x140`, THIRSTY `0x148` (labels per `chao-details.md`). `r` = `rand()/32768` (`0x904E90` = 1/32768). "jitter" = `0x5624D0` (s·(0.4+0.6r)). `f16(v,t)=(v−t)/(10000−t)` (`0x562440`), `f8(v,t)=(v−t)/(200−t)` (`0x562490`). All need/emotion writes clamp to 0..10000 (u16 needs) or 0..200 (emotion bytes).
 
 **"best < 1.0" gate.** Choosers that test the running best do `FLD1; FCOMP [best]; TEST AH,0x41; JNP skip`, i.e. they run only while **best < 1.0 (strict)** (seen in `0x5625B0`, `0x562A20`, `0x562880`, `0x59D0D0`, `0x59C3D0`, `0x5A10B0`). Where this section says "best < 1.0" it means this test. `0x562950` (courter) and `0x5A04A0`/`0x5A1240` have no such gate.
 
@@ -1380,7 +1364,7 @@ Taking an item from the player: the fruit/seed/animal/hat approach behaviours (`
 
 ### 6.2 The player
 
-**Whistle.** Trigger `0x5637B0`: player 1 (`*0x1DEA6C0`) action byte == 42 (`'*'`) and squared distance < 10000.0 (100 units); then only if `bond[c].like` (`rec+0x16C + c·6`, signed byte, `c = 0x53E0C0()`) > 50 → `AL_SetBehavior(0x5634D0)`. Correction to `chao-garden-sync.md` "Whistling": `0x5634D0` does not walk; `0x796AB0` only turns `D+0xC` toward the player by ≤ rate BAMS and returns the remaining |angle| (pseudocode of `0x796AB0`). Walking happens in `0x563250`.
+**Whistle.** Trigger `0x5637B0`: player 1 (`*0x1DEA6C0`) action byte == 42 (`'*'`) and squared distance < 10000.0 (100 units); then only if `bond[c].like` (`rec+0x16C + c·6`, signed byte, `c = 0x53E0C0()`) > 50 → `AL_SetBehavior(0x5634D0)`. `0x5634D0` does not walk; `0x796AB0` only turns `D+0xC` toward the player by ≤ rate BAMS and returns the remaining |angle| (pseudocode of `0x796AB0`). Walking happens in `0x563250`.
 - `0x5634D0` (jump table `0x563790`): m0 motion 0 (blend 10), wait 20+r·40 → m1 motion 50% 0xEE else 3, icon 3 for 180 frames, wait 20+r·60 → m2 motion 0x64 → m3 (`0x563648`): motion speed `D+0xB8 = 1.5` (`0x1283DDC`), turn 0x300/frame until remaining angle < 0x100 BAMS (`0x563668`); then icon 1 for 60 frames, wait 20 + r·20 (`0x9050B0` = 20.0); if r < 0.7 (`0x9050C0`): motion 0x1EC (blend 10), eyes 4 (`0x563705`), sound 0x6019 only when `*0x134046C == *0x134062C` (`0x563719`) → m4; else m5. m4 waits for motion end (`D+0xAC & 1`) → m5; m5 timer → `AL_SetBehavior(0x563250)` (`0x563779`).
 - `0x563250`: m0 motion r<0.2 → 0x76, r<0.6 → 0x77, else 0x6A; mouth 40% 1 else 3; icon 4 for 120 frames. Then every frame target = player pos (`0x563335`); every 100 frames, r < 0.1 (`0x905030`) → `0x562D50` (`0x56336D`); ends (return 1) when squared distance < 64.0 (`0x905078`, 8 units, `0x5633D2`); turn 0x100/frame (`0x5633E9`); on ground velocity = facing × 0.05 × (1 + run·0.0001) (`0x9050D8`, `0x905FB0`; run = `rec+0x3C`, ×3 outside areas 6/10/11, area = `*0x134046C`).
 
@@ -1405,7 +1389,7 @@ Taking an item from the player: the fruit/seed/animal/hat approach behaviours (`
 - Gate B (`D+0x1D4 == 0`, `0x5A067B`):
   - `like > 60` and `B2 > 100`: s = jitter(f16(LONELY, 5000 `0x1312E7C`)·0.99 `0x1312E80`) → `0x5A0960` (no follow-up) (`0x5A06FC`).
   - `like < −60`, dark adult (`0x535390`), `B2 > 100`, `rec+0x14C > 30` (signed): same score; if s > best: anger byte `rec+0x12D += 200` (cap 200) and **only a follow-up** `0x5A18A0` is pushed onto the currently installed stack (`0x53D970`, no `AL_SetBehavior`), best = s (`0x5A07BC`..`0x5A07F7`).
-- `0x5A03B0` (correction: not an approach, it stands still): motion 0x18C + sound 0x6091 if alignment `rec+0xB0 > 0.5f` (strictly), else 0x18D (blend 20); eyes, mouth 3; ends after 201 frames. Follow-up `0x5A0490` = `0x53E280` (bond `+4 ++` capped 0xFFFF, `+2 = 2·⌊v/3⌋`, items §1.1) then end.
+- `0x5A03B0` (not an approach; it stands still): motion 0x18C + sound 0x6091 if alignment `rec+0xB0 > 0.5f` (strictly), else 0x18D (blend 20); eyes, mouth 3; ends after 201 frames. Follow-up `0x5A0490` = `0x53E280` (bond `+4 ++` capped 0xFFFF, `+2 = 2·⌊v/3⌋`, items §1.1) then end.
 - `0x5A0960` run to liked player: m0 motion 0x75 (blend 10); if `rec+0x12C > 180` → LONELY −6000 and end (checked once, at start, `0x5A09D9`..`0x5A0A23`). Then each frame: after 1000 frames → end (`0x5A0A2A`); when squared distance to player 1 < 25.0 (double `0x904F70`, 5 units, `0x5A0A6C`): `rec+0x12C += 10` (cap 200) → `AL_SetBehavior(0x5A0820)` + follow-up `0x5A0960` (`0x5A0A79`..`0x5A0AB9`).
 - `0x5A0820` near player: motion 0x190, eyes 3, mouth 3; at each motion end, if still within 5 units: `rec+0x12C += 10`, restart itself; if then `rec+0x12C > 140`: LONELY −6000 and end (the end pops the freshly set stack, so it settles via `0x565BE0`); if farther than 5 → `0x5A0960`.
 - `0x5A1800` dislike: motion 0x1BF (blend 20), eyes 1, mouth 4, sound 0x6069, ends at motion end.
@@ -1514,16 +1498,15 @@ Picker order (`0x562A80`): `0x590C70`, `0x599CB0`, `0x54E970`, `0x54EB20`, `0x54
 - Animal/drive reaction `0x566BC0` (touch 0x87, item not held by a Chao) → `0x566C40`: motion 0xCA (blend 15), turn 0x600 until within 0x71C BAMS, then if touching: player drops (`0x566CB7`), link → `0x566DF0` (absorb, items §1.3); not touching, or the item is Chao-held → end at once (no 60-frame window).
 - Hat reaction `0x5691B0` (touch 0x93; not while eating/sleeping/already `0x569240`) → `0x569240`: same take pattern (motion 0xCA, 60-frame window, 0xB6 BAMS; skip if hat ALW flag 2, `0x5692B0`; player drops `0x5692C2`; link `0x56CFB0`) → `AL_SetBehavior(0x569340)`: motion 0xBE (blend 35), icon 3 120 frames, sound 0x601C, 120..180 frames; follow-up chosen at take time (`0x5692E5`..`0x569315`): if `rec+0x118 & 0x10000` and no hat worn (`rec+0xD5 == 0`) → `0x569430` (motions 0xC7/0xC8, wears it, frees the record `0x5694C5`; ends once the hat is gone); else `0x569550` (motion 0xC9, throws it: forward 0.3, up 0.7, unlink).
 
-### Corrections to the groundwork
+### Notes
 - `0x5A03B0` is a stationary call to the player (motion 0x18C/0x18D, 201 frames), not an approach; follow-up `0x5A0490` updates bond counters (`0x53E280`).
-- `0x5634D0` only turns toward the player; walking to the player is `0x563250` (stops within 8 units). Same correction for `chao-garden-sync.md` "Whistling".
+- `0x5634D0` only turns toward the player; walking to the player is `0x563250` (stops within 8 units).
 - `0x567640`..`0x567B10` (the "0x85 chain") is seed pick-up → wander → planting; 0x85 is the seed collision kind (`0x8A7458`). Pick-up needs no skill bit; only planting needs `rec+0x164` bit 10.
 - `0x5680F0` is tree watering (`rec+0x148 +2000`, emits 0xAD), reached from `0x5625B0` via `0x567FA0`.
-- Extra mischief behaviours not in the list: `0x5A1600`, `0x5A1680`, `0x5A1780` (picked by `0x5A18A0`). Extra hat behaviours: `0x569340`, `0x569430`, `0x569550`. Extra choosers: `0x599A10`, `0x5998C0`, `0x5A10B0`.
+- Further mischief behaviours: `0x5A1600`, `0x5A1680`, `0x5A1780` (picked by `0x5A18A0`). Extra hat behaviours: `0x569340`, `0x569430`, `0x569550`. Extra choosers: `0x599A10`, `0x5998C0`, `0x5A10B0`.
 - The `0xA2` push at `0x53530E` is an allocator line number, not a signal.
 
-### Verifier corrections applied to the draft
-- Chooser gate is `best < 1.0` (strict), not `≤ 1.0` (`0x5625CB` pattern); courter `0x562950` has no gate.
+- Chooser gate is `best < 1.0` (strict) (`0x5625CB` pattern); courter `0x562950` has no gate.
 - Hunger gate `D+0x20C` is truncated, not rounded (`0x59EEF8`..`0x59EF11`); in branch B the starving check runs even if hungry won, and fruit is never considered in that tick.
 - Seed pick-up (`0x567560`) does not test skill bit 10.
 - Ball reaction re-fires every tick (TEDIOUS −2000 each) and restarts the chase; ball chase ends while TEDIOUS ≤ 999 or TIRE ≥ 7001.
@@ -1533,7 +1516,7 @@ Picker order (`0x562A80`): `0x590C70`, `0x599CB0`, `0x54E970`, `0x54EB20`, `0x54
 
 ## Behaviour table
 
-Every behaviour function the picker, interrupts and follow-ups install (verified rows; section column says where it is described).
+Every behaviour function the picker, interrupts and follow-ups install (the section column says where it is described).
 
 | Address | Name | Trigger | Changes | § |
 |---|---|---|---|---|
@@ -1591,22 +1574,22 @@ Every behaviour function the picker, interrupts and follow-ups install (verified
 | `0x567FA0` | go to 0xAE target | picker 0x5625B0 | motion 0x64, icon 1; turns to ALW target; <4 units (or no target: distance to self 0.0) -> 0x5680F0; 1800..1920f limit | 2B |
 | `0x5680F0` | water tree | 0x567FA0 | sound 0x601A; without rec+0x164 bit 11: rec+0x148 +2000 and end; with it: watering-can model, rec+0x148 +2000 -> 0x568460 | 6 |
 | `0x568460` | pour water | 0x5680F0 mode 5 | emits 0xAD 4 units ahead (r 5.0, 10 frames) at motion flag 8; ends | 6 |
-| `0x5685B0` | newborn (corrected from 0x5585B0) | egg hatch push at 0x57AE62, call 0x57AE67 (also 0x57B067, 0x57B2FB per core list) | motion 0xCE, end on motion&1 | 2B |
+| `0x5685B0` | newborn | egg hatch push at 0x57AE62, call 0x57AE67 (also 0x57B067, 0x57B2FB) | motion 0xCE, end on motion&1 | 2B |
 | `0x568D30` | cocoon/evolve | picker 0x562800 | cocoon task at 200f, evolution 0x568630 at ~2000f, jingle, ~3900f total, collision/holdable off then restored | 2B |
 | `0x568F60` | death / rebirth | Picker candidate 0x562A20 when best < 1.0, life rec+0x8A == 0 and 0x54AC20 is true (ground flag 0x400 and horizontal speed < 0.04). Sets best = 1.0 and clears D+0x1CC/0x1CE. | Mode 0: eyes 0x53A4B0 (EDX=3), mouth 0x53A5A0, emotion ball 0x53D660 (dl=5, 300 frames), motion 0x793D30 by D+0xAE (0→0x2F, 1→0x3E, 2→0x2A with 15 frames; 3→0x3E with 45 frames; >3 no motion). After 200 frames: cocoon 0x568CD0(1 = rebirth / 2 = death). After 1800 more frames: decision 0x568F30 ((i16)happiness > 50 && (u16)STRESS < 700). Rebirth 0x568570: rec+0x8E++, record reset 0x551560, ALW unregister, new egg 0x57B9C0 case 2 (type 1, same record). Death: jingle chao_g_dead.adx, then after 900+930 frames 0x550620 memsets the 0x4DC record and sets MainSub = 0x46F720. On rebirth, MainSub = 0x46F720 after 900+930 frames. Interrupts (0x53DB3E) and the hit check (0x563D5B) skip while it runs. | 4 |
 | `0x569240` | grab hat | hat interrupt 0x5691B0 (touch 0x93) | grab template; -> 0x569340 then 0x569430 (animal 16 absorbed and no hat) or 0x569550 | 2B |
 | `0x569340` | look at hat | 0x569240 | motion 0xBE, icon 3, sound 0x601C, 120..180 frames | 6 |
 | `0x569430` | wear hat | follow-up set by 0x569240 when rec+0x118&0x10000 and rec+0xD5==0 | motions 0xC7/0xC8; wears hat (rec+0xD5), frees hat record (0x5694C5); mode never advances (mode 2 unreachable), ends via 0x56CFF0 once the hat is gone | 6 |
-| `0x569550` | toss hat (new) | pushed by 0x569240 otherwise | motion 0xC9, hat thrown (0.3, 0.7) at rot+0x71C7, unlink | 2B |
+| `0x569550` | toss hat | pushed by 0x569240 otherwise | motion 0xC9, hat thrown (0.3, 0.7) at rot+0x71C7, unlink | 2B |
 | `0x56B480` | notice | go-eat chain, toy choosers | emotion icon 1 (180 frames), returns 1 on 122nd frame; D+0x1C8 timeout -> reset | 2A |
 | `0x56B500` | face target (skill join/watch head) | pickers 0x59D0D0, 0x59C3D0, 0x59B710 (signals 0xA5/0xA6/0xA7) | motion 0x64, 0x796910(0x200) until the angle error < 0xB6; target = signal pos (join) or performer pos (watch); follow-ups as listed in the 1.5 table; skill joins change TEDIOUS -4000, LONELY -4000 self, performer LONELY -4000 (A) / -3000 (B) | 1 |
-| `0x56B560` | walk to W+0x54 | follow-up of TV/radio/horse/toy choosers (groundwork) | eyes 4; stands still (timeout restarted) for 32f, then motion 0x73/0x64, D+0xB8=1.5; turn 0x180/f; accel 0.044 (no ground check); return 1 at 3D dist<4.0; 1800f timeout -> 0x565BE0 | 5 |
-| `0x56B6C0` | face linked object | follow-up of TV/radio/toy, 0x5A2EEB (groundwork) | motion 0x64; 0x530510(0x200) toward ALW link for 90f; D+0xB8=1.6; pop (not re-checked) | 5 |
+| `0x56B560` | walk to W+0x54 | follow-up of TV/radio/horse/toy choosers | eyes 4; stands still (timeout restarted) for 32f, then motion 0x73/0x64, D+0xB8=1.5; turn 0x180/f; accel 0.044 (no ground check); return 1 at 3D dist<4.0; 1800f timeout -> 0x565BE0 | 5 |
+| `0x56B6C0` | face linked object | follow-up of TV/radio/toy, 0x5A2EEB | motion 0x64; 0x530510(0x200) toward ALW link for 90f; D+0xB8=1.6; pop | 5 |
 | `0x56B740` | spin away from wall | 0x5A3000: W+0x40&0x4000 without 0xCB hit, or 0xCC object after D+6>30 | motion 0x64 blend 15; D+0xC +/-0x16C per frame (50/50) for 45..90 frames; D+0xB8=1.6; return 1 | 5 |
-| `0x56B860` | turn around 180 deg (NEW) | unknown (no caller identified in this pass) | motion 0x64 blend 15, rotate +-0x16C/frame for 90 frames (180 deg), D+0xB8=1.6, then 1 | 2A |
-| `0x56B960` | random spin | follow-up of 0x54EE10 (groundwork) | motion 0x64; +/-0x16C BAMS/f for ftol(91r) frames (0..90); pop (only the 91.0 constant re-checked) | 5 |
-| `0x56BA80` | walk to linked object | 0x54EE10, 0x5614D0, 0x599210, 0x599400, 0x599770, 0x5A2EDC (groundwork) | eyes 4; after 31f motion 0x64, D+0xB8=1.5; 0x530510(0x180); accel 0.044; dist (0x530580) <4.0 -> return 1 (no link: 0x530580 = 0.0, ends on frame 33; the <0 reset cannot fire); 1800f timeout | 5 |
-| `0x56BBA0` | press toy switch | follow-up of 0x599210/0x599400/0x599770 (groundwork) | motion 0xBE; v*=0.9 on ground while waiting; after >60f emits signal 0xAF ahead of the Chao (0x55A920, 10 frames) and returns 1 | 5 |
+| `0x56B860` | turn around 180 deg | unknown | motion 0x64 blend 15, rotate +-0x16C/frame for 90 frames (180 deg), D+0xB8=1.6, then 1 | 2A |
+| `0x56B960` | random spin | follow-up of 0x54EE10 | motion 0x64; +/-0x16C BAMS/f for ftol(91r) frames (0..90); pop | 5 |
+| `0x56BA80` | walk to linked object | 0x54EE10, 0x5614D0, 0x599210, 0x599400, 0x599770, 0x5A2EDC | eyes 4; after 31f motion 0x64, D+0xB8=1.5; 0x530510(0x180); accel 0.044; dist (0x530580) <4.0 -> return 1 (no link: 0x530580 = 0.0, ends on frame 33; the <0 reset cannot fire); 1800f timeout | 5 |
+| `0x56BBA0` | press toy switch | follow-up of 0x599210/0x599400/0x599770 | motion 0xBE; v*=0.9 on ground while waiting; after >60f emits signal 0xAF ahead of the Chao (0x55A920, 10 frames) and returns 1 | 5 |
 | `0x598890` | watch TV | last entry of 0x599210 chain | motions 0x3E/0x3F/0x1CB(/0x3A/0x3C if animal 9), re-pick every 300..600f; TV signal 0xC9 gone -> motion 0x23D 120..210f, D+0x1F4=1800..3600, end | 2B |
 | `0x598B90` | listen to radio | 0x599400, 0x5998C0 (signal 0xCA) | same as watch TV with signal 0xCA; cooldown 1800..3600 | 6 |
 | `0x598E90` | jump off horse | 0x598F40 mode 3 sets it, but the ride returns 1 at once, so it never runs from there | MotionSet 0x84, side hop vel 0.3 at rot+0x4000, vy 0.8 [0xDF21B4], rewritten every frame (rises forever if started in the air); ends when on-ground bit set | 2B |
@@ -1669,10 +1652,10 @@ Every behaviour function the picker, interrupts and follow-ups install (verified
 | `0x5A1020` | go to water | picker 0x562520 (groundwork: THIRSTY>9000) | W+0x54 = random point in a water cell (list 9 at 0x1A1E95C); sound 0x6043 (0x6044 only if r == 0.0; active area); installs walk 0x5A3650 | 5 |
 | `0x5A10B0` | play/skill/song chooser | TEDIOUS>2000, 0.99*f16(TEDIOUS,2000); 40% skills A/B/C or song, 60% toy skill or animal play | TEDIOUS -5000 when something is installed | 3 |
 | `0x5A1460` | dark mischief laugh | 0x5A1240: p14B<=30, type in {7,10,13,16,19,22}, anger>80; either jitter(f8(anger,80)*0.99) (perceived, like<0, p14C>30, r<0.7) or 1-(100-p14C)*0.005*0.3 | motion 0x203, voices 0x6065/0x6066/0x6068, timed; follow-up 0x5A18A0 only in the perceived branch | 6 |
-| `0x5A1600` | mischief act 1 (new) | 0x5A18A0 (r<0.35) | motion 0x1B9, eyes 10, end on motion&1 | 2B |
-| `0x5A1680` | mischief act 3 (new) | 0x5A18A0 (r<0.9) | motion 0x1C3, eyes 10, end on motion&1 | 2B |
+| `0x5A1600` | mischief act 1 | 0x5A18A0 (r<0.35) | motion 0x1B9, eyes 10, end on motion&1 | 2B |
+| `0x5A1680` | mischief act 3 | 0x5A18A0 (r<0.9) | motion 0x1C3, eyes 10, end on motion&1 | 2B |
 | `0x5A1700` | mischief act 4 | 0x5A18A0 (r>=0.9) | motion 0x1BB, eyes 10, end on motion&1 | 2B |
-| `0x5A1780` | mischief act 2 (new) | 0x5A18A0 (r<0.7) | motion 0x1BD, eyes 10, end on motion&1 | 2B |
+| `0x5A1780` | mischief act 2 | 0x5A18A0 (r<0.7) | motion 0x1BD, eyes 10, end on motion&1 | 2B |
 | `0x5A1800` | dislike player | picker 0x5A1240; 0x5A04A0 | motion 0x1BF, eyes 1, mouth 4, snd 0x6069, end on motion&1 | 2B |
 | `0x5A18A0` | mischief loop (approach player, taunt) | follow-up of 0x5A1460 (perceived branch), 0x5A04A0 gate-B angry branch (follow-up only), itself | motion 0x7D; within 5 units anger -10 and picks 0x5A1600/0x5A1780/0x5A1680/0x5A1700 (0.35/0.35/0.2/0.1); 60% voice 0x606F..0x6072; ends if anger<10 or 1000 frames | 6 |
 | `0x5A1BA0` | rest (tired) | picker 0x5626D0: TIRE > 2000+round(4000*(p14A-p155+200)/400), score 0.99*f16; installs 0x55C430 and pushes 0x5A1BA0 as follow-up | per need period: TIRE -trunc(100*(300+p151)/300), CONDITN +trunc(30*(300+p151)/300); when timer D+0x1C0 expires it ends if HUNGER/SLEEPY/TEDIOUS/LONELY>8000 or TIRE<100, otherwise ends with p=0.3 (r<0.3) and repeats with p=0.7 | 3 |
@@ -1686,7 +1669,7 @@ Every behaviour function the picker, interrupts and follow-ups install (verified
 | `0x5A25D0` | animal play 12 | 0x5A2F10 | motion 1, sound 0x1013, effect 0x6CC4E0 behind, signal 0x97 r5 60 frames | 2A |
 | `0x5A27B0` | animal play 18 | 0x5A2F10 table | motion 0x11D, hand-node effect 0x6ECA30 after 20f, end on motion&8 | 2B |
 | `0x5A2860` | animal play 3 | 0x5A2F10 | motion 0x135, 4..7 end pulses | 2A |
-| `0x5A2910` | animal play 11 body (NEW) | push by 0x5A29C0 | motion 0x136, 4..7 end pulses, then 1 | 2A |
+| `0x5A2910` | animal play 11 body | push by 0x5A29C0 | motion 0x136, 4..7 end pulses, then 1 | 2A |
 | `0x5A29C0` | animal play 11 | 0x5A2F10 | Set(0x55C430)+push 0x5A2910; returns 0 | 2A |
 | `0x5A2A10` | animal play 13 | 0x5A2F10 | motion 0x132, forward 0.1/frame, 4..7 end pulses | 2A |
 | `0x5A2B10` | animal play 1 | 0x5A2F10 | motion 0x141, sideways 0.05/frame, 500..800 frames | 2A |
@@ -1703,221 +1686,38 @@ Every behaviour function the picker, interrupts and follow-ups install (verified
 | `0x5AB2C0` | sing | 0x5AB5D0 | motions 0x143/0x145, blocks on nodes 4/11, signal 0xA9 r2 1800 frames, spawns 0x5AB200 song object (id D+0x41C), sound 0x1026; 1800 frames | 2A |
 | `0x11C9BF4` | illness behaviour slot i | picker 0x599CB0: (i8)rec+0x15A+i < 0 and 30000r > CONDITN+20000 | best=0.99 (behaviour body not mapped here) | 1 |
 
-## Open questions
+## Unknowns
 
+- Names of the emotion bytes `rec+0x12C..0x133`, and the need-word labels, which follow record order only: the debug label table at `0x12E5BC4` has no xrefs. The behaviour evidence fits `0x12E..0x133` = ANGER..TOTAL; `0x12C`/`0x12D` have no label.
+- Who writes `D+0x1CC` (forced-behaviour id) and `*0x1A5A3EF` / `*0x1A5A3F2`; only reads were seen (it looks like a debug leftover).
+- Which garden situations set `D+0xA0 & 0x2000` (CreateChao clears it).
+- Where `D+0x6` (the obstacle counter in `0x5A3000`) is reset.
+- What `*0x174AFFE` is exactly (it selects `0x53D720` vs `0x564320` on release).
+- Meaning of the icon ids passed to `0x53D660`, the eye/mouth ids, and many motion ids.
+- The per-character sign table of `AddHappiness` (`0x5363B8`/`0x5363AC`) has not been read.
+- Who sends mailbox message 6 (fruit lost), and what `0x565BC0` (balloon mode 6) means.
+- The caller of `0x56B860` (fixed 180° turn) and any setter of sleeping mode 14.
+- Collision kinds: the object that emits 0xA2 (main `0x56A110`), 0xAC (planting spot), 0xAE, the 0x81 partner check in courting, and what kind 2 (pet trigger) is attached to.
+- The second fruit-category object (`0x55A560`, main `0x55A290`), toy kind 0 (`0x5604C3`), and which objects register toy kinds 5 and 6.
+- Which animals `rec+0x118` bits 2 (swim trick), 9 (TV motions) and 16 (wear hat) stand for.
+- NOURISH (`0x144`) is never raised and STRESS (`0x142`) never written in the scanned code; CONDITN (`0x146`) has no reader outside the tick and rest.
+- Meaning of `rec+0xD1`/`rec+0xD2` (looked up from personality buckets in `0x12D6534`/`0x12D68B4`); personality bytes `0x152..0x154` and taste bytes `0x158`/`0x159` have no readers.
+- The 20 u16 entries at `rec+0x1A6 + 0x1C·k` that the bond tick grows (+16, cap 50000), probably Chao-to-Chao memory.
+- The gene mix for bred eggs (`0x551D20`).
+- Who sets physics mode `D+0xA4` to 1 (heightmap `0x53DD50`) or 2.
+- Uses of `W+0x28`, `W+0x30`, `W+0xB4`, `W+0xC0`, `W+0xCC`, `W+0x40` bit 0x4, and the bit 0x10 that swim sets at `[[D+0x2C]+0xC]+0x64`.
+- Whether Chao push each other or the player through the object collision system (`0x47E750`).
+- Signals: no listener found for 0x97; the behaviours containing the 0xAF emitters at `0x55F6BB`/`0x55F8B8` and the 0xA8 emitter at `0x59B386`; when the TV/radio emit 0xC9/0xCA (`0x55C960`, `0x57CA10`).
+- The preludes `0x55C3C0`/`0x55C430` return whatever EAX `0x793D30` leaves in mode 0.
+- `0x530510` with no ALW target reads an uninitialised stack slot as the target.
+- The mating dance modes of `0x59BB50` after mode 3.
 
-### §1 Per-frame update and behaviour picker
-
-- Names of the u8 emotions rec+0x12C..0x133 and the order-only mapping of the 11 u16 needs to SLEEPY..THIRSTY (no xrefs to the label table at 0x12E5BC4).
-- Who writes D+0x1CC (forced-behaviour id) and *0x1A5A3EF / *0x1A5A3F2? Only the reads at 0x53DD04/0x53DD18 and 0x562C88 were seen; it looks like a debug leftover.
-- Who sets D+0xA0 bit 0x2000 (the frozen-think path at 0x53DC56)? CreateChao clears it (chao-garden-sync.md).
-- Writers and meaning of the think timers other than D+0x1D4, 0x1DC, 0x1F4, 0x20C and 0x210 (D+0x1D8, 0x1E0..0x1F0, 0x1F8..0x208). D+0x214/0x218 are zeroed by init but not decremented.
-- Initial values and writers of D+0x7CC (perception range) and D+0x7D4 (view half-angle); what perception list 5 (D+0x19D8) is for.
-- Consumer of D+0x1C8 (set to 3600 by AL_SetBehavior and pop); whether any generic timeout reads it.
-- What 0x534F80 returns as a wander destination and the layout of the list at 0x1A1693C (movement section).
-- Signal kinds 0xC9 (TV) and 0xCA (radio): who emits them and with what radius. The TV and radio choosers require them and were missing from the draft.
-- Why the TV/radio choosers set best=0.99 even when they fail (0x599B4C / 0x5999FC). It looks like an intended reservation or a bug. (What 0x55C4A0/0x57C7A0 compute is now in §6.4.)
-- Toy kinds outside 2..8 in 0x599B60 still cost TEDIOUS -5000 and set best with no behaviour installed. Do such toy kinds exist in the garden (list 4 = ALW category 6)?
-- 0x535010(EAX=&pos) return values (1, 2, 3, 9 seen): their meaning (terrain or zone type?) is not established.
-- The random index scale constant 0x9055C8 used in 0x59D0D0 (count - c) * r → 0x8287C0, and the FPU rounding mode of 0x8287C0 there and in 0x5A2F10. (0x55E7A0 truncates r·(n − 1e-4), 0x904FF8.)
-- 0x566AF0(D+0x510) in the cleanup 0x53D760: the draft's 'hides attached models' was not verified.
-- The push-after-pop index quirk (0x53D970 writes at count, 0x53D9B0 decrements count and increments index): does any behaviour rely on it?
-- Interrupt checks hat 0x5691B0, 0x567560, fruit 0x560640, animal 0x566BC0, 0x564760, held 0x566720, pet 0x564C10 and hit 0x563D30 were not re-verified in this pass beyond their call order.
-- Meaning of motion ids 0, 1, 3, 0xEE, 0xEF, 0x3E and of sound 0x601C used by the idle fallback 0x565BE0.
-- chao-garden-sync.md says evolution starts when rec+0xC0 > 1.0. The code at 0x562827 also accepts exactly 1.0, so that note should say >= 1.0.
-- Non-garden behaviour sites (0x538EE0, 0x538D00, 0x5392A0, 0x55F700, 0x558660, 0x55F790, 0x55FC00, 0x538350, 0x560090, 0x53D6B0) are still unconfirmed as to area context.
-- ~~0x5585B0 newborn~~ resolved: the address is `0x5685B0` (§2B corrections).
-
-### §2A Behaviour routines (part A)
-
-- Who clears the rec+0x12A once-latch, and how often? This sets the real rate of the walk/eat/sleep need changes. Candidate: life tick 0x5353C0, which runs every few frames per 0x1312DE2 (chao-garden-sync.md); unverified.
-- D+0x6 (u16) is incremented by 0x5A3000 and gates the 0xCC obstacle check after 30 frames; nothing in these routines resets it.
-- What does the destination list at 0x1A1E95C (thirsty 0x5A1020) contain, versus the wander list 0x1A1693C (water spots?)
-- W+0x140..0x148 is assumed to be the ground normal and W+0x13C a reference ground height; not verified in the physics code.
-- Labels for rec+0x13C (TEDIOUS) and rec+0x140 (TIRE) assume the debug-label order at 0x12E5BC4 matches the u16 order 0x134..0x148. Eating reducing rec+0x140 by 2400 (with the same constant as HUNGER, 0x560E86) is surprising.
-- Eat modes 11-13 are statically unreachable (verified). Still needs in-game confirmation that no external code sets mode 11..13 or re-links the fruit before the tail.
-- Meaning of the emotion icon ids passed to 0x53D660 (1, 3, 5), and of the eye/mouth ids.
-- What does 0x536260 do with the float passed by AddHappiness 0x536320? The sign is chosen from the player character byte (*0x1DE9600)+1 via tables 0x5363B8/0x5363AC. Alignment is assumed but unverified, and the per-character sign table was not read.
-- Semantics of 0x565BC0 (balloon mode 6) and of the object spawned by 0x5AB200 (main 0x5AAFB0, name string at 0x11BB924, not read).
-- What is the fruit-lost mailbox message 6 and who sends it? It causes happiness -1 and rec+0x12D/0x12E = 200.
-- 0x56B860 (fixed 180-degree turn, 90 frames) is a behaviour body found between 0x56B740 and 0x56B960. Its caller/trigger was not identified.
-- Sleeping mode 14 (0x54F023, sleep tick only): no setter was seen; it may be dead.
-- With D+0xA0 & 0x2000 set, the AI tick ignores return 2 and frame limits. Which garden situations set 0x2000 (CreateChao clears it)?
-- 0x530510 fallback when no ALW target: it reads an uninitialised stack slot ([esp+0xC] after the pushes) as the target; behaviour in that case is undefined from the code alone.
-- 0x5304F0 (set ALW target +0x44) was not re-decoded.
-
-### §2B Behaviour routines (part B)
-
-- Method caveat: most functions have no Ghidra function object (verified for 0x5648A0), so they were disassembled offline from REA read_bytes. Rows marked 'not re-checked' in the section were kept from the draft without verifier confirmation: toy picker chains 0x599210/0x599400/0x5995F0/0x599770, animal-play rows 14/18/19/20, 0x561920 (apart from drag and sound), 0x59BB50, 0x568D30 body, 0x566670, 0x566DF0, 0x5606D0, 0x566C40, 0x569340/0x569430/0x569550 bodies, and the grab template.
-- ~~Meaning of Status D+4 bit 0x1~~ resolved: on-ground bit (§5.10; set at 0x53DF90 with W+0x40 |= 0x400, cleared at 0x53E048).
-- What *0x174AFFE is (selects 0x53D720 vs 0x564320 on release): written by game-mode code (0x43A80B.., 0x519A52..), probably "player control on", unconfirmed. How 0x53D720 (returns 0 forever) is left: by an interrupt or by a stack limit.
-- What clears the latch u16 rec+0x12A (needed for per-latch need deltas in 0x5A1BA0, 0x59F5F0, 0x563830, 0x561920, 0x561AF0, 0x561E00)? Probably the life tick 0x5353C0; not confirmed.
-- Does AL_SetBehavior (0x53D890) reset cnt D+0x1C4? This decides how the swim step's double cnt increment (0x561B63, 0x561C33) interacts with re-dispatch.
-- Semantics of W+0xC/W+0x14 (walk drive), W+0x10 (0x565DC0 does W+0x10 -= W+0x48 every call), W+0x18, W+0xDC (water surface height?); these belong to physics 0x53DF00.
-- Identity of collision kinds 0xA2 (0x5647B0 trigger), 0xAC (planting spot), 0xAE (target of 0x567FA0), and 0x81 (partner check in courting). (0xCB = C_CLIMB, garden-collision.md §8.)
-- ~~Ball globals~~ resolved: *0x1DBE574 = ball in mode 1 with speed > 0.4 (0x55D373); *0x1DBE56C = ball in water (set 0x55CF49, cleared each ball frame 0x55D32B). *0x1DBE570 (ball object) not re-checked.
-- 0x565DC0 also clears *0x1AED28C and writes 7 to **(*0x1AED28C+0x40) when that object's +0x38 is the released Chao; that object was not identified.
-- Values not re-read by the verifier: 0x104DD30 (drafted 4.0), 0x89E4DC (drafted 30.0), 0xB18F54 (drafted 1.4), 0xA3D28C (drafted 0.35), 0x905A10 (court cnt range).
-- 0x54B0E0(obj, -0.015) in 0x5680F0 mode 3 and 0x5AAF60's child task 0x5AAE20 (breed) were not decoded.
-- 0x5A27B0 effect call 0x6ECA30 argument meaning (D+0x608 node, scale 0.25) was not decoded.
-- The emotion byte names for rec+0x12C..0x133 are not confirmed; behaviours are named by offset only. The debug label 'HUNGER' for rec+0x138 drives the held mood drift in 0x565DC0, which is unexpected; the label mapping should be double-checked.
-- Which animal ids correspond to rec+0x118 bits 2 (swim trick), 9 (TV motions 0x3A/0x3C) and 16 (wear hat).
-
-### §3 Emotions and needs
-
-- Names of emotion bytes 0x12C..0x133: the debug labels ANGER, SORROW, FEAR, PAIN, RELAX, TOTAL (0x12E5BC0..) have no xrefs, so the label-to-byte mapping is unconfirmed. The behaviour evidence fits 0x12E..0x133 = ANGER..TOTAL, but this is not proven, and 0x12C/0x12D have no label.
-- NOURISH (0x144) is never raised and STRESS (0x142) is never written in the drafter's pattern scan ([reg+off] and base+0x124 forms only; not re-run by the verifier). The verifier checked that the fruit-effect path 0x545790 → 0x535F00 → 0x536040 does not write them. A raiser using another addressing form may still exist.
-- CONDITN (0x146) has no reader outside the tick and rest; its effect on behaviour or health is unknown.
-- 0x5513C0 writes u16 words at rec+0x14A..0x158, which overlap the personality bytes overwritten right after (0x55164C). What 0x157..0x159 hold afterwards, and the meaning of the second caller 0x551FCC, are unconfirmed.
-- Meaning of ALW entry command word (obj+0x3C)+0x34 == 6, which causes the eat 'dislike' reaction (0x5611B1).
-- Emotion-ball handlers 0x53C180..0x53C790: Ghidra could not decompile them, so the state→icon mapping (D+0x726: 0→10, 1→1, 3→2, 4→3, 5→4, 2 holds) and the claim that no handler reads the save record were not re-verified. The icon pictures (texture table 0x1366ACC) were not decoded.
-- Counts of emotion-ball requests by immediate DL (state 5 ×18, 1 ×10, 3 ×6, 4 ×3) come from the drafter's scan and were not re-verified.
-- ~~0x53E1F0~~ resolved: raises the bond fear byte bond+1 (n = 50 hit, 10 thrown), §3.3.
-- Garden logic frame rate is assumed to be 60 Hz when converting frames to seconds; not verified in code.
-- The 20 entries at rec+0x1A6 + j*0x1C that the bond tick ages (+16, cap 50000): likely Chao-to-Chao memory, but unconfirmed.
-- Exact branch semantics inside eat 0x5607C0 for p14A<0 and HUNGER<=5000 (mode 4, 0x56087C), and for p150<=50 and HUNGER<=8000 (motion 0xAF, 0x560B31); what eat mode 9 (set at 0x560EC1 when HUNGER reaches 0) does before the behaviour returns.
-- Age-period block (§4 territory): for type byte rec+0x80 == 2 it calls 0x536110(f32 0x1312CA0) then 0x536260(±f32 0x1312CA8) in Hero/Dark gardens (0x535424..0x53546E). For other types it increments u16 rec+0x88; when type < 0x14 it lowers rec+0x8C by trunc((rec+0x88+100)/15) floored at 0 and caps rec+0x8A to rec+0x8C; then it calls 0x536110(0x1312CA4) and 0x536110(±0x1312CAC) (0x535478..0x535508). rec+0x86 += 1 every age period (0x53540F). Meaning left to §4.
-- Ball-chase exit after D+0x1C0 > 3000 frames (0x563B1A..0x563B37): it clears ALW ball entry word +6 and jumps to 0x5639FF; whether that path returns 1/2/3 to the behaviour stack was not traced.
-- The 'garden has >= 8 Chao' condition for the BREED reset at 0x56293C, and the 0x590CE0 check used by the mischief picker 0x5A1240, were not re-verified.
-- f8(v,t) (0x562490) is assumed to be (v−t)/(200−t) by analogy with f16; not re-verified.
-- The drafter reported that code bytes 0x7B0000+ were read incompletely (787968 of 983040 bytes), so the scan for emotion writes did not cover the tail of the image.
-
-### §4 Stats, aging and personality
-
-- 0x530850 is a task main; it is assumed to run once per frame, so a life tick slot comes every 96 frames. The task update rate was not confirmed.
-- Rebirth leaves taste rec+0x157 = 0x27 and rec+0x158/0x159 = 0, because 0x5513C0 writes u16 10000 at rec+0x156 and 0x551560 doesn't re-roll taste. No later writer was found (hatching runs 0x551DA0 only when DNA[0]==0). Confirm in game whether reborn Chao keep this value. Their fruit 7/8/9 dislikes would then never trigger.
-- Meaning of 0x5513C0's u16 writes over rec+0x14A..0x152 (always overwritten by personality afterwards). They may be leftovers of an older layout; not resolved.
-- No writer of personality rec+0x14A..0x156 or taste rec+0x157..0x159 was found besides 0x551DA0, 0x551560 and 0x5513C0. An exhaustive struct-offset write search isn't possible with these REA queries, and undisassembled behaviour code (e.g. 0x5607C0, 0x568F60) is invisible to caller and xref lists.
-- No readers were seen for personality bytes 0x152, 0x153 or 0x154, or for taste bytes 0x158/0x159. (0x14D is read by the SLEEPY term at 0x535977.)
-- Meaning of rec+0xD1/rec+0xD2, which are looked up from personality buckets in tables 0x12D6534/0x12D68B4.
-- Meaning of the fields 0x53E2D0 grows every 11 life ticks: u16 rec+0x16E+6k (bond[k]+2, k=0..5) and 20 u16 at rec+0x1A6+0x1C*k, +16 each, capped at 50000.
-- Does anything besides the clamp to rec+0x8C and fruit (+3) change life rec+0x8A? If not, life only reaches 0 when maxLife decays to 0.
-- Byte rec+0x134 (low byte of SLEEPY) is zeroed at rebirth (0x551643); intent unclear.
-- The gene mix for bred eggs, 0x551D20 (named in chao-garden-sync.md), has no resolved caller in Ghidra; its algorithm was not mapped.
-- 0x568F60 mode 0 calls 0x54A690 and 0x54A730 (unmapped).
-- Whether evolution resets adultAge rec+0x88 (it affects the lifespan worked example) was not checked; evolution is out of scope.
-- The adult age tick adds ±1/240 to evolution rec+0xC0 by garden through 0x536110. Its effect on adults belongs to evolution and was not checked.
-- 0x535010 (checked == 9 before the climb/fly choice in 0x5A3000) and 0x590CE0 (player-seen check in 0x5A1240) were not mapped here.
-- The ordering and weight of the death candidate 0x562A20 relative to the other picker candidates is section 1's job.
-- The fruit-bite use of 0x1312D00 (+3 life) and 0x1312D04 (+5 max life), and the 9999 cap constant used by 0x5362D0 (0x1312C7C or 0x1312C7E, both 9999), were cited from chao-garden-items.md rather than re-read in 0x545790/0x5362D0.
-
-### §5 Movement and pathing
-
-- Meaning of grid values 2, 4, 6 (Hero only) and 8 (all gardens): lists 2/4/6 have no xrefs; list 8 (0x1A1D958) is read only inside 0x57BD40 (small-animal main).
-- Other readers of the land list 0x1A1693C and of 0x535010 were not traced: 0x567830 (0x567A7E), 0x59F490 (0x59F5C7), 0x599B60. They may be Chao behaviours that pick land/water points (e.g. after a throw).
-- Tree climbing: no tree-climbing locomotion was found among the movement routines. The only climb is the ledge climb 0x562EB0, gated by collision kind 0xCB (C_CLIMB, garden-collision.md §8). Behaviours using the tree perception list (D+0x12A8) were not traced.
-- Does Chao-vs-Chao or Chao-vs-player pushing happen in the object collision system (0x47E750 / 0x47E520(&0x13134D0,5,9) at 0x550334)? Not traced.
-- Who sets physics mode D+0xA4 to 1 (heightmap 0x53DD50) or 2? CreateChao leaves it 0; no writer was searched for.
-- u16 D+6 counter used by 0x5A3000 (>30 enables the 0xCC check): where it is reset is unknown.
-- Who clears the once-latch rec+0x12A (gates the walk/swim need changes) is not traced.
-- ~~0x530580 with no link~~ resolved: returns 0.0 (distance to self), so 0x56BA80 ends (returns 1) on its first walking frame (§2A.1).
-- Which ponds have a solid floor and which have only water-flagged bed COLs (no floor for the physics). Simulation runs reached y −5..−7 in some ponds; garden-collision.md §7.2 finds solid pool floors under some shore cells; the swim mapping says bed COLs carry the water bits (§5.10). Both are kept until each pond is checked.
-- Return value of the preludes 0x55C3C0/0x55C430 in mode 0 is whatever EAX 0x793D30 leaves (no explicit MOV EAX); if non-zero it could be read as pop/choose/reset by the stack runner.
-- Bit 0x10 set at [[D+0x2C]+0xC]+0x64 by 0x562330 (swim) is not identified; nor the byte *(D+0x2C)+4 bit 0x10 that wakes resting physics in 0x796780.
-- W+0x28 (0x100), W+0x30, W+0xB4 (1.5), W+0xC0 and W+0xCC: uses not traced.
-- Meaning of W+0x40 bit 0x4 (selects reflect-along-normal and no friction in 0x796B20) and who sets it is not traced.
-- Steady-state speeds (about 1.5*accel on land, 20*accel swimming) are derived from the constants, not measured in game.
-- The 0x48C5E0 ray range (220, 48400) and the heightmap formula in 0x53DD50 were not re-verified.
-
-### §6 Interactions
-
-- Who emits the 0xA2 collider in a garden: object with main 0x56A110 (init 0x56A700, collision kinds 0/0xA3) and code at 0x53F963 were found, but the object's identity and creator are not known.
-- What kind 2 is attached to (pet trigger 0x564C10 via 0x54B1F0(2); pet continue is a touch query 0x486760(obj,2) at 0x564B1C); player hand collision not traced.
-- ~~Meaning of Status bit D+4 & 1~~ resolved: on-ground bit (§5.10).
-- Which code clears the once-latch rec+0x12A that gates eating's HUNGER/TIRE -2400 and ball chase TIRE/TEDIOUS changes (rate per real time unknown).
-- Meaning of the global comparison *0x134046C == *0x134062C that gates the whistle voice 0x6019 (0x563719) and pet voices 0x6074/0x6075 (0x564A45/0x564A71); *0x134046C is also the area id used for the x3 run-point rule.
-- Where the lonely gates D+0x1D4 and D+0x1DC are set (only decremented by 0x562C00 per groundwork).
-- Toy ALW kinds 5 and 6 (mapped to no-op 0x40AD80): which objects register them.
-- Signal 0xA8 emitters at 0x59B386 and 0x59BAE2 were not decoded (which trick/behaviour, radius, duration).
-- 0xAF emitters at 0x55F6BB and 0x55F8B8: containing behaviours not identified.
-- Signal 0x97 (animal play, 0x5A2793) has no listener found in the read code ranges.
-- Whether rec+0x118 bit 0x10000 (needed to wear hats, 0x5692E5) is only the 'animal 16 absorbed' bit or is also set elsewhere (e.g. at birth).
-- 0x535010(&pos) return values 1/2/3 used by the horse case (3 = skip): meaning not mapped.
-- 0x590CE0 (player-perceived test used by 0x5A1240) not decompiled; assumed equivalent to the list-0 test in 0x5A04A0 but not verified.
-- Eat modes 5, 7 and 8 are now decoded (§2A.4) and 11–13 are unreachable. The mailbox-6 tail ordering (0x5611BB..0x56126A) was only partly decoded.
-- 0x55C4A0 / 0x57C7A0 viewing spot: now in §6.4. Movement helpers are in §2A.1/§5.8.
-- Mating dance modes of 0x59BB50 after mode 3 and timing of motions 0x1D4/0x1EC on the caller side were not fully decoded.
-- ~~0x5AB5D0 song selection~~ resolved (§2A.5): *0x1AEDC00 counts song objects (≥ 100 → no song).
-- Skill joiners: the play mapping says joiners (0x59D0D0/0x59C3D0) "walk to the signal position"; the food/reach mapping says 0x56B500, which they install, only faces the target (§2A.1, V). The doc keeps "target = signal pos, 0x56B500 face"; whether a joiner ever walks there is unchecked.
-- Choosers 0x599A10, 0x5998C0, 0x59B710, 0x59B820 were not re-read by the verifier; their best gate is assumed to be the same strict best < 1.0 pattern but this is unconfirmed.
-- Not re-verified in this pass (kept from the draft): eat taste rules (0x560946..0x5609DD), fruit-taken anger +200 (0x5611BB..0x56126A), 0x5A0820 near-player loop, 0x5A1460/0x5A18A0/taunt motions and voices, 0x59ED60/0x59EF40/0x59E8C0 internals, 0x567830 search radius formula, hat sub-behaviour motions, and signal-table entries other than 0xAB/0xAE/0xA2.
-
-## Verification log
-
-Per section: claims a verifier re-read in REA. *corrected* claims are fixed in the text above; *refuted* ones were removed or moved to open questions.
-
-| § | confirmed | corrected | refuted | unverifiable |
-|---|---|---|---|---|
-| 1 | 29 | 13 | 0 | 1 |
-| 2A | 26 | 6 | 0 | 1 |
-| 2B | 23 | 7 | 0 | 0 |
-| 3 | 25 | 8 | 0 | 1 |
-| 4 | 25 | 4 | 1 | 0 |
-| 5 | 27 | 9 | 0 | 2 |
-| 6 | 32 | 6 | 0 | 1 |
-
-Corrections and refutations:
-
-- §1 (corrected): Tick: if D+0x47C[i] > 0 decrement, else if ret==2 picker... (timer > 0 suppresses ret handling) → 0x53DCD2..0x53DCFF: after DEC, JZ 0x53DC8C (pop) only when it reaches 0; otherwise it falls through to CMP EAX,2 at 0x53DCFC, so ret is still handled while a limit is running; ret is ignored only on the frame the limit hits 0
-- §1 (corrected): Deep sleep 0x54EB20 score = 0.5 + 0.5*f16(v,500) → 0x54EB4A FLD 0.5; FMUL ST1; FADDP gives f + 0.5f = 1.5*f16(v,500), then jitter
-- §1 (corrected): Drowsy cooldown D+0x210 = round(600+2400*0.5*((10000-SLEEPY)/10000 + r)), rewritten every decision → 0x54EAB5 OR EAX,0xC00 before FISTP: truncation, not rounding; the rewrite happens on every picker run whatever the gate (0x54EA3C reached from both paths)
-- §1 (corrected): Hunger HUNGER >= 9901 gives score 1.0 → 0x59EBAD FLD1 then CALL 0x5624D0 (jitter): score is 0.4..1.0, compared with best again
-- §1 (corrected): Tired threshold 2000 + round(4000*(p14A-p155+200)/400) → 0x562750 OR 0xC00 (truncation); 0x1312EAC=2000, 0x1312EB0=6000, 0x905278=400.0; the quotient is stored as a float first (0x56272F)
-- §1 (corrected): Evolve gate rec+0xC0 > 1.0 → 0x562827 FCOM then TEST AH,0x41; JP: equality also passes, so the condition is >= 1.0; rec+0xC0 is set to 1.0 before the 0x54AC20 check (0x562834)
-- §1 (corrected): 0x5625B0 with THIRSTY >= 5000 multiplies 0.891 by a stale FPU value → The ST0 at 0x562648 on that path is the 0.0 loaded at 0x5625B3 (FST, not popped), so the score is 0; 0x1312EA4=5000, 0x1312EA8=0.891
-- §1 (corrected): TV 0x599A10 gate: TV object *0x1AED288 and 0x55C4A0 → It also requires signal 0xC9 via 0x486880 (0x599A31..0x599A82); best is set to 0.99 even if the TV or 0x55C4A0 fails (0x599ACE..0x599B56). Radio 0x5998C0 is the same with signal 0xCA (0x5998E1)
-- §1 (corrected): 0x59D0D0 side effects TEDIOUS -4000, LONELY -4000 self and performer for the candidate → Only in the own-skill branch (0x59D28D..0x59D35C); the no-skill watch branch (0x59D361..0x59D3F9) changes no needs
-- §1 (corrected): 0x59F210 player-seen branch operand garbled → 0x59F273..0x59F2A8: requires u8 rec+0x16D+c*6 > 75 (0x1312E0C), score 0.99*f8(rec+0x12F,75) jittered; otherwise 0
-- §1 (corrected): 0x5A1240 installs 0x5A1460 / 0x5A1800 → Mapped per branch: (a) p14C>30 and r<0.7 → 0x5A1460 + push 0x5A18A0 (0x5A1335); (b) else if p14C > -50 → 0x5A1800 (0x5A13B3); (c) no player, like>=0 or p14C<=-50 → 0x5A1460 with no push (0x5A142A); 0x9050C0 = 0.7
-- §1 (corrected): Toy 0x599B60: kinds 2/3/4-6/7/8, horse skipped when 0x535010()==3, TEDIOUS -5000 → Confirmed, plus: 0x535010 takes EAX=&toy pos (0x599C0C); kinds outside 2..8 still get TEDIOUS -5000 and best=score with no install (0x599BD6 → 0x599C40)
-- §1 (corrected): 0x565BE0 mode 0 blends to an idle motion via 0x793D30, D+0x1C0 = 60+trunc(121r), velocity x0.8, returns 2 after 61..181 frames → Bytes 0x565BE0..0x565DBC: 0x793D30(0x3E, 0x23) only when motion id D+0xAE in 1..3; otherwise a random motion 3/0/0xEE/0xEF/1 by r thresholds 0.15/0.5/0.6/0.7 (0x165DFD8, 0x165DFD4, 0x8AF048, 0x109DFF0), and on 3 also icon 0x53D660(3,180) and sound 0x601C; damping x0.8 (0x905230) applies to all of W+0..8 when on ground; -121.0 at 0x905A20; the 61..181 count is confirmed
-- §2A (corrected): Any behaviour return other than 1/2/3 is a no-op; frame limit D+0x47C pops regardless of return → 0x53DC40 decoded: the normal path (D+0xA0&0x2000 clear) matches the claim (0x53DCD2-0x53DCFA pop, 0x53DCFC ret==2 -> picker if word D+0x1CC==0, then 0x562C50; 0x53DD28 ret==3 reset). But when D+0xA0&0x2000 is set (0x53DC5F-0x53DC95): no think timers, no frame-limit countdown, and return 2 is ignored. A null slot counts as 1 (0x53DCC7).
-- §2A (corrected): Pop semantics / stack empty -> reset → 0x53D9B0 increments the read index D+0x438 and decrements the count D+0x434 (a FIFO queue, not a stack). Sets D+0x430 = popped fn, clears mode/+0x1B8/+0x1C0/+0x1C4, D+0x1C8=3600, returns (next slot != 0). Tick resets at 0x53DD2D on 0.
-- §2A (corrected): 0x53DA00 zeroes mode, D+0x1B8, D+0x1C0, D+0x1C4, D+0x1BC; D+0x1C8=3600; mailbox 3; 0x53D760 → Also zeroes D+0x41C (esi+0x268 at 0x53DA44). D+0x1BC zeroed after 0x53D760 (0x53DA6B). Swap current slot with D+0x430 (0x53DA3A-0x53DA3E).
-- §2A (corrected): rec+0x12A latch via 0x536420 gates walk-step, eat-bite and sleep-tick → 0x536420 is the check-and-set (rec=D+0x5C; word +0x12A). Only the eat bite calls it (0x560E3F). The walk step (0x5A3151) and sleep tick (0x54EC7C) inline the same check-and-set.
-- §2A (corrected): Eat mode 6 details (counts, motions) → 0x560BC0-0x560E3D: msg 4 -> 0x793D30 motion 0xA5 blend 60, D+0x1C4=180+trunc(200r) (0x9051D8=200), mode 11, unlink, 0x565BC0, eyes 4, mouth 2, sound 0x6042. Count 0: p150>50 && r<0.4 (0x904EB0) -> 0xB7, mode 5, 2+trunc(5r) (0x905010=5), sound 0x603D, eyes 1; else 0xB1(r<0.5)/0xB0, count 10 if r<0.3 (0x9050C8) else 40+trunc(200r), eyes 0, mode 7.
-- §2A (corrected): Sleeping 17 modes, table 0x54F750, mode 16 returns 1 → Table at 0x54F750 has 17 entries. Mode 11 has its own handler 0x54F649 (end pulse -> mode 2, same effect). Mode 14 -> 0x54F023 only runs the sleep tick (not in the draft). Mode 16 0x54F726 returns 1 and clears D+0x1CC/0x1CE. Mode 0 (0x54EF35): posture 1 && rec+0x140>7000 (0x1B58) && r<0.5 -> Set(0x54F7A0).
-- §2B (corrected): The swim step re-targets on xz dist^2 < 36, >600 frames, or 0.2% on wall; it climbs out (0x562EB0) on wall when THIRSTY < 1000 and touch 0xCB. [0x561B89..0x561C3E] → 0x561B89 cmp rec+0x148,1000: <1000 -> touch 0xCB -> 0x562EB0, else nothing; the r<0.002 (0x9055B0) re-dispatch only happens when THIRSTY>=1000. xz dist^2 < [0x8AE5DC]=36.0f confirmed. cnt D+0x1C4 is incremented twice per frame (0x561B63 and 0x561C33), so 'cnt>600' fires after ~300 frames. Also an unused rand() every 10 frames (0x561B6E).
-- §2B (corrected): With no ALW target, 0x530580 returns -1.0, so 0x567FA0 switches to 0x5680F0 immediately. [0x5305B6 (0xB087CC), 0x56806F] → 0xB087CC = -1.0f, but 0x530580 begins with push ecx, and the missing-target path does mov eax,[esp] (the saved ECX = the Chao object), which is non-null, so it computes 0x77FBD0(D+0x14, D+0x14) = distance to itself (0.0). The -1.0 path runs only if the saved ECX is null. Either way < 4.0, so the immediate switch holds. 0x56806F itself not re-read.
-- §2B (corrected): Eye ids across the section (0x53A4B0 convention) → 0x53A4B0 decompile: EAX->D+0x68C (duration), DX->D+0x692 (id). With 'or eax,-1; lea edx,[eax+N]' id = N-1. Wrong in draft: 0x59F350 (0x59F3B9 +2 -> Eyes 1, not 2), 0x59F5F0 (0x59F657 +2 -> Eyes 1), 0x5647B0 (0x5647DC -> 1), 0x566300 (0x56635B -> 1), 0x5648A0 mode 2 (0x564AC7 +4 -> 3, not 4). Others verified correct: 0x5A0859 (3), 0x5A09A4 (4), 0x5A14AB (10), 0x59F9C8 (3), 0x5A0110 (6), 0x568FA0 (3), 0x5665C0 (9), 0x56774C/0x567A18/0x567FD6 (0).
-- §2B (corrected): 0x564320 mode 2 landing timer is 120+trunc(120r) → 0x56444D mov edx,0xB4; fmul [0x905A20]=-121; sub -> 180..300. Same as hit 0x563EB0 (0x564210/0x56429D).
-- §2B (corrected): 0x563EB0 hit mode 1 -> Motion 0x9F, timer, D+0x50=0, mode 2 → 0x5641CB..0x5642D3: also Icon(5,150) (push 0x96, dl=5) before mode++; mode 2 (0x564254) repeats Motion 0x9F/timer/Icon on Status&1 and goes to mode 3.
-- §2B (corrected): All toy skills set Eyes 4 at start → Drum 0x55E4D4..0x55E4F1 and book 0x55E2E3..0x55E30D call Eyes 4 only when r<0.5; skills 0,4,5,6,7,9 call it unconditionally (0x55DE1D, 0x55E637, 0x55DD4D, 0x55DEED, 0x55E70D, 0x55DB4D).
-- §2B (corrected): Held behaviour mood drift in 0x565DC0 → Missing from draft/groundwork: every 601 frames (D+0x1C4>600) HUNGER rec+0x138 >9999 in 0x566300 with area 1..3 -> 0x46E5E0 + 0x565B90 + AL_SetBehavior(0x565BE0); >8000 in 0x5662B0 -> 0x566300; >5000 in 0x5660A0 -> 0x5662B0 (0x565DC0 decompile).
-- §3 (corrected): Sub-periods: decay 8 (rec+0x126, const 7), needs 11 (rec+0x12A, 10), conditions 81 (rec+0x128, 80), age 121 (rec+0xA4, 120) → Periods confirmed at 0x535401/0x53559E/0x53595E/0x535DF5 with u16 consts 0x1312DE4=120, DE6=10, DE8=7, DEC=80. Correction: rec+0xA4 is a u32 (MOV EAX,dword [EBX+0xA4] at 0x5353E5) and the bond counter rec+0x168 is an i32 compared with JL, not u16.
-- §3 (corrected): 0x12F picker: with player perceived and familiarity>75 → 0.99*f8, otherwise 1-(p14C+100)*0.005*0.3 → 0x59F234..0x59F2AD: the fallback formula is used only when the player is NOT perceived (D+0x7E4==0, D+0x7F4<0 or *0x1DEA6E0==0). When the player is perceived and familiarity <=75 (0x59F28C JBE), the score stays 0.0 and nothing is installed. Follow-up 0x59F5F0 confirmed at 0x59F2D1.
-- §3 (corrected): 0x12D mischief: dark adult, p14B<31 → 0x5A1460/0x5A1800 → 0x5A1240 decompile: type-7 <16 and %3==0 (types 7..22 step 3); disliked-player branch (0x590CE0 != 0 and like<0) picks 0x5A1460 with follow-up (p14C>30 and r<0.7) or 0x5A1800 (p14C>-50) at 0.99*f8(v,80) jittered; otherwise 0x5A1460 at 1-(100-p14C)*0.005*0.3
-- §3 (corrected): Bond tick adds 150 to bond+2 for 6 bonds and 20 entries, cap 50000 → 0x53E2F5: MOV DI, word [0x1312D6C], and u16 0x1312D6C = 16 (0x1312D6E is 150). The increment is +16. Targets rec+0x16E stride 6 ×6 and rec+0x1A6 stride 0x1C ×20, cap 0xC350, period 11 via i32 rec+0x168 vs u16[0x1312DEA]=10 — all confirmed.
-- §3 (corrected): Rest ends at timer expiry if needs>8000, TIRE<100, or r>=0.3 → 0x5A1C21..0x5A1C3F: rand/32768 FCOMP double 0x9050C8 (=0.3), TEST AH,5 / JNP end → it ends when r < 0.3 (30%) and repeats (mode 0) when r >= 0.3 (70%). The need checks (0x1312EB8=8000) and TIRE<0x64 are confirmed.
-- §3 (corrected): Eat: HUNGER -2400, TIRE -2400 per need period, ends at HUNGER 0 → 0x560E3F call 0x536420; 0x560E52 u16[0x1312DA6]=2400 subtracted from 0x138 and 0x140. At HUNGER==0 it sets mode word [ebx+2]=9 (0x560EC1); it does not return 1 directly there.
-- §3 (corrected): Deep-sleep ball state 5 for 360 frames, refreshed every 401 frames → 0x54FD81 push 0x168, dl=5, call 0x53D660. 0x54FD99: refresh when the old D+0x1C0 > 0x190 (400), then reset to 0 → period 402 frames.
-- §3 (corrected): CreateChao sets Data1+0xA0 bit 0x20000 at 0x55054D → Instruction 'or dword [eax+0xA0],0x20000' starts at 0x550546 (0x550540 sets 0x10)
-- §4 (corrected): Taste rec+0x157 decides dislike for kinds 7/8/9; hero fruit disliked by dark adults, dark fruit by hero adults; dislike = happiness -1, alignment -0.1 → Switch at 0x5608F3 (kind-5, ja 4), table 0x5613AC = 0x56090C/0x56091D/0x56095E/0x5609A9/0x560A15. Sets {2,4}, {0,5}, {1,3} confirmed; calls 0x535390 and 0x535360 confirmed. AddHappiness 0x536320 is called with EDI=-1 and push -0.1. Per chao-garden-items.md, the float's sign is applied by the local player's character, so alignment changes by ∓0.1, not a fixed -0.1.
-- §4 (corrected): Needs growth personality terms HUNGER 70, BREED 12, TEDIOUS 60/30/30, LONELY 60, TIRE 10 → Confirmed at 0x5359DF..0x535C76 with u16 0x1312DA4=70, DA8=12, DAA=60, DAC=30, DAE=30, DB4=60, DBC=10. BREED gated to types 3..19 (0x535A3E..0x535A44). The draft omitted SLEEPY 0x134 += trunc((300+p14D)*90/300 * (1+TIRE*6e-5)) (0x535964..0x5359E6), NOURISH -36, the CONDITN +80/-120/-60/-300 rules and THIRSTY +150 (0x535C7D..0x535DDE); these were added.
-- §4 (corrected): 0x5513C0 is unmapped (drafter open question) → 0x5513C0 assembly with ESI=rec+0x124 at both call sites (0x55163D/0x551F7C) writes u16: rec+0x144 rand*5000, 0x146=0, 0x148=3000+rand*6000, 0x14A..0x152 random/0, 0x154=0x156=10000, 0x158=0. At rebirth taste 0x157 is left as 0x27 because 0x551560 doesn't rewrite taste.
-- §4 (refuted): No readers for personality byte 0x14D (drafter open question) → 0x535977 movsx ecx, byte [rec+0x14D] is the SLEEPY rate term in the needs tick.
-- §4 (corrected): DNA crossover for bred eggs not located (drafter open question) → chao-garden-sync.md (Breeding, 2026-10-18) names 0x551D20 as the gene mix called from the mating behaviour. procedure_callers 0x551D20 returns none (caller undisassembled); the algorithm itself remains unmapped.
-- §5 (corrected): 0x797E10 ray-casts from pos+(0,3,0); floor at W+0x13C, normal W+0x140; 0x47CD60 bounding sphere radius x max scale +1+30 for both lists → 0x797E10 sets W+0xE4 = y + W+0xAC and calls 0x47CD60(x,y+3,z,1.0). 0x47CD60 uses MIN of scales (+0x20/+0x24/+0x28) +1+30 for the dynamic list and 'dist-1 < entry+0xC' for the landtable list (only when *0x171CAAC==1 && *0x19459DC!=0); max-scale check is in 0x797E10 for entries with +8!=0. Range 220 in 0x48C5E0 not re-checked.
-- §5 (corrected): Water polygons excluded from floor/ceiling only → 0x797E10: the 0x2002 test also guards the +X slot; -X, -Z, +Z slots have no exclusion. Ceiling-slot water hit writes W+0xDC = floor-slot hit Y (local_13c). W+0xDC is reset to -2e6 (0xC9F42400) at the start.
-- §5 (corrected): Stumble: walk every 85 frames 3%, jog every 100 frames 2% → 0x5A3380 uses D+0x1C0 (old%0x55==1, rand<0.03); 0x5A3460 bytes: IDIV 100 on D+0x1C0, JNZ on remainder -> old%100==0, rand<*0x9054C0=0.02. 0x5A3280 sound uses D+0x30%0x78==0 and 30%.
-- §5 (corrected): 0x5A3000 handles cases sequentially (implied early exit) → After each CALL 0x53D890 the code continues (0x5A308D, 0x5A30C7, 0x5A3143 fall through to the next checks and the once-latch); returns 0 at the end. Multiple SetBehavior calls per frame possible.
-- §5 (corrected): Swim timeout D+0x1C4 > 600 → 0x561AF0 increments D+0x1C4 at 0x561B64 and again at 0x561C36, compare at 0x561C2E against 0x258 -> fires after ~300 frames.
-- §5 (corrected): Swim wall: rec+0x148<1000 and hit -> climb, else 0.2% re-dispatch → 0x561B84: CMP word [rec+0x148],1000; JNC -> 0.2% (0x9055B0) branch only when >=1000; when <1000 and no 0xCB hit nothing happens.
-- §5 (corrected): Prelude 0x55C3C0: posture 1 -> 0x26, 2 -> 0x30; 0x55C430: posture 0 -> 0x2A, 2 -> 0x2F → 0x55C3C0 bytes: posture 1 -> MOV EDX,0x30; posture 2 -> MOV EDX,0x26; posture 3 -> 0x26 with PUSH 0x23. 0x55C430: posture 0 -> 0x2F; posture 2 -> 0x2A; posture 3 -> 0x2A (blend 0x23); others return 1.
-- §5 (corrected): 0x562330 sets bit 0x10 at *(D+0x2C)+0xC+100 → Decompile: puVar1 = *(int*)(*(D+0x2C)+0xC) + 100; *puVar1 \|= 0x10 (double dereference).
-- §5 (corrected): 0x561920 float movement: walked-out test → 0x561920 tests D+0x1B4 & 1 (not & 4) before calling SetBehavior(0x562D20).
-- §6 (corrected): 0x5634D0 m3: D+0xB8=1.5, turn 0x300 until <0x100, then 70% motion 0x1EC + sound 0x6019 → 0x563648 FLD [0x1283DDC]=1.5; PUSH 0x300 CALL 0x796AB0; CMP EAX,0x100; r vs 0x9050C0=0.7; also eyes 4 (0x563705) and sound only if *0x134046C==*0x134062C (0x563719); timer 20+r*20 (0x9050B0=20.0)
-- §6 (corrected): Hunger branch B only when D+0x20C==0 and r<0.6; gate = 1200+5400*((10000-H)/10000+r) rounded → 0x59EB09 CMP [EAX+0x20C],0; 0x59EB33 FCOMP [0x905268]=0.6; gate computed 0x59EE99..0x59EF18 with FLDCW (cw\|0xC00) + FISTP = truncation; constants 0x1312E3C=1200, 0x1312E40=10800, 0x904E98=0.5, 0x904F50=10000.0
-- §6 (corrected): Seed pick-up needs rec+0x3C >= 150 (x3 outside areas 6/10/11) and planting needs toy-skill bit 10 → 0x56758E..0x5675B9 area test and u16 0x1312D6E=150 confirmed; no skill-bit test in 0x567560 (full listing); bit 10 tested only in planting 0x567C13 via 0x53E360(ECX=10) (pseudocode: (1<<cl)&rec+0x164)
-- §6 (corrected): Watering chooser scores 0.891*(5000-v)/5000, needs bit 11, adds 2000 → 0x5625B0 assembly: signal 0xAE via 0x486880; 0x1312EA4=5000, 0x1312EA8=0.891; v>=5000 -> s=jitter(0.891*0.0 [0x8AF004]) = 0; jitter applied in both cases; gate best<1.0 strict; bit 11 via 0x53E360(ECX=11) at 0x56823E; +0x7D0 cap 10000 at 0x568243
-- §6 (corrected): Mischief 0x5A1240 gates and branches → 0x5A1240 assembly confirms p14B<=30, type (t-7)%3==0 & t-7<=15, anger>[0x1312DF8]=80, r<0.7 (0x9050C0), p14C>-50 (0xCE), default 1-(100-p)*0.005(0x9055A8)*(1-0.7 0x1312E00); added: losing score returns without fallback (0x5A1326, 0x5A13AB); follow-up 0x5A18A0 confirmed at 0x5A133D; default branch has no follow-up
-- §6 (corrected): Ball reaction: moving, TEDIOUS>4000, dist<50: TEDIOUS -2000 → pseudocode 0x563B70 confirms; added: no check for an ongoing chase, so it re-fires every tick (-2000 each, restarts chase)
 
 ## 7. Perception (0x590C70) and senses
 
-Mapped 2026-10-19 (REA pseudocode and assembly of `0x5904C0`..`0x590D20`, `0x530410`, `0x53E0C0`,
+Sources: REA pseudocode and assembly of `0x5904C0`..`0x590D20`, `0x530410`, `0x53E0C0`,
 `0x55A920`, `0x55A850`, `0x486760`, `0x486880`, `0x47EC50`, `0x485620`, `0x485850`, `0x483170`;
-constants read from the dumped exe). Supersedes the perception rows of §0 where they differ.
+constants read from the dumped exe.
 
 ### 7.1 Record layout
 
@@ -2008,7 +1808,7 @@ ALW categories as registered (`0x530750`, ECX = cat, kind = 2nd push):
   with no player). It is **independent of perception**. `p+1` is the main character slot (the one
   `src/game.rs` reads at `co2+1`): 0 Sonic, 1 Shadow, 2 Tails, 3 Eggman, 4 Knuckles, 5 Rouge. Per
   `game.rs`, Tails and Eggman on foot in the garden have 6/7 there, so **they map to bond 0
-  (Sonic's)** (to be checked in game).
+  (Sonic's)**.
 
 ### 7.4 Signals and touches (`0x55A920`, `0x55A850`, `0x486880`, `0x486760`)
 
@@ -2058,24 +1858,15 @@ ALW categories as registered (`0x530750`, ECX = cat, kind = 2nd push):
 Computed when the picker runs, from positions at that moment. "In view" = `d < 50` (3D) and
 `|s16(rotY − bearing)| < 0x271C`, bearing as in §7.2.
 
-| Method | Game rule | Server notes |
+| Method | Game rule | Server |
 |---|---|---|
-| `signal(kind)` | The live signal of that kind (any emitter, any Chao but see below) with `|chao.pos + (0,2,0) − S.pos| < S.R + 1.5`. Returns S.pos and parent = emitter (pos, current behaviour) for `0x55A920` signals, none for `0x55A850` ones (TV/radio). Order among several: the collision record order (not reproducible); pick any/nearest. | Server knows signals from Chao it runs (kind, R, pos = pos + facing·8, frames, removed when the emitter changes behaviour). TV/radio (0xC9/0xCA, R 25.5, 3600 frames from the TV/radio position) need the toys' on/off state from a client. A Chao does sense its own signal (no parent filter); moot while it is busy performing. |
-| `player_seen()` | Player 1 in view. Value: bond index `0x53E0C0` = P1's `co2+1` if 1..5 else 0. | Game has one P1 per machine; the server has several players. Suggested: the nearest player in view. Map character 1..5 to itself, everything else (Sonic, walkers 10/11 = Tails/Eggman on foot, others) to 0. |
-| `player_pos()` | `*0x1DEA6C0 + 0x14`, perceived or not. | Same player choice as above, else the nearest player. |
-| bond for bond_tick (`0x5A0490`) | `0x53E0C0()`, **regardless of perception** | `bond_tick` uses `player_seen().unwrap_or(0)`: should be the current player's character, seen or not (0 only with no player). |
+| `signal(kind)` | The live signal of that kind (any emitter, any Chao but see below) with `|chao.pos + (0,2,0) − S.pos| < S.R + 1.5`. Returns S.pos and parent = emitter (pos, current behaviour) for `0x55A920` signals, none for `0x55A850` ones (TV/radio). Order among several: the collision record order. | Signals from the Chao the server runs (kind, R, pos = pos + facing·8, frames, removed when the emitter changes behaviour), checked with the same sphere test; a Chao ignores its own. TV/radio (0xC9/0xCA, R 25.5, 3600 frames from the TV/radio position) depend on the toys' on/off state. |
+| `player_seen()` | Player 1 in view. Value: bond index `0x53E0C0` = P1's `co2+1` if 1..5 else 0. | The game has one P1 per machine; the server has several players. A Chao's player is the nearest one whistling within 100, else the nearest; "seen" is the in-view test against that player. Characters 1..5 map to themselves, everything else (Sonic, walkers 10/11 = Tails/Eggman on foot, others) to 0. |
+| `player_pos()` | `*0x1DEA6C0 + 0x14`, perceived or not. | The same player's position. |
+| bond for bond_tick (`0x5A0490`) | `0x53E0C0()`, **regardless of perception** | `bond_tick` uses that player's character, seen or not (0 only with no player). |
 | `nearest_fruit()` | Minimum-d fruit (ALW cat 3) in view. **Only the nearest is tested**: if its ALW `+0x40` is set and is not this Chao's entry, hunger returns (no second choice). `held` = fruit Data1 `+4 & 0x8000`. | Fruit position: on the ground, the item position; held by a player, the hand (≈ player position); held by a Chao, its hold point. |
-| `tree_seen()` | List 3 found: **any of the 7 tree spots (cat 5, any state, including empty) in view**. | The only `tree_seen` reader that matters is go-to-bed `0x54EE10`, which needs the **nearest** tree in view: `d < 30.0` and Data1 `+0x31` (state) ∈ {3, 5}. If the nearest is an empty/young spot it fails even when a grown tree is farther. So `Senses` needs `nearest_tree() -> Option<(V3, d, state)>`, not a bool. Tree spots are fixed per garden (`0x1366B30 + (garden−1)·0x78 + slot·0xC`); states come from the referee. |
+| `tree_seen()` | List 3 found: **any of the 7 tree spots (cat 5, any state, including empty) in view**. | The only `tree_seen` reader that matters is go-to-bed `0x54EE10`, which needs the **nearest** tree in view: `d < 30.0` and Data1 `+0x31` (state) ∈ {3, 5}. If the nearest is an empty/young spot it fails even when a grown tree is farther, so `Senses::nearest_tree()` returns position, distance and state. Tree spots are fixed per garden (`0x1366B30 + (garden−1)·0x78 + slot·0xC`); states come from the referee. |
 | `nearest_toy()` | Minimum-d ALW cat-6 object in view; kind = ALW `+4` (2 TV, 3 radio, 4 ball, 7, 8, 0). | Toys are fixed per garden except the ball (position from whoever owns it). |
-| `touch(kind)` | `0x486760`: the Chao's entry-1 sphere (pos + (0,2,0), r 1.5) overlaps a collider of that kind (§7.4). | Needs the item colliders (§6.1 touch table). Ledge 0xCB is already handled by `Near`. |
+| `touch(kind)` | `0x486760`: the Chao's entry-1 sphere (pos + (0,2,0), r 1.5) overlaps a collider of that kind (§7.4). | Uses the item colliders (§6.1 touch table). Ledge 0xCB is handled by `Near`. |
 | `chao_count()` | `0x5319F0(ESI = garden)`: non-empty save slots of the garden (not perception). | Chao in the garden's records. |
 | other Chao | List 1 is built and **never read**. Chao react to each other only through signals and the ALW partner/target links. | No "Chao seen" sense needed. |
-
-### 7.6 Open questions
-
-- `0x55A560` (a second ALW cat-3 object) and toy kinds 8 and 0 (`0x5808F4`, `0x5604C3`) are not
-  identified. Kind 7 (`0x580F19`) is the horse (main `0x580BC0`, §2B).
-- That `co2+1` is 6/7 for Tails/Eggman in the garden (so bonds go to slot 0) comes from `src/game.rs`'s
-  comment; not checked in game.
-- ~~Self-hearing~~ resolved: performers sense their own signal (§7.4).
-- When the TV/radio emit (and re-emit) 0xC9/0xCA (conditions at `0x55C960`, `0x57CA10`) was not decoded.

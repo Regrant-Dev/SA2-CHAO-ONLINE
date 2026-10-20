@@ -32,6 +32,9 @@ impl Rng {
     }
 }
 
+/// The evolution cocoon behaviour (acts/tend.rs).
+const COCOON: u32 = 0x568D30;
+
 /// A behaviour: a game function the stack can hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Behaviour {
@@ -225,6 +228,11 @@ pub mod motion {
 pub struct Chao {
     pub body: Body,
     pub rec: Record,
+    /// What its owner's save keeps of it while a player it's locked against plays with it:
+    /// `rec` lives through their doings (the brain reacts as ever), this only through its
+    /// life ticks and what its owner does; `rec` goes back to it when they're done. None
+    /// otherwise.
+    pub saved: Option<Record>,
     /// The motion it plays (`D+0xAC` table, id at `+8`).
     pub motion: u16,
     pub(super) stack: [Option<Behaviour>; SLOTS],
@@ -321,6 +329,7 @@ impl Chao {
         let mut chao = Self {
             body: Body::new(pos, rot_y),
             rec,
+            saved: None,
             motion: 0,
             stack: [None; SLOTS],
             limits: [0; SLOTS],
@@ -370,8 +379,27 @@ impl Chao {
         chao
     }
 
+    /// The record its owner's save keeps (`saved`, else `rec`).
+    pub fn kept(&self) -> &Record {
+        self.saved.as_ref().unwrap_or(&self.rec)
+    }
+
+    /// Changes both its records alike (its owner's doings, the server's limits).
+    pub fn change(&mut self, f: impl Fn(&mut Record)) {
+        f(&mut self.rec);
+        if let Some(saved) = self.saved.as_mut() {
+            f(saved);
+        }
+    }
+
     pub fn current(&self) -> Option<Behaviour> {
         self.stack.get(self.index).copied().flatten()
+    }
+
+    /// In the closed cocoon of an evolution (`0x568D30` modes 2 and 3: made by `0x568CD0(0)`,
+    /// opened by `0x568D10`).
+    pub fn cocooned(&self) -> bool {
+        self.current() == Some(Behaviour::Game(COCOON)) && (2..=3).contains(&self.mode)
     }
 
     /// One frame: think (`0x53DC40`), then move (`0x796780`, `0x53DF00`).

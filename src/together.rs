@@ -115,7 +115,7 @@ fn release(t: &mut Together) {
     t.go_seen = false;
 }
 
-/// "Players: You, Sam, Alex" for the players held at the same start (`ids`, without us).
+/// "Players: You, Player2, Player3" for the players held at the same start (`ids`, without us).
 pub fn players_here(ids: impl Iterator<Item = u8>) -> String {
     let names: Vec<String> = std::iter::once("You".to_string())
         .chain(ids.map(crate::room::name_of))
@@ -123,7 +123,7 @@ pub fn players_here(ids: impl Iterator<Item = u8>) -> String {
     format!("Players: {}", names.join(", "))
 }
 
-/// "Opponents: Sam, Alex" ("Opponent: Sam"), or "Opponents: none yet" (races and karate).
+/// "Opponents: Player2, Player3" ("Opponent: Player2"), or "Opponents: none yet" (races and karate).
 pub fn opponents_here(ids: impl Iterator<Item = u8>) -> String {
     let names: Vec<String> = ids.map(crate::room::name_of).collect();
     match names.len() {

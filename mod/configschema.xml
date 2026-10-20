@@ -20,20 +20,20 @@
       <Property name="MyChao" display="My Chao (save slot, -1 = first)" type="int" defaultvalue="-1" minvalue="-1" maxvalue="23" alwaysinclude="true">
         <HelpText>The Chao you race and fight with. Easier to pick in game: F9 > My Chao.</HelpText>
       </Property>
-      <Property name="VisitWith" display="Visit friends" type="VisitWith" defaultvalue="On" alwaysinclude="true">
-        <HelpText>On: up to 4 Chao from the garden you're in visit friends in the same garden. Off: they stay home.</HelpText>
+      <Property name="Visitor1" display="Bring Chao 1 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the first. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 1.</HelpText>
       </Property>
-      <Property name="Visitor1" display="Visitor 1 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
-        <HelpText>Which Chao visits first. Easier to pick in game: F9 > Visitor 1.</HelpText>
+      <Property name="Visitor2" display="Bring Chao 2 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the second. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 2.</HelpText>
       </Property>
-      <Property name="Visitor2" display="Visitor 2 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
-        <HelpText>Which Chao visits second. Easier to pick in game: F9 > Visitor 2.</HelpText>
+      <Property name="Visitor3" display="Bring Chao 3 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the third. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 3.</HelpText>
       </Property>
-      <Property name="Visitor3" display="Visitor 3 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
-        <HelpText>Which Chao visits third. Easier to pick in game: F9 > Visitor 3.</HelpText>
+      <Property name="Visitor4" display="Bring Chao 4 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the fourth. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 4.</HelpText>
       </Property>
-      <Property name="Visitor4" display="Visitor 4 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
-        <HelpText>Which Chao visits fourth. Easier to pick in game: F9 > Visitor 4.</HelpText>
+      <Property name="OthersChangeChao" display="Others can change my Chao" type="OthersChangeChao" defaultvalue="Always" alwaysinclude="true">
+        <HelpText>When other players' feeding, petting and play count for your Chao. Always; ChaoWorld: while you're anywhere in Chao World (gardens, lobby, Kindergarten, races, karate); ThatGarden: while you're in the garden your Chao is in; Never. Otherwise they can still see, carry, throw and pet them, but nothing reaches your save. Also in game: F9 > Others can change my Chao.</HelpText>
       </Property>
       <Property name="RoomMode" display="Party mode (parties you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
         <HelpText>Race: everyone has their own enemies. Coop: enemies someone destroys are gone for everyone.</HelpText>
@@ -50,6 +50,9 @@
       <Property name="ChaoRace" display="Friends' Chao in races" type="bool" defaultvalue="True" alwaysinclude="true">
         <HelpText>Friends' Chao fill the other lanes in your Chao Races.</HelpText>
       </Property>
+      <Property name="PlayerKey" display="Player key (made by the mod)" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Made by the mod the first time it runs: servers know your Chao by it, so the ones you leave in a shared garden are still yours next time. Leave it as it is and don't share it.</HelpText>
+      </Property>
     </Group>
   </Groups>
   <Enums>
@@ -62,9 +65,11 @@
       <EnumMember name="Race" />
       <EnumMember name="Coop" />
     </Enum>
-    <Enum name="VisitWith">
-      <EnumMember name="On" />
-      <EnumMember name="Off" />
+    <Enum name="OthersChangeChao">
+      <EnumMember name="Always" />
+      <EnumMember name="ChaoWorld" />
+      <EnumMember name="ThatGarden" />
+      <EnumMember name="Never" />
     </Enum>
   </Enums>
 </ConfigSchema>

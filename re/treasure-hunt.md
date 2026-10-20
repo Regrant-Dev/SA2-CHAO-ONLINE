@@ -1,65 +1,11 @@
-# Treasure hunt: emerald pieces, selection, collection, radar/hints (for a room hunt battle)
+# Treasure hunt: emerald pieces, selection, collection, radar/hints
 
-## Shared physical locations correction (2026-10-19, REA VM/Ghidra)
+Steam `sonic2app.exe`, image base 0x400000. Sources: the disassembly of
+`re/bin/sonic2app.dumped.exe` and the game's own SET files in `resource/gd_PC`.
 
-Reported in co-op Death Chamber: one player saw a buried key while another saw a flying
-key, although shared credit worked. Local log 07:16:33 selected `(10,12),(5,2),(4,5)`;
-collection at 07:17:43/07:19:19 confirmed the existing referee path worked. Server logs
-only contained joins/leaves, not treasure/boss payloads. Do not infer matching physical
-objects from matching scores.
-
-Rechecked native code in REA:
-
-- **0x6D0AD0**: normal/hidden/buried piece. Data1 +1 queries in state 1, then stays active
-  (2) or hidden (3); active objects do not automatically reconsider a changed slot.
-- **0x6D2310**: moving piece has the same selection sub-states, but a different MainSub.
-  The mod's old re-query scan only recognized 0x6D0AD0, leaving old moving picks active.
-- **0x6D2880**: enemy-drop object collects through 0x73B3E0. Enemy registration at
-  **0x4789D0** takes its ID from Data1 rotation Y's low byte into work +0x45, and appends
-  its position to the E list while the manager is in states 1/2/3. IDs are not random
-  per-machine counters. Ghosts/moving enemies can still be in different physical states;
-  they are not all synchronized by the enemy module.
-- **0x73AFE0**: fixed candidate lists C/B/A are manager pointers +0x5C/+0x60/+0x64,
-  counts +6/+7/+8, 16-byte entries, allocated capacity 48 each. The native picker mutates
-  the enemy list when selecting, but leaves these three fixed pools available.
-- **0x739570** manager assembly verifies PUSH EDI / CALL **0x7380A0** at
-  **0x739A54/0x739A55**, caller pops 4, then sets manager state 4. Hooking this call
-  reapplies the shared slots before EMERALD objects can select/collide after a retry.
-
-The lowest present party ID supplies the canonical set. Followers only accept that
-authority and can replace an earlier conflicting set; only the authority broadcasts.
-Co-op participation includes same-stage/mission members still loading or starting, rather
-than requiring their start flags to have arrived already. Competitive hunt participation
-keeps its start-together requirement.
-
-Keep native fixed choices (C kinds 1/3, B kinds 0/2/5, A kind 4). Replace enemy-held,
-moving and upgrade-only picks with the nearest eligible native candidate in the same
-list. This keeps buried/hidden treasure and native hint IDs without promising physical
-enemy/path movement that is not synchronized. Exclude duplicate `(kind,id)` candidates
-(notably Mad Space 3/6) so one shared ID cannot point at two physical spots. Mission 5
-keeps native FINAL IDs 0/1/2. Read existing in-memory candidates, respecting loaded SET
-replacements; no game data/assets are bundled or new placements invented.
-
-Validate finite positions, list counts/pointers and slot roles. Rebinding writes positions
-even when an ID coincides, clears old local collected markers for a different set, resets
-hints, recomputes remaining count and re-queries normal and moving objects. The native
-picker hook projects known owners/claims into collected slots on retry. Native collection,
-referee ownership and team completion remain in charge. Preserve pickup acknowledgements
-that arrive before their set announcement; reject other stages/outsiders.
-
-Headless regressions cover fixed fallbacks, duplicate IDs, authoritative replacement,
-repeated announcements preserving credit, early acknowledgements, retries and invalid sets.
-Read-only checks of retail SET files found unique fixed C/B/A candidates in every supported
-normal hunt stage. The buried/flying case still needs an in-game retest.
-
-Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
-of `re/bin/sonic2app.dumped.exe` plus the game's own SET files in `resource/gd_PC` (parsed
-offline). None of it has been run in game yet.
-
-Goal: up to 8 players, each in their own 1P game of the same Knuckles/Rouge hunting stage and
-mission. Everyone gets the same 3 pieces and starts together. A host-side referee decides who
-was first to each piece. A piece someone collected disappears for everyone, and everyone sees
-the scores.
+In a room hunt, up to 8 players each run their own 1P game of the same Knuckles/Rouge hunting
+stage and mission. Everyone hunts the same 3 pieces, a host-side referee decides who was first
+to each piece, a collected piece disappears for everyone, and everyone sees the scores.
 
 Short version:
 - The candidate spots are the stage's **EMERALD SET objects**. The exe has no table of spots.
@@ -90,7 +36,7 @@ Short version:
 | +0x04 | u8 | "it's close" voice already played (bit0 P1, bit1 P2) |
 | **+0x05** | u8 | **pieces still to find**. The hunt ends when it reaches 0 |
 | +0x06..+0x09 | i8 | candidate counts: C list, B list, A list, enemy list |
-| +0x0A/+0x0B | u8 | thought to be the radar level P1/P2, but it stayed 0 through a whole hunt in game (2026-10-16); 0x73A6F0 works the colour out from the distance each frame instead |
+| +0x0A/+0x0B | u8 | per-player radar bytes (P1/P2). They stay 0 during a 1P hunt; 0x73A6F0 works the radar colour out from the distance each frame |
 | +0x0C..+0x2B | | debug: duplicate candidates found during selection |
 | **+0x2C, +0x3C, +0x4C** | `Slot[3]` | **the 3 chosen pieces** (piece 1, 2, 3) |
 | +0x5C / +0x60 / +0x64 / +0x68 | `Slot*` | candidate lists **C** (48 slots), **B** (48), **A** (48), **E** in-enemy (128) |
@@ -142,6 +88,15 @@ manager runs first. Vanilla relies on this order (see 3).
 | 9 | ? FINAL | display 0x6D2950 | **Mission 5 only**: it writes slot[id] directly |
 | 10 | ? INENEMY | 0x6D27F0 / 0x6D2880 | E. Also registered by enemies (0x478A05, enemy work +0x45 = id) |
 
+- Kinds 0..5 and 8 share MainSub 0x6D0AD0; the moving kind 7 has its own MainSub 0x6D2310 with
+  the same selection sub-states (section 3). A scan for chosen pieces must match both.
+- Enemy registration **0x4789D0** takes the id from the enemy's Data1 rotation Y low byte (into
+  work +0x45) and appends its position to the E list while the manager is in states 1/2/3. Ids
+  are fixed by the SET data, not per-machine counters, but enemies (ghosts, moving enemies) are
+  not in the same physical state on every machine.
+- The candidate lists C/B/A (+0x5C/+0x60/+0x64, counts +6/+7/+8, 16-byte entries, capacity 48
+  each) stay intact after selection; the picker only removes entries from the E list.
+
 - **Register**: init 0x6D09B0 calls **0x73AFE0** (cdecl `(kind, id)`, EDI = `&pos`), which
   appends to a list (jump table 0x73B2D8).
   - In **Pumpkin Hill (5) and Egg Quarters (26) 1P**, kinds 7/8 are only added if
@@ -190,10 +145,10 @@ Skips any slot that is already 0xFE.
 Mission 5 has **fixed** pieces: the FINAL objects in the `_hd_` SET (ids 0..2), with `+5 = 3`.
 So Mission 5 is already identical for everyone.
 
-### Forcing a set (the room leader's choice)
+### Forcing a set
 
-**Recipe A, hook (recommended):** redirect the `call 0x7380A0` at **0x739A55**. It is in this
-sequence:
+**Hook:** the only call to the picker is at **0x739A55**, in this sequence in the manager's
+MainSub 0x739570:
 
 ```
 0x739A54  push edi
@@ -202,46 +157,26 @@ sequence:
 0x739A5D  mov byte [edi],4
 ```
 
-Point the call at an `extern "C" fn(m: *mut u8)`:
+Redirecting it to an `extern "C" fn(m: *mut u8)` that writes the 3 slots (`{kind, id, 0, x, y, z}`)
+and adds 1 to `m[5]` per slot written replaces the selection:
+- It runs at the vanilla moment, before the EMERALD objects query in the same frame.
+- It runs again after death and full restarts (states 6/7), so restarts keep the same set. A slot
+  already 0xFE (collected before a death restart) is left as is.
+- A spot that isn't in the local candidate list (upgrade gating) still works: the object exists
+  in the SET file and turns active because only (kind, id) is compared (0x73B660).
 
-```
-if have_set(level, mission):
-    for s in 0..3:
-        slot = m + 0x2C + s*0x10
-        if slot.kind == 0xFE: continue           // collected before a death restart
-        if taken_by_someone[s]: slot.kind = 0xFE; slot.id = 2; continue
-        *slot = set[s]                           // {kind, id, 0, x, y, z}
-        m[5] += 1
-else:
-    original_0x7380A0(m)
-```
-- This runs at exactly the vanilla moment: before the EMERALD objects query in the same frame.
-- It is also used again after death and full restarts (states 6/7), so restarts keep the same set.
-- `set[s]` may be a spot that isn't in the local candidate list (upgrade gating). The object
-  still exists in the SET file and turns active because only (kind, id) is compared (0x73B660).
+**Data only:** in the frame hook (before 0x43CE20), when `m && m[0] == 2`, writing the 3 slots,
+setting `m[5]` to the number written and setting `m[0] = 4` skips the vanilla selection. Writing
+`m[0] = 1` every frame while it is 2 holds the selection (case 1 puts it back to 2 because
+0x1A5A33C is still 1), but the objects then query too early and go to sub-state 3, so they need a
+re-query (section 3) once the slots are written.
 
-**Recipe B, data only (no code patch):** in the frame hook (before 0x43CE20), when
-`m && m[0] == 2`:
-1. Write the 3 slots as above, set `m[5]` to the number written, and set `m[0] = 4`. The
-   vanilla selection never runs.
-2. To **wait** for the leader's set, write `m[0] = 1` every frame while it is 2. Case 1 puts it
-   back to 2 because 0x1A5A33C is still 1.
-3. Waiting lets the objects query too early and go to sub-state 3. So after applying, re-query
-   the loaded EMERALD objects (section 3, "re-query").
-
-**Choosing the set (leader):**
-- The leader can roll it before the stage loads. The mod can parse
-  `resource/gd_PC/set00NN_s.bin` + `_u.bin`:
-  - big-endian, header 0x20, `u32 count` at +0,
-  - entries of 0x20 bytes: `u16 ID, i16 rotX, rotY, rotZ, f32 pos[3], f32 scale[3]`.
-- Take `ID & 0x7FFF == 0x0F` (0x0E in level 7). Respect Mod Loader file replacements.
-- Take piece 1 from C (kinds 1, 3), piece 2 from B (0, 2, 5), piece 3 from A (4, 7, 8).
-  - Leave out kind 6 (2P only) and kind 9.
-  - Leave out kinds 7/8 in levels 5/26 (not every save has the upgrade).
-  - Preferably take pieces 2 and 3 far from piece 1, like vanilla.
-- Or let the leader's vanilla pick run, read `m+0x2C..` once `m[0] == 4`, and broadcast it.
-  With the start hold (`freeze_world_after(2)`) that may happen after other players already
-  selected, so they then need recipe B step 3.
+**SET file format** (`resource/gd_PC/set00NN_s.bin` + `_u.bin`, subject to Mod Loader
+replacements): big-endian, header 0x20, `u32 count` at +0; entries of 0x20 bytes:
+`u16 ID, i16 rotX, rotY, rotZ, f32 pos[3], f32 scale[3]`. EMERALDs have `ID & 0x7FFF == 0x0F`
+(0x0E in level 7). Piece 1 comes from C (kinds 1, 3), piece 2 from B (0, 2, 5), piece 3 from A
+(4, 7, 8); kind 6 is 2P only, kind 9 is Mission 5 only, and kinds 7/8 in levels 5/26 depend on the
+save's upgrades.
 
 ---
 
@@ -301,24 +236,14 @@ With player 0/1 it:
 
 The object then calls `KillObject 0x488DA0`, so the record loses 0x8000 and never reloads.
 
-### Detecting "local player collected piece s" (polling, recommended)
-Run this each frame in the frame hook, while `m != 0 && m[0] == 4`:
-```
-for s in 0..3:
-    k = m[0x2C + s*0x10]
-    if last_kind[s] != 0xFE && k == 0xFE && !removed_by_us[s]:
-        send Collected(level, mission, s, last_kind[s], last_id[s], game timer)
-    if k != 0xFE: last_kind[s] = k; last_id[s] = m[0x2D + s*0x10]
-    else: last_kind[s] = 0xFE
-```
-- Snapshot the previous (kind, id) yourself: after collection +1 holds the player, not the id.
-- Ignore slots going back to 0xFF (states 6/7 reset).
-
-Hook alternative: wrap 0x73B3E0 (5 call sites, or an entry trampoline). At entry, EAX/stack
+### Detecting a local collection
+While `m != 0 && m[0] == 4`, a slot whose kind changes to 0xFE is a collection. After collection
+slot +1 holds the player, not the id, so the previous (kind, id) has to be remembered. Slots going
+back to 0xFF are the state 6/7 resets. Alternatively 0x73B3E0 can be wrapped: at entry, EAX/stack
 give (kind, id, player), and a matching slot that isn't 0xFE means a real collection.
 
-### Removing piece s for us, without giving it to us
-Run this on the game thread, only when level and mission match and `m[0] >= 4`:
+### Removing a piece without collecting it
+On the game thread, when `m[0] >= 4`:
 ```
 slot = m + 0x2C + s*0x10
 if slot.kind in (0xFE, 0xFF): return
@@ -327,7 +252,6 @@ was_target = (s is the first slot whose kind != 0xFE)
 slot.kind = 0xFE; slot.id = 2                // 2 = "someone else" (0/1 are counted in 2P)
 m[5] -= 1                                    // see section 5 for what 0 means
 if was_target: m[3] = 0; m[4] = 0            // like vanilla: next target's hints start over
-removed_by_us[s] = true
 // the live object:
 for each SET record with flag 1 and main_of == 0x6D00C0 whose Data1 rotX == kind<<8|id:
     KillObject 0x488DA0 (EAX = obj)          // or Data1[1] = 3 to just hide it
@@ -336,7 +260,7 @@ for each SET record with flag 1 and main_of == 0x6D00C0 whose Data1 rotX == kind
 - If the object is not loaded, the slot change alone is enough. When it loads, the query fails,
   so it becomes sub-state 3.
 - If it stays loaded and active, it is **still collectible**. 0x73B3E0 would then do nothing,
-  but the object would still vanish locally. So hide or kill it.
+  but the object would still vanish locally, so it has to be hidden or killed.
 - **Enemy-held piece (kind 10):** the enemy still carries the id, but on death 0x73B3E0 finds no
   slot, so nothing spawns.
 - **Radar:** 0x73A6F0 skips 0xFE slots and puts the full radar on the first remaining slot, so
@@ -345,7 +269,7 @@ for each SET record with flag 1 and main_of == 0x6D00C0 whose Data1 rotX == kind
   up the first slot that isn't 0xFE in the per-stage hint table (`*(ptr*)0x1AF016C`: 8-byte
   `{kind, id, i16 hint[3]...}` entries ending at 0xFF; texts `*(ptr*)0x1AF0170`). They follow
   the new target automatically.
-- **Death restart:** state 7 keeps 0xFE slots. Recipe A puts the forced set back for the others.
+- **Death restart:** state 7 keeps 0xFE slots, and the picker hook puts the forced set back for the others.
 
 ---
 
@@ -374,10 +298,8 @@ for each SET record with flag 1 and main_of == 0x6D00C0 whose Data1 rotX == kind
     - 50 has only kinds 4/5, so piece 1's list C is empty in 1P,
     - 49 has only 4 C pieces,
     - kind 6 never registers in 1P.
-  - Start positions etc. for these levels in 1P weren't checked.
-- Recommendation: use the 1P hunting stages **5, 7, 8, 16, 18, 25, 26, 32, 44** (and 59) in 1P
-  mode. Keep everyone on the same mission. Missions 1, 4 and 5 have a hunt. 2 and 3 don't create
-  the manager. Mission 5 uses other SET files and fixed pieces.
+- Usable 1P hunt stages: **5, 7, 8, 16, 18, 25, 26, 32, 44** and 59. Missions 1, 4 and 5 have a
+  hunt; 2 and 3 don't create the manager. Mission 5 uses other SET files and fixed pieces.
 
 ---
 
@@ -393,31 +315,30 @@ for each SET record with flag 1 and main_of == 0x6D00C0 whose Data1 rotX == kind
   (1/60)**. They are frozen from that frame on. They are reset from the checkpoint copies
   0x174B00E/0F/10 (0x44C975).
   - `m+0x6C` counts frames since the last piece (bonus only).
-- For the battle, remote removals also decrement `m[5]`. Pick one of two behaviours:
-  - **let it reach 0**: when the last piece is taken by anyone, every game clears at the same
-    moment with its own time (simplest),
-  - **clamp at 1**: losers stay in the stage with no target until the mod ends the round
-    itself, e.g. by calling 0x43E6D0 with ESI = 0, or by leaving.
-- Vanilla scoring isn't fair for a battle (time/hint bonus, per-machine). Keep the referee's
-  count of pieces as the real score.
+- Removing a piece (section 3) also decrements `m[5]`, so when the last piece is taken by anyone,
+  every game clears at the same moment with its own time.
+- The vanilla score includes per-machine time/hint bonuses.
 
 ---
 
-## Room hunt battle (recipe)
+## How the mod runs a room hunt
 
-1. The leader rolls `set[3] = {kind, id, pos}` for (level, mission) from the SET files, or
-   broadcasts its own vanilla pick. The leader sends it with the room start.
-2. Every client (leader included) installs recipe A at 0x739A55. While the set is unknown, the
-   start hold keeps the stage frozen. If the selection already ran, apply recipe B steps 1 and 3.
-3. Each frame, poll the slots (section 3). On a new local 0xFE, send
-   `Collected(s, kind, id, timer)` to the host.
-4. The host referee keeps `owner[s]`, first message wins. It broadcasts `Taken(s, by)` and the
-   scoreboard.
-5. On `Taken(s, by)` from someone else, remove the piece (section 3). If we collected it locally
-   but lost the race, our game already counted it. The piece is gone for everyone either way.
-   Only the referee's score matters.
-6. The round ends when all 3 slots are owned (section 5).
-7. Death restarts reapply the set and the taken slots (recipe A + `taken_by_someone`).
+- Applies to stages 5, 7, 8, 16, 18, 25, 26, 32, 44 and 59 in 1P, Missions 1, 4 and 5, in a room
+  (a co-op room, or a stage started together).
+- The lowest player number present in the stage is the authority. It reads its own picks once
+  hunting starts (after waiting 2 s for a set already going round) and broadcasts the set every
+  second. Only the authority's set is accepted, and it can replace an earlier conflicting one.
+- Sets keep vanilla's fixed choices (C kinds 1/3, B kinds 0/2/5, A kind 4; Mission 5 FINAL ids
+  0/1/2). Enemy-held, moving and upgrade-only picks are replaced with the nearest fixed
+  candidate in the same list. Duplicate (kind, id) candidates (Mad Space 3/6) are excluded so one
+  id never points at two spots.
+- Every game, the authority's too, keeps its slots set to the room's set through the picker hook
+  at 0x739A55 and a per-frame check, then re-queries the loaded piece objects (MainSubs 0x6D0AD0
+  and 0x6D2310). Rebinding clears local collected marks from a different set and resets hints.
+- A local collection is claimed from the host's referee; the first claim wins. Pieces owned by
+  others are removed from every other game with no score (radar and hints move on by
+  themselves). Claims that arrive before the set are kept.
+- The last piece clears the stage for everyone. The referee's piece count is the score.
 
 Confidence:
 - High:
@@ -436,7 +357,6 @@ Confidence:
   - 0x43D8E0/0x43E520 being the restart point,
   - timer byte meanings (standard SA2 layout, matched to the reset code only).
 - Low: `slot.id = 2` for "someone else" being harmless in 1P (only 2P code reads it).
-- Untested in game.
 
 ## Radar draw gates (0x73A6F0)
 

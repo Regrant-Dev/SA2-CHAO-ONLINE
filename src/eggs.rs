@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::chao::CHAO_SIZE;
 use crate::game::Vector;
 use crate::net::protocol::Body;
 
@@ -34,8 +33,6 @@ const EGG_MAIN: usize = 0x0057_B520;
 const HATCHING: [u8; 3] = [4, 6, 8];
 /// The object goes on its next run.
 const DELETE_OBJECT: usize = 0x0046_F720;
-/// The save's Chao records.
-const CHAO_SLOTS: usize = 0x019F_6EC4;
 /// Players' CharObj2 pointers; +0x94 what they hold.
 const PLAYER_CHAR_OBJ2: usize = 0x01DE_9600;
 const HELD_OBJECT: usize = 0x94;
@@ -276,7 +273,7 @@ fn held_object() -> usize {
 
 /// Our live egg object whose record is save slot `slot`.
 fn real_egg(slot: usize) -> Option<usize> {
-    let record = CHAO_SLOTS + slot * CHAO_SIZE;
+    let record = crate::game::chao_slot_address(slot);
     crate::registry::entries(EGG_CATEGORY)
         .into_iter()
         .map(|(_, object)| object)
@@ -375,7 +372,8 @@ fn real_egg_is(slot: usize, object: usize) -> bool {
     // SAFETY: a live egg's Data1.
     unsafe {
         let data1 = ((object + OBJ_DATA1) as *const usize).read();
-        data1 != 0 && ((data1 + D_RECORD) as *const usize).read() == CHAO_SLOTS + slot * CHAO_SIZE
+        data1 != 0
+            && ((data1 + D_RECORD) as *const usize).read() == crate::game::chao_slot_address(slot)
     }
 }
 

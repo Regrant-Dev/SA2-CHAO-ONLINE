@@ -1,10 +1,10 @@
 # Chao Garden: interaction effects and garden items (for network sync)
 
-Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
-of `re/bin/sonic2app.dumped.exe` (2026-10-16). Ghidra has no functions in most of this range. No
-community headers were used, so names are ours. Read `chao.md` and `chao-race-sync.md` first.
+Steam `sonic2app.exe`, image base 0x400000. Addresses come from the objdump listing of
+`re/bin/sonic2app.dumped.exe`; Ghidra has no functions in most of this range. Names are the
+project's own. See `chao.md` and `chao-race-sync.md`.
 This file covers what interactions do to `ChaoData` and how garden items exist and are saved.
-How a Chao is drawn, held and driven from the network is in `chao-garden-sync.md` (separate work).
+How a Chao is drawn, held and driven from the network is in `chao-garden-sync.md`.
 
 Conventions used below:
 - `obj` is an `ObjectMaster*`. `obj+0x10` is MainSub, `+0x18` DeleteSub, `+0x34` Data1 ("work"),
@@ -14,12 +14,12 @@ Conventions used below:
 
 ---
 
-## 0. Corrections and new facts for `chao.md`
+## 0. ChaoData fields and the save region
 
 | Item | Finding | Confidence |
 |---|---|---|
 | Slot count | `SpawnAllChaoInGarden` 0x531B10 walks 0x19F6EC4 .. 0x1A02EC4 in 0x800 steps: **24 slots**. | high |
-| Chao save region | `0x19F6460`, size **0xCA6C**. There are two copies; the game picks `0x19F6460 + (*0x173D06C == 1 ? 0xCA6C : 0)`. Helper **0x52E440** (no args) returns the base in EAX. In practice the copy index is 0. The mod's `0x19F6EC4` constant is the copy-0 slot array. | high (selector meaning: medium) |
+| Chao save region | `0x19F6460`, size **0xCA6C**. There are two copies; the game picks `0x19F6460 + (*0x173D06C == 1 ? 0xCA6C : 0)`. Helper **0x52E440** (no args) returns the base in EAX. The mod addresses slots through `game::chao_slot_address`, which follows the same selector. | high (selector meaning: medium) |
 | Save walks live objects? | **Only items** (§3.4). Chao (category 0) are never walked back; their `ChaoData` is edited in place through `Data1+0x5C`. A visitor whose data is in a mod buffer is never written to the save by that path. Exceptions are in §5. | high |
 | `ChaoData+0x20` | `u8 StatProgress[8]`, 0..99 (100 = 1 level). Not in the old table. | high |
 | `ChaoData+0x8A / +0x8C` | lifespan / max lifespan (u16, max 9999 = 0x1312C7E). | high |
@@ -66,8 +66,8 @@ intelligence, unused). The two leading words aren't read by 0x535F00.
 | Eating, the Chao's own side | eat behaviour 0x5607C0 | - | - | - | `+0x138` and `+0x140` -= 2400 (0x1312DA6) per step | medium |
 | **Animal or Chaos Drive absorbed** | behaviour **0x566DF0** (set at 0x566CC5; trigger 0x566BC0) | **+1** (0x1312D34) | child ±0.025, adult ±0.01 | like +1 | see 1.3 | high |
 
-The "sign by local character" column matters for networking: the game uses **the local player's
-current character** (`*0x1DE9600 + 1`) for both the alignment sign and the bond slot. The local
+For the "sign by local character" column, the game uses **the local player's current
+character** (`*0x1DE9600 + 1`) for both the alignment sign and the bond slot. The local
 player is whoever's game runs the code.
 
 ### 1.3 Animals and drives in detail (0x566DF0, from 0x567011)
@@ -80,7 +80,7 @@ player is whoever's game runs the code.
     **0x5668B0**(EAX=obj, EDX=slot, ECX=id). Otherwise, with probability 0.2 (0x1312CB4), clear
     the part (-1).
   - Animals 0x0F/0x10/0x11 can set extra flags `0x118 |= 0x8000/0x10000/0x20000`, `+0xD3`,
-    `+0xD6`. This is **random**, so the owner can't recompute it. Send the resulting bytes.
+    `+0xD6`. This is **random**, so the result has to be sent as bytes rather than recomputed.
 - Appearance (magnitude m = 0.1 child / 0.05 adult; table 0x567530):
   - animals 0-2: FlySwim -m (swim)
   - animals 3-5: PowerRun -m (run)
@@ -122,44 +122,28 @@ code. The rest is guessed from the values.
 
 ---
 
-## 2. Applying a friend's interaction to YOUR real Chao (goal a)
+## 2. Interactions on a visitor copy
 
-Problem: the friend pets their **visitor copy** of your Chao. Their game changes the visitor
-buffer (a mod pool buffer, `Data1+0x5C`), using **their** character for the alignment sign and
-bond slot. Your save never sees the change.
+Another player who pets, holds, throws or feeds a **visitor copy** of a Chao changes the copy's
+buffer (a mod pool buffer, `Data1+0x5C`), using **their own** character for the alignment sign and
+bond slot. The owner's save does not see that change by itself.
 
-**Recommended: hook, snapshot, diff, send.** On the friend's side, wrap these functions. Inside
-each wrapper, if `obj` is one of our visitor objects (check `Data1+0x5C` against the visitor pool),
-copy the 0x800 record before calling the original, call it, then diff a whitelist and send
-`{owner, slot, field deltas}`.
-| Hook | Covers |
+Functions that change the record during an interaction:
+| Function | Covers |
 |---|---|
 | 0x536320 (ESI/EDI/stack) | pet, hold, throw, hit, given fruit, animal happiness, alignment, bonds |
 | 0x545790 (ESI; 2 stack args) | fruit bite: lifespan, evolution, stats (it calls 0x535F00 itself) |
-| 0x535F00 (EAX/DX; 2 stack args) | stats from animals and drives (and fruit, if 0x545790 isn't hooked) |
-| 0x566DF0 (cdecl obj) | animal or drive absorb: parts, 0x118 mask, appearance, flags. The random results arrive as plain bytes |
-| 0x545D32 path, or diff after 0x545C20 | heart/hero/dark fruit finish |
+| 0x535F00 (EAX/DX; 2 stack args) | stats from animals and drives (and fruit, through 0x545790) |
+| 0x566DF0 (cdecl obj) | animal or drive absorb: parts, 0x118 mask, appearance, flags; partly random |
+| 0x545D32 path (after 0x545C20) | heart/hero/dark fruit finish |
 
-Whitelist (deltas for numbers, values for parts):
-- 0x20..0x27 progress, 0x30..0x37 levels, 0x38..0x47 points
-- 0x82 happiness, 0x8A/0x8C lifespan, 0xA8/0xAC/0xB0/0xC0 floats
-- 0x118..0x123 animals, 0x16C..0x18F bonds
-- optionally 0x124..0x16B emotions
-
-The owner applies the deltas to `ChaoSlots[slot]` (clamping as the game does). If the Chao is
-spawned right now, also set `Data1+0x674 |= 2` so the appearance refreshes. Apply on the game
-thread.
-
-Alternative (owner replays): send `{event, kind, friendCharacter}` and have the owner call 0x536320
-or 0x535F00 on their live Chao object. This only works while the Chao is spawned. The
-character-dependent parts would use the owner's character, not the friend's, and animal parts
-are random. Only use this for stat growth from a known item kind.
-
-Policy note: hit (-30) and throw (-5) also go through 0x536320. Decide whether friends may
-harm your Chao, and filter by delta sign or by caller.
-
-Confidence: hook points and field effects high. Using the diff approach for everything is a
-design choice; it is untested.
+The mod diffs the copy's record against its snapshot (`chao::changes`) and sends the changes to
+the owner, whose game applies them to its slot with the game's clamps. Fields: stat progress
+0x20..0x27, levels 0x30..0x37, points 0x38..0x47, happiness 0x82, lifespan / max lifespan
+0x8A/0x8C (increases only), PowerRun/FlySwim/alignment 0xA8/0xAC/0xB0, hat 0xD5, animals seen
+0x118 (OR-ed), animal parts 0x11C..0x123 (copied as is, since absorbing is random), and bond like /
+familiarity at 0x16C + i*6. Evolution progress (0xC0) is not forwarded: the game raises it over
+time in the owner's game too. Deltas rather than absolute values keep the owner's own changes.
 
 ---
 
@@ -298,80 +282,53 @@ Record helpers:
   - hats a Chao drops (§5)
   - GBA fruit 0x57DE36
 
-Confidence: layout, counts and helpers high. Fruit kind names and the copy-selector meaning
-medium.
+Fruit kind names and the copy-selector meaning are less certain than the layout, counts and
+helpers.
 
 ---
 
-## 4. Minimal operations for sharing items (goal b)
+## 4. Item operations
 
 | Op | How | Notes |
 |---|---|---|
-| Spawn item T at P | fruit `0x546180(kind,&P,ang,NULL,NULL)`; animal `0x548D30(id,&P,ang,&zeroVel,NULL)`; drive `0x545600(color,&P,&zeroVel,NULL)`; seed `0x549B00(kind,&P,NULL,NULL)`; hat `0x54A540(kind,&P,ang,NULL,NULL)` | Use `save = NULL` for **mirrored** items so they never reach the local save. Fruit bites left: write `Data1+0x10` after the call. Check that `*0x1DC0F80[cat] < 0x8AB838[cat]` first. |
-| Spawn a real (persisted) item | `rec = 0x52F9E0(ECX=cat)`; if `rec` is not NULL, create with `save = rec` | Only for items that should **move into** this player's save (ownership transfer). |
-| Remove item | if `entry+8`: `0x52F680(EAX=entry+8)`, `entry+8 = 0`; then `0x46F720(obj)` (or `obj+0x10 = 0x46F720`) | Free the record only when the item really leaves this save. |
+| Spawn item T at P | fruit `0x546180(kind,&P,ang,NULL,NULL)`; animal `0x548D30(id,&P,ang,&zeroVel,NULL)`; drive `0x545600(color,&P,&zeroVel,NULL)`; seed `0x549B00(kind,&P,NULL,NULL)`; hat `0x54A540(kind,&P,ang,NULL,NULL)` | `save = NULL` keeps an item out of the local save. Fruit bites left: write `Data1+0x10` after the call. Check that `*0x1DC0F80[cat] < 0x8AB838[cat]` first. |
+| Spawn a real (persisted) item | `rec = 0x52F9E0(ECX=cat)`; if `rec` is not NULL, create with `save = rec` | For an item that moves into this player's save. |
+| Remove item | if `entry+8`: `0x52F680(EAX=entry+8)`, `entry+8 = 0`; then `0x46F720(obj)` (or `obj+0x10 = 0x46F720`) | Freeing the record removes the item from this save. |
 | Enumerate items | for cat in {2,3,7,9}: walk the 64 entries at `0x1DC0FC0+cat*0x1200`, keeping those with `+0x3C != 0` | Kind: `Data1+8` (fruit/seed/hat) or `Data1+3` (animal/drive). Pos: `Data1+0x14`. Persisted: `entry+8 != 0`. |
 | Local player picks up / drops | poll `*(obj*)(*0x1DE9600 + 0x94)` each frame | null→obj = pickup, obj→null = drop, throw or give. On drop, `entry(+0x40)` → a category-0 entry means it was given to that Chao. |
 | Feeding detected | fruit `Data1[0] == 4` and partner is a Chao; `Data1+0x10` decrements per bite; the object disappears at 0 | Or hook 0x545790 (the bite) / 0x545C20. |
 | Item removed by the game | its ALW slot `+0x3C` changes or becomes 0 | eaten, absorbed, worn as a hat, or fruit rotted on save |
 | Make the local player hold an item | 0x46E5B0(ECX=0, push obj) | only when `CharObj2+0x98 == 0` |
 
-Suggested model: the **garden owner's** items are real (with records) in the owner's game and
-mirrored with `save = NULL` everywhere else. Each item gets a network id mapped to the local
-`ObjectMaster*` on each side. Each game runs its own physics; send position on drop and at rest
-rather than every frame. Hide a mirrored item while a remote player holds it (delete it) and
-re-create it on drop. When a mirror is eaten, absorbed, worn or picked up for good, tell the
-owner, who removes the real item and frees its record. Moving an item into the other player's
-save means: the giver frees and deletes, the receiver allocates with 0x52F9E0 and creates.
-
-Feasible:
-- spawn, delete and enumerate (all plain cdecl)
-- pickup/drop detection by polling
-- forwarding effects with the hook-and-diff approach (§2)
-
-Hard:
-- keeping item physics in step; held and thrown items look different on each side
-- exact replay of random animal effects (send the results instead)
-- the Chao-held link: entry `+0x40` and flag 2 point at local objects only, so a remote Chao
-  can't "hold" a local item without driving its entry ourselves
-- concurrent pickups need an owner arbitration step
+The Chao-held link (entry `+0x40` and flag 2) points at local objects only, so a remote Chao
+can't "hold" a local item unless the mod drives its entry.
 
 ---
 
-## 5. Save-file risks
+## 5. Save-file effects of visitors
 
-1. **Visitor Chao drops its hat into YOUR save.** When a hatted Chao is hit (0x563D30 → 0x563E84)
-   or thrown (0x564320 → 0x56440A), the game allocates a hat record in the **local** list at
-   B+0x4D8 and spawns the hat. It then clears `+0xD5` only in that Chao's data. For a visitor,
-   that duplicates the friend's hat into your save, while their real Chao keeps it. Fix: hook
-   these paths, or clear `+0xD5` in visitor buffers and draw the hat some other way, or create
-   the hat with `save = NULL`. **Done 2026-10-18** (garden.rs `drop_hat`): a visitor keeps its hat.
-2. **Visitor Chao puts on YOUR hat.** (**Done 2026-10-18**: visitors skip the hat check
-   0x5691B0, garden.rs `may_wear_hat`.) 0x569240 frees the local hat record and deletes the hat.
-   The hat ends up only in the visitor buffer, so it is lost from your save. Your own Chao
-   wearing a *mirrored* hat duplicates it unless the owner is told to remove theirs.
-3. **Visitor Chao eats or absorbs your items.** The local record is freed (fruit 0x545DD9;
-   animals are deleted). This may be intended. Note it.
-4. **Carrying a visitor Chao out of the garden.**
-   - GoToChaoArea stores its `ChaoData*` (the mod's pool buffer) in **0x1A5CA5C**.
-   - The next area re-creates it with `CreateChao(ptr)` (0x531E10).
-   - `visitors::on_frame` releases the pool on leaving the garden, so the pointer dangles.
-   - It also means a visitor walking into the kindergarten machines (name, doctor, etc.) with
-     their data.
-   - Fix: before area changes, if the held object is a visitor, drop it first (0x46E5E0) or clear
-     `*0x1A5CA5C`. Hook 0x52B5B0, or check `CharObj2+0x94` each frame against the visitor
-     objects.
-5. **Mirrored items must have `save = NULL`.** Otherwise 0x52F090 writes them into this player's
-   save on the next area change or Chao save. A mirrored item the player carries out is lost,
-   which is safe.
-6. **Copy selector.** Item lists and ChaoSlots live in the copy chosen by `*0x173D06C`. Use
-   0x52E440 for the base instead of a constant if this ever matters.
-7. **Character-dependent effects.** On the friend's side, alignment and bond changes use the
-   friend's character. That is correct for "friend X petted my Chao", but apply deltas, not
-   absolute values, or the owner's own changes get overwritten.
-8. **Breeding.** Not checked: a visitor mating with a local Chao probably creates an egg (cat 1)
-   in the local garden, and possibly a local record. Check before enabling visitor AI near
-   local Chao.
+1. **A visitor's hat.** When a hatted Chao is hit (0x563D30 → 0x563E84) or thrown
+   (0x564320 → 0x56440A), the game allocates a hat record in the **local** list at B+0x4D8 and
+   spawns the hat, then clears `+0xD5` in that Chao's data. For a visitor that would duplicate
+   the other player's hat into the local save. The mod skips both for visitors
+   (garden.rs `drop_hat`): a visitor keeps its hat.
+2. **A visitor putting on a local hat.** 0x569240 frees the local hat record and deletes the hat,
+   so the hat would end up only in the visitor buffer. Visitors skip the hat check 0x5691B0
+   (garden.rs `may_wear_hat`). A local Chao wearing a *mirrored* hat goes through the item claim.
+3. **Eating and absorbing.** A Chao eating or absorbing an item frees its local record (fruit
+   0x545DD9; animals are deleted).
+4. **Carrying a visitor out of the garden.** GoToChaoArea stores the held Chao's `ChaoData*`
+   (for a visitor, the mod's pool buffer) in **0x1A5CA5C**, and the next area re-creates it with
+   `CreateChao(ptr)` (0x531E10). The pool is released on leaving the garden, so visitors.rs
+   clears `*0x1A5CA5C` for visitor buffers (and eggs).
+5. **Mirrored items have `save = NULL`.** Otherwise 0x52F090 writes them into this player's save
+   on the next area change or Chao save. A mirrored item the player carries out is lost.
+6. **Copy selector.** Item lists and ChaoSlots live in the copy chosen by `*0x173D06C`; 0x52E440
+   returns the base.
+7. **Character-dependent effects.** Alignment and bond changes made on another player's game use
+   that player's character, so they are sent as deltas (§2).
+8. **Breeding.** The mating behaviour makes the egg from a free slot in the local save (0x531AA0),
+   so a baby made in a shared garden belongs to the game whose Chao ran the mating behaviour.
 
 ---
 
@@ -398,69 +355,54 @@ Hard:
 | Carried item cat / record / Chao | 0x19F6450 / 0x19F6454 / 0x1A5CA5C |
 | Player held object | `*0x1DE9600 + 0x94` (`+0x98` pending) |
 | Player grab / drop | 0x46E5B0 / 0x46E5E0 |
+| Unlink an object from its partner (EAX = object) / item still held by a Chao (EDX = item) | 0x530690 / 0x56D170 |
 
-## 7. The server's share of a garden (design, 2026-10-18)
+## 7. The server's share of a garden
 
-Goal: nothing in a shared garden belongs to a player who can leave, unless it really is in
-their save. The host's referee (`net/referee.rs`; the dedicated server and a hosting player run
-the same one) keeps it; the dedicated server also keeps it in a file across restarts.
+Nothing in a shared garden belongs to a player who can leave unless it is in their save. The
+host's referee (`net/referee.rs`; the dedicated server and a hosting player run the same one)
+keeps the shared state; the dedicated server also keeps it in a file across restarts. It is plain
+data (records, modes, item kinds and spots), so the server needs no game files.
 
 **Trees.** The referee keeps 7 records (`TREE_RECORD` bytes each) per garden.
-- Seeded by the first `GardenTrees` it hears for a garden (the first keeper's own trees, as
-  today), then updated by every later one.
-- It sends its set (`ServerGarden`, every 2 s and to newcomers' first tick) to everyone.
+- Seeded by the first `GardenTrees` it hears for a garden, then updated by every later one.
+- It sends its set (`ServerGarden`, every 2 s and on a newcomer's first tick) to everyone.
 - The keeper's game, once it has the server's set, runs trees made from it (records the mod
-  owns, like the copies' records) with the tree's own MainSub: they grow and ripen as usual. Its
-  wrapper keeps the game from dropping fruit itself (that would make a save record), and drops
-  ripe fruit (by itself at 1.9, or shaken) the mod's way, *without* a save record. It sends
-  those records as its `GardenTrees`.
-- Everyone else shows copies of the keeper's (or, before the keeper has sent any, the
-  server's). A new keeper starts from the server's set, so a keeper change no longer swaps the
-  trees.
-- Players' own trees stay untouched in their saves; the real ones come back when nobody else is
-  in the garden.
+  owns) with the tree's own MainSub, so they grow and ripen as usual. Its wrapper keeps the game
+  from dropping fruit itself (that would make a save record) and drops ripe fruit (by itself at
+  1.9, or shaken) without a save record. It sends those records as its `GardenTrees`.
+- Everyone else shows copies of the keeper's (or the server's, before the keeper has sent any).
+  A new keeper starts from the server's set, so a keeper change keeps the trees.
+- Players' own trees stay untouched in their saves and come back when nobody else is in the garden.
 
 **Toys.** The referee keeps each garden's last toy jump (`ToyMode`) and when. `ServerGarden`
 carries them with their age; a player entering a garden makes its toys jump to modes younger
-than a minute (a TV programme runs 3600 frames), so the newcomer sees what everyone sees.
+than a minute (a TV programme runs 3600 frames).
 
-**Items.** Ownership stays as it is (the owner's game has the real object and reports it; the
-others show copies and claim what they use). New: an item can be *unsaved*, in no one's save:
-fruit from the server's trees, or a copy we hold for the server. Its owner reports it with
-`place | 0x80`.
+**Items.** The owner's game has the real object and reports it; the others show copies and claim
+what they use. An item can also be *unsaved*, in no one's save: fruit from the server's trees, or
+a copy held for the server. Its owner reports it with `place | 0x80`.
 - When its owner leaves the garden (their `PlayerState` shows another area) or the lobby, the
-  referee keeps their unsaved items itself: from then on *it* reports them (`ServerItems`, every
-  second, with a fresh id from its own counter so they can't clash with a player's) and they
-  stay where they were.
-- Every game shows a server item as a copy. A claim (picked up, or a Chao took it) is answered as
-  now: the first claimer gets it (`ItemOwner`), adopts it into their save (it's saved now), and
-  reports it; the referee forgets it.
-- Items in a leaver's save (what they brought or picked up and kept) still leave with them. If
-  the server kept them, they'd be in their save *and* in the garden: one item twice. That's why
-  only unsaved items stay.
-- The dedicated server keeps its items in its file too; a player-hosted session keeps them while
-  it runs.
+  referee keeps their unsaved items: it reports them (`ServerItems`, every second, with a fresh
+  id from its own counter so they can't clash with a player's) and they stay where they were.
+- Every game shows a server item as a copy. A claim (picked up, or a Chao took it) goes to the
+  first claimer (`ItemOwner`), who adopts it into their save and reports it; the referee forgets it.
+- Items in a leaver's save leave with them; keeping them would put one item both in their save
+  and in the garden.
+- The dedicated server keeps its items in its file; a player-hosted session keeps them while it runs.
 
-What the server keeps is plain data (records, modes, item kinds and spots), no game code: the
-server needs no game files.
-
-**Fix after the first live test (2026-10-18).** The host saw extra mangoes and egg shells kept by
-the server. Two causes:
+Registry gotchas:
 - The item registry isn't packed. Removing an item (0x5307F0) lowers the category count and
   leaves a hole; registering one (0x530750) takes the first hole. So the first `count` slots
-  (what the game's own walk 0x530470 looks at, and what the server trees' fruit check looked at)
-  can miss the last item. When a tree drop filled a hole, the count went up and a saved fruit
-  further on came into view, looked new, and lost its save record. Those were the host's saved
-  mangoes; their spots are the game's fixed item spots (0x1366260, where the pre-save pass
-  0x52E710 puts items), hence several at one spot. Fix: all 64 slots are compared, by (entry,
-  object), and only a fruit within reach of the tree that dropped it counts (test
-  `only_fruit_made_now_is_new`).
+  (what the game's own walk 0x530470 looks at) can miss the last item. The mod compares all 64
+  slots by (entry, object), and only a fruit within reach of the tree that dropped it counts as
+  newly dropped.
 - An egg's shell is a hat made by the hatch (0x57AFA2, 0x57B1A2, 0x57B416) with a record from the
-  hat list, or none when the list is full (24): the game itself drops those on reload. "No record"
-  isn't "the server's", so only items the mod made unsaved (`items::mark_unsaved`, the server
-  trees' fruit) are reported unsaved now.
+  hat list, or none when the list is full (24); the game drops record-less shells on reload. So
+  "no record" doesn't mean "the server's": only items the mod made unsaved
+  (`items::mark_unsaved`, the server trees' fruit) are reported unsaved.
 
-## 8. Where a held fruit goes (2026-10-19, static)
+## 8. Where a held fruit goes
 
 - Hands: `Data1+0x5D8` (node 4) and `+0x5E4` (node 11), world positions. Written every frame by
   the MainSub's model pass `0x56CCF0` → `0x56FC20` (identity, translate `D+0x14`, rotate `D+0xC`)
@@ -480,6 +422,6 @@ the server. Two causes:
   `E+6 & 2`. Return 0 → mode 2 (ground).
 - Fruit entry sizes: `E+0x2C = 1.0`, `E+0x28 = 2.0` (`*0x12848D4`) at create `0x546180`; after each
   bite `0x545C20` sets `E+0x28 = bites * 0.5`.
-- Mod: `garden::hold_point` (both hands, as `0x56CFB0` sets) for a fruit in a Chao copy's hands
-  (`ItemPlace::Chao`, `items::place`); falls back to the fixed offset. No 0.3 easing: the copy is
+- The mod: `garden::hold_point` (both hands, as `0x56CFB0` sets) for a fruit in a Chao copy's hands
+  (`ItemPlace::Chao`, `items::place`); falls back to the fixed offset. There is no 0.3 easing: the copy is
   put on the target each frame.

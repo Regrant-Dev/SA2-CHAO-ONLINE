@@ -18,9 +18,11 @@ use crate::chao::{self, ChaoData, file};
 use crate::game;
 use crate::log;
 
-/// Visitors per garden visit (Chao from files and other players' Chao together): three friends'
-/// four each. With the garden's own (at most 8) that's 20 of the Chao registry's 32 entries.
-pub const MAX_VISITORS: usize = 12;
+/// Visitors per garden visit (Chao from files, other players' Chao and the ones the server
+/// holds for players who aren't there, together). In a shared garden we show only the
+/// `online::BRING_CHAO` (4) we bring (bring.rs), so with these that's the Chao registry's 32
+/// entries (the server shows 32 in all, `chao_host::ROOM`).
+pub const MAX_VISITORS: usize = 32 - crate::online::BRING_CHAO;
 
 /// Where a visitor came from, so the same Chao isn't spawned twice in one visit.
 #[derive(Clone, Debug, PartialEq)]

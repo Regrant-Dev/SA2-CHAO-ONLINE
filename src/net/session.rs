@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::files::SkinStore;
 
-use super::protocol::{Body, GameBuild, MAX_PLAYERS, Message, PROTOCOL_VERSION};
+use super::protocol::{Body, GameBuild, MAX_PLAYERS, Message, PROTOCOL_VERSION, PlayerKey};
 use super::referee::{Out, Referee, To};
 use super::udp::{Endpoint, Received};
 
@@ -27,6 +27,8 @@ pub struct Identity {
     pub name: String,
     pub mod_version: String,
     pub game_build: GameBuild,
+    /// The player's own key (config.ini `PlayerKey`; a dedicated host's is unused).
+    pub key: PlayerKey,
 }
 
 #[derive(Debug, PartialEq)]
@@ -125,10 +127,17 @@ pub struct Host {
 
 impl Host {
     pub fn new(ep: Endpoint, me: Identity, now: Instant) -> Self {
+        let mut host = Self::make(ep, me, now, false);
+        // The hosting player is player 0, known by their key like everyone.
+        host.referee.joined(0, host.me.key, &host.me.name);
+        host
+    }
+
+    fn make(ep: Endpoint, me: Identity, now: Instant, dedicated: bool) -> Self {
         Self {
             ep,
             me,
-            dedicated: false,
+            dedicated,
             clients: BTreeMap::new(),
             by_addr: HashMap::new(),
             last_heartbeat: now,
@@ -233,10 +242,7 @@ impl Host {
 
     /// A host that isn't a player: it only relays, and all 8 ids go to clients.
     pub fn dedicated(ep: Endpoint, me: Identity, now: Instant) -> Self {
-        Self {
-            dedicated: true,
-            ..Self::new(ep, me, now)
-        }
+        Self::make(ep, me, now, true)
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -324,13 +330,14 @@ impl Host {
                         mod_version,
                         game_build,
                         name,
+                        key,
                     } = msg
                     {
                         self.handle_hello(
                             addr,
                             protocol,
                             &mod_version,
-                            game_build,
+                            (game_build, key),
                             name,
                             now,
                             &mut events,
@@ -396,13 +403,24 @@ impl Host {
         self.referee.load(text);
     }
 
+    /// The Chao the host holds for players (net/roster.rs), one file per player key, that
+    /// changed since last asked: (file name, its text, or `None` when it's gone).
+    pub fn chao_files(&mut self) -> Vec<(String, Option<String>)> {
+        self.referee.chao_files()
+    }
+
+    /// Takes back a file `chao_files` wrote.
+    pub fn load_chao_file(&mut self, name: &str, text: &str) {
+        self.referee.load_chao_file(name, text);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_hello(
         &mut self,
         addr: SocketAddr,
         protocol: u16,
         mod_version: &str,
-        game_build: GameBuild,
+        (game_build, key): (GameBuild, PlayerKey),
         name: String,
         now: Instant,
         events: &mut Vec<Event>,
@@ -457,6 +475,7 @@ impl Host {
             },
         );
         self.by_addr.insert(addr, id);
+        self.referee.joined(id, key, &name);
         events.push(Event::Joined { id, name });
     }
 }
@@ -479,6 +498,7 @@ impl Client {
             mod_version: me.mod_version.clone(),
             game_build: me.game_build,
             name: me.name.clone(),
+            key: me.key,
         };
         ep.send_reliable(host, &hello.encode(), now);
         Self {
@@ -606,6 +626,7 @@ mod tests {
             name: name.into(),
             mod_version: "0.0.1".into(),
             game_build: [9; 8],
+            key: [name.len() as u8; 16],
         }
     }
 

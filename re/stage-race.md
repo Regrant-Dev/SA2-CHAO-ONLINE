@@ -1,13 +1,13 @@
-# Stage race: timer, goal, checkpoints and progress (for online stage races)
+# Stage race: timer, goal, checkpoints and progress
 
-Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
-of `re/bin/sonic2app.dumped.exe` (2026-10-16) plus the stage SET files in the game folder
-(`resource/gd_PC/setNNNN_s.bin` / `_u.bin`, parsed offline). None of it has been run in game yet.
-Read `stage-objects.md` first: it covers the SET record table this note uses.
+Steam `sonic2app.exe`, image base 0x400000. Sources: the disassembly of
+`re/bin/sonic2app.dumped.exe` and the stage SET files in the game folder
+(`resource/gd_PC/setNNNN_s.bin` / `_u.bin`). `stage-objects.md` covers the SET record table used
+here.
 
-Goal: up to 8 players race the same level and mission, each in their own game. While racing, show
-each player's live position (1st..8th). Detect the frame a player clears the stage and their exact
-time. Show everyone the finish order and times. Later this will also be used for 2P speed races.
+Online stage races have up to 8 players run the same level and mission, each in their own game.
+The mod shows each player's live position, detects the frame a player clears the stage, and shows
+everyone the finish order and times.
 
 ---
 
@@ -96,8 +96,8 @@ otherwise: 0x451450(ESI)  → creates the results task in the same frame
     ITEMBOX child there instead (0x6C6449).
 - On touch (0x6C698F): `0x486520(obj)` collision, then 0x46DCC0 → player index.
   - **Mission 2** (MissionNum 1), or **Mission 3** with a type-0 ring: no clear. 0x43F330 stops
-    the timer and the controller and requests 7 (state 15 → 0x43C3A0, restart). Medium confidence
-    that this is "mission failed".
+    the timer and the controller and requests 7 (state 15 → 0x43C3A0, restart), probably
+    "mission failed".
   - Otherwise: **`call 0x43E6D0`** with ESI = player, then `0x1AEFD74[player] = 2`.
 
 ### Game state after the goal
@@ -117,21 +117,12 @@ The state request is the u16 at 0x1A558A4, read after 0x43CE20 in the state-16 h
 GameState stays **16** after the goal while the victory pose and the results tally run. The
 stage ends from the results task later. So **GameState is not a usable goal signal; 0x174B002 is.**
 
-### Recipe: detect "local player reached the goal" on that frame
-In the existing frame hook (`game.rs`, the call at 0x43AB24 → 0x43CE20), **after** the original
-returns:
-```
-if level/mission are the race's && !finished && *(u8*)0x174B002 == 1:
-    finished = true
-    game_time = min*3600 + sec*60 + frames          // 0x174AFDB/DC/DD, 1/60 s
-    race_time = frames counted by the mod since the together-release (see 4)
-    send Finish{level, mission, race_time, game_time, rings 0x174B028, score 0x174B050}
-reset `finished` when 0x174B002 goes back to 0 (restart) or the level changes
-```
-- This catches every clear type and runs in the same frame as the touch.
-- A **hook** alternative is a detour at the entry of 0x43E6D0. It is usercall (ESI), so it needs
-  a naked stub that saves registers. Polling gives the same frame and is simpler.
-- In 2P, ESI tells which player cleared: also hook 0x43E6D0, or read the wins 0x174AFF5[p].
+### Detecting the clear
+The mod polls 0x174B002 in its frame hook (`game.rs`, the call at 0x43AB24 → 0x43CE20), after the
+original returns. It goes to 1 on the clear frame for every clear type, and back to 0 on a restart
+or level load. The game time is then `min*3600 + sec*60 + frames` (0x174AFDB/DC/DD, 1/60 s).
+0x43E6D0 is usercall (ESI), so a detour on it needs a naked stub that saves registers. In 2P, ESI
+(or the wins counter 0x174AFF5[p]) tells which player cleared.
 
 ---
 
@@ -171,7 +162,7 @@ State byte Data1[0]. Jump table at 0x6D9B30: 0 init 0x6D99EF, 1 idle 0x6D9ACB, 2
   every restart.
 - The touch (0x6DA2F7) passes the **player's** position and rotation (player Data1 +0x14 / +0x8
   via 0x1DEA6C0[p]), not the checkpoint's. The object's record pointer is ObjectMaster +0x30.
-- Co-op sharing (src/coop.rs): a record gaining 0x40 is sent with RestartPoint[0] +8/+0x14; the
+- Co-op checkpoint sharing: a record gaining 0x40 is sent with RestartPoint[0] +8/+0x14; the
   others set 0x40, move a live idle one (state 1) to state 3, and call 0x43E520(0, 0) with the
   sender's position/rotation when it's further along the stage route.
 
@@ -194,10 +185,9 @@ In **0x43DA40**:
   it.
 
 **So the in-game clear time does not include time lost to deaths.** It is the time of the
-successful attempt, measured from the last checkpoint's saved time. For a race that started
-together, rank finishers by a **mod-side race clock**: frames since the together-release, counted
-by the mod once per game frame in any state. The arrival order then matches what players saw.
-Report the game's own time next to it.
+successful attempt, measured from the last checkpoint's saved time. In a stage started together,
+the mod ranks finishers by its own race clock (time since the GO, deaths included) and shows the
+game's time next to it.
 
 Restart from the pause menu (request 7 path / 0x43C3A0 with 0x1A558A0 = 1) is a full stage
 reset. It cancels the restart point and clears 0x40 on all records (0x488B30).
@@ -218,42 +208,26 @@ reset. It cancels the restart point and clears 0x40 on all records (0x488B30).
   - Cosmic Wall's goal is about 30 000 units from every checkpoint.
   - The Crazy Gadget, Final Chase and Eternal Engine checkpoints get closer and then farther.
 
-### Recommended measure: arc length along a per-stage reference route
-1. **Route data** per (level, mission-file set: normal or `_hd_` for Mission 5): a polyline of
-   positions from a clean run, sampled every ~50 units of movement, with cumulative length.
-   - Record it with a dev "record route" option, and ship it in the mod as a small binary, about
-     500 to 2000 points per stage.
-   - Or record it live from the room's first finisher and cache it, so later races have it.
-2. **Each frame** (frame hook, cheap):
-   - `p = *(float[3]*)(MainCharObj1[0] + 0x14)`.
-   - Find the nearest point on the route segments within a window around the last segment, about
-     ±40 segments.
-   - If the best distance is over ~400 units (a respawn, a teleport, or the cannon in Cannon's
-     Core), search the whole route once.
-   - `progress = cum[i] + t*len[i]`. Report it as `progress / total` (0..1).
-   - Clamp to `max(progress, respawn floor)`, so going backwards through a loop doesn't flicker.
-     Otherwise accept any value, because a death really sends the player back.
-3. **Send** `progress` (u16 permille or f32) and a `finished` flag in the per-player state the mod
-   already sends (`net/protocol.rs PlayerState`). Send `Finish{race_time, game_time}` once,
-   reliably.
-4. **Rank**:
-   - finished players first, by race_time, ties by game_time;
-   - then by progress, descending;
-   - then players still loading or waiting.
-   Each client sorts the same data, so everyone sees the same order give or take a packet.
+### How the mod measures progress
+- The first clear of a stage records its route: the player's position every ~50 units, with loops
+  caused by deaths cut out. It is saved under `routes/<level>_<mission>.route` and shared with the
+  room.
+- Each frame, progress is the nearest route point (searched within ±40 points of the last match,
+  or along the whole route when the player is more than 200 units away), plus the fraction
+  towards the next point, as a 0..1 value.
+- Players are ranked: finished first (by race time), then by progress, then those still loading.
 
-### Fallback until a route exists for a stage
-`score = passedCheckpoints * 1e6 - dist3(p, goalRingPos)`, where:
+A rough measure without a route is `passedCheckpoints * 1e6 - dist3(p, goalRingPos)`:
 - `passedCheckpoints` = count of SAVEPOINT records (main 0x6D99A0) with flag **0x40** in the SET
   table (0x1DDE280, `count` at 0x1DDE270). It survives death restarts.
 - `goalRingPos` = the SETEntry position (+8) of the GOALRING record whose `rotX % 3 == 0`
-  (`== 1` in Mission 3). Use the C-style remainder of the sign-extended i16 at SETEntry+2.
-  The ring is always loaded, so the SET entry can be read at stage start.
+  (`== 1` in Mission 3), using the C-style remainder of the sign-extended i16 at SETEntry+2.
+  The ring is always loaded, so its SET entry can be read at stage start.
 
-This is good enough on straight stages (City Escape's end, Metal Harbor, Radical Highway, Pyramid
-Cave) and wrong on winding ones. Show it as approximate.
+This works on straight stages (City Escape's end, Metal Harbor, Radical Highway, Pyramid Cave)
+and is wrong on winding ones.
 
-Hunting (Knuckles/Rouge) and boss stages have no meaningful route. Race only goal-ring stages.
+Hunting (Knuckles/Rouge) and boss stages have no meaningful route.
 
 ---
 
@@ -305,8 +279,7 @@ name next to each level's init, e.g. "STG13" → init 0x5DCD50 → object list 0
 - the RestartPoint layout (0x1934B88, 0x2C);
 - the restart path rewinding the time (0x43E3F0 → SetTime 0x44DD50, or 0x44CAC0 without a
   checkpoint);
-- the per-stage SET data. It was parsed from the real files with the exe's object lists, and
-  each stage has exactly one ring of each type, which fits.
+- the per-stage SET data (parsed from the game's files with the exe's object lists).
 
 **Medium:**
 - the meaning of request codes 3/4/5/7/8 and states 9/11..15;
@@ -314,11 +287,8 @@ name next to each level's init, e.g. "STG13" → init 0x5DCD50 → object list 0
 - 0x43ECA0 = save the clear record;
 - results task names;
 - the 0x1A5A230 record fields;
-- the level ID ↔ name mapping (from the `STGnn` headers plus memory of the community level
-  list).
+- the level ID ↔ name mapping.
 
 **Low:**
 - 0x174AFF7 / 0x174AFF9 roles;
 - 0x1AEFD74 meaning.
-
-Nothing here was tested in game.

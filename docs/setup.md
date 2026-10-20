@@ -60,7 +60,7 @@ Manager once so you can accept the update that installs it.
 
 On Linux, the update subprocess uses the host's libraries, avoiding Steam runtime
 `libcurl` conflicts. Proton and the game keep Steam's original environment for Steam
-Input and the overlay. The script also applies this fix when bootstrapping an older updater.
+Input and the overlay. The script does the same when it bootstraps an older updater.
 
 ### Automatic updates when launching from Steam (Windows)
 

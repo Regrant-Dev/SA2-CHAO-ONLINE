@@ -36,9 +36,10 @@ Whatever kind, nothing of the character shows while a skin is on: not its body, 
 upgrades, effects drawn with it or its jump ball, and the shadow is the skin's (re/skins.md "Hiding the
 character").
 
-`skins-src/build.sh` builds all of ours; each tool's `--help` lists its options.
+Each tool's `--help` lists its options. `tools/skinpreview.py` draws a converted skin as wireframes,
+to check a conversion without the game.
 
-Solid skins with `kart=on`, including Lightning McQueen, also replace your vehicle in
+Solid skins with `kart=on` also replace your vehicle in
 Route 101, Route 280 and the single-player Kart Race minigame. Friends in a room kart race
 see your selected kart skin once their copy has downloaded. Other skins use the normal kart.
 Skin switching and turning the skin off apply to the next draw without restarting the race.
@@ -85,8 +86,7 @@ when control returns. Omochao and story voices are kept. File names: letters, di
 and `_ - . ( ) ! ' , & +` only, and the
 whole path under 96 characters, or it won't be shared.
 
-How chatty it is goes in `skin.ini` (all optional; in our build, `skins-src/sounds/<who>/voice.ini`
-is added to it):
+How chatty it is goes in `skin.ini` (all optional):
 
 | Line | Default | What |
 |---|---|---|

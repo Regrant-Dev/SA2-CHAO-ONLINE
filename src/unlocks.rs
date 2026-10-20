@@ -42,6 +42,15 @@ fn gardens() -> u8 {
     (unsafe { (flags_at() as *const u32).read_volatile() } as u8) & GARDENS
 }
 
+/// One of our Chao evolved toward `garden` (`GARDEN_HERO`, `GARDEN_DARK`) while the server
+/// ran it (held.rs): our save opens that garden, as the evolution does in the game (game
+/// thread).
+pub fn open(garden: u8) {
+    let at = flags_at() as *mut u32;
+    // SAFETY: as in `gardens`, on the game thread; the evolution code sets them the same way.
+    unsafe { at.write_volatile(at.read_volatile() | u32::from(garden & GARDENS)) };
+}
+
 /// Network: a party player's open gardens.
 pub fn received(gardens: u8) {
     UNLOCKS.lock().unwrap_or_else(|e| e.into_inner()).incoming |= gardens & GARDENS;

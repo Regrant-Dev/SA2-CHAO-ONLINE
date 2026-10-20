@@ -1,4 +1,5 @@
-//! On-screen text: toasts (connect/join/leave messages) and name tags above other players.
+//! On-screen text: toasts (connect/join/leave messages) and name tags above other players (a
+//! Chao's with a padlock when it's locked against us).
 //!
 //! Drawn with the Mod Loader's debug text (`DisplayDebugString`): one queued line per call,
 //! drawn at the end of the frame, on a grid of font-size cells with square glyphs.
@@ -19,11 +20,14 @@ const MAX_TOASTS: usize = 4;
 /// Mod Loader default font size, restored after we draw.
 const DEFAULT_FONT: f32 = 12.0;
 const TOAST_COLOR: i32 = 0xFFFF_FFFFu32 as i32;
+/// Routine notices (`note`) are drawn this much smaller than toasts.
+const NOTE_SCALE: f32 = 0.6;
 const TAG_COLOR: i32 = 0xFFE0_E8FFu32 as i32;
 
 struct Hud {
     helpers: usize,
-    toasts: VecDeque<(String, Instant)>,
+    /// Text, when it came, and whether it's a small routine notice (`note`).
+    toasts: VecDeque<(String, Instant, bool)>,
 }
 
 static HUD: Mutex<Hud> = Mutex::new(Hud {
@@ -41,8 +45,17 @@ pub fn init(helpers: &HelperFunctions) {
 
 /// Shows `text` for a few seconds (newest at the bottom).
 pub fn toast(text: impl Into<String>) {
+    push(text.into(), false);
+}
+
+/// A routine notice (an autosave): like `toast`, smaller.
+pub fn note(text: impl Into<String>) {
+    push(text.into(), true);
+}
+
+fn push(text: String, small: bool) {
     let mut hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
-    hud.toasts.push_back((text.into(), Instant::now()));
+    hud.toasts.push_back((text, Instant::now(), small));
     while hud.toasts.len() > MAX_TOASTS {
         hud.toasts.pop_front();
     }
@@ -116,20 +129,20 @@ pub fn on_frame() {
     while hud
         .toasts
         .front()
-        .is_some_and(|(_, t)| now.duration_since(*t) > TOAST_TIME)
+        .is_some_and(|(_, t, _)| now.duration_since(*t) > TOAST_TIME)
     {
         hud.toasts.pop_front();
     }
     let size = (screen_height() / 45.0).round().max(10.0);
-    for (i, (text, _)) in hud.toasts.iter().enumerate() {
-        draw(
-            &hud,
-            size,
-            size * (1.5 + i as f32 * 1.2),
-            size,
-            TOAST_COLOR,
-            text,
-        );
+    let mut y = size * 1.5;
+    for (text, _, small) in &hud.toasts {
+        let size = if *small {
+            (size * NOTE_SCALE).round().max(10.0)
+        } else {
+            size
+        };
+        draw(&hud, size, y, size, TOAST_COLOR, text);
+        y += size * 1.2;
     }
 }
 
@@ -329,12 +342,63 @@ pub fn banner(line: &str) {
 }
 
 /// Draws `name` centred above screen point (x, y), `scale` times the normal size (far players
-/// get smaller tags). Called from the puppet display.
-pub fn name_tag(x: f32, y: f32, scale: f32, name: &str) {
+/// get smaller tags), with a padlock after it when `locked` (a Chao locked against us). Called
+/// from the puppet display.
+pub fn name_tag(x: f32, y: f32, scale: f32, name: &str, locked: bool) {
     let hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
     let size = (screen_height() / 60.0 * scale).round().max(8.0);
-    let width = size * name.chars().count() as f32;
-    draw(&hud, x - width / 2.0, y - size, size, TAG_COLOR, name);
+    let chars = name.chars().count();
+    // The lock takes a cell of its own, after a space.
+    let cells = chars + if locked { 2 } else { 0 };
+    let width = size * cells as f32;
+    // The debug text sits on a grid of `size` cells: the lock goes where its cell will be.
+    let (left, top) = (x - width / 2.0, y - size);
+    let (col, row) = ((left / size).round(), (top / size).round());
+    draw(&hud, left, top, size, TAG_COLOR, name);
+    if locked {
+        for (rect, color) in padlock((col + chars as f32 + 1.0) * size, row * size, size) {
+            rects::push(rect, color);
+        }
+    }
+}
+
+/// The padlock's body and shackle, and its outline and keyhole.
+const LOCK_COLOR: u32 = 0xFFF0_C030;
+const LOCK_DARK: u32 = 0xFF10_1420;
+
+/// A padlock filling the `size`-pixel text cell at pixel (x, y), as rectangles in drawing order
+/// (`rects::push`): a dark outline, then the shackle (an arch over the body's middle) and the
+/// body, then the keyhole. Like a glyph, it stands on the cell's baseline.
+fn padlock(x: f32, y: f32, size: f32) -> Vec<([i32; 4], u32)> {
+    let px = |f: f32| f * size;
+    // The shackle's bars, at least a pixel; the outline round everything.
+    let bar = (size * 0.12).round().max(1.0);
+    let edge = (size / 14.0).round().max(1.0);
+    let (bx1, bx2, by1, by2) = (x + px(0.18), x + px(0.82), y + px(0.46), y + px(0.92));
+    let (sx1, sx2, sy1) = (x + px(0.3), x + px(0.7), y + px(0.1));
+    let shackle = [
+        [sx1, sy1, sx1 + bar, by1],
+        [sx2 - bar, sy1, sx2, by1],
+        [sx1, sy1, sx2, sy1 + bar],
+    ];
+    let body = [bx1, by1, bx2, by2];
+    let round = |r: [f32; 4]| r.map(|v| v.round() as i32);
+    let grow = |r: [f32; 4]| [r[0] - edge, r[1] - edge, r[2] + edge, r[3] + edge];
+    let (kw, kx) = ((size * 0.12).round().max(1.0), x + px(0.5));
+    let keyhole = [kx - kw / 2.0, y + px(0.6), kx + kw / 2.0, y + px(0.8)];
+    let mut out: Vec<([i32; 4], u32)> = shackle
+        .iter()
+        .chain([&body])
+        .map(|&r| (round(grow(r)), LOCK_DARK))
+        .collect();
+    out.extend(
+        shackle
+            .iter()
+            .chain([&body])
+            .map(|&r| (round(r), LOCK_COLOR)),
+    );
+    out.push((round(keyhole), LOCK_DARK));
+    out
 }
 
 /// Solid rectangles filled with Direct3D 9 `Clear` right before the Mod Loader draws its debug
@@ -348,7 +412,7 @@ mod rects {
     /// Queues a rectangle `[x1, y1, x2, y2]` in back-buffer pixels.
     pub fn push(rect: [i32; 4], color: u32) {
         let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        if queue.len() < 64 {
+        if queue.len() < 256 {
             queue.push((rect, color));
         }
     }
@@ -483,7 +547,32 @@ mod rects {
 
 #[cfg(test)]
 mod tests {
-    use super::printable;
+    use super::{LOCK_COLOR, LOCK_DARK, padlock, printable};
+
+    #[test]
+    fn a_padlock_fits_its_cell_with_the_shackle_over_the_body() {
+        for size in [8.0, 18.0, 36.0] {
+            let rects = padlock(100.0, 50.0, size);
+            let cell = [100, 50, 100 + size as i32, 50 + size as i32];
+            // Outline (shackle bars and body), the same filled in, the keyhole.
+            assert_eq!(rects.len(), 9);
+            assert!(rects[..4].iter().all(|r| r.1 == LOCK_DARK));
+            assert!(rects[4..8].iter().all(|r| r.1 == LOCK_COLOR));
+            for ([x1, y1, x2, y2], _) in &rects {
+                assert!(x1 < x2 && y1 < y2, "{size}: {rects:?}");
+                assert!(*x1 >= cell[0] - 1 && *x2 <= cell[2] + 1, "{size}");
+                assert!(*y1 >= cell[1] - 1 && *y2 <= cell[3] + 1, "{size}");
+            }
+            let (left, right, top, body) = (rects[4].0, rects[5].0, rects[6].0, rects[7].0);
+            // The arch stands on the body, inside its width, above it.
+            assert!(left[0] > body[0] && right[2] < body[2], "{size}");
+            assert_eq!((left[3], right[3]), (body[1], body[1]));
+            assert!(top[1] < body[1] && top[0] == left[0] && top[2] == right[2]);
+            // The keyhole is inside the body.
+            let key = rects[8].0;
+            assert!(key[0] > body[0] && key[2] < body[2] && key[1] > body[1] && key[3] < body[3]);
+        }
+    }
 
     #[test]
     fn printable_replaces_non_ascii_and_terminates() {

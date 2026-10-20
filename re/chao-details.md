@@ -1,32 +1,28 @@
 # Detailed Chao inspection
 
-`src/chao_details.rs` formats owned record snapshots for the F9 **Chao details** view.
-Snapshots come from the existing `game::read_chao_slot` path (memory after Chao World loads,
-otherwise the save file). The menu rereads them each frame and retains a save-slot identity,
-never an ObjectMaster/Data1 pointer. Holding a Chao initially selects its slot only when the
-current registry identifies it as one of our own save records. No AI or mutation calls are
-needed for inspection.
+`src/chao_details.rs` formats record snapshots for the F9 **Chao details** view.
+Snapshots come from `game::read_chao_slot` (memory after Chao World loads, otherwise the save
+file). The menu rereads them each frame and keeps a save-slot identity, never an
+ObjectMaster/Data1 pointer. Holding a Chao preselects its slot when it is one of the local
+save's records. Inspection makes no AI or mutation calls.
 
-## Existing viewer reference
+## Field names
 
-[Justin113D/SA2ChaoStatMenu](https://github.com/Justin113D/SA2ChaoStatMenu) provides an existing
-in-garden held-Chao viewer. Its `ChaoData.h` and stat display identify fields useful for this
-feature, including personality axes, emotions, symptoms and appearance. The repository had
-no license listed when checked on 2026-10-19. Our Rust formatting, navigation and HUD drawing
-are implemented independently with our existing menu and font; no third-party assets are used.
+Field names for personality axes, emotions, symptoms and appearance follow
+[Justin113D/SA2ChaoStatMenu](https://github.com/Justin113D/SA2ChaoStatMenu)'s `ChaoData.h`
+(naming only; the mod's formatting, navigation and HUD drawing are its own, with no
+third-party assets). A name does not prove that a hidden trait affects vanilla gameplay, so
+the view shows exact signed/unsigned values without invented personality categories or
+health diagnoses, and a raw page shows the uninterpreted data.
 
-The reference supplies naming/interpretation, not proof that every hidden trait affects
-vanilla gameplay. Display exact signed/unsigned values without assigning invented personality
-categories or health diagnoses. The raw page preserves access to uninterpreted data.
+## Native life/emotion tick
 
-## Native checks (REA / offline Ghidra VM)
-
-`0x5353C0`, the native life/emotion tick, was decompiled from a staged code slice. It reads
+`0x5353C0`, the native life/emotion tick, reads
 the record via `ObjectMaster+0x34 -> Data1+0x5C` and uses emotion base `record+0x124`.
 It increments clock `+0xA4`, age `+0x86`, adult age `+0x88`, adjusts maximum lifespan `+0x8C`,
 and clamps remaining life `+0x8A` to the maximum. These are counters, not real-world minutes.
 
-The native pass confirms:
+Field widths from this function:
 
 - Emotion magnitudes at `+0x12C..+0x133` are unsigned bytes clamped to 0..200. Reading them
   as signed chars would incorrectly turn values above 127 negative.
@@ -35,37 +31,28 @@ The native pass confirms:
   `+0x14C`, `+0x14F`, `+0x150`, `+0x155` and `+0x156` influencing different rates.
 - Six condition counters `+0x15A..+0x15F` move toward zero using signed-byte arithmetic.
 
-The decompiler reports bad instruction/control-flow boundaries in part of this function;
-use the observed operand widths and clamp blocks, not that incomplete pseudocode as an
-exhaustive behavioral model. The inspection code does not execute or hook this function.
+The decompiler reports bad instruction/control-flow boundaries in part of this function, so
+its pseudocode is incomplete; the operand widths and clamp blocks above are reliable.
 
 Native debug-label data in the dumped image includes `ANGER`, `SORROW`, `FEAR`, `PAIN`,
 `RELAX`, `TOTAL`, `SLEEPY`, `SLPDPTH`, `HUNGER`, `BREED`, `TEDIOUS`, `LONELY`, `TIRE`,
 `STRESS`, `NOURISH`, `CONDITN` and `THIRSTY` around `0x12E5BC4..0x12E5CCC`. These corroborate
 the emotion/need layout. The `+0x148` field is called energy in the old viewer, but THIRSTY
-in native debug data; our view labels it thirst/raw rather than assuming an energy mechanic.
+in native debug data; the details view labels it thirst.
 
 Happiness `+0x82`, alignment `+0xB0`, tendencies `+0xA8/+0xAC`, evolution `+0xC0` and the
-six-character bond table `+0x16C` were already verified in [chao-garden-items.md](chao-garden-items.md).
+six-character bond table `+0x16C` are covered in [chao-garden-items.md](chao-garden-items.md).
 The two legacy form IDs 3/4 precede the normal forms: 5 is Neutral Normal, 6 Hero Normal,
 20 Neutral Chaos and 23..25 Tails/Knuckles/Amy. Don't shift these by omitting the legacy IDs.
 
-Appearance and personality field names also use the existing viewer as a reference. Some
-fields are unused in vanilla; these are displayed as stored values/IDs, without speculative
-effects. Eggs and invalid hidden-stat filler are shown as uninitialized, and nonfinite shape
-floats are not drawn as valid gauges.
-
-## Checks
-
-Tests cover unsigned emotion 200, signed personality -80 and affection -100, 16-bit needs,
-unchanged record bytes after inspecting every page, egg filler, NaN values, form IDs, stable
-save-slot navigation, disappearing selections, and fitting 320x240 through 2560x1440.
-Native HUD appearance and navigation still need an in-game check after updating.
+Some appearance and personality fields are unused in vanilla; the view shows them as stored
+values/IDs. Eggs and invalid hidden-stat filler show as uninitialized, and nonfinite shape
+floats are not drawn as gauges.
 
 ## The status balloon (ParamFukidasi)
 
-REA/Ghidra on the dumped exe (d1ac8ed9…), 2026-10-19. Texture pictures checked from the PC
-`resource/gd_PC/PRS/al_tex_common.pak` (DDS, extracted locally, not committed).
+Addresses from the dumped exe (d1ac8ed9…). Texture contents are from the PC
+`resource/gd_PC/PRS/al_tex_common.pak` (DDS).
 
 ### Lifecycle
 
@@ -80,8 +67,8 @@ REA/Ghidra on the dumped exe (d1ac8ed9…), 2026-10-19. Texture pictures checked
   other half of the screen.
 - Callers: 0x560771 (take offered fruit 0x5606D0), **0x565B50** (cdecl obj; held, from 0x566720;
   only when CurrentChaoArea 0x134046C is 1..3; forces X = 120, side 0), 0x566ED2 (absorb
-  animal/drive 0x566DF0 mode 0). Close: 0x565B90 (state 7), 0x565BC0 (state 6), 0x565DC0, our
-  `garden::delete_chao`.
+  animal/drive 0x566DF0 mode 0). Close: 0x565B90 (state 7), 0x565BC0 (state 6), 0x565DC0, and
+  the mod's `garden::delete_chao`.
 
 Data block (`d = obj+0x40`):
 
@@ -165,7 +152,7 @@ Ends by setting the colour global `0x12D27A4` = 0xFFFFFFFF.
   0xFFFF (yellow), neither → 0x7F7F7F.
 - **0x536770**(x, y, w, h, alpha) cdecl, EAX = value: black box, inner box and a fill of
   `(w−4)·(v%1000)/1000`; inner/fill colours = table[v/1000], table[v/1000+1] (grey, yellow,
-  orange, red, pink…; read from stack constants, order approximate).
+  orange, red, pink…; from stack constants, order approximate).
 - **0x5369F0**(x, y, alpha) cdecl, EAX = value: white 4 digits of `v%10000` (leading zeros) at
   x, +14, +28, +42, z −1.2.
 - **0x536BE0** text: (char* s, x, y, f32 size_w, f32 size_h, u32 colour 0xAABBGGRR, int mode)
@@ -193,39 +180,34 @@ frame 0x1312B38/B5C/B80/BA4, ovals 0x1312BC8/BEC/C10 (36×26, 28×22, 18×16; no
 exe references them; they look like a speech-bubble tail). The PC DDS files are 2× the DC size;
 UVs are normalized so this does not matter.
 
-### Adding N rows (plan)
+### Extra rows (src/balloon.rs)
 
-1. Display: write our cdecl fn into the imm32 at 0x565A83 (new balloons call it). It
-   calls 0x565200 and then draws our rows.
-2. Frame: patch the imm8s at 0x564CBD and 0x564CC7 from 5 to 5 + N, so `+0xC` grows to 5 + N and
-   shrinks back from it. Skip the game's frame: 5-byte `JMP 0x5653C4` (`E9 56 01 00 00`) at
+The mod adds N = 4 rows (happiness, alignment, needs, mood) under the game's five:
+
+1. Display: the imm32 at 0x565A83 points to the mod's cdecl fn, so new balloons call it. It
+   draws the frame, calls 0x565200, then draws the extra rows.
+2. Frame: the imm8s at 0x564CBD and 0x564CC7 are 5 + N, so `+0xC` grows to 5 + N and shrinks
+   back from it. The game's frame is skipped by a 5-byte `JMP 0x5653C4` (`E9 56 01 00 00`) at
    **0x565269** (over `AND EAX,0x80000001`; ESP is back at the frame base there, EBX = data,
-   EBP = 0, X/Y locals already set). Before calling 0x565200, our fn draws the frame itself with
-   the four frame sprites above and n = `+0xC`. Its top must stay at Y − 100 so the vanilla rows
-   (Y − 96 + 40i) and name (Y − 124) line up: top = Y − 100, middle k at top + 40k, bottom at
-   top + 40n. Set `*0x1AED260 = 0` and colour (0.4,1,1,1) first.
-3. To keep it on screen, write `+0x14` = 216 − 20N (only the display reads it). N ≤ 4 with
+   EBP = 0, X/Y locals already set). The mod draws the frame with the four frame sprites above
+   and n = `+0xC`, with its top at Y − 100 so the vanilla rows (Y − 96 + 40i) and name
+   (Y − 124) line up: middle k at top + 40k, bottom at top + 40n. `*0x1AED260 = 0` and colour
+   (0.4,1,1,1) are set first.
+3. To keep it on screen, `+0x14` = 216 − 20N (only the display reads it). N ≤ 4 fits with
    40-px rows (the cap then starts at y ≈ 4 and the bottom ends at ≈ 408).
-4. Extra row k (y = Y − 96 + 40·(5+k), x0 = X − 72) only when rec ≠ 0 and alpha > 0.01, using
-   alpha `+0x20`: label at (x0, y) with 0x536BE0 (white, size ~16, NUL mode) or an ad_common
-   icon (heart for happiness, "!"/"?" for mood) through our own desc → 0x558BE0; bar at
-   (x0+49, y+26) via 0x536E80 (shown = target = segments) or a 0x559720 bar (alignment: centred,
-   blue for hero, red for dark); number via 0x536BE0 text (handles signs) or 0x5369F0.
-   Values: happiness `rec+0x82` (s8, −100..100), alignment `rec+0xB0` (f32 ±1), emotions
-   `+0x12C..0x133` (u8 0..200), needs `+0x134..0x148` (u16 0..10000), personality
-   `+0x14A..0x156` (s8). Each 40-px row has two lines (y and y+20), like the vanilla rows.
-5. After our rows, reset `0x12D27A4` = 0xFFFFFFFF.
+4. Extra row k (y = Y − 96 + 40·(5+k), x0 = X − 72) is drawn only when rec ≠ 0 and
+   alpha `+0x20` > 0.01: label and value text with 0x536BE0, bars with 0x536E80. Each 40-px
+   row has two lines (y and y+20), like the vanilla rows. Sources: happiness `rec+0x82`
+   (s8, −100..100), alignment `rec+0xB0` (f32 ±1), emotions `+0x12C..0x133` (u8 0..200),
+   needs `+0x134..0x148` (u16 0..10000), personality `+0x14A..0x156` (s8).
+5. After the rows, `0x12D27A4` is reset to 0xFFFFFFFF.
 
-Constraints: the hook is cdecl(obj), called from the delayed display list; keep EBX/ESI/EDI/EBP
-and leave the x87 stack empty. 0x558BE0, 0x5369F0 and 0x536770 take EAX and 0x536BE0 takes ECX,
-so they need small asm thunks. Draw order is call order; the frame is 40 % alpha, so do not
-draw frame pieces over each other. AL_TEX_COMMON must be loaded (it is in every Chao area that
-makes the balloon). Our sprite descs must stay in static memory. One balloon at a time;
-`+0x3C` points into the live record, so read it each frame.
-
-Open: the colour byte order is inferred (0x559720 swaps byte0 into red; then yellow "Lv."/name
-and blue segments fit), not tested. The 0x536770 colour table order and the AL_ICON picture
-mapping have not been checked. 0x565269 / 0x564CBD / 0x564CC7 patches are untested.
+Constraints: the hook is cdecl(obj), called from the delayed display list; it must keep
+EBX/ESI/EDI/EBP and leave the x87 stack empty. 0x558BE0, 0x5369F0 and 0x536770 take EAX and
+0x536BE0 takes ECX, so they need small asm thunks. Draw order is call order; the frame is 40 %
+alpha, so frame pieces must not overlap. AL_TEX_COMMON is loaded in every Chao area that makes
+the balloon. Sprite descs must stay in static memory. There is one balloon at a time, and
+`+0x3C` points into the live record, so it is read each frame.
 
 ### Opening it without a pickup (src/chao_peek.rs)
 
@@ -239,7 +221,7 @@ mapping have not been checked. 0x565269 / 0x564CBD / 0x564CC7 patches are untest
 
 ## Controller buttons in the garden
 
-REA, dumped exe d1ac8ed9…, 2026-10-19.
+Addresses from the dumped exe d1ac8ed9….
 
 Pads (`PDS_PERIPHERAL`-like, 0x34 bytes): +0x04 support mask, **+0x08 held**, +0x0C ~held,
 **+0x10 pressed this frame**, +0x14 released, +0x1C/+0x1E stick x/y (i16, ×128/72; menus use
@@ -277,6 +259,37 @@ Garden use (Sonic's action code 0x719920, the action switch 0x7230E0, cameras):
   only while their own screen runs (controls are off for the player then).
 - 0x5381E0 (Chao World camera manager create): Y held at that moment picks another camera.
 
-Chosen for the status-balloon peek: **D-pad up** (`held & 0x10` on the raw pad, our own edge),
-only while the stick is inside ±0x27 so a keyboard's "forward" (which also sets 0x10, with the
-stick at full tilt) doesn't fire it.
+The status-balloon peek (src/chao_peek.rs) uses **D-pad up** (`held & 0x10` on the raw pad,
+edge-detected by the mod), only while the stick is inside ±0x27, so a keyboard's "forward"
+(which also sets 0x10, with the stick at full tilt) doesn't fire it.
+
+## The Chao save checksum and saving outside a garden
+
+The Chao save lives in memory as two 0xCA6C-byte copies at **0x19F6460** and **+0xCA6C**;
+`0x173D06C == 1` selects the second and GetSaveData **0x52E440** returns the active base. On
+disk (`SONIC2B__ALF`, Steam layout) the payload is at file offset 0x3040.
+
+Pre-save pass **0x52F090**: `0x52E6B0()` (walks the live Chao counts at 0x1DC0F90/0x1DC0F94,
+0x530410 → 0x548660 writes each live Chao back into its record; its area test
+`0 < area || area < 4` is always true, so it trusts whatever the counts hold), `0x52E710(cat)`
+for item categories 2/3/7/9 (live item positions into their records), `0x52EDE0()` (copies
+live garden globals at 0x1DBED8C.. into save +0xA0C..+0xA62 of the active copy), the race copy
+when `*0x134046C == 4`, then the checksum. The first two need a loaded garden; none of these
+run when the mod saves outside a garden.
+
+Checksum **0x52EEE0**: usercall **ESI = save base**, no stack arguments, plain `ret`. Clobbers
+EAX/ECX/EDX, calls rand 0x7A89D8, saves/restores the x87 control word. It zeroes bytes
+0xCA69/64/6B/66/67, writes rand salt to 0xCA65/68/6A, then calls **0x549C40** (ECX = base):
+a reflected CRC-32 loop over all 0xCA6C bytes, `crc = (crc >> 8) ^ T[(crc ^ b) & 0xFF]`, start
+0x6368616F ("chao"), final XOR 0x686F6765 ("hoge"). **T at 0x8A6FF8 is not the standard
+table**: the low 24 bits match poly 0xEDB88320 but the top bytes differ (T[1] = 0xC9073096),
+so it isn't any polynomial's table (`saving.rs` embeds it). Result bytes 0..3 go to
+0xCA69/0xCA64/0xCA6B/0xCA66, then 0xCA67 gets more salt (not covered). The Rust
+reimplementation matches the stored checksum of a real Steam save.
+
+Mod (`game::chao_save_snapshot`, `saving.rs`): in a garden (state 16/17 with a player) the full
+0x52F090 runs. Elsewhere, only with Chao data in memory and either a running/paused
+stage (GameMode 5/10, GameState 16/17, a player; Chao World's lobby and other areas included)
+or the menus (GameMode 0xE), the thunk calls 0x52EEE0 with ESI = the validated active base
+and copies the buffer as is. Every snapshot is re-verified with the Rust checksum before the
+atomic write. Autosaves wait 2 s after any GameMode/level/area change.

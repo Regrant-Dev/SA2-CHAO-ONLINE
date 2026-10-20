@@ -11,8 +11,7 @@ Notation:
 - `M` = `*(ObjectMaster**)0x1A5D14C`. This is the karate main object.
 - `MD` = `M->Data1` (+0x34).
 - For a fighter object F: `FD` = `F->Data1` (+0x34), `W` = `F->Data2` (+0x40, 0x4C-byte work).
-  The task brief used offsets from the allocation base (base = W-4). This file uses offsets
-  from W, which is what the game code uses.
+  Offsets are from W (the allocation base is W-4), as the game code uses them.
 
 ---
 
@@ -90,35 +89,25 @@ The state is `MD[0]` and the sub-state is `MD[1]`.
 - **sub2**: `old=MD+6; MD+6=old-1; if old==0 → sub3`. That is about 300 frames.
 - **sub3**: when g+3==0, state 10.
 
-### Recipe: make a follower start a fight (recommended: VS mode, g+5=1)
-VS mode spawns **both** sides as real records with mode 1:
+### Starting a VS fight (karate_live.rs)
+VS mode (g+5=1) spawns **both** sides as real records with mode 1:
 - no CPU table and no `rand()` in the setup,
 - no tournament progression and no prize,
 - after the result it goes back to the menu (state 2, then 3), because state 12 sets 0x800
   when g+5 != 0.
 
-Steps:
-1. Preconditions: `M != 0`, and `MD[0]` is in the menu (3, 4 or 5; best 3 = mode select)
-   with g+3 == 0.
-2. Write:
-   - `g+5 = 1`
-   - `*(ChaoData**)(g+0x18) = own record` (pointer into the save Chao array)
-   - `*(ChaoData**)(g+0x1C) = friend record`. This must be a stable 0x800-byte buffer owned by
-     the mod. Keep +0x80 type >= 2 and +0x438 != 0, as in the race notes.
-3. Set `MD[0] = 7; MD[1] = 0`. State 7 sees g+5==1 and goes straight to state 8, then state 9.
-   - Alternative: `MD[0]=8, MD[1]=0` skips the confirm window update.
-   - The window object at g+0x3C may stay visible for a moment. States 4/5/6 normally close it
-     by writing `win->Data1[8]=0xFF; [9]=1; [0xA]=1; (u16)[0xC]=(u16)[0xE]=(u16)[0x10]=(u16)[0x12]=0xFFFF`.
-     Do the same.
+The mod starts one from the mode select (`MD[0]` 3, 4 or 5 with g+3 == 0):
+1. Write `g+5 = 1`, `*(ChaoData**)(g+0x18)` = side 0's record and `*(ChaoData**)(g+0x1C)` =
+   side 1's. A record that isn't a save slot must be a stable 0x800-byte buffer with +0x80 type
+   >= 2 and +0x438 != 0, as in the race notes.
+2. Set `MD[0] = 7; MD[1] = 0`. State 7 sees g+5==1 and goes straight to state 8, then state 9.
+   (`MD[0]=8, MD[1]=0` also works and skips the confirm window update.)
+3. Close the menu window at g+0x3C as states 4/5/6 do:
+   `win->Data1[8]=0xFF; [9]=1; [0xA]=1; (u16)[0xC]=(u16)[0xE]=(u16)[0x10]=(u16)[0x12]=0xFFFF`.
 
-With 1P instead (g+5=0):
-- set g+0x18 = own, g+6 = tournament, `MD[0]=7` (this waits for A), or `MD[0]=8`.
-- Side 1 comes from the CPU table unless the existing 0x542308 redirect is used.
-- After a win, 1P **advances to the next round** (state 13 then 9). To force a return to the
-  menu, set `MD+4 |= 0x800` while `MD[0]==0xC/0xD`.
-
-Confidence: state table and handlers high (decompiled). Skipping the menu via `MD[0]=7/8`
-medium (not run).
+In 1P (g+5=0) side 1 comes from the CPU table (unless redirected at 0x542308), and after a win
+the game **advances to the next round** (state 13 then 9); setting `MD+4 |= 0x800` while
+`MD[0]==0xC/0xD` returns to the menu instead.
 
 ---
 
@@ -128,18 +117,13 @@ The fighters stay in their intro action 1 until they see **g+2==4** (0x578010). 
 object 0x5750C0 also waits for g+2==4 (in its state 1). g+2==4 is only produced at the end of
 state 10, so holding anywhere before that holds everything.
 
-**Recommended clamp:** each frame, if `MD[0]==9 && MD[1]==2 && *(u16*)(MD+6) < 2`, write
+**Hold:** each frame, if `MD[0]==9 && MD[1]==2 && *(u16*)(MD+6) < 2`, write
 `*(u16*)(MD+6) = 2`.
 - This holds after the fighters, HUD and timer exist (the "fighters in the ring" intro) and
   before the round announcer.
-- Release by no longer clamping. That gives about 2 frames, then state 10 (announcer, fixed
-  length), then state 11.
-- Release both games on the same network tick, as for the race.
-
-Alternative: clamp in sub1 before HUD creation (`MD+6 > 301`). This is less useful because the
-HUD isn't there yet.
-
-Confidence: high (the sub2 decrement-and-compare is read directly).
+- Releasing (no longer clamping) gives about 2 frames, then state 10 (announcer, fixed
+  length), then state 11. Both games release on the same network tick, as for the race.
+- Clamping in sub1 (`MD+6 > 301`) also holds, but before the HUD exists.
 
 ---
 
@@ -238,8 +222,7 @@ Per frame after the switch, in order:
   - g+4==4 (time-up): **0x5430C0** compares `round(W.HP/W.HPmax*100)` for both sides.
     Equal → 2 (draw), otherwise the higher one wins (0/1).
 
-### What to overwrite on the follower
-**Recommended ("puppet" fighters):**
+### Puppet fighters on the follower
 1. When the fight starts (follower sees `MD[0]==0xB`), put both follower fighters in **action 8**
    (`FD[0]=8, FD[1]=0`) and keep them there.
    - Action 8 has no handler.
@@ -255,24 +238,22 @@ Per frame after the switch, in order:
 3. Animation: stream the motion id `*(u8*)(*(W+0xC))`. When it changes, apply it the way the
    game does:
    `m=*(u8**)(W+0xC); FD+4 &= 0x7FFF; m[5] &= 0xE7; m[0]=id; m[1]=0; m[2]=0;`
-   (the inline pattern at 0x579689, for example). 0x575A00 is the game's helper. Its regcall
-   was not verified.
-   - Optional hit effects: on a network "hit" event, momentarily set the target's action to 5.
-     It plays the effect/sound and damage, and the HP is overwritten afterwards. Then put it back
-     to 8.
+   (the inline pattern at 0x579689, for example). 0x575A00 is the game's helper (register
+   convention not verified).
+   - Setting a fighter's action to 5 for a moment plays the hit effect, sound and damage; the HP
+     is overwritten afterwards.
 4. Write `g+0xC` (clock) from the leader every frame.
 5. Stop all overrides once `MD[0] >= 0xC`. State 12 (0x5795E0) re-positions the fighters and
    sets the result motions itself.
 
-**Do not overwrite** (or don't rely on):
+Left alone:
 - `FD+4` status bits other than as described,
 - `W+0x08/+0x0C/+0x18/+0x1C` pointers,
 - the Chao object's MainSub,
 - the camera object (0x574480 / g+0x38). It reads `g+4` and calls 0x577DE0 itself at 0x57574C.
 
-Simpler fallback: let the follower AI run and only overwrite pos/rot/HP/morale after the
-original MainSub. It works, but the animations won't match and local hits can still fire the
-end triggers, so the patches below are required.
+With the follower's AI running instead, the animations don't match and local hits can fire the
+end triggers.
 
 ### Making the native end triggers inert on the follower
 Byte patches, only while a network fight is active:
@@ -281,7 +262,8 @@ Byte patches, only while a network fight is active:
   `fstp st0; return 0` path.
 - **0x575114** `75 04` → `EB 04`: time-up never sets g+3=3. The timer still stops at 0.
 
-With puppets, only the time-up patch is strictly needed. The other two are a safety net.
+With puppet fighters only the time-up patch is strictly needed; the other two guard against
+stray local hits.
 
 ### Ending the fight on the leader's signal
 The leader sends `{code: 2|3, result: 0|1|2}` after its g+0xB is known (at `MD[0]==0xC`).
@@ -293,13 +275,7 @@ On the follower:
   - code 3: write the final HP of both sides first (so 0x5430C0 gives the same answer,
     including a draw), then `g+3=3`.
 - Then call the original.
-- It must be set **inside** the wrapper, because KarateMainExec clears g+3 at the end of every
-  run.
-
-Confidence:
-- End triggers, judge and HP/max offsets: high (decompiled).
-- Puppet via action 8: medium-high (read, not run).
-- Motion id write: medium.
+- It is set **inside** the wrapper, because KarateMainExec clears g+3 at the end of every run.
 
 ---
 
@@ -311,18 +287,10 @@ Confidence:
 - Camera default: 0x1297C50 = (0, 13, 37).
 - The ring is symmetric about the plane **x = 0** (z is about 19). Ring-out depends only on Y
   (`y < 7.0`), not X.
-- The follower has its own Chao on side 0 and the leader's Chao on side 1. Map:
-  - follower side0 ← leader side1, follower side1 ← leader side0
-  - pos `(x,y,z) → (-x, y, z)`
-  - rot Y `→ (0x10000 - rotY) & 0xFFFF` (0x4000 ↔ 0xC000 checks out). Rot Z → −Z if non-zero.
-    Rot X unchanged.
-  - HP/morale swap with the sides.
-  - result 0 ↔ 1 (2 stays 2).
-- The HUD shows g+0x18's record name on the left (side 0). Swapping the records on the follower
-  is the reason the mirroring is needed. If you don't mind the follower's own Chao on the
-  right, use the leader's side order and skip the mirroring.
-- Confidence: positions high (read from data). Arena mesh symmetry medium (inferred from the
-  symmetric spawn/result points).
+- The HUD shows g+0x18's record name on the left (side 0). Live karate uses the leader's side
+  order in both games (side 0 the leader's Chao, side 1 the follower's), so no mirroring is
+  needed. Mirroring would map pos `(x,y,z) → (-x, y, z)` and rot Y `→ (0x10000 - rotY) & 0xFFFF`.
+- Arena mesh symmetry is inferred from the symmetric spawn/result points.
 
 ---
 
@@ -336,22 +304,17 @@ Confidence:
   - the 1P CPU-alternate pick (0x5422CA),
   - every AI decision (0x5780F0, 0x578230, 0x578890, 0x577A40),
   - damage (0x578510).
-- Seeding both games with `srand(x)` at fight start (call 0x7A89C6 on the game thread) only
-  gives lockstep if every `rand` consumer runs identically on both machines. Effects, other
-  objects and frame drops make that fragile. So it is **only a fallback**. The streamed
-  pos/HP plus forced end above is the reliable path.
+- Seeding both games with `srand(x)` does not give lockstep: every other `rand` consumer
+  (effects, other objects) and frame drops would have to match too. Live karate streams the
+  fighters and forces the end instead.
 
-## 6. Gaps (audit 2026-10-18)
+## 6. Live karate
 
-Live karate already streams both fighters (position, rotation, HP, morale, motion) and the clock
-from the leader; the follower's fighters are puppets (action 8). Left:
+The leader's game streams both fighters (position, rotation, HP, morale, motion) and the clock;
+the follower's fighters are puppets (action 8).
 - Sounds: fighter voices and hits are played by the fighter actions (0x437260, ESI = id, 3 cdecl
-  arguments, e.g. 0x5772A2, 0x577741, 0x5787C8) in the leader's game only, so the follower's fight
-  is quieter. The same calls in 0x579xxx (around the fighter code) couldn't be told apart from ones
-  that run in both games (menus, announcer), so they aren't redirected: sending them would play
-  some twice. Left as is.
-- Hit sparks and the drummer (KarateDrummerMgrExec 0x575551): not traced in this pass; check
-  in game whether the follower shows them.
-- Non-live karate (a friend's Chao as the CPU opponent, karate.rs) is each player's own fight by
-  design.
-
+  arguments, e.g. 0x5772A2, 0x577741, 0x5787C8) in the leader's game only, so they are not heard
+  in the follower's game. The same calls in 0x579xxx can't be told apart from ones that run in
+  both games (menus, announcer), so they aren't redirected.
+- Hit sparks and the drummer (KarateDrummerMgrExec 0x575551) are not traced.
+- Non-live karate (another player's Chao as the CPU opponent, karate.rs) is each player's own fight.

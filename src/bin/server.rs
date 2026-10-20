@@ -9,7 +9,9 @@
 //! online, where they are and their parties, for a web page (the Boyz Hub) to show.
 //!
 //! With `SA2CO_DATA=<folder>` it keeps the shared gardens (their trees and the server's items:
-//! re/chao-garden-items.md 7) in `gardens.txt` there, so they outlive a restart.
+//! re/chao-garden-items.md 7) in `gardens.txt` there, and the Chao players bring (shown asleep
+//! while they're offline, net/roster.rs) in `chao/`, a file per player key, so they outlive a
+//! restart.
 //!
 //! Players join it like any host: F9 > Multiplayer: Join, Host address `<server>:<port>`.
 //! They need the mod version printed at start. Stops cleanly on Ctrl+C / SIGTERM.
@@ -37,6 +39,7 @@ const SKINS_EVERY: Duration = Duration::from_secs(60);
 /// The shared gardens are written (when they changed) this often.
 const GARDENS_EVERY: Duration = Duration::from_secs(10);
 const GARDENS_FILE: &str = "gardens.txt";
+const CHAO_DIR: &str = "chao";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -65,6 +68,7 @@ fn main() {
         name: "server".into(),
         mod_version: env!("CARGO_PKG_VERSION").into(),
         game_build: KNOWN_GAME_BUILD,
+        key: [0; 16],
     };
     let mut host = Host::dedicated(ep, me, Instant::now());
     // Gardens' Chao run here instead of in a player's game (chao_sim; still being built).
@@ -84,15 +88,20 @@ fn main() {
     let mut last_skins = Instant::now() - SKINS_EVERY;
 
     // Shared gardens kept across restarts (SA2CO_DATA: a folder, e.g. a mounted volume).
-    let gardens_file = std::env::var("SA2CO_DATA")
+    let data_dir = std::env::var("SA2CO_DATA")
         .ok()
         .filter(|d| !d.is_empty())
-        .map(|d| PathBuf::from(d).join(GARDENS_FILE));
+        .map(PathBuf::from);
+    let gardens_file = data_dir.as_ref().map(|d| d.join(GARDENS_FILE));
+    let chao_dir = data_dir.as_ref().map(|d| d.join(CHAO_DIR));
     if let Some(file) = &gardens_file
         && let Ok(text) = std::fs::read_to_string(file)
     {
         host.load_garden_state(&text);
         println!("Shared gardens from {}", file.display());
+    }
+    if let Some(dir) = &chao_dir {
+        load_chao(&mut host, dir);
     }
     let mut last_gardens = Instant::now();
 
@@ -143,6 +152,9 @@ fn main() {
         {
             last_gardens = Instant::now();
             save_gardens(&mut host, file);
+            if let Some(dir) = &chao_dir {
+                save_chao(&mut host, dir);
+            }
         }
         if let Some(file) = &status_file
             && last_status.elapsed() >= STATUS_EVERY
@@ -160,6 +172,9 @@ fn main() {
     if let Some(file) = &gardens_file {
         save_gardens(&mut host, file);
     }
+    if let Some(dir) = &chao_dir {
+        save_chao(&mut host, dir);
+    }
     println!("Stopping: telling {} player(s)", names.len());
     host.shutdown(Instant::now());
 }
@@ -172,6 +187,54 @@ fn save_gardens(host: &mut Host, file: &Path) {
     let tmp = file.with_extension("tmp");
     if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file)) {
         eprintln!("can't write {}: {e}", file.display());
+    }
+}
+
+/// Reads the Chao kept for players from `dir` (one `<key>.txt` each).
+fn load_chao(host: &mut Host, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".txt") {
+            continue;
+        }
+        match std::fs::read_to_string(entry.path()) {
+            Ok(text) => {
+                host.load_chao_file(&name, &text);
+                count += 1;
+            }
+            Err(e) => eprintln!("can't read {}: {e}", entry.path().display()),
+        }
+    }
+    println!("Chao of {count} player(s) from {}", dir.display());
+}
+
+/// Writes the players' kept Chao that changed to `dir` (each to a temporary file, then
+/// renamed), and removes those of players forgotten.
+fn save_chao(host: &mut Host, dir: &Path) {
+    let files = host.chao_files();
+    if files.is_empty() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("can't make {}: {e}", dir.display());
+        return;
+    }
+    for (name, text) in files {
+        let file = dir.join(&name);
+        let result = match text {
+            Some(text) => {
+                let tmp = file.with_extension("tmp");
+                std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &file))
+            }
+            None => std::fs::remove_file(&file),
+        };
+        if let Err(e) = result {
+            eprintln!("can't write {}: {e}", file.display());
+        }
     }
 }
 

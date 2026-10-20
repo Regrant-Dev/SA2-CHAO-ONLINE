@@ -1,15 +1,14 @@
 # Built-in jewel eggs in the native Black Market
 
-2026-10-18/19: Steam decrypted `sonic2app.exe`, base 0x400000. Code slices were staged
-into the REA VM and inspected with its Ghidra provider. Reference: Exant64/CWE's
-`alg_kinder_bl.cpp` and egg color mapping, used for factual cross-checks, not copied code
-or assets. This feature is an original Rust implementation.
+Addresses are for the Steam `sonic2app.exe` (decrypted), base 0x400000. Exant64/CWE's
+`alg_kinder_bl.cpp` and egg color mapping were used as a factual cross-check only; the
+feature is an original Rust implementation with no copied code or assets.
 
 ## Native path
 
 - BlackMarketExec **0x58B5E0** calls the stock generator **0x589A00** at **0x58B8EC**.
-  The original generator has no arguments and the caller ignores EAX. We replace this
-  one CALL, run the original, then append at most one eligible egg.
+  The original generator has no arguments and the caller ignores EAX. The mod replaces this
+  one CALL, runs the original, then appends at most one eligible egg.
 - Emblems: unsigned byte **0x1DEC60E**, read by the original generator.
 - Inventory: count dword **0x1DBED90**, packed `{category:u8,id:u8}` entries at
   **0x1DBEDC0**, capacity 32. Category 1 is eggs. The purchased bag is a different
@@ -22,7 +21,7 @@ or assets. This feature is an original Rust implementation.
   creation **0x57B9C0**. That copies the 0xA4-byte genome into the record at +0x438.
 - Gene application **0x551DA0** maps egg IDs 54..68 to texture IDs 1..15. It writes the
   body's jewel texture at +0xDA, egg color at +0xDC, and both jewel gene alleles at
-  genome +0x98/+0x99. We use IDs 54..65 only: Gold through Pearl. Native purchase,
+  genome +0x98/+0x99. The mod uses IDs 54..65 only: Gold through Pearl. Native purchase,
   payment, capacity checks, hatching, gene inheritance and saves remain in charge.
 
 ## Messages and ownership
@@ -32,7 +31,7 @@ contain 99 strings. Each has big-endian offsets terminated by FFFFFFFF. Native s
 uses **0x57A5D0**, walks the terminator rather than assuming 99, and stores separate dialog
 and item tables in its work. Extending the item table is therefore possible.
 
-On startup we resolve each source through Mod Loader's GetReplaceablePath, decode
+On startup the mod resolves each source through Mod Loader's GetReplaceablePath, decode
 bounded PRS, append names 99..110 and descriptions 111..122, then generate replacements in
 the mod's `cache/jewel-eggs/` directory. All original message IDs and payload bytes are
 preserved. The files are registered with ReplaceFile; **the native loader allocates and
@@ -41,24 +40,16 @@ Only new English strings and code are shipped; no game messages or textures are 
 
 ## Activation and limits
 
-Always initialized before the shop loads. Jewel eggs are part of normal progression, so the
-original F9/Mod Manager opt-in was removed. Old
-`JewelEggs=Off` configuration entries are ignored and omitted on the next settings save.
-Each unlock tier from 120 to 180 emblems has a price from 10000 to 40000.
-These are our balance choices, not original-game unlock rules. At restock, choose one
-unlocked, absent jewel egg with a private RNG; do not advance the game's RNG, overwrite
-normal offers, or exceed 32 slots. Full stock gets no extra egg.
+Jewel eggs are always on and are initialized before the shop loads. Old `JewelEggs=Off`
+configuration entries are ignored and dropped on the next settings save.
+Each unlock tier from 120 to 180 emblems has a price from 10000 to 40000; these thresholds
+and prices are the mod's own, not original-game rules. At restock the mod picks one
+unlocked jewel egg not already in stock with a private RNG. It does not advance the game's
+RNG, overwrite normal offers, or exceed 32 slots; a full stock gets no extra egg.
 
-Before changing anything, verify the native catalog pointer/count, the stock function's
-first eight bytes, the original restock CALL, and every modified attribute byte. Refuse
-activation on a conflict rather than overwrite another shop mod. Reject message tables
-with a different string count, invalid offsets or truncated/oversized PRS. Activation never
-edits existing Chao or eggs. Runtime restock also verifies the descriptor still matches.
-
-Tests cover exact thresholds, duplicate/capacity handling, attribute/message indices,
-message preservation, invalid inputs and PRS control boundaries/overlapping copies.
-The Rust decoder/encoder was also run on all twelve real item-message files; the existing
-independent Python PRS decoder produced identical payloads from every generated stream,
-and every original table had the required 99 messages. Game files were only read.
-Native activation, rendered shop previews, purchase/delivery, hatching and save/reload
-still require an in-game retest; headless tests do not establish those outcomes.
+Before changing anything, the mod verifies the native catalog pointer/count, the stock
+function's first eight bytes, the original restock CALL, and every modified attribute byte,
+and refuses to activate on a conflict rather than overwrite another shop mod. Message tables
+with a different string count, invalid offsets or truncated/oversized PRS are rejected.
+Activation never edits existing Chao or eggs. Each restock also checks that the descriptor
+still matches.

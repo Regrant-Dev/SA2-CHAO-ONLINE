@@ -1,5 +1,4 @@
-//! Co-op parties: one boss for everyone (re/bosses.md "GroboLib bosses", "Choosing the boss
-//! leader", "Boss following").
+//! Co-op parties: one boss for everyone (re/bosses.md "GroboLib bosses", "Boss following").
 //!
 //! A boss's MainSub turns its head, runs the function for its mode (`Data1[0]`: these move it,
 //! pick its motion and fire its attacks), plays its motion, takes hits (its hit code is inlined)
@@ -73,7 +72,7 @@ const FIGHT_START: u8 = 2;
 
 /// The GroboLib attacks a follower draws when they're aimed at someone else: (display slot,
 /// display). Each display reads only its object's Data1 below its collision pointer
-/// (re/bosses.md "Attacks drawn on followers"), so a copy of ours with the leader's Data1 bytes
+/// (re/bosses.md "GroboLib bosses"), so a copy of ours with the leader's Data1 bytes
 /// draws it, and having no update or collision of the game's, it never hits anything.
 const ATTACKS: [(usize, usize); 6] = [
     (0x14, 0x005D_6AA0), // missile (main 0x5D6A30)

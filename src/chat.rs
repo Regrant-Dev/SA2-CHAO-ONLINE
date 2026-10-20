@@ -1,5 +1,5 @@
 //! Text chat: T opens a line at the bottom of the screen, Enter sends it to everyone in the
-//! lobby, Esc cancels. Messages show as toasts ("Mason: gg"). While typing, the game's controls
+//! lobby, Esc cancels. Messages show as toasts ("Player1: gg"). While typing, the game's controls
 //! are off (letters are also game buttons) but the world keeps running.
 
 use std::sync::Mutex;

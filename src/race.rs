@@ -7,7 +7,8 @@
 //! creates it. We let the game build its CPU racers, then copy friends' records over the first
 //! lanes. The buffer is never saved, so nothing reaches anyone's save.
 //!
-//! Each player runs their own race (races aren't streamed between games).
+//! Each player runs their own race; in a party race the friends' lanes follow their racing Chao
+//! (online.rs).
 
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 

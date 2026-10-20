@@ -1,13 +1,11 @@
 # Chao Race: selection, start, progress and finish (for network sync)
 
 Steam `sonic2app.exe`, image base 0x400000. Ghidra has no functions defined in most of the
-0x52B000-0x5A0000 Chao code (`procedure_pseudo_code` fails with "no procedure"). Everything
-below was read from the objdump listing. Read `chao-stadium.md` first.
+0x52B000-0x5A0000 Chao code, so addresses come from the objdump listing. See `chao-stadium.md`.
 
-**Correction to earlier notes:** 0x558690 (`RaceSpawnRacers`) runs in the **Entrance** at the
-line-up screen. Its only caller is 0x533DEF, the entrance confirm. It fills the lane list
-0x1A5CC00 and spawns the line-up Chao into 0x1DBE5A0. That explains why those objects are stale
-in the race area. The race area spawns its own Chao from the same lane list at **0x52CF10**
+0x558690 (`RaceSpawnRacers`) runs in the **Entrance** at the line-up screen. Its only caller is
+0x533DEF, the entrance confirm. It fills the lane list 0x1A5CC00 and spawns the line-up Chao
+into 0x1DBE5A0, so those objects are stale in the race area. The race area spawns its own Chao from the same lane list at **0x52CF10**
 (see section 3).
 
 ---
@@ -75,7 +73,7 @@ generator 0x596140 uses the same three bytes.
   (work+0x10/+0x1C/+0x20/+0x24, built by the menu builders 0x5937A0 / 0x594550 / ...).
 - Nothing at race load re-checks unlocks. The race data exists for every course and level.
 
-### Recipe: force a race from the entrance
+### Starting a race from the entrance
 Preconditions: the master exists (`*0x1A5CC20 != 0`), lane 0 is chosen (`*0x1A5CC00 != 0`),
 and the master state is 0x11, 0x12 or 0x13 (the course menu is open).
 1. Write 0x1A0FBD3 = cat, 0x1A0FBD4 = course and 0x1A0FBD5 = level. For party, also write
@@ -83,14 +81,12 @@ and the master state is 0x11, 0x12 or 0x13 (the course menu is open).
 2. Set `w=*0x1A5CC20; *(int*)(w+4)=1;` and
    `m=*(ObjectMaster**)(w+0xE8); m->Data1[0]=0x14; m->Data1[1]=0`.
    The state machine then runs 0x14, then 0x15 (lane list, CPU racers and line-up), then 0x16.
-   Optionally skip calling 0x532FA0 so no save byte changes.
-3. At state 0x16 the game waits for A. To skip the wait, once `Data1[0]==0x16`, call
-   `0x52B5B0(4)` (cdecl, 1 arg) or copy the 0x533E7C..0x533ED4 sequence.
-   - Alternative: call 0x558690 yourself and then 0x52B5B0(4). This needs fewer state
-     assumptions, but leaves the menu windows to be freed by the area change.
+   Skipping 0x532FA0 leaves the save byte unchanged.
+3. At state 0x16 the game waits for A. Once `Data1[0]==0x16`, `0x52B5B0(4)` (cdecl, 1 arg) or
+   the 0x533E7C..0x533ED4 sequence skips the wait. Calling 0x558690 and then 0x52B5B0(4)
+   directly also works; the area change frees the menu windows.
 
-Confidence: globals and descriptor maths high. Entrance states 0x14/0x15/0x16 high. Menu
-geometry and save-byte semantics medium.
+Menu geometry and the save-byte semantics are less certain than the globals and states above.
 
 ---
 
@@ -127,24 +123,19 @@ geometry and save-byte semantics medium.
   Until then the Chao stay in the pre-race idle behaviour 0x538BE0. That behaviour is set by
   the race Chao main 0x53FC10 when `Data1[0]==0`.
 
-### How to hold the start
-Recommended:
-- While holding, each frame, if `mgr=*0x1A5AF18` and `D=mgr->Data1` and `D[0]==1`, set
-  `*(u16*)(D+6) = min(cur, T-2)`. Use T-2 because the game increments before it compares
-  (`==T`). This stops the starter from being created, so state stays below 3, the Chao stay
-  idle at the line and the clock doesn't run.
-- Release by no longer clamping. The game creates the starter and fires GO about one beat
+### Holding the start
+- Each frame, if `mgr=*0x1A5AF18` and `D=mgr->Data1` and `D[0]==1`, set
+  `*(u16*)(D+6) = min(cur, T-2)` (T-2 because the game increments before it compares `==T`).
+  The starter is never created, so state stays below 3, the Chao stay idle at the line and the
+  clock doesn't run.
+- Releasing (no longer clamping) lets the game create the starter and fire GO about one beat
   (~1 s) later. All clients release on the same network tick.
+- Hooking 0x53A670 and returning early while the starter's `Data1[0]==4` also holds. Stubbing
+  0x53A950 does not: its call sites still do `inc Action`, so the race would never start.
 
-Alternatives:
-- Hook 0x53A670 and return early while `Data1[0]==4` on the starter.
-- Don't stub 0x53A950 itself. Its call sites still do `inc Action`, so the race would never
-  start.
+The BGM keeps playing, so the GO can drift off the music beat.
 
-The BGM keeps playing, so the GO can drift off the music beat. That is cosmetic.
-
-Confidence: state values and writers high. Exact T per category medium (two jump tables
-inferred from code order).
+The exact T per category is inferred from the order of two jump tables.
 
 ---
 
@@ -216,50 +207,33 @@ Other globals:
 - 0x1DBE634 is a global "update race Chao" gate.
 
 ### Driving a lane from the network
-(a) Stop the AI:
-- On the remote lane's object (`*(ObjectMaster**)(0x1DCFAF0 + i*0x14)`), replace `MainSub`
-  (+0x10) with a wrapper. The wrapper calls the original 0x53FC10 and then writes the network
-  position (Data1+0x14), rotation and progress (`Data1+0xA8`). Writing after the original
-  means physics can't move the Chao and the display uses the network position.
-- For a fully passive Chao, also clear `Data1+0xA0` bit **0x10** after spawn (after 0x52CF10).
-  0x53FAF0 then skips the behaviour, the trigger/goal checks and the progress update. The Chao
-  stays in whatever animation it had.
-- Keeping bit 0x10 set keeps the running animation, but the AI's own triggers (pit, water,
-  goal) can then switch behaviours and fire the goal by itself.
-
-(b) Finish:
-- When the network reports that player finished, run once (in host-authoritative order on
-  every client):
-  `AL_SetBehavior(obj,0x538420,-1)`, then `0x52BB40(EDX=obj)`, then `Data1+0xA0 &= ~0x40;
-  |= 0x80`.
-- Keep `+0xA8` updated so unfinished remote lanes rank correctly when the race ends.
-- With bit 0x10 cleared the native goal never fires, so there's no risk of a double call.
-
-Caveats:
+- The lane's object is `*(ObjectMaster**)(0x1DCFAF0 + i*0x14)`. Replacing its `MainSub` (+0x10)
+  with a wrapper that calls the original 0x53FC10 and then writes the network position
+  (Data1+0x14) means physics can't move the Chao and the display uses the network position.
+- Clearing `Data1+0xA0` bit **0x10** after spawn (after 0x52CF10) makes the Chao fully passive:
+  0x53FAF0 then skips the behaviour, the trigger/goal checks and the progress update, and the
+  Chao keeps whatever animation it had. With bit 0x10 set, the running animation continues, but
+  the AI's own triggers (pit, water, goal) can switch behaviours and fire the goal by itself.
+- A finish driven from the network is `AL_SetBehavior(obj,0x538420,-1)`, then
+  `0x52BB40(EDX=obj)`, then `Data1+0xA0 &= ~0x40; |= 0x80`, once per lane (0x52BB40 doesn't
+  guard against a second call).
+- `+0xA8` must stay updated so unfinished lanes rank correctly when the race ends.
 - In non-party categories the local player's finish ends the race and blocks later finishes.
-  To let everyone finish:
-  - set 0x133AE14 back to 1 after the local finish,
-  - patch the category test `cmp eax,4 / ja 0x52C0E6` at 0x52C007 so every category uses the
-    party end rule (`finishCount >= racerCount`, 0x52C0E6).
-  CPU lanes that never finish would then hang the race.
+  Setting 0x133AE14 back to 1 after the local finish and patching the category test
+  `cmp eax,4 / ja 0x52C0E6` at 0x52C007 makes every category use the party end rule
+  (`finishCount >= racerCount`, 0x52C0E6); CPU lanes that never finish then hang the race.
 - Medals and rewards come from 0x5396C0 using lane 0's rank.
 
-Confidence: lane table, finish function, goal trigger and end rule high. Flag 0x10 skipping
-all AI medium-high (read from 0x53FAF5, not run). Effects of 0x53DF00 and the other movement
-callees not verified, which is why the post-main position overwrite is recommended.
+## 4. Other players' lanes in a party race (race.rs)
 
-## 4. Gaps (audit 2026-10-18)
-
-What a friend's lane shows in our party race, against their real Chao in theirs:
-- Position: theirs (shifted by the lane gap), set after the lane's own update (race.rs).
-- Animation: was the lane's own behaviour's (running), so a friend's Chao that stopped to rest,
-  tripped, swam or cheered in their race ran on the spot in ours. Fixed: the racer's state now
-  carries its motion id in `PlayerState::anim` (current, or the one it blends into), and the
-  lane starts it (SetMotionLink 0x793C40, checked against the shared table) when theirs changes.
+What another player's lane shows, compared with their real Chao in their own race:
+- Position: theirs (shifted by the lane gap), set after the lane's own update.
+- Animation: their racer's motion id goes in `PlayerState::anim` (current, or the one it blends
+  into), and the lane starts it (SetMotionLink 0x793C40, checked against the shared table) when
+  theirs changes, so resting, tripping, swimming and cheering show.
 - Facing and progress (`Data1+0xA8`) stay the lane's: the lane follows the course, so it faces
   the right way, and the ranking (0x52BC40) keeps working.
-- Finish: the lane's own goal check fires when it reaches the goal where their Chao is, so the
-  finish order follows the real one to within the update delay.
+- Finish: the lane keeps bit 0x10, so its own goal check fires when it reaches the goal where
+  their Chao is; the finish order follows the real one to within the update delay.
 - Not synced: the lane's emotion ball and face (the race shows them small), sounds. Results and
   rewards are each player's own (0x5396C0 in each game).
-
