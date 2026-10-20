@@ -611,9 +611,26 @@ on every (re)connect. Everyone follows `ServerChao` (sender `garden::SERVER`, 0x
   (`ChaoHeld`). A Chao in the local player's own hands never follows the stream
   (`garden::place`). The emotion ball goes as (state, elapsed, length).
 - **Timing.** Time the local game stood still (tab-out with "pause when inactive") doesn't count
-  as the server going quiet (`PAUSE_GAP`). The server keeps a garden running 15 s with too few
-  players (`RUN_GRACE`), sends to players heard within 8 s, and pushes its Chao 5 units out of
-  players' way (their collision would shove the player).
+  as the server going quiet (`PAUSE_GAP`), nor as friends' Chao, touches or holds going quiet
+  (`Garden::stood_still` moves every kept time on by it). The server keeps a garden running 15 s
+  with too few players (`RUN_GRACE`), sends to players heard within 8 s, and pushes its Chao 5
+  units out of players' way (their collision would shove the player).
+- **Paused players.** A connected player counts as in the garden of their last state however
+  long ago (`present_in`): a paused game sends nothing at all. Their stream counts while it was
+  heard within 8 s of their last state (`streaming`), so their Chao stay in the server's world,
+  the garden stays run, and none of theirs becomes a held copy (a second copy beside the paused
+  owner's, or a lone garden run for the owner's own Chao).
+- **Under the ground.** A Chao that came in at a spot just below the floor (or slipped through a
+  seam) has no solid floor under it but one over it (`land::fell_through`, water looked
+  through): the server puts it back on top (checked every 10 frames, and when it's added), and
+  the copies are never placed under the ground their game read (`land_share::under_ground`).
+- **Taking a copy over.** When our game's AI takes a copy that followed the server (a touch, or
+  one of ours when the server stops running it), it is set to the behaviour its brain shows
+  (`AL_SetBehavior` 0x53D890, EAX = object, push -1, push behaviour): sleeping (0x54EF10; its
+  eyes 7 say so) when it was asleep, so it lies on and the game's own reactions check decides
+  what the touch does (a fruit doesn't wake it: 0x560640 skips 0x54EF10); else settle
+  (0x565BE0), so its picker chooses afresh, never from what its AI did before it followed (a walk
+  to a long-gone target walks on the spot).
 
 Before the server runs a garden (no ground yet, or one player there), each owner's game runs its
 own Chao and every other game's copy follows the owner's stream.

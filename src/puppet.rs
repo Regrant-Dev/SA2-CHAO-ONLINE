@@ -434,7 +434,9 @@ extern "C" fn display(_object: usize) {
             let theirs = crate::garden::visitors()
                 .into_iter()
                 .map(|(at, owner, index, name)| (at, Some(owner), index, name));
-            for (at, owner, index, name) in theirs.chain(ours) {
+            let all: Vec<_> = theirs.chain(ours).collect();
+            let lifts = tag_lifts(&all.iter().map(|t| t.0).collect::<Vec<_>>());
+            for ((at, owner, index, name), lift) in all.into_iter().zip(lifts) {
                 // One the server holds for a player who isn't here: "Player1's Chao (asleep)".
                 let held = owner.and_then(|o| crate::held::label(o, index));
                 let who = owner.map_or_else(|| "You".to_string(), crate::room::name_of);
@@ -448,7 +450,7 @@ extern "C" fn display(_object: usize) {
                     (None, Some(name)) => format!("{who} {}: {name}", index + 1),
                     (None, None) => format!("{who} {}", index + 1),
                 };
-                tags.draw_tag(at, CHAO_TAG_HEIGHT, &label, CHAO_TAG_SCALE, locked);
+                tags.draw_tag(at, CHAO_TAG_HEIGHT + lift, &label, CHAO_TAG_SCALE, locked);
             }
         }
         // Puppets blink while their player was just hurt, as characters do: every other two
@@ -960,6 +962,30 @@ const TAG_HEIGHT: f32 = 10.0;
 /// Friends' Chao: tags just over their heads, smaller than players'.
 const CHAO_TAG_HEIGHT: f32 = 6.0;
 const CHAO_TAG_SCALE: f32 = 0.7;
+/// Chao closer than this have their tags stacked, each this much over the one before.
+const TAG_CROWD: f32 = 4.0;
+const TAG_STEP: f32 = 2.0;
+
+/// How much higher each Chao's tag goes (in order) so tags of Chao at about the same spot
+/// don't print over each other.
+fn tag_lifts(at: &[[f32; 3]]) -> Vec<f32> {
+    let near = |a: [f32; 3], b: [f32; 3]| {
+        let (x, y, z) = (a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+        x * x + y * y + z * z < TAG_CROWD * TAG_CROWD
+    };
+    let mut lifts: Vec<f32> = Vec::with_capacity(at.len());
+    for (i, &here) in at.iter().enumerate() {
+        let mut lift = 0.0;
+        // Above the highest of the earlier ones it crowds.
+        for (j, &there) in at[..i].iter().enumerate() {
+            if near(here, there) {
+                lift = f32::max(lift, lifts[j] + TAG_STEP);
+            }
+        }
+        lifts.push(lift);
+    }
+    lifts
+}
 /// Hide tags beyond this distance (world units).
 const TAG_RANGE: f32 = 1500.0;
 /// Camera depth up to which tags are drawn at full size (about the usual follow distance).
@@ -1428,6 +1454,11 @@ use ffi::{
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tags_of_chao_on_the_same_spot_stack() {
+        let lifts = super::tag_lifts(&[[0.0; 3], [0.5, 0.0, 0.0], [50.0, 0.0, 0.0], [0.0; 3]]);
+        assert_eq!(lifts, vec![0.0, 2.0, 0.0, 4.0]);
+    }
     use super::*;
 
     fn pose(x: f32, rot_y: i32, anim: u16, frame: f32) -> Pose {

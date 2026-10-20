@@ -183,6 +183,12 @@ when held Chao wait there (two otherwise).
 - Owner comes into its garden: their game has it again (their stream for it, or 5 s); the held
   copy goes (HeldChao `has` 0) and their game runs it.
 
+A connected player is in the garden their last PlayerState put them in, however long ago: a game
+paused on a tab-out sends nothing but is still there, so its garden keeps running for them, their
+Chao stay theirs (their stream counts while it was heard within 8 s of their last state) and no
+held copy of them is made. Only a state elsewhere or leaving moves them. A held Chao is never
+shown in a garden where any session of its owner's key is.
+
 ## Locked Chao (net/chao_host.rs, garden.rs, protocol `ChaoLock`)
 
 A player's lock (`Brought` lock) says when others' doings are saved to their Chao. Where the

@@ -784,6 +784,30 @@ pub fn probe(tris: &[Tri], q: V3) -> Probe {
     slots
 }
 
+/// The nearest solid (not water) surface from `q` along Y, down or up (`probe` slots 2, 3).
+fn solid_y(tris: &[Tri], q: V3, up: bool) -> Option<f32> {
+    let mut q = q;
+    // Water surfaces in the way are looked through, a few deep.
+    for _ in 0..4 {
+        let hit = probe(tris, q)[2 + usize::from(up)]?;
+        if !hit.water() {
+            return Some(hit.at);
+        }
+        q[1] = hit.at + if up { 0.01 } else { -0.01 };
+    }
+    None
+}
+
+/// Where a body at `at` that fell through the ground belongs: with no solid floor under it but
+/// one over it, back on top of that one. None while it stands over a floor (or off any).
+pub fn fell_through(tris: &[Tri], at: V3) -> Option<V3> {
+    if solid_y(tris, [at[0], at[1] + 1.0, at[2]], false).is_some() {
+        return None;
+    }
+    let y = solid_y(tris, [at[0], at[1] + 1.0, at[2]], true)?;
+    Some([at[0], y, at[2]])
+}
+
 /// Whether `q` projected on the (b, c) plane is inside the triangle, either winding.
 fn inside_2d(v: [V3; 3], q: V3, b: usize, c: usize) -> bool {
     let edge = |i: usize| {
@@ -980,6 +1004,30 @@ mod tests {
         assert!(p[0].is_none() && p[1].is_none() && p[4].is_none() && p[5].is_none());
         // Out past the edge, nothing.
         assert!(probe(&[floor], [30.0, 3.0, 0.0])[2].is_none());
+    }
+
+    #[test]
+    fn a_body_under_the_ground_goes_back_on_top() {
+        let floor = Tri {
+            v: [[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [0.0, 0.0, 10.0]],
+            flags: 1,
+        };
+        let pond = Tri {
+            v: [[-10.0, 3.0, -10.0], [10.0, 3.0, -10.0], [0.0, 3.0, 10.0]],
+            flags: WATER | 1,
+        };
+        let tris = [floor, pond];
+        // On the floor, or swimming over it: where it is.
+        assert_eq!(fell_through(&tris, [0.0, 0.0, 0.0]), None);
+        assert_eq!(fell_through(&tris, [0.0, 2.0, 0.0]), None);
+        assert_eq!(fell_through(&tris, [0.0, 3.5, 0.0]), None);
+        // Under it: back on it.
+        assert_eq!(
+            fell_through(&tris, [0.0, -30.0, 0.0]),
+            Some([0.0, 0.0, 0.0])
+        );
+        // Off the ground altogether: nothing to go back to.
+        assert_eq!(fell_through(&tris, [50.0, -30.0, 0.0]), None);
     }
 
     #[test]

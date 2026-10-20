@@ -43,8 +43,8 @@ use std::time::{Duration, Instant};
 use crate::chao::{ChaoData, changes};
 use crate::chao_sim::brain::{Chao, FruitEvent, ItemEvent, LifeEvent, TreeEvent};
 use crate::chao_sim::evolve::evolve;
-use crate::chao_sim::land::Garden;
 use crate::chao_sim::land::V3;
+use crate::chao_sim::land::{Garden, fell_through};
 use crate::chao_sim::motion::MotionTable;
 use crate::chao_sim::picker::{Ball, Carried, Fruit, Release, Senses, Signal, ToyEvent, Tree};
 use crate::chao_sim::record::{Record, off};
@@ -957,6 +957,19 @@ impl ChaoHost {
                     }) {
                         push_out(&mut chao.body.pos, p.position);
                     }
+                    // Under the ground (in at a spot just below the floor, or through a seam):
+                    // back on top, or everyone's copy shows it under the garden.
+                    if self.frames.is_multiple_of(RESCUE_EVERY)
+                        && let Some(at) = fell_through(&run.world.garden.tris, chao.body.pos)
+                    {
+                        crate::log!(
+                            "chao host: {key:?} in garden {} was under the ground at {:?}; back on it",
+                            index + 1,
+                            chao.body.pos
+                        );
+                        chao.body.pos = at;
+                        chao.body.vel = [0.0; 3];
+                    }
                 }
             }
             // The server's items lie on the floor, as the games' own do (their position is
@@ -1224,12 +1237,7 @@ impl ChaoHost {
     /// Who's in garden `index` now, whether it's run, and which Chao are in it.
     fn membership(&mut self, index: usize, now: Instant, out: &mut Vec<Out>) {
         let area = index as u8 + 1;
-        let here: Vec<u8> = self
-            .players
-            .iter()
-            .filter(|(_, p)| p.area == area && now.duration_since(p.at) < PLAYER_STALE)
-            .map(|(&id, _)| id)
-            .collect();
+        let here = self.present_in(area);
         let land = self.land(index).map(|(f, g)| (f, g.clone()));
         // One player is enough when Chao held for others wait there.
         let enough = here.len() >= MIN_PLAYERS || (!here.is_empty() && self.held_here[index]);
@@ -1274,21 +1282,16 @@ impl ChaoHost {
             });
         }
         let table = self.table();
-        // Whose Chao are out: a player heard lately (a hitch or a tab-out doesn't take theirs
-        // out of the garden, and its brain with it).
-        let present: Vec<u8> = self
-            .players
-            .iter()
-            .filter(|(_, p)| p.area == area && now.duration_since(p.at) < VISIT_STALE)
-            .map(|(&id, _)| id)
-            .collect();
+        // Whose Chao are out: the players here (a hitch or a tab-out doesn't take theirs out of
+        // the garden, and its brain with it).
+        let present = here;
         let Some(run) = self.runs[index].as_ref() else {
             return;
         };
         let gone: Vec<Key> = run
             .slots
             .keys()
-            .filter(|k| k.0 < HELD_OWNER && !self.wanted(k, &present, now))
+            .filter(|k| k.0 < HELD_OWNER && !self.wanted(k, &present))
             .copied()
             .collect();
         for &key in &gone {
@@ -1297,9 +1300,7 @@ impl ChaoHost {
                 key.0,
                 key.1,
                 present.contains(&key.0),
-                self.own
-                    .get(&key)
-                    .is_some_and(|(_, at)| now.duration_since(*at) < VISIT_STALE),
+                streaming(&self.own, &self.players, &key),
                 self.own.get(&key).is_some_and(|(c, _)| c.owner_runs),
             );
             self.remember(key, area);
@@ -1316,7 +1317,9 @@ impl ChaoHost {
         let wanted: BTreeMap<Key, GardenChao> = self
             .own
             .iter()
-            .filter(|(key, _)| Self::is_wanted(&self.own, &self.records, key, &present, now))
+            .filter(|(key, _)| {
+                Self::is_wanted(&self.own, &self.records, &self.players, key, &present)
+            })
             .map(|(&key, (c, _))| (key, *c))
             .collect();
         for key in gone {
@@ -1332,7 +1335,9 @@ impl ChaoHost {
             let Some(record) = self.records.get(&key) else {
                 continue;
             };
-            let chao = Chao::new(c.position, c.rotation_y as u16, Record((**record).clone()));
+            // From where its owner's game has it, but never under the ground.
+            let at = fell_through(&run.world.garden.tris, c.position).unwrap_or(c.position);
+            let chao = Chao::new(at, c.rotation_y as u16, Record((**record).clone()));
             if let Some(slot) = run.world.add(chao) {
                 run.slots.insert(key, slot);
                 self.sent.insert(key, record.clone());
@@ -1374,8 +1379,8 @@ impl ChaoHost {
         }
     }
 
-    fn wanted(&self, key: &Key, here: &[u8], now: Instant) -> bool {
-        Self::is_wanted(&self.own, &self.records, key, here, now)
+    fn wanted(&self, key: &Key, here: &[u8]) -> bool {
+        Self::is_wanted(&self.own, &self.records, &self.players, key, here)
     }
 
     /// Out now: an owner here streams it as visiting (their game has it in this garden, its
@@ -1383,15 +1388,34 @@ impl ChaoHost {
     fn is_wanted(
         own: &HashMap<Key, (GardenChao, Instant)>,
         records: &HashMap<Key, Box<ChaoData>>,
+        players: &HashMap<u8, Player>,
         key: &Key,
         here: &[u8],
-        now: Instant,
     ) -> bool {
         here.contains(&key.0)
-            && own
-                .get(key)
-                .is_some_and(|(c, at)| now.duration_since(*at) < VISIT_STALE && !c.owner_runs)
+            && streaming(own, players, key)
+            && own.get(key).is_some_and(|(c, _)| !c.owner_runs)
             && records.contains_key(key)
+    }
+
+    /// Player ids in garden `area`: where their last state put them, however long ago. A game
+    /// paused on a tab-out sends nothing (the session stays up) and is still there; only a
+    /// state elsewhere or leaving (`left`) takes a player out.
+    fn present_in(&self, area: u8) -> Vec<u8> {
+        self.players
+            .iter()
+            .filter(|(_, p)| p.area == area)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// The player ids player `key` is online as.
+    fn sessions(&self, key: &PlayerKey) -> Vec<u8> {
+        self.keys
+            .iter()
+            .filter(|(_, (k, _))| k == key)
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// `ServerChao` for each owner's Chao in garden `index`, to each player there.
@@ -1611,23 +1635,24 @@ impl ChaoHost {
     /// and asleep: `None` while its owner's game has it (they're in that garden, and their
     /// stream for it came or `HANDOVER` passed).
     fn held_state(&self, key: &PlayerKey, area: u8, row: u8, now: Instant) -> Option<bool> {
-        let Some(id) = self.session_of(key) else {
+        let ids = self.sessions(key);
+        if ids.is_empty() {
             return Some(true);
-        };
-        if let Some(p) = self
-            .players
-            .get(&id)
-            .filter(|p| p.area == area && now.duration_since(p.at) < VISIT_STALE)
-        {
-            let streamed = self
-                .own
-                .get(&(id, row))
-                .is_some_and(|(_, at)| now.duration_since(*at) < VISIT_STALE);
+        }
+        // Any session of theirs in that garden (a reconnect can leave an old one a moment).
+        for id in &ids {
+            let Some(p) = self.players.get(id).filter(|p| p.area == area) else {
+                continue;
+            };
+            let streamed = streaming(&self.own, &self.players, &(*id, row));
             if streamed || now.duration_since(p.since) >= HANDOVER {
                 return None;
             }
         }
-        Some(!self.awake.get(&id).copied().unwrap_or(false))
+        Some(
+            !ids.iter()
+                .any(|id| self.awake.get(id).copied().unwrap_or(false)),
+        )
     }
 
     /// The held Chao that would show in garden `area` now (`choose` picks among them).
@@ -1658,11 +1683,10 @@ impl ChaoHost {
     /// way back to them (or every visit alone would start a run for a moment).
     fn held_waiting(&self, area: u8, now: Instant) -> bool {
         self.candidates(area, now).iter().any(|c| {
-            !self.session_of(&c.id.key).is_some_and(|id| {
-                self.players
-                    .get(&id)
-                    .is_some_and(|p| p.area == area && now.duration_since(p.at) < VISIT_STALE)
-            })
+            !self
+                .sessions(&c.id.key)
+                .iter()
+                .any(|id| self.players.get(id).is_some_and(|p| p.area == area))
         })
     }
 
@@ -1771,6 +1795,7 @@ impl ChaoHost {
         let Some(run) = self.runs[index].as_mut() else {
             return;
         };
+        let pos = fell_through(&run.world.garden.tris, pos).unwrap_or(pos);
         let chao = Chao::new(pos, facing as u16, Record((*stored.record).clone()));
         let Some(slot) = run.world.add(chao) else {
             return;
@@ -2021,6 +2046,19 @@ impl ChaoHost {
             self.outbox.append(&mut out);
         }
     }
+}
+
+/// Whether owner stream `key` is current: heard within `VISIT_STALE` of its owner's last
+/// state (their game paused, both stop alike; their game going on without it, it's gone).
+fn streaming(
+    own: &HashMap<Key, (GardenChao, Instant)>,
+    players: &HashMap<u8, Player>,
+    key: &Key,
+) -> bool {
+    let (Some((_, at)), Some(p)) = (own.get(key), players.get(&key.0)) else {
+        return false;
+    };
+    p.at.saturating_duration_since(*at) < VISIT_STALE
 }
 
 /// Where player `p` counts as being for their Chao's locks at `now` (`lock_place`): the
@@ -2662,6 +2700,9 @@ type Flying = (ItemId, u8, V3, V3, u32);
 /// A thrown item falls this much faster each frame, and lands after this many frames at most.
 const ITEM_GRAVITY: f32 = 0.055;
 const MAX_FLIGHT: u32 = 120;
+
+/// Running Chao are checked for having fallen under the ground this often (frames).
+const RESCUE_EVERY: u64 = 10;
 
 /// The server's lying items are checked against the floor this often.
 const SETTLE_EVERY: u64 = 60;
@@ -3859,6 +3900,90 @@ mod tests {
             !out.iter()
                 .any(|o| matches!(o.body, Body::ServerChao { .. } | Body::HeldChao { .. }))
         );
+    }
+
+    #[test]
+    fn a_paused_game_alone_with_its_own_chao_starts_no_run() {
+        let t0 = Instant::now();
+        let mut host = two_keys(t0);
+        host.observe(0, &brings(&[(1, 0, kid(1))], true), t0);
+        let stream = Body::GardenChao {
+            owner: 0,
+            list: vec![GardenChao {
+                index: 0,
+                ..GardenChao::default()
+            }],
+        };
+        let each = [
+            (0, state(1, [0.0; 3])),
+            (0, stream),
+            (3, state(0, [0.0; 3])),
+        ];
+        let mut out = live(&mut host, &each, ms(0), ms(3000), t0);
+        // Player1 tabs out for half a minute (their game sends nothing), then comes back.
+        out.extend(live(&mut host, &each[2..], ms(3000), ms(33_000), t0));
+        out.extend(live(&mut host, &each, ms(33_000), ms(36_000), t0));
+        assert!(host.runs[0].is_none());
+        assert!(host.shown.is_empty());
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o.body, Body::ServerChao { .. } | Body::HeldChao { .. }))
+        );
+    }
+
+    #[test]
+    fn a_paused_player_keeps_their_chao_and_no_held_copy_of_it_shows() {
+        let t0 = Instant::now();
+        let mut host = two_keys(t0);
+        let record = kid(1);
+        host.observe(0, &brings(&[(1, 0, record.clone())], true), t0);
+        host.observe(
+            0,
+            &Body::Chao {
+                index: 0,
+                data: record,
+            },
+            t0,
+        );
+        let stream = Body::GardenChao {
+            owner: 0,
+            list: vec![GardenChao {
+                index: 0,
+                position: [10.0, 0.0, 10.0],
+                ..GardenChao::default()
+            }],
+        };
+        let each = [
+            (0, state(1, [0.0; 3])),
+            (0, stream),
+            (3, state(1, [40.0, 0.0, 40.0])),
+        ];
+        live(&mut host, &each, ms(0), ms(2000), t0);
+        assert!(host.chao_mut((0, 0)).is_some());
+        // Player1's game is paused (a tab-out) for 30 s; Player2 plays on.
+        let out = live(&mut host, &each[2..], ms(2000), ms(32_000), t0);
+        assert!(
+            host.chao_mut((0, 0)).is_some(),
+            "it's still theirs, run here"
+        );
+        assert!(host.shown.is_empty());
+        assert!(told(&out, 3).is_empty(), "no held copy of it");
+        assert!(streamed(&out, 3, (0, 0)).is_some());
+        // Back: as it was, nothing made anew.
+        let out = live(&mut host, &each, ms(32_000), ms(34_000), t0);
+        assert!(host.chao_mut((0, 0)).is_some());
+        assert!(host.shown.is_empty() && told(&out, 3).is_empty());
+    }
+
+    #[test]
+    fn a_chao_under_the_ground_is_put_back_on_it() {
+        let t0 = Instant::now();
+        let mut host = running(t0);
+        let chao = host.chao_mut((0, 0)).unwrap();
+        chao.body.pos = [10.0, -40.0, 10.0];
+        run_to(&mut host, ms(200), ms(600), t0);
+        let pos = host.chao_mut((0, 0)).unwrap().body.pos;
+        assert!(pos[1] > -1.0, "{pos:?}");
     }
     /// What player `to` was last told is locked against them.
     fn locked_to(out: &[Out], to: u8) -> Option<Vec<Key>> {

@@ -499,6 +499,42 @@ mod tests {
     }
 
     #[test]
+    fn asleep_it_lies_with_its_eyes_shut_never_walking() {
+        use super::super::super::brain::motion::{JOG, RUN, WALK, WALK_SLOW};
+        use super::super::super::motion::fallback_posture;
+        let mut rng = Rng::new(7);
+        let garden = garden();
+        let mut c = chao(SLEEPING, |c| {
+            c.rec.set_u16(off::SLEEPY, 9000);
+            c.rec.set_u16(off::TIRE, 5000);
+        });
+        let mut asleep = 0;
+        for f in 1..100_000u32 {
+            if f % 100 == 0 {
+                c.rec.set_u16(off::NEED_CLOCK, 0);
+            }
+            c.frame(&garden, 0, &Alone, &mut rng);
+            if c.current() != Some(Behaviour::Game(SLEEPING)) {
+                break;
+            }
+            // What the server sends of it (`ServerChao` motion and eyes): once lying down,
+            // a lying motion with the sleeping eyes until it wakes (mode 15 on).
+            if (3..15).contains(&c.mode) {
+                asleep += 1;
+                assert_eq!(c.eyes, 7, "mode {} motion {:#x}", c.mode, c.motion);
+                assert!(![WALK, WALK_SLOW, JOG, RUN].contains(&c.motion));
+                assert!(
+                    matches!(fallback_posture(c.motion), 2 | 3),
+                    "mode {} motion {:#x}",
+                    c.mode,
+                    c.motion
+                );
+            }
+        }
+        assert!(asleep > 1000);
+    }
+
+    #[test]
     fn the_sleep_tick_waits_for_the_latch() {
         let mut c = chao(SLEEPING, |_| {});
         let mut rng = Rng::new(1);

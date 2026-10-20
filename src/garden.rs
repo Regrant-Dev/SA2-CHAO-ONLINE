@@ -186,6 +186,18 @@ const BALLOON_CLOSE: u8 = 7;
 const DELETE_OBJECT: usize = 0x0046_F720;
 /// A friend holding our Chao: their updates count this long.
 const HELD_STALE: Duration = Duration::from_millis(500);
+/// `AL_SetBehavior` (`0x53D890`): EAX = object; push the frame limit, push the behaviour
+/// (cdecl, the caller pops both).
+#[cfg(target_arch = "x86")]
+const SET_BEHAVIOUR: usize = 0x0053_D890;
+/// What our game's AI goes on with when it takes over a copy that followed the server: sleeping
+/// (`0x54EF10`; lying already, it picks a sleeping pose at once) for one the server shows asleep
+/// (its eyes shut, `SLEEP_EYES`), else the settle behaviour an empty stack falls back to
+/// (`0x565BE0`), so its picker chooses afresh. Never what its AI did before it followed (a walk
+/// to somewhere long gone: it walked on the spot).
+const BEHAVIOUR_SLEEPING: usize = 0x0054_EF10;
+const BEHAVIOUR_SETTLE: usize = 0x0056_5BE0;
+const SLEEP_EYES: i16 = 7;
 
 /// `chao::changes::diff` output: (offset, delta or value).
 type Changes = Vec<(u16, f32)>;
@@ -250,6 +262,7 @@ struct Held {
     at: Instant,
 }
 
+#[derive(Default)]
 struct Garden {
     /// (owner, index) -> our visitor object for it.
     mirrors: HashMap<(u8, u8), Mirror>,
@@ -295,32 +308,39 @@ struct Garden {
 
 type Rebuilt = ((Vector, i32, i32), Option<Instant>, Instant);
 
+impl Garden {
+    /// Our game stood still for `gap` (nothing was heard meanwhile, as nothing was read): every
+    /// time kept moves on by it, so no friend's Chao goes home and no touch or hold ends for it.
+    fn stood_still(&mut self, gap: Duration) {
+        for at in self.heard.values_mut() {
+            *at += gap;
+        }
+        for m in self.mirrors.values_mut() {
+            m.since += gap;
+            if let Some((_, at, _)) = m.target.as_mut() {
+                *at += gap;
+            }
+            for at in [&mut m.owner_runs, &mut m.local_until]
+                .into_iter()
+                .flatten()
+            {
+                *at += gap;
+            }
+        }
+        for h in self.held.values_mut() {
+            h.at += gap;
+        }
+        for until in self.self_run.values_mut() {
+            *until += gap;
+        }
+    }
+}
+
 static GARDEN: Mutex<Option<Garden>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut Garden) -> R) -> R {
     let mut g = GARDEN.lock().unwrap_or_else(|e| e.into_inner());
-    f(g.get_or_insert_with(|| Garden {
-        mirrors: HashMap::new(),
-        holders: HashMap::new(),
-        mine: Vec::new(),
-        held: HashMap::new(),
-        wrapped: HashMap::new(),
-        changes_out: Vec::new(),
-        held_out: Vec::new(),
-        touched_out: Vec::new(),
-        changes_in: Vec::new(),
-        frame: 0,
-        heard: HashMap::new(),
-        left: Vec::new(),
-        looks_in: HashMap::new(),
-        rows_changed: HashMap::new(),
-        self_run: HashMap::new(),
-        sounds_out: Vec::new(),
-        sounds_in: Vec::new(),
-        live_in: Vec::new(),
-        rebuilt: HashMap::new(),
-        alive: Vec::new(),
-    }))
+    f(g.get_or_insert_with(Garden::default))
 }
 
 /// Visitors: we created `object` for player `owner`'s Chao `index`.
@@ -602,6 +622,8 @@ static SERVER_BRAIN: Mutex<Option<(u8, Instant)>> = Mutex::new(None);
 /// When `server_runs` was last asked; a longer gap than `PAUSE_GAP` is our game standing still.
 static LAST_ASKED: Mutex<Option<Instant>> = Mutex::new(None);
 const PAUSE_GAP: Duration = Duration::from_millis(500);
+/// When `on_frame` last ran.
+static LAST_FRAME: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Whether the server runs our garden's Chao now (it sends them): everyone's follow it. Else
 /// each owner's game runs their own. Trees and toys stay the keeper's (keeper.rs).
@@ -1683,7 +1705,17 @@ fn chao_state(index: u8, object: usize) -> Option<GardenChao> {
 /// Call every frame (game thread).
 pub fn on_frame() {
     let now = Instant::now();
+    // Our game stood still (a tab-out pauses it): that time isn't others going quiet.
+    let gap = LAST_FRAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(now)
+        .map(|at| now.duration_since(at))
+        .filter(|g| *g > PAUSE_GAP);
     with(|g| {
+        if let Some(gap) = gap {
+            g.stood_still(gap);
+        }
         g.frame = g.frame.wrapping_add(1);
         prune_mirrors(g);
         own_frame(g);
@@ -1828,6 +1860,12 @@ fn release_own(g: &mut Garden, key: (u8, u8)) {
             let d = data1(m.object);
             if d != 0 {
                 adopt_target(m.object, d, m.local_until.is_some(), m.target);
+                // Asleep there sleeps on here; anything else starts afresh.
+                if m.local_until.is_none()
+                    && let Some((t, _, _)) = m.target
+                {
+                    set_behaviour(m.object, takeover_behaviour(&t));
+                }
                 let flags = (d + D_FLAGS) as *mut u32;
                 flags.write(flags.read() | FLAG_AI);
                 let status = (d + D_STATUS) as *mut u16;
@@ -1962,6 +2000,11 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                          held {held_by_us}, petting {})",
                         petting_near(here, petter)
                     );
+                    // Our game's AI takes it from here: from what its brain shows now (asleep
+                    // sleeps on, and the touch wakes it or not as the game decides).
+                    if let Some((t, _, _)) = m.target {
+                        set_behaviour(m.object, takeover_behaviour(&t));
+                    }
                 }
                 m.local_until = Some(now + LOCAL_TIME);
             }
@@ -3225,6 +3268,12 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
         t.position[2] + v[2] * ahead,
     ];
     let mut at = follow_position(here, predicted);
+    // Never under the ground we can see (the server's came in just below the floor).
+    if let Ok(area) = u8::try_from(game::current_chao_area())
+        && let Some([x, y, z]) = crate::land_share::under_ground(area, [at.x, at.y, at.z])
+    {
+        at = Vector { x, y, z };
+    }
     // The brain only knew where we were a moment ago: a copy put inside us would shove us
     // (the game's collision moves the player, not a copy we place). It steps aside instead.
     if let Some((player, _)) = game::player_position() {
@@ -3305,6 +3354,38 @@ fn follow_position(here: Vector, target: [f32; 3]) -> Vector {
         z: here.z + (z - here.z) * amount,
     }
 }
+
+/// The behaviour our game's AI takes a copy over in, from its brain's last state.
+fn takeover_behaviour(t: &GardenChao) -> usize {
+    if t.eyes == SLEEP_EYES {
+        BEHAVIOUR_SLEEPING
+    } else {
+        BEHAVIOUR_SETTLE
+    }
+}
+
+/// `AL_SetBehavior(object, behaviour, -1)`: the stack becomes just `behaviour`.
+///
+/// # Safety
+/// `object` is a live garden Chao, on the game thread.
+#[cfg(target_arch = "x86")]
+unsafe fn set_behaviour(object: usize, behaviour: usize) {
+    unsafe {
+        std::arch::asm!(
+            "push -1",
+            "push {b}",
+            "call {f}",
+            "add esp, 8",
+            b = in(reg) behaviour,
+            f = in(reg) SET_BEHAVIOUR,
+            inout("eax") object => _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86"))]
+unsafe fn set_behaviour(_object: usize, _behaviour: usize) {}
 
 /// # Safety
 /// `object` and `d` are the live Chao's ObjectMaster and Data1, on the game thread.
@@ -3484,6 +3565,33 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_copy_we_take_over_goes_on_from_what_its_brain_shows() {
+        use super::{BEHAVIOUR_SETTLE, BEHAVIOUR_SLEEPING, GardenChao, takeover_behaviour};
+        let asleep = GardenChao {
+            motion: 0x13,
+            eyes: 7,
+            ..GardenChao::default()
+        };
+        assert_eq!(takeover_behaviour(&asleep), BEHAVIOUR_SLEEPING);
+        let walking = GardenChao {
+            motion: 0x64,
+            ..GardenChao::default()
+        };
+        assert_eq!(takeover_behaviour(&walking), BEHAVIOUR_SETTLE);
+    }
+
+    #[test]
+    fn our_game_standing_still_isnt_others_going_quiet() {
+        let mut g = super::Garden::default();
+        let then = Instant::now();
+        g.heard.insert((1, 0), then);
+        g.self_run.insert(0, then);
+        g.stood_still(Duration::from_secs(30));
+        assert_eq!(g.heard[&(1, 0)], then + Duration::from_secs(30));
+        assert_eq!(g.self_run[&0], then + Duration::from_secs(30));
+    }
 
     #[test]
     fn a_shared_pickup_cancels_pet_reactions_without_waiting_five_seconds() {

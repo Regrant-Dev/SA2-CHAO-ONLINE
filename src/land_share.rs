@@ -2,9 +2,9 @@
 //! has them (chao_sim::land), and the Chao motion table (chao_sim::motion), so a server running
 //! gardens' Chao has them without any game files.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::chao_sim::land::{Garden, Mem};
+use crate::chao_sim::land::{Garden, Mem, Tri, V3, fell_through};
 use crate::net::protocol::{Body, LAND_PART};
 
 /// The garden whose ground we last sent (0: none yet, or we left).
@@ -16,6 +16,22 @@ const TOYS_WAIT: u32 = 120;
 
 /// `GardenLand` "garden" number of the motion table.
 pub const MOTION_TABLE: u8 = 3;
+
+/// The ground of the garden we last sent (its area), for `under_ground`.
+static GROUND: Mutex<Option<(u8, Arc<Vec<Tri>>)>> = Mutex::new(None);
+
+/// Where a copy at `at` in garden `area` belongs if it's under the ground there (the server's
+/// Chao came in just below the floor, or slipped through a seam): back on top. None otherwise,
+/// or before we've read that garden's ground.
+pub fn under_ground(area: u8, at: V3) -> Option<V3> {
+    let tris = GROUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(a, _)| *a == area)
+        .map(|(_, t)| t.clone())?;
+    fell_through(&tris, at)
+}
 
 /// Connected (again): the garden we're in goes to the host anew.
 pub fn reset() {
@@ -47,6 +63,7 @@ pub fn on_frame(area: u8) -> Vec<Body> {
     }
     *waited = 0;
     *sent = area;
+    *GROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some((area, Arc::new(garden.tris.clone())));
     let mut out = parts(index as u8, &garden.to_bytes(), garden.fingerprint());
     crate::log!(
         "land: sending garden {area} ({} triangles, {} ledges, {} blockers, {} toys, {:08x})",
