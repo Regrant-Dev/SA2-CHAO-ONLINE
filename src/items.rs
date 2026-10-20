@@ -43,6 +43,11 @@ const FRUIT_BEING_EATEN: u8 = 4;
 const D_KIND: usize = 0x08;
 const D_ANIMAL_KIND: usize = 0x03;
 const D_BITES: usize = 0x10;
+/// A fruit's ALW entry radius (`+0x28`) is bites left × 0.5 (2.0 from 0x546180, then set by
+/// the eat mode 0x545C20 after each bite); its height (`+0x2C`) is 1.0 (0x546180). The Chao
+/// holds it that far out and that much lower (0x56CFF0).
+const FRUIT_HOLD_RADIUS_PER_BITE: f32 = 0.5;
+const FRUIT_HOLD_HEIGHT: f32 = 1.0;
 
 /// Item create functions (cdecl, return the ObjectMaster), all called without a save record.
 const CREATE_FRUIT: usize = 0x0054_6180;
@@ -163,7 +168,7 @@ pub fn mark_unsaved(object: usize) {
 
 /// The server, as an items' owner: its items come from the referee (`ServerItems`), not from a
 /// player (re/chao-garden-items.md 7).
-pub const SERVER: u8 = 0xFF;
+pub use crate::net::protocol::SERVER;
 
 /// Network (the referee): the server's own items in garden `area`.
 pub fn received_server(area: u8, items: Vec<GardenItem>) {
@@ -468,6 +473,18 @@ fn place(owner: u8, item: &GardenItem) -> Option<(Vector, bool)> {
             owner: chao_owner,
             index,
         } => {
+            // A fruit goes where the game itself keeps it: at the copy's animated hands, so it
+            // follows the motion (eating) rather than a fixed spot (re/chao-garden-items.md).
+            if usize::from(item.category) == FRUIT
+                && let Some(at) = garden::hold_point(
+                    chao_owner,
+                    index,
+                    f32::from(item.bites) * FRUIT_HOLD_RADIUS_PER_BITE,
+                    FRUIT_HOLD_HEIGHT,
+                )
+            {
+                return Some((at, true));
+            }
             let (at, angle) = garden::following_pose(chao_owner, index)?;
             Some((garden::in_hands(at, angle, item.position), true))
         }

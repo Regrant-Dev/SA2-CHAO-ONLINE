@@ -1,6 +1,7 @@
-//! Who keeps a shared garden: one player whose game runs every Chao there (theirs and the
-//! visitors), the trees and the toys, so the garden has one brain (re/chao-garden-sync.md
-//! "Keeper").
+//! Who keeps a shared garden: one player whose game runs its trees and toys, so they have one
+//! brain (re/chao-garden-sync.md "Keeper"). The garden's Chao are the server's
+//! (net/chao_host.rs), not the keeper's. The election also picks co-op stages' boss leader
+//! (boss_follow.rs).
 //!
 //! The keeper says so a few times a second (`GardenKeeper`, with a term). Everyone follows the
 //! player saying so; a newcomer doesn't take over from a keeper already there. When nobody says

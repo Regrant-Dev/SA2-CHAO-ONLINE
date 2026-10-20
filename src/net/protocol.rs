@@ -4,13 +4,30 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
 
 /// Chao each player brings into a shared garden.
 pub const MAX_CARRIED_CHAO: usize = 4;
+/// Record fields a `ChaoLive` carries, (offset, length): happiness, power/run, fly/swim and
+/// alignment, emotions, needs and personality, and the six character bonds.
+pub const CHAO_LIVE_FIELDS: [(usize, usize); 4] =
+    [(0x82, 2), (0xA8, 12), (0x12C, 0x2B), (0x16C, 36)];
+/// `Ball::flags`: its owner holds it; it's in the water (`*0x1DBE56C`).
+pub const BALL_HELD: u8 = 1;
+pub const BALL_IN_WATER: u8 = 2;
+
+/// Record bytes a `ChaoTouched` carries, (offset, length): emotions, needs and personality
+/// (the part of `CHAO_LIVE_FIELDS` that never goes to a save).
+pub const CHAO_MOOD: (usize, usize) = (0x12C, 0x2B);
+/// Bytes in a `ChaoLive`.
+pub const CHAO_LIVE_LEN: usize = 2 + 12 + 0x2B + 36;
+
+/// `GardenLand` parts: at most this many bytes each, this many parts.
+pub const LAND_PART: usize = 16 * 1024;
+pub const MAX_LAND_PARTS: u8 = 64;
 /// `Body::Chao` index of the player's chosen Chao for races and karate ("My Chao").
 pub const MY_CHAO_INDEX: u8 = MAX_CARRIED_CHAO as u8;
 /// Chao slots per player in `Body::Chao`: the garden Chao, then "My Chao".
@@ -161,6 +178,46 @@ pub enum Body {
         area: u8,
         items: Vec<GardenItem>,
     },
+    /// From the host: it runs shared garden `area`'s Chao (chao_sim) and this is player
+    /// `owner`'s, as `GardenChao` has them; ~30 per second while it does. Everyone in the
+    /// garden follows these instead of a keeper's game.
+    ServerChao {
+        area: u8,
+        owner: u8,
+        list: Vec<GardenChao>,
+    },
+    /// From the host: player `owner`'s Chao `index` as the server runs it, the record fields that
+    /// change as it lives (`CHAO_LIVE_FIELDS`, in order), about once a second; the others' copy
+    /// of it shows them (the status balloon).
+    ChaoLive {
+        owner: u8,
+        index: u8,
+        bytes: Vec<u8>,
+    },
+    /// To the host: the sender's game runs `owner`'s Chao `index` for a while because they
+    /// touched it (threw, petted, fed it; not while holding it: `ChaoHeld`), and this is where it
+    /// is, with its emotions, needs and personality as the touch left them (`CHAO_MOOD`); ~10
+    /// per second meanwhile. The server's Chao goes on from there.
+    ChaoTouched {
+        owner: u8,
+        index: u8,
+        position: [f32; 3],
+        rotation_y: i32,
+        /// The motion it plays there (the others are shown it).
+        motion: u16,
+        mood: Vec<u8>,
+    },
+    /// To the host: part `part` of `parts` of garden `garden`'s ground (0 Neutral, 1 Hero,
+    /// 2 Dark; `chao_sim::land::Garden::to_bytes`, whose fingerprint is `fingerprint`), or with
+    /// `garden` 3 the Chao motion table (`chao_sim::motion::MotionTable::to_bytes`), read from
+    /// the sender's game, for the host to run Chao on.
+    GardenLand {
+        garden: u8,
+        fingerprint: u32,
+        part: u8,
+        parts: u8,
+        bytes: Vec<u8>,
+    },
     /// The sender carries this Chao around Chao World outside the gardens (lobby, kindergarten,
     /// entrances), `offset` from them in their frame; `None`: not any more. On a change and
     /// every second or so while carrying.
@@ -305,6 +362,8 @@ pub enum Body {
         claim: u16,
         position: [f32; 3],
         velocity: [f32; 3],
+        /// `BALL_HELD`, `BALL_IN_WATER`.
+        flags: u8,
     },
     /// Shared garden: the sender keeps garden `area`'s trees (the lowest player id there) and
     /// these are their 7 tree spots, as their save has them (8 bytes each: kind, state, growth,
@@ -312,6 +371,10 @@ pub enum Body {
     GardenTrees {
         area: u8,
         trees: [[u8; TREE_RECORD]; TREE_SLOTS],
+        /// Bit per spot: its tree wants water (a planted seed, or a grown one whose life fell
+        /// under 6000: GrowTree `Data1+0xAC`; its watering sphere 0xAE is on). The record
+        /// keeps only life's low byte.
+        thirsty: u8,
     },
     /// Shared garden: the sender planted a seed of `kind` in tree spot `slot` (`TREE_PLANT`) or
     /// shook its tree (`TREE_SHAKE`) in their copy of garden `area`'s trees; its keeper does it
@@ -572,7 +635,7 @@ pub const SOUND_JINGLE: u8 = 2;
 pub const MAX_CHAO_SOUNDS: usize = 16;
 
 /// Entries in `garden::PROPS` (`GardenChao::props` values go up to this).
-pub const MAX_CHAO_PROP: u8 = 20;
+pub const MAX_CHAO_PROP: u8 = 22;
 
 /// A shared garden item, the same in every game: who first had it and their number for it.
 /// It keeps this id when it changes hands.
@@ -629,6 +692,8 @@ pub const TREE_RECORD: usize = 8;
 /// `TreeAction` actions.
 pub const TREE_PLANT: u8 = 0;
 pub const TREE_SHAKE: u8 = 1;
+/// A Chao watered it (the game's 0xAD sphere reached it): its life to 10000 (`trees.rs`).
+pub const TREE_WATER: u8 = 2;
 
 /// `ToyMode` toys, and the highest mode any of them has.
 pub const TOY_TV: u8 = 0;
@@ -774,7 +839,10 @@ mod tag {
     pub const SERVER_GARDEN: u8 = 43;
     pub const SERVER_ITEMS: u8 = 44;
     pub const CARRIED_CHAO: u8 = 45;
-    // 46..=49 are left for the garden.
+    pub const SERVER_CHAO: u8 = 46;
+    pub const GARDEN_LAND: u8 = 47;
+    pub const CHAO_LIVE: u8 = 48;
+    pub const CHAO_TOUCHED: u8 = 49;
     pub const STAGE_RINGS: u8 = 50;
     pub const LOCK_ON: u8 = 51;
     pub const BOSS_CLAIM: u8 = 52;
@@ -785,6 +853,83 @@ mod tag {
     pub const ENEMY_STATES: u8 = 56;
     pub const UPGRADE_GOT: u8 = 57;
     pub const GARDEN_UNLOCKS: u8 = 58;
+}
+
+/// `GardenChao` lists as `GardenChao` and `ServerChao` carry them.
+fn write_garden_chao(w: &mut Writer, list: &[GardenChao]) {
+    w.u8(list.len() as u8);
+    for c in list {
+        w.u8(c.index);
+        for v in c.position {
+            w.f32(v);
+        }
+        w.i32(c.rotation_y).u16(c.motion).u8(u8::from(c.held));
+        for v in c.offset {
+            w.f32(v);
+        }
+        w.i16(c.bubble.0)
+            .i32(c.bubble.1)
+            .i32(c.bubble.2)
+            .i16(c.eyes)
+            .i16(c.mouth);
+        for p in c.props {
+            w.u8(p);
+        }
+        w.u8(c.drum)
+            .u8(c.cocoon)
+            .u8(c.book)
+            .u8(u8::from(c.owner_runs));
+    }
+}
+
+fn read_garden_chao(r: &mut Reader) -> Result<Vec<GardenChao>> {
+    let count = usize::from(r.u8()?);
+    if count > MAX_CARRIED_CHAO {
+        return Err(WireError::BadValue("garden chao count"));
+    }
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        let index = r.u8()?;
+        if usize::from(index) >= MAX_CARRIED_CHAO {
+            return Err(WireError::BadValue("garden chao index"));
+        }
+        let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+        let (rotation_y, motion, held) = (r.i32()?, r.u16()?, r.u8()?);
+        if held > 1 {
+            return Err(WireError::BadValue("garden chao held"));
+        }
+        let offset = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
+        let bubble = (r.i16()?, r.i32()?, r.i32()?);
+        let (eyes, mouth) = (r.i16()?, r.i16()?);
+        let props = [r.u8()?, r.u8()?, r.u8()?];
+        if props.iter().any(|&p| p > MAX_CHAO_PROP) {
+            return Err(WireError::BadValue("garden chao prop"));
+        }
+        let (drum, cocoon, book, owner_runs) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
+        if cocoon > 3 {
+            return Err(WireError::BadValue("garden chao cocoon"));
+        }
+        if book > 4 || owner_runs > 1 {
+            return Err(WireError::BadValue("garden chao book"));
+        }
+        list.push(GardenChao {
+            index,
+            position,
+            rotation_y,
+            motion,
+            held: held == 1,
+            offset,
+            bubble,
+            eyes,
+            mouth,
+            props,
+            drum,
+            cocoon,
+            book,
+            owner_runs: owner_runs == 1,
+        });
+    }
+    Ok(list)
 }
 
 /// Garden items as `GardenItems` and `ServerItems` carry them.
@@ -861,6 +1006,19 @@ fn item_id(r: &mut Reader) -> Result<ItemId> {
         serial: r.u16()?,
     })
 }
+
+/// A `Game` message's sender: a player id, or `SERVER` (the host's own Chao and items).
+fn sender(r: &mut Reader) -> Result<u8> {
+    let id = r.u8()?;
+    if (id as usize) < MAX_PLAYERS || id == SERVER {
+        Ok(id)
+    } else {
+        Err(WireError::BadValue("player id"))
+    }
+}
+
+/// The sender id the host's own messages carry (no player has it: `garden::SERVER`).
+pub const SERVER: u8 = 0xFF;
 
 fn player_id(r: &mut Reader) -> Result<u8> {
     let id = r.u8()?;
@@ -958,7 +1116,7 @@ impl Message {
             tag::HEARTBEAT => Self::Heartbeat,
             tag::BYE => Self::Bye,
             tag::GAME => Self::Game {
-                from: player_id(&mut r)?,
+                from: sender(&mut r)?,
                 body: Body::decode(&mut r)?,
             },
             t => return Err(WireError::BadTag("message", t)),
@@ -1051,29 +1209,48 @@ impl Body {
                 }
             }
             Self::GardenChao { owner, list } => {
-                w.u8(tag::GARDEN_CHAO).u8(*owner).u8(list.len() as u8);
-                for c in list {
-                    w.u8(c.index);
-                    for v in c.position {
-                        w.f32(v);
-                    }
-                    w.i32(c.rotation_y).u16(c.motion).u8(u8::from(c.held));
-                    for v in c.offset {
-                        w.f32(v);
-                    }
-                    w.i16(c.bubble.0)
-                        .i32(c.bubble.1)
-                        .i32(c.bubble.2)
-                        .i16(c.eyes)
-                        .i16(c.mouth);
-                    for p in c.props {
-                        w.u8(p);
-                    }
-                    w.u8(c.drum)
-                        .u8(c.cocoon)
-                        .u8(c.book)
-                        .u8(u8::from(c.owner_runs));
+                w.u8(tag::GARDEN_CHAO).u8(*owner);
+                write_garden_chao(w, list);
+            }
+            Self::ServerChao { area, owner, list } => {
+                w.u8(tag::SERVER_CHAO).u8(*area).u8(*owner);
+                write_garden_chao(w, list);
+            }
+            Self::ChaoTouched {
+                owner,
+                index,
+                position,
+                rotation_y,
+                motion,
+                mood,
+            } => {
+                w.u8(tag::CHAO_TOUCHED).u8(*owner).u8(*index);
+                for v in position {
+                    w.f32(*v);
                 }
+                w.i32(*rotation_y).u16(*motion).bytes(mood);
+            }
+            Self::ChaoLive {
+                owner,
+                index,
+                bytes,
+            } => {
+                w.u8(tag::CHAO_LIVE).u8(*owner).u8(*index).bytes(bytes);
+            }
+            Self::GardenLand {
+                garden,
+                fingerprint,
+                part,
+                parts,
+                bytes,
+            } => {
+                w.u8(tag::GARDEN_LAND)
+                    .u8(*garden)
+                    .u32(*fingerprint)
+                    .u8(*part)
+                    .u8(*parts)
+                    .u16(bytes.len() as u16)
+                    .bytes(bytes);
             }
             Self::ChaoChanges {
                 owner,
@@ -1296,17 +1473,24 @@ impl Body {
                 claim,
                 position,
                 velocity,
+                flags,
             } => {
                 w.u8(tag::BALL).u8(*area).u16(*claim);
                 for v in position.iter().chain(velocity) {
                     w.f32(*v);
                 }
+                w.u8(*flags);
             }
-            Self::GardenTrees { area, trees } => {
+            Self::GardenTrees {
+                area,
+                trees,
+                thirsty,
+            } => {
                 w.u8(tag::GARDEN_TREES).u8(*area);
                 for b in trees.iter().flatten() {
                     w.u8(*b);
                 }
+                w.u8(*thirsty);
             }
             Self::TreeAction {
                 area,
@@ -1613,53 +1797,64 @@ impl Body {
             }
             tag::GARDEN_CHAO => {
                 let owner = player_id(r)?;
-                let count = usize::from(r.u8()?);
-                if count > MAX_CARRIED_CHAO {
-                    return Err(WireError::BadValue("garden chao count"));
-                }
-                let mut list = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let index = r.u8()?;
-                    if usize::from(index) >= MAX_CARRIED_CHAO {
-                        return Err(WireError::BadValue("garden chao index"));
-                    }
-                    let position = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
-                    let (rotation_y, motion, held) = (r.i32()?, r.u16()?, r.u8()?);
-                    if held > 1 {
-                        return Err(WireError::BadValue("garden chao held"));
-                    }
-                    let offset = [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?];
-                    let bubble = (r.i16()?, r.i32()?, r.i32()?);
-                    let (eyes, mouth) = (r.i16()?, r.i16()?);
-                    let props = [r.u8()?, r.u8()?, r.u8()?];
-                    if props.iter().any(|&p| p > MAX_CHAO_PROP) {
-                        return Err(WireError::BadValue("garden chao prop"));
-                    }
-                    let (drum, cocoon, book, owner_runs) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
-                    if cocoon > 3 {
-                        return Err(WireError::BadValue("garden chao cocoon"));
-                    }
-                    if book > 4 || owner_runs > 1 {
-                        return Err(WireError::BadValue("garden chao book"));
-                    }
-                    list.push(GardenChao {
-                        index,
-                        position,
-                        rotation_y,
-                        motion,
-                        held: held == 1,
-                        offset,
-                        bubble,
-                        eyes,
-                        mouth,
-                        props,
-                        drum,
-                        cocoon,
-                        book,
-                        owner_runs: owner_runs == 1,
-                    });
-                }
+                let list = read_garden_chao(r)?;
                 Self::GardenChao { owner, list }
+            }
+            tag::SERVER_CHAO => {
+                let area = r.u8()?;
+                if !(1..=3).contains(&area) {
+                    return Err(WireError::BadValue("server chao area"));
+                }
+                let owner = player_id(r)?;
+                let list = read_garden_chao(r)?;
+                Self::ServerChao { area, owner, list }
+            }
+            tag::CHAO_TOUCHED => {
+                let (owner, index) = (player_id(r)?, r.u8()?);
+                if usize::from(index) >= MAX_CARRIED_CHAO {
+                    return Err(WireError::BadValue("chao touched"));
+                }
+                Self::ChaoTouched {
+                    owner,
+                    index,
+                    position: [r.f32(MAX_COORD)?, r.f32(MAX_COORD)?, r.f32(MAX_COORD)?],
+                    rotation_y: r.i32()?,
+                    motion: r.u16()?,
+                    mood: r.take(CHAO_MOOD.1)?.to_vec(),
+                }
+            }
+            tag::CHAO_LIVE => {
+                let (owner, index) = (player_id(r)?, r.u8()?);
+                if usize::from(index) >= MAX_CARRIED_CHAO {
+                    return Err(WireError::BadValue("chao live"));
+                }
+                let bytes = r.take(CHAO_LIVE_LEN)?.to_vec();
+                Self::ChaoLive {
+                    owner,
+                    index,
+                    bytes,
+                }
+            }
+            tag::GARDEN_LAND => {
+                let (garden, fingerprint, part, parts) = (r.u8()?, r.u32()?, r.u8()?, r.u8()?);
+                let len = usize::from(r.u16()?);
+                // 0..=2 the gardens' ground, 3 the motion table.
+                if garden > 3
+                    || parts == 0
+                    || part >= parts
+                    || parts > MAX_LAND_PARTS
+                    || len > LAND_PART
+                {
+                    return Err(WireError::BadValue("garden land"));
+                }
+                let bytes = r.take(len)?.to_vec();
+                Self::GardenLand {
+                    garden,
+                    fingerprint,
+                    part,
+                    parts,
+                    bytes,
+                }
             }
             tag::CHAO_CHANGES => {
                 let (owner, index, count) = (player_id(r)?, r.u8()?, usize::from(r.u8()?));
@@ -1852,7 +2047,8 @@ impl Body {
             }
             tag::ITEM_OWNER => Self::ItemOwner {
                 id: item_id(r)?,
-                owner: player_id(r)?,
+                // A player, or the server (a Chao it runs took it).
+                owner: sender(r)?,
             },
             tag::STAGE_KILLS => {
                 let (level, mission) = (r.i16()?, r.u8()?);
@@ -1941,6 +2137,7 @@ impl Body {
                     claim,
                     position,
                     velocity,
+                    flags: r.u8()? & (BALL_HELD | BALL_IN_WATER),
                 }
             }
             tag::GARDEN_TREES => {
@@ -1952,13 +2149,18 @@ impl Body {
                 for b in trees.iter_mut().flatten() {
                     *b = r.u8()?;
                 }
-                Self::GardenTrees { area, trees }
+                let thirsty = r.u8()? & ((1 << TREE_SLOTS) - 1) as u8;
+                Self::GardenTrees {
+                    area,
+                    trees,
+                    thirsty,
+                }
             }
             tag::TREE_ACTION => {
                 let (area, slot, action, kind) = (r.u8()?, r.u8()?, r.u8()?, r.u8()?);
                 if !(1..=3).contains(&area)
                     || usize::from(slot) >= TREE_SLOTS
-                    || action > TREE_SHAKE
+                    || action > TREE_WATER
                 {
                     return Err(WireError::BadValue("tree action"));
                 }
@@ -2534,6 +2736,7 @@ mod tests {
                     claim: 7,
                     position: [1.5, 0.0, -40.0],
                     velocity: [0.25, -0.5, 1.0],
+                    flags: BALL_HELD,
                 },
             },
             Message::Game {
@@ -2541,6 +2744,7 @@ mod tests {
                 body: Body::GardenTrees {
                     area: 3,
                     trees: [[5, 3, 40, 90, 10, 200, 0, 0x70]; TREE_SLOTS],
+                    thirsty: 0b100_0010,
                 },
             },
             Message::Game {
@@ -2820,6 +3024,83 @@ mod tests {
     #[test]
     fn round_trip_every_message() {
         for msg in all_messages() {
+            assert_eq!(Message::decode(&msg.encode()), Ok(msg.clone()), "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn the_hosts_garden_messages_round_trip() {
+        for garden in 0..=3 {
+            let msg = Message::Game {
+                from: 1,
+                body: Body::GardenLand {
+                    garden,
+                    fingerprint: 0x5BF5_52E8,
+                    part: 1,
+                    parts: 2,
+                    bytes: vec![7; 300],
+                },
+            };
+            assert_eq!(Message::decode(&msg.encode()), Ok(msg.clone()), "{msg:?}");
+        }
+        let msg = Message::Game {
+            from: 0xFF,
+            body: Body::ServerChao {
+                area: 1,
+                owner: 2,
+                list: vec![GardenChao {
+                    index: 1,
+                    position: [1.0, 2.0, 3.0],
+                    motion: 175,
+                    bubble: (2, 30, 180),
+                    ..GardenChao::default()
+                }],
+            },
+        };
+        assert_eq!(Message::decode(&msg.encode()), Ok(msg));
+        // What the host sends as itself: Chao sounds, record changes, item owners, toys.
+        for body in [
+            Body::ChaoSounds {
+                sounds: vec![ChaoSound {
+                    owner: 1,
+                    index: 0,
+                    id: 0x601C,
+                    args: [0, 0, 0x6E],
+                    ..ChaoSound::default()
+                }],
+            },
+            Body::ChaoChanges {
+                owner: 1,
+                index: 0,
+                changes: vec![(0x20, 5.0)],
+            },
+            Body::ItemOwner {
+                id: ItemId {
+                    origin: 1,
+                    serial: 4,
+                },
+                owner: SERVER,
+            },
+            Body::ToyMode {
+                area: 1,
+                toy: TOY_TV,
+                mode: 1,
+            },
+            Body::ChaoLive {
+                owner: 1,
+                index: 0,
+                bytes: (0..CHAO_LIVE_LEN as u8).collect(),
+            },
+            Body::ChaoTouched {
+                owner: 1,
+                index: 2,
+                position: [3.0, -1.5, 40.0],
+                rotation_y: 0x4000,
+                motion: 0x20B,
+                mood: vec![9; CHAO_MOOD.1],
+            },
+        ] {
+            let msg = Message::Game { from: SERVER, body };
             assert_eq!(Message::decode(&msg.encode()), Ok(msg.clone()), "{msg:?}");
         }
     }

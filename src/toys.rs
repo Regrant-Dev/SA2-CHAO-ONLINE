@@ -11,10 +11,13 @@
 
 use crate::game;
 use crate::log;
+use crate::net::protocol::{BALL_HELD, BALL_IN_WATER};
 use std::sync::Mutex;
 
 /// The garden's ball object (null outside a garden).
 const BALL: usize = 0x01DB_E570;
+/// Set while the ball is in the water.
+const BALL_IN_WATER_FLAG: usize = 0x01DB_E56C;
 const OBJ_MAIN: usize = 0x10;
 const OBJ_NEXT: usize = 0x04;
 const OBJ_DATA1: usize = 0x34;
@@ -93,8 +96,8 @@ fn held_by_player(ball: usize) -> bool {
 }
 
 /// Call every frame in Chao World with the ids of the others in our garden. Returns the ball
-/// to send while we own it.
-pub fn on_frame(me: Option<u8>, area: u8, friends: &[u8]) -> Option<BallState> {
+/// to send while we own it, with its `Ball::flags` (held by us, in the water).
+pub fn on_frame(me: Option<u8>, area: u8, friends: &[u8]) -> Option<(BallState, u8)> {
     let mut t = TOYS.lock().unwrap_or_else(|e| e.into_inner());
     let incoming = t.incoming.take();
     let Some(me) = me.filter(|_| area != 0 && !friends.is_empty() && game::in_garden()) else {
@@ -174,7 +177,11 @@ pub fn on_frame(me: Option<u8>, area: u8, friends: &[u8]) -> Option<BallState> {
     t.last_velocity = Some(velocity);
 
     t.frame = t.frame.wrapping_add(1);
-    (t.owner && t.frame.is_multiple_of(SEND_EVERY)).then_some((area, t.claim, position, velocity))
+    // SAFETY: the game's "ball in the water" word (re/chao-ai.md §2B), on the game thread.
+    let in_water = unsafe { (BALL_IN_WATER_FLAG as *const u32).read() } != 0;
+    let flags = if held { BALL_HELD } else { 0 } | if in_water { BALL_IN_WATER } else { 0 };
+    (t.owner && t.frame.is_multiple_of(SEND_EVERY))
+        .then_some(((area, t.claim, position, velocity), flags))
 }
 
 /// Keeps every tree's fruit just below dropping by itself; a shake still drops ripe fruit.

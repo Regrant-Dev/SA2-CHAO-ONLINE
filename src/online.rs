@@ -520,6 +520,8 @@ fn pump(online: &mut Online, now: Instant) {
             Event::Connected { my_id } => {
                 log!("online: connected, I am player {my_id}");
                 hud::toast("Connected");
+                // A new host hasn't had our garden's ground.
+                crate::land_share::reset();
                 for b in online.skins.start(now) {
                     online.session.send(b, true, now);
                 }
@@ -723,7 +725,7 @@ fn pump(online: &mut Online, now: Instant) {
             } => crate::items::received(from, area, items),
             Event::Game {
                 from,
-                body: Body::GardenTrees { area, trees },
+                body: Body::GardenTrees { area, trees, .. },
             } => crate::trees::received_trees(from, area, trees),
             Event::Game {
                 body: Body::ServerGarden { area, trees, toys },
@@ -736,6 +738,28 @@ fn pump(online: &mut Online, now: Instant) {
                 body: Body::ServerItems { area, items },
                 ..
             } => crate::items::received_server(area, items),
+            Event::Game {
+                body: Body::ServerChao { area, owner, list },
+                ..
+            } => crate::garden::received_server(area, owner, list),
+            Event::Game {
+                from,
+                body:
+                    Body::ChaoLive {
+                        owner,
+                        index,
+                        bytes,
+                    },
+            } => {
+                if from == crate::garden::SERVER && game::in_garden() {
+                    crate::garden::received_live(owner, index, bytes);
+                }
+            }
+            // To the host only.
+            Event::Game {
+                body: Body::GardenLand { .. } | Body::ChaoTouched { .. },
+                ..
+            } => {}
             Event::Game {
                 from,
                 body: Body::CarriedChao { chao, offset },
@@ -901,11 +925,11 @@ fn pump(online: &mut Online, now: Instant) {
                         changes,
                     },
             } => {
-                // Only from someone in our garden: our Chao (and the ones we run) are only there.
-                // Ours go to our save; a visitor's to our copy when we keep the garden.
+                // Changes to our own Chao, from the server (it runs the garden) or someone in our
+                // garden (they touched it): to our save.
                 let me = online.session.my_id();
-                let keeping = me.is_some() && crate::keeper::current() == me;
-                if (Some(owner) == me || keeping) && in_my_garden(online, from) {
+                let server = from == crate::garden::SERVER && game::in_garden();
+                if Some(owner) == me && (server || in_my_garden(online, from)) {
                     crate::garden::received_changes(owner, index, changes);
                 }
             }
@@ -913,7 +937,9 @@ fn pump(online: &mut Online, now: Instant) {
                 from,
                 body: Body::ChaoSounds { sounds },
             } => {
-                if in_my_garden(online, from) {
+                if in_my_garden(online, from)
+                    || (from == crate::garden::SERVER && game::in_garden())
+                {
                     crate::garden::received_sounds(from, sounds);
                 }
             }
@@ -1090,6 +1116,7 @@ fn pump(online: &mut Online, now: Instant) {
                         claim,
                         position,
                         velocity,
+                        ..
                     },
             } => crate::toys::received(from, (area, claim, position, velocity)),
             Event::Game {
@@ -1480,6 +1507,18 @@ pub fn on_frame() {
                 };
                 online.session.send(body, false, now);
             }
+            for (owner, index, position, rotation_y, motion, mood) in crate::garden::take_touched()
+            {
+                let body = Body::ChaoTouched {
+                    owner,
+                    index,
+                    position,
+                    rotation_y,
+                    motion,
+                    mood,
+                };
+                online.session.send(body, false, now);
+            }
             for (owner, list) in crate::garden::streams() {
                 online
                     .session
@@ -1537,7 +1576,11 @@ pub fn on_frame() {
     if let Some(body) = crate::keeper::on_frame(online.session.my_id(), area, &fresh) {
         online.session.send(body, false, now);
     }
-    if let Some((area, claim, position, velocity)) =
+    // The garden's ground for a host that runs its Chao (land_share.rs).
+    for body in crate::land_share::on_frame(area) {
+        online.session.send(body, true, now);
+    }
+    if let Some(((area, claim, position, velocity), flags)) =
         crate::toys::on_frame(online.session.my_id(), area, &friends)
     {
         let body = Body::Ball {
@@ -1545,6 +1588,7 @@ pub fn on_frame() {
             claim,
             position,
             velocity,
+            flags,
         };
         online.session.send(body, false, now);
     }

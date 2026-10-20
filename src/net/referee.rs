@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::chao_host::{IN_CHAO_HANDS, ItemAct, Shared};
 use super::protocol::{
     Body, GardenItem, ItemId, ItemPlace, MAX_GARDEN_ITEMS, TREE_RECORD, TREE_SLOTS,
 };
@@ -38,6 +39,8 @@ struct Garden {
     trees: Option<Trees>,
     /// Each toy's last jump and when.
     toys: [Option<(u8, Instant)>; 3],
+    /// Which trees want water (`GardenTrees::thirsty`), as their keeper last said.
+    thirsty: u8,
 }
 
 /// The gardens (Chao World areas 1..=3).
@@ -45,6 +48,11 @@ const GARDENS: usize = 3;
 /// How often the gardens and the server's items go out.
 const GARDEN_EVERY: Duration = Duration::from_secs(2);
 const ITEMS_EVERY: Duration = Duration::from_secs(1);
+const ITEMS_HELD_EVERY: Duration = Duration::from_millis(400);
+/// Server items lying in one garden at most (the game's save has room for only so many fruit).
+const MAX_SERVER_ITEMS: usize = 20;
+/// The server as an item's owner.
+use super::protocol::SERVER;
 /// Server items get ids of their own: serials from here up, which players' own counters (from
 /// 0 each session) never get to.
 const SERVER_SERIALS: u16 = 0xF000;
@@ -81,6 +89,13 @@ pub struct Referee {
     gardens: [Garden; GARDENS],
     /// The server's own items: id -> (garden, item).
     server_items: HashMap<ItemId, (u8, GardenItem)>,
+    /// Where a Chao the server runs took each item it holds.
+    taken_at: HashMap<ItemId, [f32; 3]>,
+    /// Whose save each item a server Chao took came from (it goes back when let go).
+    taken_from: HashMap<ItemId, u8>,
+    /// When each server item came (a count), and the count: the oldest lying ones go first.
+    born: HashMap<ItemId, u64>,
+    births: u64,
     next_serial: u16,
     /// The garden each player is in (from their `PlayerState`), 0 for none.
     areas: HashMap<u8, u8>,
@@ -88,20 +103,34 @@ pub struct Referee {
     dirty: bool,
     sent_gardens: Option<Instant>,
     sent_items: Option<Instant>,
+    /// The server running gardens' Chao itself (chao_host.rs); none in some tests.
+    chao: Option<Box<super::chao_host::ChaoHost>>,
 }
 
 /// Most hunt pieces remembered (a few per hunt); past it the oldest hunts are forgotten.
 const MAX_PIECES: usize = 256;
 
 impl Referee {
+    /// A referee that runs shared gardens' Chao (chao_host.rs).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            chao: Some(Box::new(super::chao_host::ChaoHost::new())),
+            ..Self::default()
+        }
     }
 
     /// Looks at a game message from player `from`. Returns whether to pass it on to the
     /// others; answers (if any) go to `out`.
     pub fn observe(&mut self, from: u8, body: &Body, out: &mut Vec<Out>) -> bool {
+        if let Some(chao) = self.chao.as_mut() {
+            chao.observe(from, body, Instant::now());
+        }
         match body {
+            // The server's own garden Chao: only it sends those; the ground is for it alone.
+            Body::ServerChao { .. }
+            | Body::ChaoLive { .. }
+            | Body::ChaoTouched { .. }
+            | Body::GardenLand { .. } => false,
             Body::HuntClaim {
                 level,
                 mission,
@@ -144,7 +173,11 @@ impl Referee {
             | Body::ServerGarden { .. }
             | Body::ServerItems { .. } => false,
             Body::GardenItems { area, items } => {
-                for item in items {
+                // A late report of one the server's Chao took from them doesn't count.
+                for item in items
+                    .iter()
+                    .filter(|i| !self.server_items.contains_key(&i.id))
+                {
                     let entry = self.items.entry(item.id).or_insert(Ledger {
                         owner: from,
                         busy: false,
@@ -172,12 +205,17 @@ impl Referee {
                 }
                 true
             }
-            Body::GardenTrees { area, trees } => {
-                if let Some(g) = self.garden(*area)
-                    && g.trees != Some(*trees)
-                {
-                    g.trees = Some(*trees);
-                    self.dirty = true;
+            Body::GardenTrees {
+                area,
+                trees,
+                thirsty,
+            } => {
+                if let Some(g) = self.garden(*area) {
+                    g.thirsty = *thirsty;
+                    if g.trees != Some(*trees) {
+                        g.trees = Some(*trees);
+                        self.dirty = true;
+                    }
                 }
                 true
             }
@@ -189,6 +227,18 @@ impl Referee {
                     *slot = Some((*mode, Instant::now()));
                 }
                 true
+            }
+            // One a Chao the server runs has in its hands stays the server's.
+            Body::ItemClaim { id } if self.server_items.get(id).is_some_and(|(_, i)| i.busy()) => {
+                out.push(Out {
+                    to: To::One(from),
+                    from: SERVER,
+                    body: Body::ItemOwner {
+                        id: *id,
+                        owner: SERVER,
+                    },
+                });
+                false
             }
             Body::ItemClaim { id } if self.server_items.contains_key(id) => {
                 // The server's: the first claim gets it, and it's theirs (saved) from now on.
@@ -246,9 +296,200 @@ impl Referee {
         }
     }
 
+    /// What a Chao the server runs did to an item (chao_host.rs).
+    fn item_act(&mut self, act: ItemAct, out: &mut Vec<Out>) {
+        crate::log!("referee: a server Chao: {act:?}");
+        self.dirty = true;
+        match act {
+            ItemAct::Take {
+                id,
+                area,
+                chao: (owner, index),
+                at,
+            } => {
+                self.taken_at.insert(id, at);
+                // A player's goes out of their save into the server's, in the Chao's hands.
+                let item = match self.items.get(&id) {
+                    Some(l) => {
+                        let Some((_, item)) = l.last else {
+                            return;
+                        };
+                        // Theirs again once the Chao lets go of it (`Released`).
+                        self.taken_from.insert(id, l.owner);
+                        self.items.remove(&id);
+                        out.push(Out {
+                            to: To::All,
+                            from: SERVER,
+                            body: Body::ItemOwner { id, owner: SERVER },
+                        });
+                        item
+                    }
+                    None => match self.server_items.get(&id) {
+                        Some((_, item)) => *item,
+                        None => return,
+                    },
+                };
+                self.add_server_item(
+                    area,
+                    GardenItem {
+                        place: ItemPlace::Chao { owner, index },
+                        position: IN_CHAO_HANDS,
+                        unsaved: true,
+                        ..item
+                    },
+                );
+            }
+            ItemAct::Bite { id, left } => {
+                if left == 0 {
+                    self.server_items.remove(&id);
+                } else if let Some((_, item)) = self.server_items.get_mut(&id) {
+                    item.bites = left;
+                }
+            }
+            ItemAct::Drop { id, at } => {
+                self.taken_at.remove(&id);
+                if let Some((_, item)) = self.server_items.get_mut(&id) {
+                    item.place = ItemPlace::Ground;
+                    item.position = at;
+                }
+            }
+            ItemAct::Gone { id } => {
+                self.server_items.remove(&id);
+                self.taken_from.remove(&id);
+            }
+            ItemAct::Released { id } => {
+                // Back to the player whose save it came from, if they're in its garden: in
+                // their save again, theirs to report (`ItemOwner`).
+                let Some(&owner) = self.taken_from.get(&id) else {
+                    return;
+                };
+                let Some(&(area, item)) = self.server_items.get(&id) else {
+                    return;
+                };
+                if self.areas.get(&owner) != Some(&area) || item.busy() {
+                    return;
+                }
+                self.taken_from.remove(&id);
+                self.taken_at.remove(&id);
+                self.server_items.remove(&id);
+                self.items.insert(
+                    id,
+                    Ledger {
+                        owner,
+                        busy: false,
+                        last: Some((
+                            area,
+                            GardenItem {
+                                unsaved: false,
+                                ..item
+                            },
+                        )),
+                    },
+                );
+                out.push(Out {
+                    to: To::All,
+                    from: SERVER,
+                    body: Body::ItemOwner { id, owner },
+                });
+            }
+            ItemAct::ToyOn { area, toy } => {
+                let Some(slot) = self
+                    .garden(area)
+                    .and_then(|g| g.toys.get_mut(usize::from(toy)))
+                else {
+                    return;
+                };
+                if slot.is_some_and(|(mode, _)| mode != 0) {
+                    return;
+                }
+                // Its keeper's toy jumps for real and tells everyone (garden_toys.rs).
+                *slot = Some((1, Instant::now()));
+                out.push(Out {
+                    to: To::All,
+                    from: SERVER,
+                    body: Body::ToyMode { area, toy, mode: 1 },
+                });
+            }
+            ItemAct::Tree {
+                area,
+                slot,
+                action,
+                kind,
+            } => {
+                // As a player's action on their copy of that tree: the trees' keeper does it.
+                out.push(Out {
+                    to: To::All,
+                    from: SERVER,
+                    body: Body::TreeAction {
+                        area,
+                        slot,
+                        action,
+                        kind,
+                    },
+                });
+            }
+            ItemAct::New {
+                area,
+                category,
+                kind,
+                at,
+            } => {
+                let id = ItemId {
+                    origin: 0,
+                    serial: SERVER_SERIALS | (self.next_serial & 0x0FFF),
+                };
+                self.next_serial = self.next_serial.wrapping_add(1);
+                self.add_server_item(
+                    area,
+                    GardenItem {
+                        id,
+                        category,
+                        kind,
+                        bites: 0,
+                        place: ItemPlace::Ground,
+                        position: at,
+                        unsaved: true,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Adds (or replaces) one of the server's items. A garden keeps at most
+    /// `MAX_SERVER_ITEMS` of them lying around (fruit from trees, dropped by Chao, left by
+    /// players): past that the oldest lying one goes. Ones in a Chao's hands stay.
+    fn add_server_item(&mut self, area: u8, item: GardenItem) {
+        self.births += 1;
+        self.born.insert(item.id, self.births);
+        self.server_items.insert(item.id, (area, item));
+        let items = &self.server_items;
+        self.born.retain(|id, _| items.contains_key(id));
+        loop {
+            let lying = self
+                .server_items
+                .iter()
+                .filter(|(_, (a, i))| *a == area && !i.busy());
+            if lying.clone().count() <= MAX_SERVER_ITEMS {
+                break;
+            }
+            let Some(oldest) = lying
+                .min_by_key(|(id, _)| self.born.get(*id).copied().unwrap_or(0))
+                .map(|(&id, _)| id)
+            else {
+                break;
+            };
+            self.server_items.remove(&oldest);
+            self.born.remove(&oldest);
+            self.dirty = true;
+        }
+    }
+
     /// Player `id` left the lobby: their items went with them, but the server keeps those that
     /// were in no one's save.
     pub fn left(&mut self, id: u8) {
+        if let Some(chao) = self.chao.as_mut() {
+            chao.left(id);
+        }
         self.keep_unsaved(id, None);
         self.items.retain(|_, l| l.owner != id);
         self.areas.remove(&id);
@@ -279,24 +520,59 @@ impl Referee {
                 serial: SERVER_SERIALS | (self.next_serial & 0x0FFF),
             };
             self.next_serial = self.next_serial.wrapping_add(1);
-            self.server_items.insert(
-                new,
-                (
-                    a,
-                    GardenItem {
-                        id: new,
-                        place: ItemPlace::Ground,
-                        unsaved: true,
-                        ..item
-                    },
-                ),
+            self.add_server_item(
+                a,
+                GardenItem {
+                    id: new,
+                    place: ItemPlace::Ground,
+                    unsaved: true,
+                    ..item
+                },
             );
             self.dirty = true;
         }
     }
 
-    /// Call often (the host's poll): the gardens and the server's items to send now.
+    /// Call often (the host's poll): the gardens, the server's items and its Chao to send now.
     pub fn tick(&mut self, now: Instant, out: &mut Vec<Out>) {
+        if let Some(chao) = self.chao.as_mut() {
+            let items = self
+                .items
+                .values()
+                .filter_map(|l| l.last.map(|(area, item)| (area, l.owner, item)))
+                .chain(
+                    self.server_items
+                        .values()
+                        .map(|&(area, item)| (area, SERVER, item)),
+                )
+                .collect();
+            let toys = self
+                .gardens
+                .map(|g| g.toys.map(|t| t.map_or(0, |(mode, _)| mode)));
+            // Tree records: byte 1 is the state.
+            let trees = self
+                .gardens
+                .map(|g| g.trees.map_or([0; TREE_SLOTS], |t| t.map(|r| r[1])));
+            let thirsty = self.gardens.map(|g| g.thirsty);
+            chao.tick(
+                now,
+                Shared {
+                    items,
+                    toys,
+                    trees,
+                    thirsty,
+                },
+                out,
+            );
+            let acts = chao.take_item_acts();
+            if !acts.is_empty() {
+                for act in acts {
+                    self.item_act(act, out);
+                }
+                // The others see it now, not at the next round.
+                self.sent_items = None;
+            }
+        }
         let due = |at: Option<Instant>, every| at.is_none_or(|t| now.duration_since(t) >= every);
         if due(self.sent_gardens, GARDEN_EVERY) {
             self.sent_gardens = Some(now);
@@ -321,7 +597,13 @@ impl Referee {
                 });
             }
         }
-        if due(self.sent_items, ITEMS_EVERY) && !self.server_items.is_empty() {
+        // Items in Chao's hands go more often: a copy not heard of for 1.5 s goes.
+        let every = if self.server_items.values().any(|(_, i)| i.busy()) {
+            ITEMS_HELD_EVERY
+        } else {
+            ITEMS_EVERY
+        };
+        if due(self.sent_items, every) && !self.server_items.is_empty() {
             self.sent_items = Some(now);
             for area in 1..=GARDENS as u8 {
                 let mut items: Vec<GardenItem> = self
@@ -364,7 +646,12 @@ impl Referee {
         let mut items: Vec<&(u8, GardenItem)> = self.server_items.values().collect();
         items.sort_by_key(|(_, i)| (i.id.origin, i.id.serial));
         for (area, i) in items {
-            let [x, y, z] = i.position;
+            // One in a Chao's hands is saved where it was taken (its position is an offset).
+            let [x, y, z] = if i.busy() {
+                self.taken_at.get(&i.id).copied().unwrap_or(i.position)
+            } else {
+                i.position
+            };
             text.push_str(&format!(
                 "item {area} {} {} {} {} {} {x} {y} {z}\n",
                 i.id.origin, i.id.serial, i.category, i.kind, i.bites
@@ -419,7 +706,7 @@ impl Referee {
                         ))
                     })();
                     if let Some((area, item)) = item {
-                        self.server_items.insert(item.id, (area, item));
+                        self.add_server_item(area, item);
                     }
                 }
                 ["serial", n] => self.next_serial = n.parse().unwrap_or(0),
@@ -458,6 +745,128 @@ mod tests {
         let mut out = Vec::new();
         assert!(!r.observe(from, &Body::ItemClaim { id: MANGO }, &mut out));
         out
+    }
+
+    #[test]
+    fn what_a_server_chao_lets_go_of_goes_back_to_its_owner() {
+        let mut r = Referee::new();
+        let mut out = Vec::new();
+        r.observe(1, &report(ItemPlace::Ground), &mut out);
+        r.areas.insert(1, 1);
+        let take = ItemAct::Take {
+            id: MANGO,
+            area: 1,
+            chao: (2, 0),
+            at: [0.0; 3],
+        };
+        r.item_act(take, &mut out);
+        r.item_act(
+            ItemAct::Drop {
+                id: MANGO,
+                at: [5.0, 0.0, 5.0],
+            },
+            &mut out,
+        );
+        out.clear();
+        r.item_act(ItemAct::Released { id: MANGO }, &mut out);
+        assert_eq!(
+            out[0].body,
+            Body::ItemOwner {
+                id: MANGO,
+                owner: 1
+            }
+        );
+        assert!(!r.server_items.contains_key(&MANGO));
+        assert_eq!(r.items[&MANGO].owner, 1);
+        // Gone from the garden meanwhile: the server keeps it.
+        r.item_act(take, &mut out);
+        r.areas.insert(1, 0);
+        r.item_act(ItemAct::Released { id: MANGO }, &mut out);
+        assert!(r.server_items.contains_key(&MANGO));
+    }
+
+    #[test]
+    fn a_garden_keeps_only_so_many_lying_server_items() {
+        let mut r = Referee::new();
+        let mut out = Vec::new();
+        r.item_act(
+            ItemAct::Take {
+                id: MANGO,
+                area: 1,
+                chao: (2, 0),
+                at: [0.0; 3],
+            },
+            &mut out,
+        );
+        r.observe(1, &report(ItemPlace::Ground), &mut out);
+        for _ in 0..MAX_SERVER_ITEMS + 5 {
+            r.item_act(
+                ItemAct::New {
+                    area: 1,
+                    category: 9,
+                    kind: 1,
+                    at: [0.0; 3],
+                },
+                &mut out,
+            );
+        }
+        let lying: Vec<ItemId> = r
+            .server_items
+            .iter()
+            .filter(|(_, (a, i))| *a == 1 && !i.busy())
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(lying.len(), MAX_SERVER_ITEMS);
+        // The oldest went: the first five.
+        let first = SERVER_SERIALS;
+        assert!(lying.iter().all(|id| id.serial >= first + 5));
+        assert_eq!(r.born.len(), r.server_items.len());
+    }
+
+    #[test]
+    fn a_server_chaos_fruit_is_the_servers_until_eaten() {
+        let mut r = Referee::new();
+        let mut out = Vec::new();
+        r.observe(1, &report(ItemPlace::Ground), &mut out);
+        out.clear();
+        r.item_act(
+            ItemAct::Take {
+                id: MANGO,
+                area: 1,
+                chao: (2, 0),
+                at: [1.0, 2.0, 3.0],
+            },
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![Out {
+                to: To::All,
+                from: SERVER,
+                body: Body::ItemOwner {
+                    id: MANGO,
+                    owner: SERVER
+                },
+            }]
+        );
+        let (_, item) = r.server_items[&MANGO];
+        assert_eq!(item.place, ItemPlace::Chao { owner: 2, index: 0 });
+        // Its old owner's late report doesn't take it back, and nobody can claim it.
+        r.observe(1, &report(ItemPlace::Ground), &mut out);
+        assert!(!r.items.contains_key(&MANGO));
+        let out = claim(&mut r, 3);
+        assert_eq!(
+            out[0].body,
+            Body::ItemOwner {
+                id: MANGO,
+                owner: SERVER
+            }
+        );
+        let mut out = Vec::new();
+        r.item_act(ItemAct::Bite { id: MANGO, left: 2 }, &mut out);
+        assert_eq!(r.server_items[&MANGO].1.bites, 2);
+        r.item_act(ItemAct::Bite { id: MANGO, left: 0 }, &mut out);
+        assert!(!r.server_items.contains_key(&MANGO));
     }
 
     #[test]
@@ -574,7 +983,12 @@ mod tests {
         let mut r = Referee::new();
         let mut out = Vec::new();
         let trees = [[2, 3, 100, 90, 150, 40, 0, 0x70]; TREE_SLOTS];
-        r.observe(1, &Body::GardenTrees { area: 1, trees }, &mut out);
+        let body = Body::GardenTrees {
+            area: 1,
+            trees,
+            thirsty: 0,
+        };
+        r.observe(1, &body, &mut out);
         r.observe(1, &report_unsaved(MANGO), &mut out);
         r.left(1);
         assert!(r.changed());

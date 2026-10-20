@@ -100,7 +100,7 @@ them. From Stage Select you're taken into their stage.
   has the same physical pickups. Retries keep the shared selection and pickup credit.
 
 Tabbing out pauses your game like normal SA2: you stay connected and the others see you
-stand still (the garden's keeper passes to someone else meanwhile). Choose Fullscreen,
+stand still (the server keeps running the garden's Chao meanwhile). Choose Fullscreen,
 Borderless or Windowed in SA Mod Manager; the mod keeps your display choice. If an earlier
 build left you in a small custom window, select Fullscreen or Borderless again in SA Mod
 Manager before launching with the updated mod. Pausing during a party stage, or in Chao World
@@ -152,6 +152,12 @@ Life counters use game units. Some hidden traits are unused or have limited effe
 base game; a larger number isn't always better. Eggs don't have initialized traits yet.
 **Raw record** shows every saved byte, including unknown fields; PgUp/PgDn scrolls. Viewing
 any page does not edit, export or save the Chao.
+
+**Quick look:** in a garden, press **C** (or **D-pad up** on a controller) to open a Chao's
+status balloon without picking it up: the Chao in front of you, or the nearest one close by.
+Press again for the next nearest Chao; after the last one it closes. It also closes by itself
+after 6 seconds. Works on friends' Chao too (with their live stats). It doesn't open while
+you're holding something or another balloon is showing.
 
 **Visiting:** when you're in a garden with friends, up to 4 of your Chao from that garden visit
 theirs. Pick them in F9 > Visitor 1 to Visitor 4, or leave them on Auto (your My Chao first).

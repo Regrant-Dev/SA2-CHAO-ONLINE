@@ -301,6 +301,7 @@ pub mod changes {
         (0xA8, 1, 4, Kind::F32(-1.0, 1.0)),        // power/run
         (0xAC, 1, 4, Kind::F32(-1.0, 1.0)),        // fly/swim
         (0xB0, 1, 4, Kind::F32(-1.0, 1.0)),        // alignment
+        (0xD5, 1, 1, Kind::Set),                   // hat worn
         (0x118, 1, 4, Kind::Or32),                 // animals seen
         (0x11C, 8, 1, Kind::Set),                  // animal parts
         (0x16C, 6, 6, Kind::I8),                   // bond "like", per character

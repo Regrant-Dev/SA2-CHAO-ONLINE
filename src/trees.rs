@@ -29,7 +29,7 @@ use std::sync::Mutex;
 
 use crate::game;
 use crate::log;
-use crate::net::protocol::{Body, TREE_PLANT, TREE_RECORD, TREE_SHAKE, TREE_SLOTS};
+use crate::net::protocol::{Body, TREE_PLANT, TREE_RECORD, TREE_SHAKE, TREE_SLOTS, TREE_WATER};
 
 type Record = [u8; TREE_RECORD];
 
@@ -87,6 +87,14 @@ const D_GARDEN: usize = 0xE8;
 const D_RECORD: usize = 0xEC;
 const MODE_EMPTY: u8 = 0;
 const MODE_GROWN: u8 = 7;
+/// A planted seed, a growing tree, and the stage watering a growing one moves it to.
+const MODE_SEED: u8 = 1;
+const MODE_GROWING: u8 = 4;
+const MODE_GROWING_UP: u8 = 5;
+/// Its life (i32; watering sets 10000) and its "wants water" latch (set under 6000).
+const D_LIFE: usize = 0x3C;
+const D_THIRSTY: usize = 0xAC;
+const WATERED: i32 = 10_000;
 /// The garden's own tree (its fruit is the garden's kind).
 #[cfg(target_arch = "x86")]
 const STATE_GARDEN_TREE: u8 = 5;
@@ -276,7 +284,12 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
             if s.frame.is_multiple_of(SEND_EVERY) {
                 // SAFETY: our own records, only touched on the game thread.
                 let trees = unsafe { (&raw const SERVER_RECORDS).read() };
-                out.push(Body::GardenTrees { area, trees });
+                let thirsty = thirsty(s.kept);
+                out.push(Body::GardenTrees {
+                    area,
+                    trees,
+                    thirsty,
+                });
             }
             return out;
         }
@@ -318,7 +331,14 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<Body> {
             && s.frame.is_multiple_of(SEND_EVERY)
             && let Some(trees) = saved_trees(area)
         {
-            out.push(Body::GardenTrees { area, trees });
+            let thirsty = thirsty(std::array::from_fn(|slot| {
+                real_tree(area, slot).unwrap_or(0)
+            }));
+            out.push(Body::GardenTrees {
+                area,
+                trees,
+                thirsty,
+            });
         }
         return out;
     }
@@ -610,6 +630,32 @@ extern "C" fn copy_main(object: usize) {
     }
 }
 
+/// Which of these live trees (by spot; 0 none) want water, a bit each: a planted seed, or a
+/// growing or grown tree whose "wants water" latch is set (its life fell under 6000; the
+/// watering sphere 0xAE is on, GrowTree 0x546810).
+fn thirsty(objects: [usize; TREE_SLOTS]) -> u8 {
+    let mut bits = 0;
+    for (slot, object) in objects.into_iter().enumerate() {
+        if object == 0 {
+            continue;
+        }
+        // SAFETY: a live tree of ours and its Data1, on the game thread.
+        let wants = unsafe {
+            let data1 = ((object + OBJ_DATA1) as *const usize).read();
+            data1 != 0
+                && match (data1 as *const u8).read() {
+                    MODE_SEED => true,
+                    MODE_GROWING | MODE_GROWN => ((data1 + D_THIRSTY) as *const i32).read() != 0,
+                    _ => false,
+                }
+        };
+        if wants {
+            bits |= 1 << slot;
+        }
+    }
+    bits
+}
+
 /// Does what another player did to their copy of our tree at spot `slot`.
 fn act(area: u8, slot: usize, action: u8, kind: u8) {
     if let Some(object) = real_tree(area, slot) {
@@ -633,6 +679,23 @@ fn act_on(object: usize, slot: usize, action: u8, kind: u8) {
             TREE_SHAKE if ((data1 + D_MODE) as *const u8).read() == MODE_GROWN => {
                 shake(object, data1);
             }
+            // As the tree's own MainSub (0x546810) does when the 0xAD sphere reaches it.
+            TREE_WATER => match ((data1 + D_MODE) as *const u8).read() {
+                MODE_SEED => ((data1 + D_LIFE) as *mut i32).write(WATERED),
+                MODE_GROWING => {
+                    ((data1 + D_LIFE) as *mut i32).write(WATERED);
+                    (data1 as *mut u8).write(MODE_GROWING_UP);
+                    ((data1 + 1) as *mut u8).write(0);
+                    ((data1 + 3) as *mut u8).write(0);
+                    ((data1 + 6) as *mut u16).write(0);
+                    log!("trees: a Chao watered the tree at spot {slot}");
+                }
+                MODE_GROWN => {
+                    ((data1 + D_LIFE) as *mut i32).write(WATERED);
+                    ((data1 + D_THIRSTY) as *mut i32).write(0);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }

@@ -19,6 +19,7 @@ uses was checked against the game's code, and most of it in game.
 | Stage timer, goal/level clear, checkpoints, restart time, race progress | `stage-race.md` | (planned stage race) |
 | Treasure hunt: emerald piece selection, collection, radar/hints, 2P hunt | `treasure-hunt.md` | (planned hunt battle) |
 | Stage Select confirm (Stage Rooms) | `characters.md` (end) and `src/room.rs` | `src/room.rs` |
+| Controller pads, button bits, garden button use; status balloon open/close | `chao-details.md` ("Controller buttons in the garden", "The status balloon") | `src/chao_peek.rs`, `src/balloon.rs` |
 
 ## Core addresses
 

@@ -158,6 +158,11 @@ pub fn on_frame(connected: bool, menu_open: bool) {
     hud::chat_line(&format!("Say: {}_", c.text));
 }
 
+/// The chat line is open (keys type into it).
+pub fn typing() -> bool {
+    CHAT.lock().unwrap_or_else(|e| e.into_inner()).open
+}
+
 /// Messages to send.
 pub fn take_outgoing() -> Vec<String> {
     std::mem::take(&mut CHAT.lock().unwrap_or_else(|e| e.into_inner()).outgoing)

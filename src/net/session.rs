@@ -208,7 +208,21 @@ impl Host {
                         },
                         body: body.clone(),
                     };
-                    self.ep.send_reliable(addr, &msg.encode(), now);
+                    // The server's Chao stream, their sounds and live fields go like `GardenChao`
+                    // and players' `ChaoSounds`: unreliably, often.
+                    if matches!(
+                        msg,
+                        Message::Game {
+                            body: Body::ServerChao { .. }
+                                | Body::ChaoSounds { .. }
+                                | Body::ChaoLive { .. },
+                            ..
+                        }
+                    ) {
+                        self.ep.send_unreliable(addr, &msg.encode());
+                    } else {
+                        self.ep.send_reliable(addr, &msg.encode(), now);
+                    }
                 }
             }
             if !self.dedicated && matches!(to, To::All | To::One(0)) {

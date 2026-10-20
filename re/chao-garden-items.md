@@ -459,3 +459,27 @@ the server. Two causes:
   hat list, or none when the list is full (24): the game itself drops those on reload. "No record"
   isn't "the server's", so only items the mod made unsaved (`items::mark_unsaved`, the server
   trees' fruit) are reported unsaved now.
+
+## 8. Where a held fruit goes (2026-10-19, static)
+
+- Hands: `Data1+0x5D8` (node 4) and `+0x5E4` (node 11), world positions. Written every frame by
+  the MainSub's model pass `0x56CCF0` → `0x56FC20` (identity, translate `D+0x14`, rotate `D+0xC`)
+  → node walk `0x56F5C0` → `0x56F180` (switch on node counter `*0x1AED2D4`; also `+0x5C0` node 1,
+  `+0x5F0` 6, `+0x5FC` 13, `+0x5CC` 15, `+0x620` 17, `+0x638` 20, `+0x608` 28, `+0x718` 33).
+  Not behind the AI flag (`0x53DC40`) nor the on-screen flag `0x1000`; needs only the MainSub
+  `0x54FE20` and `*0x1DBE634`. So a copy with its AI off still has hands that follow its motion.
+- Link `0x56CFB0` (ESI = Chao): partner entry `+6 |= 2`, calls `0x56CFF0`, `D+0xA0 |= 0xC00`.
+- Each frame `0x56CFF0` (ECX = Chao; eat tail `0x561197` etc.) writes the **item's ALW entry**:
+  `half = 0.5 * |hand4 − hand11|` (`0x77FBD0`: 0 when dist² < 0.025), `r = sqrt(half² + E+0x28²)`;
+  `0xC00` (both hands): `E+0x10 = mid.x + r·sin(D+0xC)`, `E+0x14 = mid.y`, `E+0x18 = mid.z +
+  r·cos(D+0xC)` (`0x42AAB0` sin, `0x42AC30` cos, Ninja angles). Only `0x400`: hand 4; only
+  `0x800`: hand 11. Then `E+0x14 −= E+0x2C`, `E+0x20 = D+0xC`. Returns 0 when not mutually
+  linked (`E+0x40`).
+- Fruit side: being-eaten mode `0x545C20` (and others) call `0x56D170` (EDX = fruit): while
+  `E+6 & 2` and linked, fruit pos `Data1+0x14 += (E+0x10 − pos) * 0.3` per frame, then clears
+  `E+6 & 2`. Return 0 → mode 2 (ground).
+- Fruit entry sizes: `E+0x2C = 1.0`, `E+0x28 = 2.0` (`*0x12848D4`) at create `0x546180`; after each
+  bite `0x545C20` sets `E+0x28 = bites * 0.5`.
+- Mod: `garden::hold_point` (both hands, as `0x56CFB0` sets) for a fruit in a Chao copy's hands
+  (`ItemPlace::Chao`, `items::place`); falls back to the fixed offset. No 0.3 easing: the copy is
+  put on the target each frame.

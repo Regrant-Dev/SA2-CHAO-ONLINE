@@ -222,6 +222,65 @@ unsafe fn jump(data1: usize, toy: u8, mode: u8) {
     }
 }
 
+/// The horse's MainSub (re/chao-ai.md §2B), not a shared toy.
+#[cfg(target_arch = "x86")]
+const HORSE_MAIN: usize = 0x0058_0BC0;
+/// Object lists walked for the garden's toys.
+#[cfg(target_arch = "x86")]
+const LISTS: usize = 8;
+
+/// The garden's toys where they stand, for the host running its Chao (land_share.rs): the
+/// TV (kind 2), radio (3), box (8) and horse (7), found by their MainSub in any object list.
+#[cfg(target_arch = "x86")]
+pub fn placed() -> Vec<crate::chao_sim::land::GardenToy> {
+    let kinds = TOYS
+        .iter()
+        .zip([2, 3, 8])
+        .map(|(t, kind)| (kind, [t.main, t.wrapped as usize]))
+        .chain([(7, [HORSE_MAIN, HORSE_MAIN])]);
+    let mut out = Vec::new();
+    for (kind, mains) in kinds {
+        let Some(object) = (0..LISTS).find_map(|list| find_in(list, &mains)) else {
+            continue;
+        };
+        // SAFETY: a live toy object with Data1 (checked by `find_in`), on the game thread.
+        unsafe {
+            let d = ((object + OBJ_DATA1) as *const usize).read();
+            out.push(crate::chao_sim::land::GardenToy {
+                kind,
+                pos: ((d + 0x14) as *const [f32; 3]).read_unaligned(),
+                rot_y: ((d + 0x0C) as *const i32).read() as u16,
+            });
+        }
+    }
+    out
+}
+
+/// The object in list `list` running one of `mains`.
+#[cfg(target_arch = "x86")]
+fn find_in(list: usize, mains: &[usize]) -> Option<usize> {
+    // SAFETY: the game's static list heads and live lists, walked on the game thread.
+    unsafe {
+        let head = ((OBJECT_LISTS + list * 4) as *const usize).read();
+        let mut object = head;
+        for _ in 0..4096 {
+            if object == 0 {
+                return None;
+            }
+            if mains.contains(&((object + OBJ_MAIN) as *const usize).read())
+                && ((object + OBJ_DATA1) as *const usize).read() != 0
+            {
+                return Some(object);
+            }
+            object = ((object + OBJ_NEXT) as *const usize).read();
+            if object == head {
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// The object in the toys' list running `main`.
 fn find(main: usize) -> Option<usize> {
     // SAFETY: the game's static list head and live list, walked on the game thread.

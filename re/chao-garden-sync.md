@@ -36,7 +36,7 @@ if (*0x1DBE634 != 0) {                            // global "update Chao" gate
     0x53DC40(EAX=obj)                             // AI: interrupts + behaviour stack  [gated by D+0xA0 & 0x10]
     if (D+0xA0 & 0x4)  0x7938D0(ESI=D+0xAC)       // advance the motion (animation)
     0x53CB70(EAX=obj)                             // emotion ball (D+0x6EC)
-    0x53A3E0(EAX=obj)                             // face timers: eyes D+0x68C/0x692, mouth D+0x698/0x69E
+    0x53A3E0(EAX=obj)                             // face timers: eyes D+0x68C/0x692, mouth timer D+0x698
     0x56CCF0(EBX=obj)                             // model/shape block D+0x510, builds matrix from D+0x14/D+0xC
     if (D+0xA0 & 0x2)  0x796780(EAX=obj)          // unknown (menu Chao clear this bit)
     0x53DF00(EAX=obj)                             // physics, mode u16 D+0xA4: 0 ground 0x798300, 2 race path 0x53E3E0
@@ -91,8 +91,8 @@ and with 0x4 still set the motion keeps playing.
 ### `MotionTable` at **D+0xAC** (0x4C bytes)
 | off | type | meaning |
 |---|---|---|
-| +0x00 | u16 | flags. **bit 0x2 = blending into the next motion**. Bit 0x1 = "reached end / loop" pulse (cleared each frame by 0x7938D0; read by 0x793F70) |
-| +0x02 | u16 | from table entry +6 |
+| +0x00 | u16 | flags. **bit 0x2 = blending into the next motion**. Bit 0x1 = "reached end / loop" pulse (cleared each frame by 0x7938D0; read by 0x793F70). Bit 0x8 = held at the end (play mode 3 only, with 0x1; read by 0x793F80) |
+| +0x02 | u16 | posture, from table entry +6 (`D+0xAE`; see MotionTable timing below) |
 | **+0x04** | int | **current motion id** |
 | **+0x08** | int | **next id**: blend target while bit 0x2 is set, otherwise the motion queued after the current one (table entry +8, -1 = none) |
 | +0x0C | f32 | speed multiplier, reset to 1.0 every frame |
@@ -115,13 +115,14 @@ and with 0x4 still set the motion keeps playing.
 ### Functions (all usercall, no return value)
 | Addr | Call | Effect |
 |---|---|---|
-| **0x793C40** | **EAX = D+0xAC, EDX = id**, no stack args; clobbers ECX/EDX | **`SetMotionLink`**: blend into `id`: `+8=id`, flags=2. Blend length from the table (default constant if negative). This is what behaviours use (e.g. `0x793C40(D+0xAC, 0x101)` = held) |
+| **0x793C40** | **EAX = D+0xAC, EDX = id**, no stack args; clobbers ECX/EDX | **`SetMotionLink`**: blend into `id`: `+8=id`, flags=2. Blend length from the table entry +0xC; when it is negative (all but two entries) the step is 1/15 (`0x904DCC`), i.e. 15 frames. This is what behaviours use (e.g. `0x793C40(D+0xAC, 0x101)` = held) |
 | 0x793E40 | EAX = mt, EDX = id | Hard switch to `id` without a blend, frame = start, `+8` = table next |
 | 0x793D30 | EAX = mt, EDX = id, push u16 frames (caller pops 4) | Blend with an explicit length (used by 0x565BE0) |
 | 0x793D90 | EAX = mt, EDX = id | Blend that keeps the phase |
 | 0x7938D0 | ESI = mt | Per-frame advance (MainSub calls it when `D+0xA0 & 4`) |
 | 0x793880 | EAX = mt, push table | Init, starts motion 0 |
 | 0x793F70 | EAX = mt | Returns flags & 1 |
+| 0x793F80 | EAX = mt | Returns `(flags >> 3) & 1` (bit 8: held at the end, play mode 3 only) |
 
 Motion ids seen in code: 0x101 held (calm); 0x102/0x103/0x105/0x107 held happy; 0x109..0x10E
 held struggling (dislikes holder); 0x3E/0xC/6/0x1B race idle; 0, 1, 3, 0xEE, 0xEF after being
@@ -131,9 +132,9 @@ put down (0x565BE0).
 | Addr | Call | Effect |
 |---|---|---|
 | 0x53A4B0 | ECX = obj, EDX = eye id, EAX = duration (-1 = until changed) | eyes. Writes `D+0x68C` (timer) and `D+0x692` (eye id) |
-| 0x53A5A0 | ECX = obj, EDX = duration, push mouth id (caller pops 4) | mouth. Writes `D+0x698` (timer) and `D+0x69E` (mouth id) |
+| 0x53A5A0 | ECX = obj, EDX = duration, push mouth id (caller pops 4) | mouth. Writes only `D+0x698` (timer) and passes the id to `0x55EAF0`. `D+0x69E` is the default mouth, not the current one |
 
-The default eye is at `D+0x694`. 0x53A3E0 counts the timers down.
+The default eye is at `D+0x694`, the default mouth at `D+0x69E`. 0x53A3E0 counts the timers down.
 
 ---
 
@@ -238,7 +239,7 @@ A second formula is used for carry anims 0x31..0x34 and 0x49 (+0x26C ×2.5).
    - while held, also send the offset from the holder:
      `off = rotateY(-P.rotY, D.pos - P.pos)` (P = `*0x1DEA6C0`, pos +0x14, rotY +0xC).
      The offset keeps the mirror glued to the puppet's hands despite puppet interpolation.
-   - optional: eye `s16 D+0x692` and mouth `s16 D+0x69E`.
+   - optional: eye `s16 D+0x692`. (`D+0x69E` is the default mouth, not the displayed one; the displayed mouth goes through `0x55EAF0`.)
 
 ### Mirror (the visitor object on other clients)
 1. Spawn with `CreateChao(buffer, 0, 0, &pos, ang)` as `visitors::spawn_remote` does. Then,
@@ -275,7 +276,7 @@ A second formula is used for carry anims 0x31..0x34 and 0x49 (+0x26C ×2.5).
 - MainSub layout, the 0x10 AI gate and the display-only flag pattern: **high** (read directly;
   the game's own menus use the same flags).
 - MotionTable layout, 0x793C40/0x793E40 call convention, shared "al_motion_table": **high**.
-  Play mode semantics of +0x18 and the meaning of every flag bit: medium.
+  Play mode semantics of +0x18 and the flag bits: resolved, see "MotionTable timing (0x7938D0)" at the end.
 - Held = Status 0x8000, CO2+0x94 HeldObject, pickup/release writers, held behaviours, motion
   ids: **high**. Held position formula (0x725C70/0x740950) and which characters use which copy:
   medium-high. Status 0x40 as "holdable": medium (checked at 0x45A2AD, writer not found).
@@ -408,6 +409,11 @@ is an ordinary saved fruit and already syncs as an item.
   else's game goes to the keeper, which makes the jump and sends it to everyone.
 
 ## Keeper: one brain per shared garden (2026-10-18; src/keeper.rs, src/garden.rs)
+
+**2026-10-19: the keeper no longer runs Chao.** The server runs every shared garden's Chao
+("The server runs the Chao" below; no switch, a player host runs them too); the keeper
+election now only picks who keeps the trees and toys. The keeper-runs-visitors paths in
+garden.rs are gone. The rest of this section is history.
 
 ### Area transitions and saving (2026-10-18)
 
@@ -649,3 +655,109 @@ Visitors also no longer go home just because their owner's updates stopped while
 still in our garden by their last state (their game idles on a tab-out): `garden::set_alive`
 (players whose state came in the last 2 s) and `PAUSED_LEFT` (5 minutes); a disconnect still
 sends them home at once. Egg copies stay put the same way.
+
+
+## MotionTable timing (0x7938D0)
+
+Read from the dumped exe (2026-10-19); the server copy is `src/chao_sim/motion.rs`.
+
+- **Table**: Data_DLL export `al_motion_table` (in the install it is `Data_DLL_orig.dll`, renamed by
+  the mod loader; `*(*0x1AF0220)` is that module's handle, loaded by 0x77DD80). **622 entries**
+  (0..0x26D) of 0x1C bytes, no count in the game; entry 0x26E onward is other data (mode > 7).
+  Entry: `+0 NJS_MOTION*`, `+4 u16 play mode`, **`+6 u16 posture`** (copied to MT+2 = `D+0xAE`),
+  `+8 int next`, `+0xC int blend`, `+0x10/+0x14 f32 start/end`, `+0x18 f32 step`. The player
+  never reads the NJS_MOTION frame count (`motion+4`, nbFrame); every entry has start/end set.
+  Blend is ≤ 0 in all but two entries (-40 in 570).
+- **Posture** (`D+0xAE`): 0 standing, 1 sitting (0x2F sit down → 1, 0x30 stand up → 0), 2 lying
+  (0x25 → 2, 0x26 → 0), 3 on the belly (0x71..0x74 crawl, 0x9F trip), 4/5 others (0x8A, 0xA0,
+  0xEE/0xEF; four entries 5). It changes only when a motion actually starts (0x793E40, 0x793F10),
+  **not** when a link blend begins.
+- **Flags `+0`**: 1 end pulse, 2 blending, 4 both motions advance during the blend (only
+  0x793D90 between two mode-0 motions), **8 = held at the end (only play mode 3 sets it, with
+  1)**, 0x10 = mode-2 wrap blend. 0x7938D0 clears 1 and 8 first (`and 0xFFF6`), so pulses last
+  until the next advance (the AI runs before the advance in MainSub, so it sees the previous
+  frame's pulses). `+0xC` speed is reset to 1.0 at the end of every advance; init 0x793880 leaves
+  it 0.0, then `0x793E40(0)`.
+- **Set functions** (all write flags, clearing pulses): 0x793E40 set (frame = start, flags 0,
+  next = entry.next, posture); 0x793EA0 same keeping the overshoot (`frame + start − old end`);
+  0x793C40 link: next fields from the entry, `+8 = id`, blend step = 1/blend, or **1/15
+  (`0x904DCC`) when blend < 0**, flags 2; 0x793D30 the same with step = 1/(pushed u16);
+  0x793D90 link at the same phase `(frame−start)/(end−start)` of the new range, flags 6 if both
+  modes are 0; 0x793CB0 (mode-4 chain) step = 1/(−cur.blend) if cur.blend < 0, else
+  1/next.blend; 0x793F10 ends a blend (next fields become current, flags 0).
+  0x793F70 = `flags & 1`, 0x793F80 = `(flags >> 3) & 1`.
+- **Blend** (flags & 2): progress += |step|·speed. Without flag 4 the current frame is frozen;
+  at progress ≥ 1: with 0x10, frame = start ± (p−1) and flags &= ~0x12; else
+  `0x793E40(+8)`. With flag 4, both frames advance and wrap by their range; at ≥ 1, 0x793F10.
+  A finished blend makes no end pulse.
+- **Play** (no blend): frame += step·speed. Reached when frame ≥ end (step ≥ 0) or ≤ end
+  (step < 0); mode 1 uses end ± 1. Then by mode (jump table 0x793C1C):
+  0 loop `frame −= end−start`, pulse 1; 1 loop `frame −= end+1−start` (end−1 backwards), pulse 1;
+  2 pulse 1 and a wrap blend (flags 0x13, step |step|, progress = overshoot, frame frozen at the
+  end) back to start; 3 hold frame = end, pulse 1|8 **every frame from then on**; 4 frame = end,
+  chain to `next` (0x793CB0) if ≠ −1, pulse 1 (no next: pulses every frame); 5 `0x793E40(next)`
+  if ≠ −1, pulse 1 (no next: frame runs on, pulse every frame); 6 the same with 0x793EA0;
+  7 ping-pong: frame = end, swap start/end, step = −step, pulse 1.
+- Examples: walk 0x64 (mode 1, 0..11, 0.23) pulses every 53 frames; a 0x793C40 link takes 15
+  frames; sit 0x2F (mode 3, 0..12, 0.17) holds and pulses 1|8 from about frame 71.
+
+## The server runs the Chao (2026-10-19, protocol 21; src/net/chao_host.rs, not yet run in game)
+
+The host (dedicated server or a player hosting) runs a shared garden's visiting Chao itself
+(`chao_sim`, re/chao-ai.md) once two players are in it and their games sent its ground
+(`GardenLand` garden 0..2: LandTable, cell grid, C_CLIMB ledges, 0xCC blockers, toys from ALW
+category 6, the 7 tree spots `0x1366B30`; garden 3: the motion table). Everyone follows
+`ServerChao` (sender `garden::SERVER`, 0xFF) instead of a keeper's game.
+
+- **Sounds.** The brain's voice ids go out as `ChaoSounds` from 0xFF, unreliably, as the
+  game's `0x4372E0` call with arguments (0, 0, 0x6E) (the behaviours' usual push, e.g.
+  `0x569340`: `push 0x6E; push 0; push 0; mov edi, id`). Clients play them on copies that follow
+  the server.
+- **Record changes.** Once a second, what the AI changed in a Chao's record
+  (`chao::changes::diff`, which now includes the worn hat `rec+0xD5`) goes to its owner as
+  `ChaoChanges` from 0xFF, like a keeper's. Not the life tick's changes (the owner's game ticks
+  too; `World::ticked`), and not while a player holds or pets it or sends changes for it (3 s):
+  their game runs it then and sends its own. A newer `Body::Chao` from the owner keeps what the
+  server changed and hasn't sent yet. Evolving and dying stay the owner's game's (`hold_life`).
+- **Items.** The Chao sense the referee's items: on the ground, in a player's hands (their
+  offset), or in a server Chao's hands. A fruit, seed, animal or hat one takes becomes the
+  server's (`ItemOwner` to 0xFF; its old owner's game drops it and keeps a copy), shown in that
+  Chao's hands (`ItemPlace::Chao`, offset (0, 2, 1.5)) through `ServerItems`, sent every 0.4 s
+  while one is held. Bites change its bites; the last removes it. Let go or thrown: on the
+  ground where its hands were. A hat put on goes; one knocked off is a new server item.
+  Claims for an item a server Chao holds are refused.
+- **Toys.** A press on the TV, radio or box (`ToyEvent::Press`) switches it on when the
+  referee's last mode for it is 0: `ToyMode` mode 1 from 0xFF, which only the toys' keeper
+  carries out (and then tells everyone). A playing TV or radio gives the Chao its 0xC9 / 0xCA
+  signal (radius 25.5) from the toy's position. The horse is each game's own.
+- **Trees.** Spots from the garden bytes, states from the referee's tree records (byte 1).
+  Planting and watering stay the trees' keeper's.
+- **Effects on copies.** A copy's AI is off, so effects its behaviours spawn never appear.
+  Tears are made client-side (`garden::shed_tears`, not yet seen in game): while a copy that
+  follows its brain plays a bawling motion (0x210, 0x213, 0x215, 0x20B, 0x20D) or starving
+  (0x1DC), on 4 frames of every 8 by its own frame count, after its update. Both behaviours
+  make the same call twice (bawl `0x59FEB9..0x59FF9B`, starving `0x59F0B4..0x59F196`):
+  `0x6ED270` (push scale `[0xB5D144]` = 0.1f, push &position, EDI = &velocity, caller pops;
+  it takes a particle from pool `0xB0ACC8`, colour 0xFFA090FF, nothing of the Chao's) with
+  position = point − (0, 0.2, 0) and velocity = 0.1·direction + (0, 0.1, 0), for the two
+  body points {position, direction} at Data1+0x620 and +0x638 (`0x510+0x110`, `+0x128`).
+  The game gates on the behaviour's timer (bawl `D+0x1C0`; starving its own counter).
+
+### First run in game (2026-10-19, local server + fakepeer)
+
+What the first live test turned up, all fixed:
+- `ServerChao` never says `held`: every game hears a hold from its holder (`ChaoHeld`), and
+  the server echoing the holder's own hold made their game hand the Chao back to the stream
+  (rubber-banding, "shared pickup interrupted").
+- A Chao in our own hands never follows the stream (`garden::place`), whatever its touch timer
+  says: the stream places it from our position of a moment ago, and the two fought.
+- Time our game stood still (tab-out with "pause when inactive") doesn't count as the server
+  going quiet (`chao_keeper`, `PAUSE_GAP`), or we took the Chao back and gave it up again.
+- The server keeps a garden running 15 s with too few players (`RUN_GRACE`), sends to players
+  heard within 8 s, and pushes its Chao 5 out of players' way (their collision would shove the
+  player). The garden's ground is sent again on every (re)connect.
+- Items lie **on** the floor in the games (position y = floor): the server drops items onto the
+  floor under the Chao's hands and settles its own lying ones every second; one saved while in
+  a Chao's hands is saved where it was taken. The emotion ball goes as (state, elapsed, length).
+- The TV, radio, box and horse are found by their MainSub (`garden_toys::placed`), not ALW
+  category 6 (that found none). A garden without bought toys has none.

@@ -1,6 +1,7 @@
 //! SA2 Chao Online: mod DLL loaded by SA2 Mod Loader.
 
 mod audio;
+mod balloon;
 mod battles;
 mod boot_art;
 mod boss_follow;
@@ -8,6 +9,8 @@ mod bosses;
 mod carried;
 pub mod chao;
 mod chao_details;
+mod chao_peek;
+pub mod chao_sim;
 mod chat;
 mod coop;
 mod eggs;
@@ -26,8 +29,9 @@ mod karate;
 mod karate_live;
 mod kart;
 mod keeper;
+mod land_share;
 mod lockon;
-mod log;
+pub mod log;
 mod menu;
 mod menu_textures;
 mod modloader;
@@ -132,6 +136,7 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     hide::install();
     race::install();
     garden::install();
+    balloon::install();
     hunt::install();
     game::prepare_loader_profile(&path);
     guarded("jewel eggs init", || jewel_eggs::init(&path, helpers));
@@ -287,6 +292,8 @@ pub extern "C" fn OnFrame() {
         menu::on_frame();
         watch::mark("chat::on_frame");
         chat::on_frame(connected, menu::is_open());
+        watch::mark("chao_peek::on_frame");
+        chao_peek::on_frame(menu::is_open());
         watch::mark("hud::on_frame");
         hud::on_frame();
         // Shared skins coming down: a bar on the menus (never over play).

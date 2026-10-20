@@ -41,6 +41,7 @@ const GARDENS_FILE: &str = "gardens.txt";
 static STOP: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    sa2_chao_online::log::to_stderr();
     let port = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("SA2CO_PORT").ok())
@@ -66,6 +67,7 @@ fn main() {
         game_build: KNOWN_GAME_BUILD,
     };
     let mut host = Host::dedicated(ep, me, Instant::now());
+    // Gardens' Chao run here instead of in a player's game (chao_sim; still being built).
     stop_on_signals();
     println!(
         "SA2 Chao Online server {} (protocol {PROTOCOL_VERSION}) on UDP port {port}",

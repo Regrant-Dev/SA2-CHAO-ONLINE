@@ -1,5 +1,6 @@
 //! Networking: wire encoding, messages, UDP transport and the lobby session.
 
+pub mod chao_host;
 pub mod files;
 pub mod protocol;
 pub mod referee;
