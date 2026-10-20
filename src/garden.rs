@@ -1805,49 +1805,6 @@ fn own_frame(g: &mut Garden) {
     }
 }
 
-/// While we hold a Chao: where our player was last frame, to log a jump (a rubber band while
-/// holding one the server runs; diagnostic).
-static HOLD_WATCH: Mutex<Option<(Vector, Instant)>> = Mutex::new(None);
-/// A player move this far in one frame while holding is logged.
-const HOLD_JUMP: f32 = 3.0;
-
-fn watch_hold(
-    owner: u8,
-    index: u8,
-    chao: Vector,
-    player: Option<(Vector, i32)>,
-    local: bool,
-    target: Option<(GardenChao, Instant, u8)>,
-) {
-    let Some((at, _)) = player else {
-        return;
-    };
-    let mut last = HOLD_WATCH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((was, when)) = *last
-        && when.elapsed() < Duration::from_millis(200)
-    {
-        let d = ((at.x - was.x).powi(2) + (at.y - was.y).powi(2) + (at.z - was.z).powi(2)).sqrt();
-        if d > HOLD_JUMP {
-            log!(
-                "garden: holding Chao {owner}:{index}, we moved {d:.1} in a frame ({:.1}, {:.1}, {:.1}) -> ({:.1}, {:.1}, {:.1}); Chao at ({:.1}, {:.1}, {:.1}), local {local}, server runs {}, target {:?} {:?} ago",
-                was.x,
-                was.y,
-                was.z,
-                at.x,
-                at.y,
-                at.z,
-                chao.x,
-                chao.y,
-                chao.z,
-                server_runs(),
-                target.map(|(t, _, from)| (t.position, from)),
-                target.map(|(_, when, _)| when.elapsed()),
-            );
-        }
-    }
-    *last = Some((at, Instant::now()));
-}
-
 /// Our Chao `key` (our id, its index) stops following the server: our game runs it again.
 fn release_own(g: &mut Garden, key: (u8, u8)) {
     if !g.mirrors.get(&key).is_some_and(|m| m.own) {
@@ -1968,16 +1925,6 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
             let here = ((d + D_POSITION) as *const Vector).read_unaligned();
             let status = ((d + D_STATUS) as *const u16).read();
             let held_by_us = player_held() == m.object;
-            if held_by_us {
-                watch_hold(
-                    owner,
-                    index,
-                    here,
-                    player,
-                    m.local_until.is_some(),
-                    m.target,
-                );
-            }
             // Not our own hold echoed back (the server's stream says held while we hold it).
             let brain_holds = !held_by_us
                 && (m

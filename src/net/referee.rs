@@ -323,7 +323,6 @@ impl Referee {
 
     /// What a Chao the server runs did to an item (chao_host.rs).
     fn item_act(&mut self, act: ItemAct, out: &mut Vec<Out>) {
-        crate::log!("referee: a server Chao: {act:?}");
         self.dirty = true;
         match act {
             ItemAct::Take {

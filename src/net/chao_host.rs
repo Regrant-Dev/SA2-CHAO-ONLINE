@@ -76,8 +76,6 @@ const MIN_PLAYERS: usize = 2;
 const RUN_GRACE: Duration = Duration::from_secs(15);
 /// The same sound of the same Chao goes out at most this often (frames).
 const SOUND_AGAIN: u64 = 30;
-/// Each Chao's state goes to the log every 5 seconds.
-const STATUS_EVERY: u64 = 300;
 /// A Chao's record changes go to its owner every second.
 const CHANGES_EVERY: u64 = 60;
 /// After a player holds, pets or changes a Chao, its changes are theirs to send this long.
@@ -987,34 +985,6 @@ impl ChaoHost {
             );
             for act in &self.acts {
                 act.apply(&mut self.items);
-            }
-            if self.frames.is_multiple_of(STATUS_EVERY) {
-                // Where players' games hold items in their own Chao's hands (`IN_CHAO_HANDS`).
-                for (_, owner, item) in self
-                    .items
-                    .iter()
-                    .filter(|(a, o, _)| usize::from(*a) == index + 1 && *o != SERVER)
-                {
-                    if let ItemPlace::Chao { .. } = item.place {
-                        let [x, y, z] = item.position;
-                        crate::log!(
-                            "chao host: player {owner}'s Chao holds item {}:{} at ({x:.2}, {y:.2}, {z:.2})",
-                            item.id.origin,
-                            item.id.serial
-                        );
-                    }
-                }
-                for (key, &slot) in &run.slots {
-                    if let Some(c) = run.world.chao.get(slot).and_then(Option::as_ref) {
-                        let [x, y, z] = c.body.pos;
-                        crate::log!(
-                            "chao host: garden {} chao {key:?}: {:#x} at ({x:.1}, {y:.1}, {z:.1}), motion {}",
-                            index + 1,
-                            c.current().map_or(0, |b| b.address()),
-                            c.motion
-                        );
-                    }
-                }
             }
             let keys: Vec<Key> = run.slots.keys().copied().collect();
             for key in evolved {

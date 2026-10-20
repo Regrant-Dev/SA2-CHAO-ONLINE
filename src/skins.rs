@@ -1387,7 +1387,6 @@ pub fn on_frame() {
     };
     crate::voice::frame(voice.as_deref());
     hide::set_jump_ball_hidden(wanted);
-    log_shadow_pass();
     if object == 0 {
         return;
     }
@@ -1483,43 +1482,6 @@ static SHADOW_RIG: AtomicUsize = AtomicUsize::new(0);
 /// One matrix of the game's stack (12 floats).
 const MATRIX_SIZE: usize = 0x30;
 
-/// Diagnostics of the shadow pass (logged now and then while a skin is on): our shadow display
-/// ran, a body was offered, the skin was drawn for it, there was no pose to draw; and the
-/// matrices it was last drawn between.
-static SHADOW_RUNS: AtomicUsize = AtomicUsize::new(0);
-static SHADOW_OFFERED: AtomicUsize = AtomicUsize::new(0);
-static SHADOW_DRAWN: AtomicUsize = AtomicUsize::new(0);
-static SHADOW_NO_POSE: AtomicUsize = AtomicUsize::new(0);
-static SHADOW_LAST: Mutex<String> = Mutex::new(String::new());
-
-/// Logs the shadow pass diagnostics every few seconds, while there are any.
-fn log_shadow_pass() {
-    if !FRAME.load(Ordering::Relaxed).is_multiple_of(300) {
-        return;
-    }
-    let runs = SHADOW_RUNS.swap(0, Ordering::Relaxed);
-    if runs == 0 {
-        return;
-    }
-    log!(
-        "skins: shadow pass: {runs} runs, {} bodies offered, {} skins drawn, {} without a pose; {}",
-        SHADOW_OFFERED.swap(0, Ordering::Relaxed),
-        SHADOW_DRAWN.swap(0, Ordering::Relaxed),
-        SHADOW_NO_POSE.swap(0, Ordering::Relaxed),
-        SHADOW_LAST.lock().unwrap_or_else(|e| e.into_inner())
-    );
-}
-
-/// The first row and translation of the matrix at `at` (for the diagnostics).
-fn matrix_summary(at: usize) -> String {
-    // SAFETY: a matrix of the game's stack (12 floats).
-    let m = unsafe { std::slice::from_raw_parts(at as *const f32, 12) };
-    format!(
-        "[{:.2} {:.2} {:.2} | {:.1} {:.1} {:.1}]",
-        m[0], m[1], m[2], m[3], m[7], m[11]
-    )
-}
-
 /// The character's shadow display (re/skins.md "The shadow pass"): it starts a shadow map for the
 /// character (0x495A90), draws the body into it with DrawMotion, and lays the shadow on the
 /// ground (0x495D20). Under a skin all of that runs, with the body swapped for the skin.
@@ -1528,7 +1490,6 @@ extern "C" fn player_shadow(object: usize) {
     if original == 0 {
         return;
     }
-    SHADOW_RUNS.fetch_add(1, Ordering::Relaxed);
     let rigged = std::panic::catch_unwind(|| {
         let player = game::local_player()?;
         let co2 = game::local_char_obj2() as usize;
@@ -1560,13 +1521,11 @@ extern "C" fn player_shadow(object: usize) {
 /// A body the shadow display draws: a rigged skin's own goes as it is; any other is the
 /// character's, and the skin is drawn instead, as it was in the display. Nonzero: drawn here.
 extern "C" fn shadow_body(model: usize) -> u32 {
-    SHADOW_OFFERED.fetch_add(1, Ordering::Relaxed);
     let rig = SHADOW_RIG.load(Ordering::Relaxed);
     if rig != 0 && model == rig {
         return 0;
     }
     let Some(drawn) = fresh_drawn() else {
-        SHADOW_NO_POSE.fetch_add(1, Ordering::Relaxed);
         // A rigged skin's character's other body: nothing rather than the character.
         return u32::from(rig != 0);
     };
@@ -1578,20 +1537,11 @@ extern "C" fn shadow_body(model: usize) -> u32 {
     };
     // SAFETY: the shadow pass on the game thread; the matrix under the current one, the top
     // put back right after; the pose kept from this or the last frame's display.
-    *SHADOW_LAST.lock().unwrap_or_else(|e| e.into_inner()) = format!(
-        "top {top:#x} {} under {} at {:.1} {:.1} {:.1}",
-        matrix_summary(top),
-        matrix_summary(under),
-        drawn.position[0],
-        drawn.position[1],
-        drawn.position[2]
-    );
     unsafe {
         crate::puppet::set_matrix_top(under);
         draw_drawn(drawn);
         crate::puppet::set_matrix_top(top);
     }
-    SHADOW_DRAWN.fetch_add(1, Ordering::Relaxed);
     1
 }
 
