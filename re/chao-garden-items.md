@@ -26,7 +26,10 @@ Conventions used below:
 | `ChaoData+0xA8 / +0xAC` | f32 PowerRun (+power, -run) / FlySwim (+fly, -swim), clamped to ±1. | high |
 | `ChaoData+0xB0` | f32 alignment, clamped to ±1 (hero +). | high |
 | `ChaoData+0xC0` | f32 evolution progress, clamped to [0, 1.2]. | high |
+| `ChaoData+0xD3`, `+0xD6` | u8 absorb flags. 0x566DF0 sets `+0xD3 = 1` for animal 0x0F (type < 0x14) and `+0xD6 = 1` for animal 0x11; it clears `+0xD3` at random after any animal or drive (except 0x0F) and `+0xD6` when a new part lands in slot 4 (except animal 0x11). | high (meaning: low) |
 | `ChaoData+0xD5` | u8 hat worn (item kind; 0 = none). | high |
+| `ChaoData+0xD7` | u8 medal: the race rewards write it (0x52C3ED..0x52C740). | high |
+| `ChaoData+0xD8..0xDB` | u8 colour, two texture bytes, shiny. Written only when a record is made (0x536550 from a 0x10-byte template, 0x5959A5 from a template) and by 0x55E8D0 (EAX = Chao, CX = colour: writes `+0xD8` and re-skins the body nodes `Data1+0x514`). `+0xD4` has no writer in the Chao code. | high |
 | `ChaoData+0x118` | u32 bitmask: bit n = animal n has been absorbed at least once. | high |
 | `ChaoData+0x11C..0x123` | i8 animal part per body slot (animal id, -1 = none). | high |
 | `ChaoData+0x16C + i*6` | character bond i (0 Sonic, 1 Shadow, 2 Tails, 3 Eggman, 4 Knuckles, 5 Rouge; any other character uses 0). `+0 i8 like` ±100, `+1 u8` 0..200 (familiarity), `+2 u16`, `+4 u16` interaction counter. | high (field meaning: medium) |
@@ -197,7 +200,7 @@ All are cdecl, return `ObjectMaster*`, and **must run on the game thread**. `pos
 | Item | Create | Args | Object | Data1 fields |
 |---|---|---|---|---|
 | Fruit | **0x546180** | `(int kind, pos, int ang, vel/NULL, save)` | list 4, main 0x545E40, display 0x545EE0, delete 0x57B9B0, cat 3 | `+8` kind, `+0xC` ang, `+0x10` **bites left** (4; from save+4), `+0x14` pos. Mode `Data1[0]`: 0 init/fall 0x545A40, 1 0x545860, 2 on ground 0x5458F0, 3 held by player 0x545AF0, 4 being eaten 0x545C20 |
-| Animal | **0x548D30** | `(i8 id 0..20, pos, int ang, vel (NOT NULL), save)` | list 2, main 0x548C50, display 0x5489D0, delete 0x548C30, cat 2 | `+3` id |
+| Animal | **0x548D30** | `(i8 id 0..20, pos, int ang, vel (NOT NULL), save)` | list 2, main 0x548C50, display 0x5489D0, delete 0x548C30, cat 2 | `+3` id. Mode `Data1[0]`: 0 free (0x57BD40 for every id, table 0x1316B00), 1 0x548730, 2 0x548870, 3 deleted. 0x57BD40: `+1` state (0 set up, 1 decide, 2 walk, 3 slow down, 4 wait on the `+6` u16 timer, 5..7 water, 8/9 turn ±0x222 a frame), `+0xC` facing (BAMS; walks along (sin, cos), drawn with it), `+0x30` f32 speed (+0.01 a frame up to 0.15, `0x165DFD8`), `+0x38` motion controller (motion 0 stand, 1 walk; blended in over 15 frames by 0x793D30, EAX = controller, EDX = motion, frames pushed) |
 | Chaos Drive | **0x545600** | `(u8 color 0..3, pos, vel (NOT NULL), save)` | list 2, main 0x5450C0, delete 0x5455B0, cat 2 | `+3` = color+0x15, `+0x30` color; the save record kind is color+0x15 |
 | Seed | **0x549B00** | `(int kind, pos, vel/NULL, save)` | list 2, main 0x549860, delete 0x57B9B0, cat 7 | `+8` kind |
 | Hat | **0x54A540** | `(int kind, pos, int ang, vel/NULL, save)` | list 4, main 0x54A050, delete 0x57B9B0, cat 9 | `+8` kind |

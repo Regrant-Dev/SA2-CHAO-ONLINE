@@ -235,6 +235,9 @@ struct Mirror {
     effects: u32,
     /// Its owner last said their game runs it (`GardenChao::owner_runs`) then.
     owner_runs: Option<Instant>,
+    /// The form (`form`) it was made with or took since; a friend's Chao sent again with
+    /// another one is made anew (`looks_frame`).
+    form: Vec<u8>,
 }
 
 impl Mirror {
@@ -306,7 +309,18 @@ struct Garden {
     alive: Vec<u8>,
 }
 
-type Rebuilt = ((Vector, i32, i32), Option<Instant>, Instant);
+/// A friend's Chao whose copy is being made anew.
+struct Rebuilt {
+    /// Where the new copy goes: position, facing, motion.
+    place: (Vector, i32, i32),
+    /// The old copy's latest state from its brain and that brain's speed, for the new one to
+    /// follow on from.
+    target: Option<(GardenChao, Instant, u8)>,
+    velocity: [f32; 3],
+    owner_runs: Option<Instant>,
+    /// When the old one went.
+    at: Instant,
+}
 
 impl Garden {
     /// Our game stood still for `gap` (nothing was heard meanwhile, as nothing was read): every
@@ -353,18 +367,33 @@ pub fn spawned(owner: u8, index: u8, object: usize, initial: Option<GardenChao>)
             .map_or(0, |(entry, _)| unsafe {
                 ((entry + 8) as *const usize).read()
             });
+        let form = if record == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the copy's record (our visitor buffer), from the registry.
+            self::form(unsafe { &*(record as *const ChaoData) })
+        };
         with(|g| {
             let mut owner_runs = initial.filter(|s| s.owner_runs).map(|_| Instant::now());
-            if let Some(((at, rotation, motion), runs, when)) = g.rebuilt.remove(&(owner, index))
-                && when.elapsed() < LEFT
-            {
-                owner_runs = runs;
-                // SAFETY: the Chao object the game just made for this visitor, on the game
-                // thread; its motion id is checked against the shared table first.
-                unsafe {
-                    let d = data1(object);
-                    if d != 0 {
-                        ((d + D_POSITION) as *mut Vector).write_unaligned(at);
+            let mut target = initial.map(|s| (s, Instant::now(), owner));
+            let mut velocity = [0.0; 3];
+            let rebuilt = g
+                .rebuilt
+                .remove(&(owner, index))
+                .filter(|r| r.at.elapsed() < LEFT);
+            // SAFETY: the Chao object the game just made for this visitor, on the game thread;
+            // its motion id is checked against the shared table first.
+            unsafe {
+                let d = data1(object);
+                if d != 0 {
+                    let (mut at, rotation, motion) = match &rebuilt {
+                        Some(r) => r.place,
+                        None => (((d + D_POSITION) as *const Vector).read_unaligned(), 0, -1),
+                    };
+                    // Never under the ground we can see: there it reaches nothing (2026-10-19).
+                    at = above_ground(at);
+                    ((d + D_POSITION) as *mut Vector).write_unaligned(at);
+                    if rebuilt.is_some() {
                         ((d + D_ROTATION_Y) as *mut i32).write(rotation);
                         if let Ok(id) = u16::try_from(motion)
                             && motion_ok(d + D_MOTION, id)
@@ -372,6 +401,14 @@ pub fn spawned(owner: u8, index: u8, object: usize, initial: Option<GardenChao>)
                             start_motion(d + D_MOTION, id);
                         }
                     }
+                }
+            }
+            if let Some(r) = rebuilt {
+                owner_runs = r.owner_runs;
+                // The old copy's state is as new as the snapshot that made this one, or newer.
+                if r.target.is_some() {
+                    target = r.target;
+                    velocity = r.velocity;
                 }
                 log!("garden: player {owner}'s Chao {index}: new copy in the old one's place");
             }
@@ -381,7 +418,7 @@ pub fn spawned(owner: u8, index: u8, object: usize, initial: Option<GardenChao>)
                     object,
                     record,
                     own: false,
-                    target: initial.map(|s| (s, Instant::now(), owner)),
+                    target,
                     motion: None,
                     driven: false,
                     snapshot: None,
@@ -389,8 +426,9 @@ pub fn spawned(owner: u8, index: u8, object: usize, initial: Option<GardenChao>)
                     since: Instant::now(),
                     bubbles: 0,
                     effects: 0,
-                    velocity: [0.0; 3],
+                    velocity,
                     owner_runs,
+                    form,
                 },
             );
             // A cached owner snapshot can bootstrap a visitor while the owner is paused.
@@ -1217,11 +1255,11 @@ unsafe fn attach(object: usize, n: usize, prop: Prop) {
     let _ = (object, n, func, arg);
 }
 
-/// What a visiting copy has to match: its type (form) and animal parts with their mask.
+/// What a visiting copy has to match: its form (`form`), then what a copy takes in place
+/// (`LOOK_IN_PLACE`), then its shape.
 pub fn look(chao: &ChaoData) -> Vec<u8> {
-    let mut look = vec![chao.chao_type()];
-    look.extend_from_slice(&chao.bytes[LOOK_PARTS]);
-    look.extend_from_slice(&chao.bytes[LOOK_DRESS]);
+    let mut look = form(chao);
+    look.extend(LOOK_IN_PLACE.map(|at| chao.bytes[at]));
     // Colour and body shape: run/power, fly/swim, alignment and evolution progress, in steps
     // of 0.05.
     for at in LOOK_SHAPE {
@@ -1231,19 +1269,44 @@ pub fn look(chao: &ChaoData) -> Vec<u8> {
     look
 }
 
-/// Hat (+0xD5), texture/jewel colour (+0xD8) and the other appearance bytes. They change on
-/// hatching, absorbing an animal or drive (0x566DF0) and taking a hat on or off.
-const LOOK_DRESS: std::ops::Range<usize> = 0xD3..0xDC;
+/// What only a new copy shows: its type, animal parts and the appearance bytes the game builds
+/// the model from. Growing (stats, levels, points, happiness, emotions) changes none of them.
+fn form(chao: &ChaoData) -> Vec<u8> {
+    let mut form = vec![chao.chao_type()];
+    form.extend_from_slice(&chao.bytes[LOOK_PARTS]);
+    form.extend(LOOK_DRESS.map(|at| chao.bytes[at]));
+    form
+}
+
+/// Appearance bytes: +0xD3 and +0xD6 (absorb flags: 0x566DF0 sets them for animals 0x0F/0x11,
+/// clears +0xD3 at random for any animal or drive, +0xD6 with a new part in slot 4), the hat
+/// +0xD5 (0x569240 on, 0x563E92/0x564418 off), colour +0xD8, +0xD9/+0xDA and shiny +0xDB
+/// (set only when the record is made: 0x536550, 0x5959A5).
+const LOOK_DRESS: [usize; 7] = [0xD3, 0xD5, 0xD6, 0xD8, 0xD9, 0xDA, 0xDB];
+/// Taken by a copy in place: the animals-seen mask +0x118 (0x5670A6 ORs a bit in; it picks
+/// animal play, not the model), the medal +0xD7 (race rewards 0x52C3ED..0x52C740) and +0xD4
+/// (no Chao code writes it).
+const LOOK_IN_PLACE: [usize; 6] = [0x118, 0x119, 0x11A, 0x11B, 0xD7, 0xD4];
 /// Run/power, fly/swim, alignment and evolution progress (`chao::changes` fields): the shape
 /// and colour 0x5A49C0 computes from the record when `Data1+0x674` bit 2 asks for it.
 const LOOK_SHAPE: [usize; 4] = [0xA8, 0xAC, 0xB0, 0xC0];
-/// `look` bytes: type, parts and dress (a change makes a new copy); then the shape.
-const LOOK_FORM_LEN: usize = 1 + (0x124 - 0x118) + (0xDC - 0xD3);
+/// `look` bytes: the form (a change makes a new copy); then the in-place bytes and the shape.
+const LOOK_FORM_LEN: usize = 1 + (0x124 - 0x11C) + LOOK_DRESS.len();
 /// `Data1+0x674` bit 2: redo shape and colour (0x5A49C0 clears it when done).
 const D_RESHAPE: usize = 0x674;
 
-/// Animal part mask and parts (re/chao-garden-items.md: 0x118 mask, 0x11C..0x123 parts).
-const LOOK_PARTS: std::ops::Range<usize> = 0x118..0x124;
+/// Animal parts, one per body slot (re/chao-garden-items.md: 0x11C..0x123).
+const LOOK_PARTS: std::ops::Range<usize> = 0x11C..0x124;
+
+/// Offsets of the form bytes that differ between `a` and `b` (for the log).
+fn form_changes(a: &ChaoData, b: &ChaoData) -> Vec<String> {
+    std::iter::once(0x80)
+        .chain(LOOK_PARTS)
+        .chain(LOOK_DRESS)
+        .filter(|&at| a.bytes[at] != b.bytes[at])
+        .map(|at| format!("{at:#x}: {} -> {}", a.bytes[at], b.bytes[at]))
+        .collect()
+}
 
 /// Network: friend `owner` sent Chao `index` again; a copy of it here takes on its look.
 pub fn received_look(owner: u8, index: u8, chao: &ChaoData) {
@@ -1272,13 +1335,23 @@ fn looks_frame(g: &mut Garden) {
                 continue;
             }
             let copy = &mut *(record as *mut ChaoData);
-            let (now, want) = (self::look(copy), self::look(&new));
-            if now == want {
+            let want = self::look(&new);
+            let form_now = &want[..LOOK_FORM_LEN];
+            if self::look(copy) == want {
+                m.form = form_now.to_vec();
                 continue;
             }
-            if now[..LOOK_FORM_LEN] == want[..LOOK_FORM_LEN] {
-                // Only colour/shape: the new values, and the game redoes them. The snapshot
-                // takes them too, or the next diff would send the owner's own change back.
+            // The form it was made with (or shows already: a part it took here): only the
+            // in-place bytes and the shape are new, and the game redoes the shape. The snapshot
+            // takes them too, or the next diff would send the owner's own change back.
+            if form_now == m.form.as_slice() || form_now == self::form(copy).as_slice() {
+                m.form = form_now.to_vec();
+                for at in LOOK_IN_PLACE {
+                    copy.bytes[at] = new.bytes[at];
+                    if let Some(before) = m.snapshot.as_mut() {
+                        before.bytes[at] = new.bytes[at];
+                    }
+                }
                 for at in LOOK_SHAPE {
                     copy.bytes[at..at + 4].copy_from_slice(&new.bytes[at..at + 4]);
                     if let Some(before) = m.snapshot.as_mut() {
@@ -1296,22 +1369,35 @@ fn looks_frame(g: &mut Garden) {
                 later.push(((owner, index), new));
                 continue;
             }
-            // The new copy takes the old one's place: where its brain has it, facing and moving
-            // the same (`spawned`), not where new visitors appear.
+            // The new copy takes the old one's place (`spawned`): where its brain has it now
+            // (its latest state, moved on by its speed), or where the old copy is when that
+            // state is old; facing and moving the same, and it keeps following that state.
             let here = ((d + D_POSITION) as *const Vector).read_unaligned();
             let rotation = ((d + D_ROTATION_Y) as *const i32).read();
             let motion = ((d + D_MOTION_CURRENT) as *const i32).read();
             let place = match m.target {
-                Some((t, _, _)) => {
-                    let [x, y, z] = t.position;
+                Some((t, at, _)) if at.elapsed() < STALE => {
+                    let ahead = at.elapsed().min(PREDICT_AT_MOST).as_secs_f32();
+                    let [x, y, z] = std::array::from_fn(|i| t.position[i] + m.velocity[i] * ahead);
                     (Vector { x, y, z }, t.rotation_y, i32::from(t.motion))
                 }
-                None => (here, rotation, motion),
+                _ => (here, rotation, motion),
             };
-            g.rebuilt
-                .insert((owner, index), (place, m.owner_runs, Instant::now()));
+            g.rebuilt.insert(
+                (owner, index),
+                Rebuilt {
+                    place,
+                    target: m.target,
+                    velocity: m.velocity,
+                    owner_runs: m.owner_runs,
+                    at: Instant::now(),
+                },
+            );
             delete_chao(m.object);
-            log!("garden: player {owner}'s Chao {index} changed its look; making a new copy");
+            log!(
+                "garden: player {owner}'s Chao {index} changed its form ({}); making a new copy",
+                form_changes(copy, &new).join(", ")
+            );
             g.mirrors.remove(&(owner, index));
             g.heard.remove(&(owner, index));
             g.left.push((owner, index));
@@ -1837,6 +1923,7 @@ fn own_frame(g: &mut Garden) {
                 effects: 0,
                 velocity: [0.0; 3],
                 owner_runs: None,
+                form: Vec::new(),
             },
         );
         log!("garden: our Chao {index} now follows the server");
@@ -1923,8 +2010,13 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                 .get(&(owner, index))
                 .map_or(m.since, |at| (*at).max(m.since));
             let paused_here = g.holders.contains_key(&owner) && !g.alive.contains(&owner);
+            // Their state says they're somewhere else now: it goes at once (the server shows
+            // it under a held id meanwhile), not after their stream stops.
+            let moved_on = owner < crate::net::protocol::HELD_OWNER
+                && g.alive.contains(&owner)
+                && !g.holders.contains_key(&owner);
             if !m.own
-                && heard.elapsed() > LEFT
+                && (moved_on || heard.elapsed() > LEFT)
                 && (!paused_here || heard.elapsed() > PAUSED_LEFT)
                 && player_held() != m.object
                 && m.local_until.is_none()
@@ -3217,7 +3309,7 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
         // Updates paused: it stays where it last was (left to the game with its AI off, it
         // sank into the ground). It goes home once they stop for good (`LEFT`).
         let [x, y, z] = t.position;
-        return Some((Vector { x, y, z }, t.rotation_y, false));
+        return Some((above_ground(Vector { x, y, z }), t.rotation_y, false));
     }
     // What the copy plays now: the motion it's on, or the one it's blending into. The game's
     // own update can switch it (to standing, say), and the copy then slid around in the wrong
@@ -3288,19 +3380,22 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
         t.position[1] + v[1] * ahead,
         t.position[2] + v[2] * ahead,
     ];
-    let mut at = follow_position(here, predicted);
     // Never under the ground we can see (the server's came in just below the floor).
-    if let Ok(area) = u8::try_from(game::current_chao_area())
-        && let Some([x, y, z]) = crate::land_share::under_ground(area, [at.x, at.y, at.z])
-    {
-        at = Vector { x, y, z };
-    }
+    let mut at = above_ground(follow_position(here, predicted));
     // The brain only knew where we were a moment ago: a copy put inside us would shove us
     // (the game's collision moves the player, not a copy we place). It steps aside instead.
     if let Some((player, _)) = game::player_position() {
         step_aside(&mut at, player);
     }
     Some((at, t.rotation_y, false))
+}
+
+/// `at`, or back on top of the ground we can see when it's under it (land_share.rs).
+fn above_ground(at: Vector) -> Vector {
+    u8::try_from(game::current_chao_area())
+        .ok()
+        .and_then(|area| crate::land_share::under_ground(area, [at.x, at.y, at.z]))
+        .map_or(at, |[x, y, z]| Vector { x, y, z })
 }
 
 /// How near a copy may be put to our player (their collision radii together).
@@ -3581,8 +3676,9 @@ mod tests {
     use super::{
         ACTION_PET, CHAO_SIZE, CHAO_SLOTS, ChaoData, D_POSITION, D_ROTATION_Y, DELETE_OBJECT, Held,
         Keep, LOOK_FORM_LEN, Mirror, Near, OBJ_DATA1, OBJ_MAIN, PLAYER_ROOM, SAVE_COPY_SIZE,
-        Vector, follow_position, in_save, locked, look, object_pose, petting_near, rotate,
-        set_locked, shared_hold, step_aside, touches, undo_drift, velocity_between,
+        Vector, follow_position, form, form_changes, in_save, locked, look, object_pose,
+        petting_near, rotate, set_locked, shared_hold, step_aside, touches, undo_drift,
+        velocity_between,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -3631,6 +3727,7 @@ mod tests {
             effects: 0,
             velocity: [0.0; 3],
             owner_runs: None,
+            form: Vec::new(),
         };
         assert!(!mirror.interrupt_touch(false, false));
         assert!(!mirror.interrupt_touch(true, true));
@@ -3779,6 +3876,41 @@ mod tests {
         assert!(in_save(CHAO_SLOTS + SAVE_COPY_SIZE + 5 * CHAO_SIZE));
         assert!(!in_save(CHAO_SLOTS - CHAO_SIZE));
         assert!(!in_save(0x0800_0000));
+    }
+
+    #[test]
+    fn growing_keeps_the_form() {
+        let mut a = ChaoData {
+            bytes: [0; crate::chao::CHAO_SIZE],
+        };
+        a.bytes[0x80] = 2;
+        a.bytes[0x11C..0x124].fill(0xFF);
+        a.bytes[0xD5] = 3; // a hat
+        let base = look(&a);
+        let mut b = a.clone();
+        // Stat progress, grades, levels and points; happiness; lifespan; emotions; bonds.
+        b.bytes[0x20..0x48]
+            .iter_mut()
+            .for_each(|v| *v = v.wrapping_add(7));
+        b.bytes[0x82] = 40;
+        b.bytes[0x8A] = 9;
+        b.bytes[0x12C..0x157].fill(33);
+        b.bytes[0x16C..0x190].fill(5);
+        // Animals seen and a medal: taken in place.
+        b.bytes[0x118] = 0x10;
+        b.bytes[0xD7] = 2;
+        b.bytes[0xD4] = 1;
+        assert_eq!(form(&b), form(&a));
+        assert_eq!(look(&b)[..LOOK_FORM_LEN], base[..LOOK_FORM_LEN]);
+        assert_ne!(look(&b), base);
+        assert!(form_changes(&a, &b).is_empty());
+        // A new part or hat is a new form.
+        b.bytes[0x11E] = 4;
+        assert_ne!(form(&b), form(&a));
+        assert_eq!(form_changes(&a, &b), ["0x11e: 255 -> 4"]);
+        b.bytes[0x11E] = 0xFF;
+        b.bytes[0xD5] = 0;
+        assert_ne!(form(&b), form(&a));
     }
 
     #[test]

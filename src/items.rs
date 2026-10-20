@@ -85,7 +85,77 @@ struct Copy {
     main: usize,
     /// We claimed it (picked up / one of the Chao here took it), waiting for the referee.
     claimed: Option<Instant>,
+    /// How it moves by its owner's reports (animals walk with it).
+    walk: Walk,
 }
+
+/// An item's latest reported position, when it came and how fast it went since the one
+/// before (per second).
+#[derive(Clone, Copy, Debug)]
+struct Walk {
+    at: [f32; 3],
+    when: Instant,
+    velocity: [f32; 3],
+}
+
+impl Walk {
+    fn new(at: [f32; 3], now: Instant) -> Self {
+        Self {
+            at,
+            when: now,
+            velocity: [0.0; 3],
+        }
+    }
+
+    /// A report at `at` came `now` (only when it moved: the same report is read every frame).
+    fn report(&mut self, at: [f32; 3], now: Instant) {
+        let dt = now.duration_since(self.when).as_secs_f32();
+        self.velocity = if (0.01..=STILL_AFTER.as_secs_f32()).contains(&dt) {
+            std::array::from_fn(|i| (at[i] - self.at[i]) / dt)
+        } else {
+            [0.0; 3]
+        };
+        self.at = at;
+        self.when = now;
+    }
+
+    /// Its speed now: none once its reports stopped moving.
+    fn velocity(&self, now: Instant) -> [f32; 3] {
+        if now.duration_since(self.when) > STILL_AFTER {
+            [0.0; 3]
+        } else {
+            self.velocity
+        }
+    }
+
+    /// Where it is by `now`: the latest report moved on by its speed (a report's worth at most).
+    fn predicted(&self, now: Instant) -> [f32; 3] {
+        let ahead = now
+            .duration_since(self.when)
+            .min(PREDICT_AT_MOST)
+            .as_secs_f32();
+        let v = self.velocity(now);
+        std::array::from_fn(|i| self.at[i] + v[i] * ahead)
+    }
+
+    /// Whether it walks: faster than `WALKING` across the ground.
+    fn walking(&self, now: Instant) -> bool {
+        let [x, _, z] = self.velocity(now);
+        x * x + z * z > WALKING * WALKING
+    }
+}
+
+/// A report this much after the last that moved means it stood still meanwhile.
+const STILL_AFTER: Duration = Duration::from_millis(300);
+/// A copy is shown at most this far ahead of its last report.
+const PREDICT_AT_MOST: Duration = Duration::from_millis(120);
+/// Animals walk at up to 0.15 a frame (9 a second: `0x165DFD8`, state 2 of 0x57BD40); slower
+/// than this is standing.
+const WALKING: f32 = 1.5;
+/// A copy goes this much of the way to where its owner has it each frame; further than
+/// `SNAP` it jumps there.
+const FOLLOW: f32 = 0.3;
+const SNAP: f32 = 10.0;
 
 struct Items {
     me: Option<u8>,
@@ -569,6 +639,11 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
         .collect();
     for (id, owner, item) in &reports {
         if let Some(c) = s.copies.get_mut(id) {
+            if item.place != c.item.place {
+                c.walk = Walk::new(item.position, now);
+            } else if item.position != c.item.position {
+                c.walk.report(item.position, now);
+            }
             c.item = *item;
             c.owner = *owner;
             c.seen = now;
@@ -595,6 +670,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
                 seen: now,
                 main,
                 claimed: None,
+                walk: Walk::new(item.position, now),
             },
         );
     }
@@ -871,6 +947,7 @@ fn apply_owners(s: &mut Items, me: u8, area: u8) {
                     seen: Instant::now(),
                     main,
                     claimed: None,
+                    walk: Walk::new([p.x, p.y, p.z], Instant::now()),
                 },
             );
             log!(
@@ -910,7 +987,9 @@ fn apply_owners(s: &mut Items, me: u8, area: u8) {
 }
 
 /// MainSub of a copy: its own game logic while it's on the ground or used here (so it can be
-/// picked up and eaten), placed where its owner has it; only drawn while they hold it.
+/// picked up and eaten), placed where its owner has it; only drawn while they hold it. An
+/// animal on the ground walks there: its own wandering is held still (`hold_still`) and it
+/// faces and walks (or stands) the way its owner's moves (`walk_with`).
 extern "C" fn copy_main(object: usize) {
     let step = std::panic::catch_unwind(|| {
         let s = lock();
@@ -918,11 +997,11 @@ extern "C" fn copy_main(object: usize) {
         let local =
             c.claimed.is_some() || entry_of(object).is_some_and(|entry| used_here(entry, object));
         let spot = if local { None } else { place(c.owner, &c.item) };
-        Some((c.main, local, spot, c.item))
+        Some((c.main, local, spot, c.item, c.walk))
     })
     .ok()
     .flatten();
-    let Some((main, local, spot, item)) = step else {
+    let Some((main, local, spot, item, walk)) = step else {
         // A copy we no longer know (we left the garden): it goes.
         delete(object);
         return;
@@ -932,10 +1011,28 @@ extern "C" fn copy_main(object: usize) {
         delete(object);
         return;
     }
+    let walks = !local
+        && usize::from(item.category) == ANIMAL
+        && item.kind < DRIVE_KIND
+        && item.place == ItemPlace::Ground;
+    // SAFETY: the copy's Data1 (checked for null), on the game thread.
+    let d = unsafe { data1(object) };
+    if walks && d != 0 {
+        // SAFETY: as above; an animal's Data1.
+        unsafe { hold_still(d) };
+    }
     let in_hands = spot.is_some_and(|(_, held)| held);
     if local || !in_hands {
         // SAFETY: the item's own MainSub, which this object had.
         unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(main)(object) };
+    }
+    // SAFETY: the object stays readable until the game's next object pass.
+    let deleted = unsafe { ((object + OBJ_MAIN) as *const usize).read() } == DELETE_OBJECT;
+    // SAFETY: as above.
+    if walks && d != 0 && !deleted && unsafe { data1(object) } == d {
+        // SAFETY: still the live animal with this Data1 (its update didn't delete it).
+        unsafe { walk_with(d, &walk, Instant::now()) };
+        return;
     }
     if let Some((at, _)) = spot {
         // SAFETY: the copy's Data1, on the game thread.
@@ -948,5 +1045,162 @@ extern "C" fn copy_main(object: usize) {
                 }
             }
         }
+    }
+}
+
+/// Animal category (animals and drives).
+const ANIMAL: usize = 2;
+/// Animal Data1 (0x57BD40, the wandering every animal uses): `+1` i8 its state, `+6` u16 that
+/// state's timer, `+0xC` facing (BAMS; it walks along (sin, cos)), `+0x30` f32 speed, `+0x38`
+/// its motion controller.
+const D_ANIMAL_STATE: usize = 0x01;
+const D_ANIMAL_TIMER: usize = 0x06;
+const D_ANIMAL_FACING: usize = 0x0C;
+const D_ANIMAL_SPEED: usize = 0x30;
+const D_ANIMAL_MOTION: usize = 0x38;
+/// States that wander on the ground: 1 decide, 2 walk, 3 slow down, 4 wait (timer), 8/9 turn.
+/// 0 sets the animal up; 5..7 are the water ones (falling in, swimming).
+const WANDER_STATES: [i8; 6] = [1, 2, 3, 4, 8, 9];
+const WAIT_STATE: i8 = 4;
+const WAIT_FRAMES: u16 = 2;
+/// Its motions: 0 stand, 1 walk (0x57BD40 starts only these on the ground).
+const MOTION_STAND: u32 = 0;
+const MOTION_WALK: u32 = 1;
+/// Motion controller: `+0` u16 flags (2 = blending), `+4` current, `+8` next. 0x793D30 blends
+/// into a motion: EAX = controller, EDX = motion, one stack argument (frames, caller pops).
+const MOTION_FLAGS: usize = 0x0;
+const MOTION_CURRENT: usize = 0x4;
+const MOTION_NEXT: usize = 0x8;
+const MOTION_BLENDING: u16 = 0x2;
+#[cfg(target_arch = "x86")]
+const BLEND_MOTION: usize = 0x0079_3D30;
+
+/// Keeps an animal copy from wandering by itself: it waits (state 4) and doesn't move. The
+/// wait is a few frames, renewed every frame, so one that becomes ours wanders again at once.
+///
+/// # Safety
+/// `d` is a live animal's Data1, on the game thread.
+unsafe fn hold_still(d: usize) {
+    unsafe {
+        let state = (d + D_ANIMAL_STATE) as *mut i8;
+        if WANDER_STATES.contains(&state.read()) {
+            state.write(WAIT_STATE);
+            ((d + D_ANIMAL_TIMER) as *mut u16).write(WAIT_FRAMES);
+            ((d + D_ANIMAL_SPEED) as *mut f32).write(0.0);
+        }
+    }
+}
+
+/// Puts an animal copy where its owner's is by now, facing the way it goes, walking while it
+/// moves and standing while it doesn't.
+///
+/// # Safety
+/// `d` is a live animal's Data1, on the game thread.
+unsafe fn walk_with(d: usize, walk: &Walk, now: Instant) {
+    unsafe {
+        let p = (d + D_POSITION) as *mut Vector;
+        let here = p.read_unaligned();
+        let [x, y, z] = walk.predicted(now);
+        let (dx, dy, dz) = (x - here.x, y - here.y, z - here.z);
+        let amount = if dx * dx + dy * dy + dz * dz > SNAP * SNAP {
+            1.0
+        } else {
+            FOLLOW
+        };
+        p.write_unaligned(Vector {
+            x: here.x + dx * amount,
+            y: here.y + dy * amount,
+            z: here.z + dz * amount,
+        });
+        let walking = walk.walking(now);
+        if walking {
+            let [vx, _, vz] = walk.velocity(now);
+            ((d + D_ANIMAL_FACING) as *mut i32).write(facing(vx, vz));
+        }
+        // Only on the ground states it wanders in: in the water its own motions play.
+        if !WANDER_STATES.contains(&((d + D_ANIMAL_STATE) as *const i8).read()) {
+            return;
+        }
+        let motion = d + D_ANIMAL_MOTION;
+        let want = if walking { MOTION_WALK } else { MOTION_STAND };
+        let blending = ((motion + MOTION_FLAGS) as *const u16).read() & MOTION_BLENDING != 0;
+        let (current, next) = (
+            ((motion + MOTION_CURRENT) as *const u32).read(),
+            ((motion + MOTION_NEXT) as *const u32).read(),
+        );
+        if if blending {
+            next != want
+        } else {
+            current != want
+        } {
+            blend_motion(motion, want);
+        }
+    }
+}
+
+/// BAMS facing of a walk along (`x`, `z`): the animal moves along (sin, cos) of it.
+fn facing(x: f32, z: f32) -> i32 {
+    (x.atan2(z) * 65536.0 / std::f32::consts::TAU).round() as i32
+}
+
+/// `0x793D30`: blend the controller at `motion` into motion `id` over 15 frames (as the
+/// animals' own wandering does).
+///
+/// # Safety
+/// `motion` is a live animal's motion controller and `id` one of its motions, on the game
+/// thread.
+#[cfg(target_arch = "x86")]
+unsafe fn blend_motion(motion: usize, id: u32) {
+    // SAFETY: the game's usercall (EAX controller, EDX motion, one cdecl argument); it writes
+    // only the controller and keeps ESI.
+    unsafe {
+        std::arch::asm!(
+            "push 15",
+            "call {f}",
+            "add esp, 4",
+            f = in(reg) BLEND_MOTION,
+            inout("eax") motion => _,
+            inout("edx") id => _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86"))]
+unsafe fn blend_motion(_motion: usize, _id: u32) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_animal_walks_the_way_its_reports_go_and_stands_when_they_stop() {
+        let start = Instant::now();
+        let mut walk = Walk::new([0.0, 0.0, 0.0], start);
+        assert!(!walk.walking(start));
+        let t = start + Duration::from_millis(100);
+        walk.report([0.5, 0.0, 0.0], t);
+        assert!(walk.walking(t));
+        assert!((walk.velocity(t)[0] - 5.0).abs() < 1e-3);
+        // Shown a little ahead, never more than a report's worth.
+        let later = t + Duration::from_millis(50);
+        assert!((walk.predicted(later)[0] - 0.75).abs() < 1e-3);
+        let much_later = t + Duration::from_millis(250);
+        assert!((walk.predicted(much_later)[0] - 1.1).abs() < 1e-3);
+        // No new position for a while: it stands.
+        let still = t + STILL_AFTER + Duration::from_millis(1);
+        assert!(!walk.walking(still));
+        assert_eq!(walk.predicted(still), [0.5, 0.0, 0.0]);
+        // A report after a long gap isn't a walk.
+        walk.report([3.0, 0.0, 0.0], t + Duration::from_secs(2));
+        assert_eq!(walk.velocity(t + Duration::from_secs(2)), [0.0; 3]);
+    }
+
+    #[test]
+    fn facing_points_along_the_walk() {
+        assert_eq!(facing(0.0, 1.0), 0);
+        assert_eq!(facing(1.0, 0.0), 0x4000);
+        assert_eq!(facing(0.0, -1.0), 0x8000);
+        assert_eq!(facing(-1.0, 0.0), -0x4000);
     }
 }
