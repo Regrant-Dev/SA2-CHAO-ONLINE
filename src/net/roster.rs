@@ -388,8 +388,8 @@ mod tests {
     use super::*;
     use crate::chao::CHAO_SIZE;
 
-    const MASON: PlayerKey = [7; 16];
-    const ERIN: PlayerKey = [9; 16];
+    const PLAYER_1: PlayerKey = [7; 16];
+    const PLAYER_2: PlayerKey = [9; 16];
 
     /// A child of garden `garden` whose DNA is `dna`.
     fn chao(dna: u8, garden: u8) -> Box<ChaoData> {
@@ -413,7 +413,7 @@ mod tests {
 
     fn id(dna: u8, nth: u8) -> ChaoId {
         ChaoId {
-            key: MASON,
+            key: PLAYER_1,
             identity: chao(dna, 1).identity(),
             nth,
         }
@@ -423,8 +423,8 @@ mod tests {
     fn the_save_wins_at_every_login() {
         let mut r = Roster::default();
         let first = r.sync(
-            MASON,
-            "Mason",
+            PLAYER_1,
+            "Player1",
             ChaoLock::Always,
             &[brought(1, 1, 0, 0), brought(2, 1, 1, 0)],
             100,
@@ -439,8 +439,8 @@ mod tests {
         let mut egg = brought(5, 1, 1, 0);
         egg.data.bytes[0x80] = TYPE_EGG;
         let next = r.sync(
-            MASON,
-            "Mason",
+            PLAYER_1,
+            "Player1",
             ChaoLock::Always,
             &[grown, brought(2, 3, 0, 0), egg, brought(3, 2, 0, 0)],
             200,
@@ -462,38 +462,44 @@ mod tests {
         assert!(r.get(&id(5, 0)).is_none());
         // Then Chao 2 is given away (or died) and 1 isn't brought: they go.
         let last = r.sync(
-            MASON,
-            "Mason",
+            PLAYER_1,
+            "Player1",
             ChaoLock::Always,
             &[brought(3, 2, 0, 0)],
             300,
         );
         assert!(last.changed.is_empty());
         assert_eq!(last.removed, [id(1, 0), id(2, 0)]);
-        assert_eq!(r.owners[&MASON].chao.len(), 1);
+        assert_eq!(r.owners[&PLAYER_1].chao.len(), 1);
     }
 
     #[test]
     fn twins_are_told_apart_by_slot_order_and_owners_by_key() {
         let mut r = Roster::default();
         r.sync(
-            MASON,
-            "Mason",
+            PLAYER_1,
+            "Player1",
             ChaoLock::Always,
             &[brought(1, 1, 0, 0), brought(1, 1, 1, 1)],
             0,
         );
-        assert_eq!(r.owners[&MASON].chao.len(), 2);
+        assert_eq!(r.owners[&PLAYER_1].chao.len(), 2);
         assert_ne!(id(1, 0), id(1, 1));
-        // Erin's copy of the same DNA is Erin's Chao, not Mason's.
-        r.sync(ERIN, "Erin", ChaoLock::Always, &[brought(1, 1, 0, 0)], 0);
+        // Player2's copy of the same DNA is Player2's Chao, not Player1's.
+        r.sync(
+            PLAYER_2,
+            "Player2",
+            ChaoLock::Always,
+            &[brought(1, 1, 0, 0)],
+            0,
+        );
         let erins = ChaoId {
-            key: ERIN,
+            key: PLAYER_2,
             ..id(1, 0)
         };
         assert!(r.get(&erins).is_some() && r.get(&id(1, 0)).is_some());
-        assert_eq!(r.in_row(&MASON, 1, 1), Some(id(1, 1)));
-        assert_eq!(r.in_row(&ERIN, 1, 1), None);
+        assert_eq!(r.in_row(&PLAYER_1, 1, 1), Some(id(1, 1)));
+        assert_eq!(r.in_row(&PLAYER_2, 1, 1), None);
     }
 
     #[test]
@@ -508,19 +514,19 @@ mod tests {
             row,
             asleep: seen != u64::MAX,
         };
-        // Mason brings five rows' worth (an old file can't, but four is the most shown).
+        // Player1 brings five rows' worth (an old file can't, but four is the most shown).
         let all = vec![
-            c(MASON, 1, 10, 0),
-            c(MASON, 2, 10, 1),
-            c(MASON, 3, 10, 2),
-            c(MASON, 7, 10, 3),
-            c(MASON, 8, 10, 3),
-            c(ERIN, 4, 50, 1),
-            c(ERIN, 5, 50, 0),
+            c(PLAYER_1, 1, 10, 0),
+            c(PLAYER_1, 2, 10, 1),
+            c(PLAYER_1, 3, 10, 2),
+            c(PLAYER_1, 7, 10, 3),
+            c(PLAYER_1, 8, 10, 3),
+            c(PLAYER_2, 4, 50, 1),
+            c(PLAYER_2, 5, 50, 0),
             c([1; 16], 6, u64::MAX, 0),
         ];
         let ids = |v: Vec<Candidate>| v.into_iter().map(|c| c.id.identity).collect::<Vec<_>>();
-        // Online first, then Erin (seen later), then Mason; four each at most.
+        // Online first, then Player2 (seen later), then Player1; four each at most.
         assert_eq!(ids(choose(all.clone(), 32)), [6, 5, 4, 1, 2, 3, 7]);
         assert_eq!(ids(choose(all.clone(), 3)), [6, 5, 4]);
         assert!(choose(all, 0).is_empty());
@@ -530,8 +536,8 @@ mod tests {
     fn kept_chao_survive_a_restart_and_expire_after_a_week() {
         let mut r = Roster::default();
         r.sync(
-            MASON,
-            "Mason K",
+            PLAYER_1,
+            "Player1 K",
             ChaoLock::ThatGarden,
             &[brought(1, 2, 1, 0)],
             1000,
@@ -547,7 +553,7 @@ mod tests {
         let mut back = Roster::default();
         assert!(back.load(name, text));
         assert_eq!(back.owners, r.owners);
-        assert_eq!(back.owners[&MASON].lock, ChaoLock::ThatGarden);
+        assert_eq!(back.owners[&PLAYER_1].lock, ChaoLock::ThatGarden);
         // A file from before locks: as Always.
         let old: String = text
             .lines()
@@ -556,14 +562,14 @@ mod tests {
             .collect();
         let mut older = Roster::default();
         assert!(older.load(name, &old));
-        assert_eq!(older.owners[&MASON].lock, ChaoLock::Always);
+        assert_eq!(older.owners[&PLAYER_1].lock, ChaoLock::Always);
         // A bad file or name is left out.
         assert!(!back.load("nothex.txt", text));
         assert!(!Roster::default().load(name, "seen x"));
         // Seen lately (or online) it stays; a week later it goes, and its file with it.
         assert!(back.expire(1000 + EXPIRE, &[]).is_empty());
-        assert!(back.expire(1001 + EXPIRE * 2, &[MASON]).is_empty());
-        assert_eq!(back.expire(1001 + EXPIRE, &[]), [MASON]);
+        assert!(back.expire(1001 + EXPIRE * 2, &[PLAYER_1]).is_empty());
+        assert_eq!(back.expire(1001 + EXPIRE, &[]), [PLAYER_1]);
         assert!(back.owners.is_empty());
         assert_eq!(back.files(), [(name.clone(), None)]);
     }

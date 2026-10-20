@@ -124,7 +124,7 @@ pub fn asleep(owner: u8, index: u8) -> bool {
     owner >= HELD_OWNER && with(|h| h.chao.get(&(owner, index)).is_some_and(|e| e.chao.asleep))
 }
 
-/// Its name tag ("Mason's Chao", "Mason's Chao (asleep)"), and whether it's locked (nothing we
+/// Its name tag ("Player1's Chao", "Player1's Chao (asleep)"), and whether it's locked (nothing we
 /// do to it reaches its owner's save: the tag shows a padlock).
 pub fn label(owner: u8, index: u8) -> Option<(String, bool)> {
     with(|h| {
@@ -316,8 +316,8 @@ mod tests {
 
     #[test]
     fn name_tags_say_asleep() {
-        assert_eq!(tag("Mason", false), "Mason's Chao");
-        assert_eq!(tag("Mason", true), "Mason's Chao (asleep)");
+        assert_eq!(tag("Player1", false), "Player1's Chao");
+        assert_eq!(tag("Player1", true), "Player1's Chao (asleep)");
     }
 
     #[test]
