@@ -356,6 +356,18 @@ begins is the camera's: drawn from there, nothing lands in the shadow map.
   own root goes as it is.
 - Skipping the whole +0x2C call would also drop the shadow laid on the ground, which is why only
   its DrawMotion is replaced.
+- **Extras besides the body.** Each init writes +0x2C: Sonic's family 0x71E520, Knuckles
+  0x72DCE0, Rouge 0x72E390, Tails on foot 0x74FF20, Eggman on foot 0x73E8B0. Sonic's family,
+  Knuckles and Eggman draw only the body (DrawMotion). Tails' then draws the two tails: per
+  tail, a matrix from 0x1A5218C (kept by the node callback 0x74FEF0 that +0x2C sets at
+  `0x1A55834` during the body's draw), turns CharObj2 +0x370 / +0x36C, and 0x42EB30(model,
+  0x42D650) with the models at `*(CharObj2 +0x3A8) + 0x18` and `*(CharObj2 +0x3AC) + 0x18`
+  (objects made from slot 222 at init), calls at 0x750201 and 0x75027F. Rouge's, when slot 190
+  (`0x1DE9C14`) is loaded, draws it with its own motion through 0x7847D0 (call at 0x72E9B8) or
+  0x784E00 (0x72E9D1, CharObj2 +0x3AE == 2). None of these go through DrawMotion, so the mod
+  points those four calls at its own (src/hide.rs), which draw nothing while `replacing` and go
+  on to the game's otherwise. All are cdecl with the caller popping, and the caller uses no
+  result.
 
 **Separate objects.** The jump ball is a JumpAura object per frame (re/spin-ball.md), drawn by
 its own display 0x756960 (+0x1C). The hook there skips the local player's balls (data +1 == 0)

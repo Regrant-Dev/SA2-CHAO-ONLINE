@@ -17,7 +17,9 @@
 //! display; this lets only that body show.
 //!
 //! And DrawMotion's models can be replaced (`replacing`): the shadow pass (re/skins.md) must
-//! run as the game does, with only the body it draws swapped for the skin.
+//! run as the game does, with only the body it draws swapped for the skin. What some shadow
+//! displays draw besides the body (Tails' twin tails, Rouge's slot 190) doesn't go through
+//! DrawMotion: those calls are pointed at us, and draw nothing while `replacing`.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -44,6 +46,15 @@ const DRAW_MOTION_START: [u8; 6] = [0x51, 0xD9, 0x44, 0x24, 0x0C, 0x51];
 const JUMP_BALL_DISPLAY: usize = 0x0075_6960;
 #[cfg(target_arch = "x86")]
 const JUMP_BALL_START: [u8; 7] = [0x8B, 0x44, 0x24, 0x04, 0x83, 0xEC, 0x30];
+/// The shadow displays' extra draws' callees (all cdecl, the caller pops): Tails' (0x74FF20)
+/// two tails go through 0x42EB30 (model, node draw), Rouge's (0x72E390) slot 190 through the
+/// motion draws 0x7847D0 / 0x784E00 (registers in).
+#[cfg(target_arch = "x86")]
+const TAILS_DRAW: usize = 0x0042_EB30;
+#[cfg(target_arch = "x86")]
+const MOTION_DRAW: usize = 0x0078_47D0;
+#[cfg(target_arch = "x86")]
+const MOTION_DRAW_BLEND: usize = 0x0078_4E00;
 /// Our player's jump balls aren't drawn while this is set.
 static NO_JUMP_BALL: AtomicBool = AtomicBool::new(false);
 
@@ -60,7 +71,7 @@ static REPLACE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "x86")]
 static QUIET: std::sync::Mutex<Option<(usize, Box<[usize]>)>> = std::sync::Mutex::new(None);
 
-/// Puts the DrawMotion hook in (once, at start).
+/// Puts the hooks in (once, at start).
 pub fn install() {
     #[cfg(target_arch = "x86")]
     {
@@ -80,6 +91,23 @@ pub fn install() {
             .copy_from_slice(&(ours.wrapping_sub(JUMP_BALL_DISPLAY + 5) as u32).to_le_bytes());
         if !crate::patch::replace_code(JUMP_BALL_DISPLAY, &JUMP_BALL_START, &jump) {
             crate::log!("hide: couldn't hook the jump ball; it shows under skins");
+        }
+        // The shadow displays' calls that draw more than the body: `call rel32` site, callee.
+        let extras: [(usize, usize, unsafe extern "C" fn()); 4] = [
+            (0x0075_0201, TAILS_DRAW, shadow_tails_thunk),
+            (0x0075_027F, TAILS_DRAW, shadow_tails_thunk),
+            (0x0072_E9B8, MOTION_DRAW, shadow_motion_thunk),
+            (0x0072_E9D1, MOTION_DRAW_BLEND, shadow_motion_blend_thunk),
+        ];
+        for (site, callee, ours) in extras {
+            let call = |to: usize| {
+                let mut code = [0xE8u8; 5];
+                code[1..].copy_from_slice(&(to.wrapping_sub(site + 5) as u32).to_le_bytes());
+                code
+            };
+            if !crate::patch::replace_code(site, &call(callee), &call(ours as usize)) {
+                crate::log!("hide: couldn't hook {site:#x}; its part shows in skins' shadows");
+            }
         }
     }
 }
@@ -327,6 +355,50 @@ unsafe extern "C" fn draw_motion_visible() {
         show = sym show,
         original = sym draw_motion_original,
         quiet = sym quiet_again,
+    )
+}
+
+/// A shadow display's extra draw (`install`): nothing while `replacing` (the skin is the
+/// shadow's body), else on to the game's (registers and stack as they came).
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn shadow_tails_thunk() {
+    std::arch::naked_asm!(
+        "cmp dword ptr [{replace}], 0",
+        "jne 2f",
+        "push {original}",
+        "2:",
+        "ret",
+        replace = sym REPLACE,
+        original = const TAILS_DRAW,
+    )
+}
+
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn shadow_motion_thunk() {
+    std::arch::naked_asm!(
+        "cmp dword ptr [{replace}], 0",
+        "jne 2f",
+        "push {original}",
+        "2:",
+        "ret",
+        replace = sym REPLACE,
+        original = const MOTION_DRAW,
+    )
+}
+
+#[cfg(target_arch = "x86")]
+#[unsafe(naked)]
+unsafe extern "C" fn shadow_motion_blend_thunk() {
+    std::arch::naked_asm!(
+        "cmp dword ptr [{replace}], 0",
+        "jne 2f",
+        "push {original}",
+        "2:",
+        "ret",
+        replace = sym REPLACE,
+        original = const MOTION_DRAW_BLEND,
     )
 }
 
