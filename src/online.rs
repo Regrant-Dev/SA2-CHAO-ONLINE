@@ -873,9 +873,14 @@ fn pump(online: &mut Online, now: Instant) {
             }
             // To the host only.
             Event::Game {
-                body: Body::GardenLand { .. } | Body::ChaoTouched { .. },
+                body: Body::GardenLand { .. },
                 ..
             } => {}
+            // Its sender's game runs that Chao now: they let go of it.
+            Event::Game {
+                from,
+                body: Body::ChaoTouched { owner, index, .. },
+            } => crate::garden::received_touched(from, owner, index),
             Event::Game {
                 from,
                 body: Body::CarriedChao { chao, offset },

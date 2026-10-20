@@ -128,10 +128,10 @@ impl Referee {
         }
         match body {
             // The server's own garden Chao: only it sends those; the ground and what players
-            // bring are for it alone.
+            // bring are for it alone. A touch (`ChaoTouched`) goes on: it ends its sender's
+            // hold of that Chao in every game at once.
             Body::ServerChao { .. }
             | Body::ChaoLive { .. }
-            | Body::ChaoTouched { .. }
             | Body::GardenLand { .. }
             | Body::Brought { .. }
             | Body::HeldChao { .. }

@@ -610,6 +610,13 @@ on every (re)connect. Everyone follows `ServerChao` (sender `garden::SERVER`, 0x
 - **Holds.** `ServerChao` never says `held`: every game hears a hold from its holder
   (`ChaoHeld`). A Chao in the local player's own hands never follows the stream
   (`garden::place`). The emotion ball goes as (state, elapsed, length).
+- **Throws.** On release (`0x475600`: `CO2+0x94 = 0`, velocity (1, 1, 0) into the Chao's
+  Data2) the thrower's game runs the Chao and reports it as `ChaoTouched` (every 2 frames). The
+  first report ends that player's hold at once, on the host and in every game (the referee
+  passes `ChaoTouched` on; `garden::received_touched`). Between reports the host flies it on
+  from the last two (`flight`: gravity −0.055 per frame², stopped on the floor), and when the
+  reports stop it goes on with that velocity under its own physics. The copies predict a flying
+  Chao (vertical speed over 6 per second) with the same gravity, up to 100 ms ahead.
 - **Timing.** Time the local game stood still (tab-out with "pause when inactive") doesn't count
   as the server going quiet (`PAUSE_GAP`), nor as friends' Chao, touches or holds going quiet
   (`Garden::stood_still` moves every kept time on by it). The server keeps a garden running 15 s

@@ -1461,6 +1461,20 @@ pub fn received_held(holder: u8, owner: u8, index: u8, offset: [f32; 3]) {
     });
 }
 
+/// Network: player `from`'s game runs player `owner`'s Chao `index` for a touch: if they
+/// held it, they let go of it (thrown or dropped). Its copy follows its brain again at once,
+/// not where their last `ChaoHeld` put it.
+pub fn received_touched(from: u8, owner: u8, index: u8) {
+    with(|g| {
+        if g.held
+            .get(&(owner, index))
+            .is_some_and(|h| h.holder == from)
+        {
+            g.held.remove(&(owner, index));
+        }
+    });
+}
+
 /// Where other players are drawn this frame (their puppets), for Chao they hold.
 pub fn set_holders(holders: HashMap<u8, (Vector, i32)>) {
     with(|g| g.holders = holders);
@@ -3373,13 +3387,7 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
     // SAFETY: the visitor's Data1 (read on the game thread inside its MainSub).
     let here = unsafe { ((d + D_POSITION) as *const Vector).read_unaligned() };
     // Where its brain's Chao is by now (a moment after that state was sent).
-    let ahead = at.elapsed().min(PREDICT_AT_MOST).as_secs_f32();
-    let v = m.velocity;
-    let predicted = [
-        t.position[0] + v[0] * ahead,
-        t.position[1] + v[1] * ahead,
-        t.position[2] + v[2] * ahead,
-    ];
+    let predicted = predict(t.position, m.velocity, at.elapsed());
     // Never under the ground we can see (the server's came in just below the floor).
     let mut at = above_ground(follow_position(here, predicted));
     // The brain only knew where we were a moment ago: a copy put inside us would shove us
@@ -3436,8 +3444,33 @@ fn shared_hold(
 
 /// How far ahead a copy is shown from its brain's last state at most.
 const PREDICT_AT_MOST: Duration = Duration::from_millis(100);
-/// Faster than this (per second) between two states is a jump (a hand-off, a hold), not a walk.
+/// Faster than this (per second) between two states is a jump (a hand-off, a hold, a push
+/// aside), not a walk; flying, faster than `FASTEST_FLIGHT` (the game's throw is about (1, 1)
+/// per frame forward and up, `0x475600`).
 const FASTEST_WALK: f32 = 60.0;
+const FASTEST_FLIGHT: f32 = 240.0;
+/// Rising or falling faster than this (per second) is a flight (thrown, dropped, jumping
+/// down): gravity pulls it on between states.
+const FLYING: f32 = 6.0;
+/// The game's gravity (`chao_sim::physics::GRAVITY`, per frame²), per second².
+const GRAVITY_PER_S2: f32 = crate::chao_sim::physics::GRAVITY * 3600.0;
+
+/// Where a copy is `since` after its brain's state at `position` moving at `velocity` (per
+/// second): on along that, falling when it flies. Never more than `PREDICT_AT_MOST` ahead; the
+/// ground is `above_ground`'s.
+fn predict(position: [f32; 3], velocity: [f32; 3], since: Duration) -> [f32; 3] {
+    let t = since.min(PREDICT_AT_MOST).as_secs_f32();
+    let fall = if velocity[1].abs() > FLYING {
+        0.5 * GRAVITY_PER_S2 * t * t
+    } else {
+        0.0
+    };
+    [
+        position[0] + velocity[0] * t,
+        position[1] + velocity[1] * t + fall,
+        position[2] + velocity[2] * t,
+    ]
+}
 
 /// Per-second velocity from `from` to `to` over `dt`; none for a jump or a stale gap.
 fn velocity_between(from: [f32; 3], to: [f32; 3], dt: Duration) -> [f32; 3] {
@@ -3450,7 +3483,12 @@ fn velocity_between(from: [f32; 3], to: [f32; 3], dt: Duration) -> [f32; 3] {
         (to[1] - from[1]) / dt,
         (to[2] - from[2]) / dt,
     ];
-    if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() > FASTEST_WALK {
+    let fastest = if v[1].abs() > FLYING {
+        FASTEST_FLIGHT
+    } else {
+        FASTEST_WALK
+    };
+    if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() > fastest {
         return [0.0; 3];
     }
     v
@@ -3674,11 +3712,11 @@ extern "C" fn held_main(object: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_PET, CHAO_SIZE, CHAO_SLOTS, ChaoData, D_POSITION, D_ROTATION_Y, DELETE_OBJECT, Held,
-        Keep, LOOK_FORM_LEN, Mirror, Near, OBJ_DATA1, OBJ_MAIN, PLAYER_ROOM, SAVE_COPY_SIZE,
-        Vector, follow_position, form, form_changes, in_save, locked, look, object_pose,
-        petting_near, rotate, set_locked, shared_hold, step_aside, touches, undo_drift,
-        velocity_between,
+        ACTION_PET, CHAO_SIZE, CHAO_SLOTS, ChaoData, D_POSITION, D_ROTATION_Y, DELETE_OBJECT,
+        GRAVITY_PER_S2, Held, Keep, LOOK_FORM_LEN, Mirror, Near, OBJ_DATA1, OBJ_MAIN, PLAYER_ROOM,
+        PREDICT_AT_MOST, SAVE_COPY_SIZE, Vector, follow_position, form, form_changes, in_save,
+        locked, look, object_pose, petting_near, predict, rotate, set_locked, shared_hold,
+        step_aside, touches, undo_drift, velocity_between,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -3818,6 +3856,34 @@ mod tests {
             velocity_between([0.0; 3], [1.0, 0.0, 0.0], Duration::from_secs(1)),
             [0.0; 3]
         );
+    }
+
+    #[test]
+    fn a_thrown_copy_flies_on_and_falls_between_states() {
+        // A throw: about (1, 1) per frame forward and up, two states 33 ms apart.
+        let dt = Duration::from_millis(33);
+        let v = velocity_between([0.0; 3], [2.0, 2.0, 0.0], dt);
+        assert!(v[0] > 55.0 && v[1] > 55.0, "a throw is no jump: {v:?}");
+        // As fast along the ground is a jump (pushed aside, handed over).
+        assert_eq!(velocity_between([0.0; 3], [2.0, 0.0, 2.0], dt), [0.0; 3]);
+        // Between states it flies on, and gravity pulls it down.
+        let at = predict(
+            [0.0, 10.0, 0.0],
+            [60.0, 0.0, 0.0],
+            Duration::from_millis(50),
+        );
+        assert!((at[0] - 3.0).abs() < 1e-3 && at[1] == 10.0, "{at:?}");
+        let up = predict(
+            [0.0, 10.0, 0.0],
+            [60.0, 60.0, 0.0],
+            Duration::from_millis(50),
+        );
+        let g = 0.5 * GRAVITY_PER_S2 * 0.05 * 0.05;
+        assert!((up[1] - (13.0 + g)).abs() < 1e-3 && up[1] < 13.0, "{up:?}");
+        // Never further than `PREDICT_AT_MOST` ahead (its brain went quiet).
+        let far = predict([0.0; 3], [0.0, -60.0, 0.0], Duration::from_secs(2));
+        let most = predict([0.0; 3], [0.0, -60.0, 0.0], PREDICT_AT_MOST);
+        assert_eq!(far, most);
     }
 
     #[test]

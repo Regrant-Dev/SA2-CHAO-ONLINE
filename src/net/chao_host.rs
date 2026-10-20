@@ -162,6 +162,8 @@ pub struct ChaoHost {
     /// motion; and whose game that is.
     touched: HashMap<Key, ([f32; 3], i32, u16, Instant)>,
     touched_by: HashMap<Key, u8>,
+    /// How each touched Chao moves between its toucher's reports (thrown: it flies).
+    flights: HashMap<Key, Flight>,
     /// Each garden's ball as its kicker last sent it.
     balls: [Option<BallSeen>; 3],
     uploads: HashMap<(u8, u8), Upload>,
@@ -212,6 +214,16 @@ pub struct ChaoHost {
     told_locks: HashMap<u8, Vec<Key>>,
     /// The time of the latest message or tick (locks look at where owners are then).
     now: Option<Instant>,
+}
+
+/// A Chao a player's game runs for a touch, between their reports (`ChaoTouched`).
+#[derive(Clone, Copy, Debug)]
+struct Flight {
+    /// Where the last report put it, and when it came.
+    pos: V3,
+    heard: Instant,
+    /// Per frame, from the last two reports: none for a jump or a gap.
+    vel: V3,
 }
 
 /// A held Chao shown in a garden.
@@ -287,6 +299,22 @@ impl ChaoHost {
                 self.touched
                     .insert(key, (*position, *rotation_y, *motion, now));
                 self.touched_by.insert(key, from);
+                let vel = self.flights.get(&key).map_or([0.0; 3], |f| {
+                    flight_velocity(f.pos, *position, now.duration_since(f.heard))
+                });
+                self.flights.insert(
+                    key,
+                    Flight {
+                        pos: *position,
+                        heard: now,
+                        vel,
+                    },
+                );
+                // Their game runs it now: they let go of it (thrown, dropped), whatever the
+                // last `ChaoHeld` says.
+                if self.held.get(&key).is_some_and(|h| h.0 == from) {
+                    self.held.remove(&key);
+                }
                 // How the touch left it (hit: angry, scared; petted: glad): it goes on so,
                 // unless it's locked against them.
                 let (at, len) = CHAO_MOOD;
@@ -414,6 +442,7 @@ impl ChaoHost {
         self.held.retain(|_, (holder, _, _)| *holder != id);
         self.touched.retain(|&(o, _), _| o != id);
         self.touched_by.retain(|&(o, _), by| o != id && *by != id);
+        self.flights.retain(|&(o, _), _| o != id);
         self.sounded.retain(|&((o, _), _), _| o != id);
         self.uploads.retain(|&(f, _), _| f != id);
         for lands in &mut self.lands {
@@ -934,14 +963,23 @@ impl ChaoHost {
                 {
                     chao.body.pos = in_hands(p.position, p.rotation_y, offset);
                     chao.body.vel = [0.0; 3];
+                    // Let go of without a word (their game went quiet), it falls from there.
+                    chao.body.wake();
                 } else if let Some(&(pos, rot, _, at)) = self.touched.get(&key)
                     && now.duration_since(at) < HELD_STALE
                 {
                     // A player's game runs it for a touch (thrown, petted, fed): it's where
-                    // theirs is, and goes on from there when they're done.
-                    chao.body.pos = pos;
+                    // theirs is, flying on between their reports, and goes on from there
+                    // (still flying) when they're done.
+                    let (at, vel) = self.flights.get(&key).map_or((pos, [0.0; 3]), |f| {
+                        let frames =
+                            now.duration_since(f.heard).as_secs_f32() / FRAME.as_secs_f32();
+                        flight(&run.world.garden, f.pos, f.vel, frames)
+                    });
+                    chao.body.pos = at;
                     chao.body.rot_y = rot as u16;
-                    chao.body.vel = [0.0; 3];
+                    chao.body.vel = vel;
+                    chao.body.wake();
                     if self
                         .touched_by
                         .get(&key)
@@ -1840,6 +1878,7 @@ impl ChaoHost {
         self.held.remove(&key);
         self.touched.remove(&key);
         self.touched_by.remove(&key);
+        self.flights.remove(&key);
         self.quiet.remove(&key);
         self.versions += 1;
         if let Some(s) = self.shown.get_mut(&key) {
@@ -2694,6 +2733,51 @@ fn fly(flying: &mut Vec<Flying>, garden: &Garden, area: u8, acts: &mut Vec<ItemA
     });
 }
 
+/// A touched Chao's velocity (per frame) from report `from` to `to` `dt` apart: none for a
+/// gap (a new touch, lost reports) or a jump (faster than a throw).
+fn flight_velocity(from: V3, to: V3, dt: Duration) -> V3 {
+    let frames = dt.as_secs_f32() / FRAME.as_secs_f32();
+    if !(0.5..=FLIGHT_GAP).contains(&frames) {
+        return [0.0; 3];
+    }
+    let v = [
+        (to[0] - from[0]) / frames,
+        (to[1] - from[1]) / frames,
+        (to[2] - from[2]) / frames,
+    ];
+    if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() > FASTEST_FLIGHT {
+        return [0.0; 3];
+    }
+    v
+}
+
+/// Where a Chao reported at `pos` moving at `vel` (per frame) is `frames` later, and its
+/// velocity then: falling as the game's gravity has it (`physics::GRAVITY`), stopped on the
+/// floor.
+fn flight(garden: &Garden, pos: V3, vel: V3, frames: f32) -> (V3, V3) {
+    if vel == [0.0; 3] {
+        return (pos, vel);
+    }
+    let t = frames.max(0.0);
+    let g = crate::chao_sim::physics::GRAVITY;
+    let at = [
+        pos[0] + vel[0] * t,
+        pos[1] + vel[1] * t + 0.5 * g * t * t,
+        pos[2] + vel[2] * t,
+    ];
+    let floor = on_floor(garden, at);
+    let falling = vel[1] + g * t;
+    if at[1] <= floor[1] && falling <= 0.0 {
+        return (floor, [vel[0], 0.0, vel[2]]);
+    }
+    (at, [vel[0], falling, vel[2]])
+}
+
+/// Reports further apart than this (frames) give no velocity; faster than this (per frame) is a
+/// jump, not a throw (the game's throw is about (1, 1) forward and up, `0x475600`).
+const FLIGHT_GAP: f32 = 15.0;
+const FASTEST_FLIGHT: f32 = 4.0;
+
 /// An item in the air: id, garden, where, velocity (per frame), frames flown.
 type Flying = (ItemId, u8, V3, V3, u32);
 
@@ -3064,6 +3148,47 @@ mod tests {
         let _ = run_to(&mut host, ms(800), ms(1400), t0);
         let pos = host.chao_mut((0, 0)).unwrap().body.pos;
         assert!(distance(pos, [30.0, 0.0, 25.0]) < 5.0, "{pos:?}");
+    }
+
+    #[test]
+    fn a_chao_its_owner_throws_flies_on_and_lands() {
+        let t0 = Instant::now();
+        let mut host = running(t0);
+        host.tick(t0 + ms(200), Shared::default(), &mut Vec::new());
+        // Its owner holds it up in front of them ...
+        let hold = Body::ChaoHeld {
+            owner: 0,
+            index: 0,
+            offset: [0.0, 8.0, 3.0],
+        };
+        host.observe(0, &hold, t0 + ms(250));
+        host.tick(t0 + ms(280), Shared::default(), &mut Vec::new());
+        assert_eq!(host.chao_mut((0, 0)).unwrap().body.pos, [0.0, 8.0, 3.0]);
+        // ... and throws it (about (1, 1) a frame): their game reports it flying, then goes
+        // quiet with it in the air.
+        let throw = |position| Body::ChaoTouched {
+            owner: 0,
+            index: 0,
+            position,
+            rotation_y: 0x4000,
+            motion: 0x10F,
+            mood: vec![0; CHAO_MOOD.1],
+        };
+        host.observe(0, &throw([0.0, 8.0, 5.0]), t0 + ms(300));
+        host.tick(t0 + ms(300), Shared::default(), &mut Vec::new());
+        // Their hold ended with the first report, not half a second later.
+        assert_eq!(host.chao_mut((0, 0)).unwrap().body.pos, [0.0, 8.0, 5.0]);
+        host.observe(0, &throw([2.0, 10.0, 5.0]), t0 + ms(333));
+        host.tick(t0 + ms(383), Shared::default(), &mut Vec::new());
+        // Between reports it flies on.
+        let pos = host.chao_mut((0, 0)).unwrap().body.pos;
+        assert!(pos[0] > 4.0 && pos[1] > 11.0, "{pos:?}");
+        // Reports stopped mid-air: it comes down and lands, and doesn't hang there.
+        let _ = run_to(&mut host, ms(400), ms(2500), t0);
+        let chao = host.chao_mut((0, 0)).unwrap();
+        assert!(chao.body.pos[1].abs() < 2.5, "{:?}", chao.body.pos);
+        assert!(chao.body.pos[0] > 6.0, "{:?}", chao.body.pos);
+        assert!(!chao.held);
     }
 
     #[test]

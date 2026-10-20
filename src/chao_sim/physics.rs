@@ -64,6 +64,12 @@ impl Body {
         }
     }
 
+    /// Moved from outside (held, or run by a player's game): no longer resting, so `step`
+    /// moves it again (a resting body ignores gravity).
+    pub fn wake(&mut self) {
+        self.flags &= !RESTING;
+    }
+
     pub fn on_ground(&self) -> bool {
         self.flags & ON_GROUND != 0
     }
