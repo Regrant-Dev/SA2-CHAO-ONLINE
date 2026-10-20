@@ -194,6 +194,14 @@ pub enum Body {
         index: u8,
         bytes: Vec<u8>,
     },
+    /// From the host, to an item's owner: a Chao the server runs has their item (it borrows it,
+    /// the item stays in their save): now it's where `item` says (in that Chao's hands, or let
+    /// go on the ground), with `item.bites` left; `gone`: eaten up or worn, it's no more.
+    ItemSteer {
+        area: u8,
+        item: GardenItem,
+        gone: bool,
+    },
     /// To the host: the sender's game runs `owner`'s Chao `index` for a while because they
     /// touched it (threw, petted, fed it; not while holding it: `ChaoHeld`), and this is where it
     /// is, with its emotions, needs and personality as the touch left them (`CHAO_MOOD`); ~10
@@ -853,6 +861,7 @@ mod tag {
     pub const ENEMY_STATES: u8 = 56;
     pub const UPGRADE_GOT: u8 = 57;
     pub const GARDEN_UNLOCKS: u8 = 58;
+    pub const ITEM_STEER: u8 = 59;
 }
 
 /// `GardenChao` lists as `GardenChao` and `ServerChao` carry them.
@@ -1215,6 +1224,10 @@ impl Body {
             Self::ServerChao { area, owner, list } => {
                 w.u8(tag::SERVER_CHAO).u8(*area).u8(*owner);
                 write_garden_chao(w, list);
+            }
+            Self::ItemSteer { area, item, gone } => {
+                w.u8(tag::ITEM_STEER).u8(*area).u8(u8::from(*gone));
+                write_items(w, std::slice::from_ref(item));
             }
             Self::ChaoTouched {
                 owner,
@@ -1808,6 +1821,18 @@ impl Body {
                 let owner = player_id(r)?;
                 let list = read_garden_chao(r)?;
                 Self::ServerChao { area, owner, list }
+            }
+            tag::ITEM_STEER => {
+                let (area, gone) = (r.u8()?, r.u8()?);
+                let mut items = read_items(r, area)?;
+                if items.len() != 1 || gone > 1 {
+                    return Err(WireError::BadValue("item steer"));
+                }
+                Self::ItemSteer {
+                    area,
+                    item: items.remove(0),
+                    gone: gone == 1,
+                }
             }
             tag::CHAO_TOUCHED => {
                 let (owner, index) = (player_id(r)?, r.u8()?);
@@ -3090,6 +3115,22 @@ mod tests {
                 owner: 1,
                 index: 0,
                 bytes: (0..CHAO_LIVE_LEN as u8).collect(),
+            },
+            Body::ItemSteer {
+                area: 2,
+                item: GardenItem {
+                    id: ItemId {
+                        origin: 1,
+                        serial: 9,
+                    },
+                    category: 3,
+                    kind: 4,
+                    bites: 2,
+                    place: ItemPlace::Chao { owner: 1, index: 0 },
+                    position: [0.0, 0.6, 2.0],
+                    unsaved: false,
+                },
+                gone: false,
             },
             Body::ChaoTouched {
                 owner: 1,

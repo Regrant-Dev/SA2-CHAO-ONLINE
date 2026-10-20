@@ -105,6 +105,11 @@ struct Items {
     reports: HashMap<ItemId, (u8, u8, GardenItem, Instant)>,
     claims_out: Vec<ItemId>,
     owner_in: Vec<(ItemId, u8)>,
+    /// What a Chao the server runs did to our items (`ItemSteer`): item as it is now, gone.
+    steer_in: Vec<(GardenItem, bool)>,
+    /// Our items a server Chao has: as the server says, and the item's own MainSub (ours
+    /// stands in while it's in that Chao's hands).
+    steered: HashMap<ItemId, (GardenItem, usize)>,
     /// Our items in no one's save that the mod made so (fruit from the server's trees): only
     /// these are reported unsaved. Ones the game itself made without a record (an egg's shell
     /// with the hat list full) aren't the server's to keep.
@@ -143,6 +148,8 @@ fn lock() -> Guard {
         reports: HashMap::new(),
         claims_out: Vec::new(),
         owner_in: Vec::new(),
+        steer_in: Vec::new(),
+        steered: HashMap::new(),
         unsaved: Vec::new(),
     });
     Guard(g)
@@ -178,6 +185,12 @@ pub fn received_server(area: u8, items: Vec<GardenItem>) {
 /// Network (the referee): item `id` belongs to `owner`.
 pub fn received_owner(id: ItemId, owner: u8) {
     lock().owner_in.push((id, owner));
+}
+
+/// Network (the server): a Chao it runs borrowed our item; it's now as `item` says (in that
+/// Chao's hands, or put down), or `gone` (eaten, worn). It stays ours, in our save.
+pub fn received_steer(item: GardenItem, gone: bool) {
+    lock().steer_in.push((item, gone));
 }
 
 /// Claims to send to the host.
@@ -503,6 +516,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
             for c in s.copies.values() {
                 delete(c.object);
             }
+            unsteer_all(&mut s);
             s.mine.clear();
             s.copies.clear();
             s.reports.clear();
@@ -520,6 +534,7 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
     s.unsaved.retain(|&o| alive(o));
 
     apply_owners(&mut s, me, area);
+    apply_steers(&mut s);
 
     let held = garden::player_held();
     if held != s.held {
@@ -632,7 +647,10 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
         }
         let (category, kind, bites) = kind_of(entry, object);
         let p = position(object);
-        let (place, position) = if garden::player_held() == object
+        let (place, position) = if let Some((steered, _)) = s.steered.get(&id) {
+            // A server Chao has it: where the server says.
+            (steered.place, steered.position)
+        } else if garden::player_held() == object
             && let Some((at, angle)) = player
         {
             (
@@ -681,6 +699,112 @@ pub fn on_frame(me: Option<u8>, area: u8) -> Vec<(u8, Vec<GardenItem>)> {
     out.chunks(MAX_GARDEN_ITEMS)
         .map(|c| (area, c.to_vec()))
         .collect()
+}
+
+/// What a server Chao did to our items: ours follow (in its hands, put down, or gone).
+fn apply_steers(s: &mut Items) {
+    for (item, gone) in std::mem::take(&mut s.steer_in) {
+        let Some((&object, _)) = s.mine.iter().find(|(_, m)| **m == item.id) else {
+            continue;
+        };
+        if gone {
+            // Eaten up or worn: out of our save, as when one of our Chao does it.
+            if let Some(entry) = entry_of(object) {
+                // SAFETY: our live item; game thread.
+                unsafe { release(entry) };
+            }
+            unsteer(s, item.id, object);
+            delete(object);
+            s.mine.remove(&object);
+            log!(
+                "items: our item {}:{} was used up by a Chao",
+                item.id.origin,
+                item.id.serial
+            );
+            continue;
+        }
+        // SAFETY: our live item's Data1, on the game thread.
+        unsafe {
+            let d = data1(object);
+            if d != 0 && item.category == FRUIT as u8 {
+                ((d + D_BITES) as *mut i32).write(i32::from(item.bites));
+            }
+        }
+        if item.place == ItemPlace::Ground {
+            unsteer(s, item.id, object);
+            let [x, y, z] = item.position;
+            // SAFETY: as above.
+            unsafe {
+                let d = data1(object);
+                if d != 0 {
+                    ((d + D_POSITION) as *mut Vector).write_unaligned(Vector { x, y, z });
+                }
+            }
+            continue;
+        }
+        let main = match s.steered.get(&item.id) {
+            Some(&(_, main)) => main,
+            None => {
+                // SAFETY: our live item; its MainSub swapped for ours while a Chao has it.
+                unsafe {
+                    let at = (object + OBJ_MAIN) as *mut usize;
+                    let main = at.read();
+                    at.write(steered_main as extern "C" fn(usize) as usize);
+                    main
+                }
+            }
+        };
+        s.steered.insert(item.id, (item, main));
+    }
+}
+
+/// Our item `id` (`object`) is ours to run again: its own MainSub back.
+fn unsteer(s: &mut Items, id: ItemId, object: usize) {
+    if let Some((_, main)) = s.steered.remove(&id) {
+        // SAFETY: our live item, still running our stand-in.
+        unsafe {
+            let at = (object + OBJ_MAIN) as *mut usize;
+            if at.read() == steered_main as extern "C" fn(usize) as usize {
+                at.write(main);
+            }
+        }
+    }
+}
+
+/// Leaving the garden: our items in server Chao's hands lie where they are, ours again.
+fn unsteer_all(s: &mut Items) {
+    let ids: Vec<(ItemId, usize)> = s
+        .mine
+        .iter()
+        .filter(|(_, id)| s.steered.contains_key(id))
+        .map(|(&object, &id)| (id, object))
+        .collect();
+    for (id, object) in ids {
+        unsteer(s, id, object);
+    }
+    s.steered.clear();
+}
+
+/// MainSub of our item while a Chao the server runs has it: in that Chao's hands (as a copy is
+/// shown), its own logic off.
+extern "C" fn steered_main(object: usize) {
+    let spot = std::panic::catch_unwind(|| {
+        let s = lock();
+        let id = s.mine.get(&object)?;
+        let (item, _) = s.steered.get(id)?;
+        place(SERVER, item)
+    })
+    .ok()
+    .flatten();
+    if let Some((at, _)) = spot {
+        // SAFETY: our live item's Data1, on the game thread.
+        unsafe {
+            let d = data1(object);
+            if d != 0 {
+                ((d + D_POSITION) as *mut Vector).write_unaligned(at);
+            }
+        }
+    }
 }
 
 /// The referee's answers: items changing hands.

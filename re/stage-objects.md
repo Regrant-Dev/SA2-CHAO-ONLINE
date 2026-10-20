@@ -15,7 +15,7 @@ This identifies the breakable step between solid boxes, rather than an item/rewa
 REA VM/Ghidra inspected the 0x6FB200 initializer: display 0x6FB8A0, update 0x6FB280,
 delete 0x6E7140, collision initialization 0x47E620. The existing Breakables evidence above
 establishes its persistent kill flag; our replay loop deliberately re-deleted it every
-restart. The user confirmed the missing crate persisted after restarting.
+restart. In game, the missing crate persisted after a restart.
 
 Standard wooden/iron crates (**0x6CD7F0,0x6D63F0,0x6FB200,0x6FBBA0**) are now per
 player, excluded from both outgoing detection and incoming destruction history. Incoming

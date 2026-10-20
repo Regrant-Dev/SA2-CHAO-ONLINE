@@ -911,6 +911,15 @@ fn pump(online: &mut Online, now: Instant) {
                 body: Body::ItemOwner { id, owner },
                 ..
             } => crate::items::received_owner(id, owner),
+            // A Chao the server runs borrowed one of our items (only the server says so).
+            Event::Game {
+                from,
+                body: Body::ItemSteer { item, gone, .. },
+            } => {
+                if from == crate::garden::SERVER {
+                    crate::items::received_steer(item, gone);
+                }
+            }
             // Claims are for the host's referee (net/referee.rs), which doesn't pass them on.
             Event::Game {
                 body: Body::ItemClaim { .. },

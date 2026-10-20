@@ -6,6 +6,7 @@ pub mod land;
 
 pub mod acts;
 pub mod brain;
+pub mod evolve;
 pub mod life;
 pub mod motion;
 pub mod physics;

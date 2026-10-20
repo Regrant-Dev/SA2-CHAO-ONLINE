@@ -41,8 +41,8 @@ Only new English strings and code are shipped; no game messages or textures are 
 
 ## Activation and limits
 
-Always initialized before the shop loads. The user clarified that jewel eggs should be
-built into normal progression, so the original F9/Mod Manager opt-in was removed. Old
+Always initialized before the shop loads. Jewel eggs are part of normal progression, so the
+original F9/Mod Manager opt-in was removed. Old
 `JewelEggs=Off` configuration entries are ignored and omitted on the next settings save.
 Each unlock tier from 120 to 180 emblems has a price from 10000 to 40000.
 These are our balance choices, not original-game unlock rules. At restock, choose one

@@ -91,8 +91,9 @@ pub struct Referee {
     server_items: HashMap<ItemId, (u8, GardenItem)>,
     /// Where a Chao the server runs took each item it holds.
     taken_at: HashMap<ItemId, [f32; 3]>,
-    /// Whose save each item a server Chao took came from (it goes back when let go).
-    taken_from: HashMap<ItemId, u8>,
+    /// Players' items a Chao the server runs has, as the server says they are (their owner's
+    /// reports don't move them until they say the same; `steer`).
+    steered: HashMap<ItemId, GardenItem>,
     /// When each server item came (a count), and the count: the oldest lying ones go first.
     born: HashMap<ItemId, u64>,
     births: u64,
@@ -169,6 +170,7 @@ impl Referee {
             }
             // Only the referee decides (or sends) these.
             Body::ItemOwner { .. }
+            | Body::ItemSteer { .. }
             | Body::HuntTaken { .. }
             | Body::ServerGarden { .. }
             | Body::ServerItems { .. } => false,
@@ -184,10 +186,19 @@ impl Referee {
                         last: None,
                     });
                     // Reports from someone who no longer owns it (crossed a hand-off) don't count.
-                    if entry.owner == from {
-                        entry.busy = item.busy();
-                        entry.last = Some((*area, *item));
+                    if entry.owner != from {
+                        continue;
                     }
+                    // One a server Chao has: as the server says, until its owner's game shows it
+                    // the same (on the ground again, it's theirs to report).
+                    if let Some(&steered) = self.steered.get(&item.id) {
+                        if item.place != steered.place || steered.place != ItemPlace::Ground {
+                            continue;
+                        }
+                        self.steered.remove(&item.id);
+                    }
+                    entry.busy = item.busy();
+                    entry.last = Some((*area, *item));
                 }
                 true
             }
@@ -308,38 +319,33 @@ impl Referee {
                 at,
             } => {
                 self.taken_at.insert(id, at);
-                // A player's goes out of their save into the server's, in the Chao's hands.
-                let item = match self.items.get(&id) {
-                    Some(l) => {
-                        let Some((_, item)) = l.last else {
-                            return;
-                        };
-                        // Theirs again once the Chao lets go of it (`Released`).
-                        self.taken_from.insert(id, l.owner);
-                        self.items.remove(&id);
-                        out.push(Out {
-                            to: To::All,
-                            from: SERVER,
-                            body: Body::ItemOwner { id, owner: SERVER },
-                        });
-                        item
-                    }
-                    None => match self.server_items.get(&id) {
-                        Some((_, item)) => *item,
-                        None => return,
-                    },
+                let held = |item: GardenItem| GardenItem {
+                    place: ItemPlace::Chao { owner, index },
+                    position: IN_CHAO_HANDS,
+                    ..item
                 };
-                self.add_server_item(
-                    area,
-                    GardenItem {
-                        place: ItemPlace::Chao { owner, index },
-                        position: IN_CHAO_HANDS,
-                        unsaved: true,
-                        ..item
-                    },
-                );
+                // A player's stays in their save: the Chao borrows it, their game shows it so.
+                if self.steer(id, out, |item| (held(item), false)) {
+                    return;
+                }
+                let Some((_, item)) = self.server_items.get(&id).copied() else {
+                    return;
+                };
+                self.add_server_item(area, held(item));
             }
             ItemAct::Bite { id, left } => {
+                let bitten = |item: GardenItem| {
+                    (
+                        GardenItem {
+                            bites: left,
+                            ..item
+                        },
+                        left == 0,
+                    )
+                };
+                if self.steer(id, out, bitten) {
+                    return;
+                }
                 if left == 0 {
                     self.server_items.remove(&id);
                 } else if let Some((_, item)) = self.server_items.get_mut(&id) {
@@ -348,49 +354,27 @@ impl Referee {
             }
             ItemAct::Drop { id, at } => {
                 self.taken_at.remove(&id);
+                let dropped = |item: GardenItem| {
+                    let item = GardenItem {
+                        place: ItemPlace::Ground,
+                        position: at,
+                        ..item
+                    };
+                    (item, false)
+                };
+                if self.steer(id, out, dropped) {
+                    return;
+                }
                 if let Some((_, item)) = self.server_items.get_mut(&id) {
                     item.place = ItemPlace::Ground;
                     item.position = at;
                 }
             }
             ItemAct::Gone { id } => {
-                self.server_items.remove(&id);
-                self.taken_from.remove(&id);
-            }
-            ItemAct::Released { id } => {
-                // Back to the player whose save it came from, if they're in its garden: in
-                // their save again, theirs to report (`ItemOwner`).
-                let Some(&owner) = self.taken_from.get(&id) else {
-                    return;
-                };
-                let Some(&(area, item)) = self.server_items.get(&id) else {
-                    return;
-                };
-                if self.areas.get(&owner) != Some(&area) || item.busy() {
+                if self.steer(id, out, |item| (item, true)) {
                     return;
                 }
-                self.taken_from.remove(&id);
-                self.taken_at.remove(&id);
                 self.server_items.remove(&id);
-                self.items.insert(
-                    id,
-                    Ledger {
-                        owner,
-                        busy: false,
-                        last: Some((
-                            area,
-                            GardenItem {
-                                unsaved: false,
-                                ..item
-                            },
-                        )),
-                    },
-                );
-                out.push(Out {
-                    to: To::All,
-                    from: SERVER,
-                    body: Body::ItemOwner { id, owner },
-                });
             }
             ItemAct::ToyOn { area, toy } => {
                 let Some(slot) = self
@@ -455,6 +439,41 @@ impl Referee {
         }
     }
 
+    /// A player's item a server Chao did something to (`change` gives it as it is now, and
+    /// whether it's gone): the referee's view of it changes, and its owner's game is told
+    /// (`ItemSteer`) so their own item, in their save, does the same. False when it's no
+    /// player's item.
+    fn steer(
+        &mut self,
+        id: ItemId,
+        out: &mut Vec<Out>,
+        change: impl FnOnce(GardenItem) -> (GardenItem, bool),
+    ) -> bool {
+        let Some(ledger) = self.items.get_mut(&id) else {
+            return false;
+        };
+        let Some((area, item)) = ledger.last else {
+            return false;
+        };
+        let item = self.steered.get(&id).copied().unwrap_or(item);
+        let (item, gone) = change(item);
+        let owner = ledger.owner;
+        if gone {
+            self.items.remove(&id);
+            self.steered.remove(&id);
+        } else {
+            ledger.last = Some((area, item));
+            ledger.busy = item.busy();
+            self.steered.insert(id, item);
+        }
+        out.push(Out {
+            to: To::One(owner),
+            from: SERVER,
+            body: Body::ItemSteer { area, item, gone },
+        });
+        true
+    }
+
     /// Adds (or replaces) one of the server's items. A garden keeps at most
     /// `MAX_SERVER_ITEMS` of them lying around (fruit from trees, dropped by Chao, left by
     /// players): past that the oldest lying one goes. Ones in a Chao's hands stay.
@@ -492,6 +511,9 @@ impl Referee {
         }
         self.keep_unsaved(id, None);
         self.items.retain(|_, l| l.owner != id);
+        // Theirs a server Chao had go with them (their save has them).
+        let items = &self.items;
+        self.steered.retain(|item, _| items.contains_key(item));
         self.areas.remove(&id);
     }
 
@@ -748,11 +770,11 @@ mod tests {
     }
 
     #[test]
-    fn what_a_server_chao_lets_go_of_goes_back_to_its_owner() {
+    fn a_server_chao_only_borrows_a_players_item() {
         let mut r = Referee::new();
         let mut out = Vec::new();
         r.observe(1, &report(ItemPlace::Ground), &mut out);
-        r.areas.insert(1, 1);
+        out.clear();
         let take = ItemAct::Take {
             id: MANGO,
             area: 1,
@@ -760,15 +782,22 @@ mod tests {
             at: [0.0; 3],
         };
         r.item_act(take, &mut out);
-        r.item_act(
-            ItemAct::Drop {
-                id: MANGO,
-                at: [5.0, 0.0, 5.0],
-            },
-            &mut out,
+        // Still player 1's (in their save); their game is told it's in that Chao's hands.
+        assert_eq!(r.items[&MANGO].owner, 1);
+        assert!(!r.server_items.contains_key(&MANGO));
+        let Body::ItemSteer { item, gone, .. } = &out[0].body else {
+            panic!("{out:?}");
+        };
+        assert_eq!(out[0].to, To::One(1));
+        assert_eq!(item.place, ItemPlace::Chao { owner: 2, index: 0 });
+        assert!(!gone);
+        // Their game's late report (on the ground still) doesn't move it; nobody can claim it.
+        r.observe(1, &report(ItemPlace::Ground), &mut out);
+        assert_eq!(
+            r.items[&MANGO].last.unwrap().1.place,
+            ItemPlace::Chao { owner: 2, index: 0 }
         );
-        out.clear();
-        r.item_act(ItemAct::Released { id: MANGO }, &mut out);
+        let out = claim(&mut r, 3);
         assert_eq!(
             out[0].body,
             Body::ItemOwner {
@@ -776,13 +805,21 @@ mod tests {
                 owner: 1
             }
         );
-        assert!(!r.server_items.contains_key(&MANGO));
-        assert_eq!(r.items[&MANGO].owner, 1);
-        // Gone from the garden meanwhile: the server keeps it.
+        // Put down: theirs to report again once their game shows it there.
+        let mut out = Vec::new();
+        r.item_act(
+            ItemAct::Drop {
+                id: MANGO,
+                at: [5.0, 0.0, 5.0],
+            },
+            &mut out,
+        );
+        r.observe(1, &report(ItemPlace::Ground), &mut out);
+        assert!(r.steered.is_empty());
+        // They leave: it goes with them.
         r.item_act(take, &mut out);
-        r.areas.insert(1, 0);
-        r.item_act(ItemAct::Released { id: MANGO }, &mut out);
-        assert!(r.server_items.contains_key(&MANGO));
+        r.left(1);
+        assert!(r.steered.is_empty() && !r.items.contains_key(&MANGO));
     }
 
     #[test]
@@ -824,49 +861,27 @@ mod tests {
     }
 
     #[test]
-    fn a_server_chaos_fruit_is_the_servers_until_eaten() {
+    fn a_borrowed_fruit_eaten_up_is_gone_from_its_owner() {
         let mut r = Referee::new();
         let mut out = Vec::new();
         r.observe(1, &report(ItemPlace::Ground), &mut out);
+        let take = ItemAct::Take {
+            id: MANGO,
+            area: 1,
+            chao: (2, 0),
+            at: [0.0; 3],
+        };
+        r.item_act(take, &mut out);
         out.clear();
-        r.item_act(
-            ItemAct::Take {
-                id: MANGO,
-                area: 1,
-                chao: (2, 0),
-                at: [1.0, 2.0, 3.0],
-            },
-            &mut out,
-        );
-        assert_eq!(
-            out,
-            vec![Out {
-                to: To::All,
-                from: SERVER,
-                body: Body::ItemOwner {
-                    id: MANGO,
-                    owner: SERVER
-                },
-            }]
-        );
-        let (_, item) = r.server_items[&MANGO];
-        assert_eq!(item.place, ItemPlace::Chao { owner: 2, index: 0 });
-        // Its old owner's late report doesn't take it back, and nobody can claim it.
-        r.observe(1, &report(ItemPlace::Ground), &mut out);
-        assert!(!r.items.contains_key(&MANGO));
-        let out = claim(&mut r, 3);
-        assert_eq!(
-            out[0].body,
-            Body::ItemOwner {
-                id: MANGO,
-                owner: SERVER
-            }
-        );
-        let mut out = Vec::new();
         r.item_act(ItemAct::Bite { id: MANGO, left: 2 }, &mut out);
-        assert_eq!(r.server_items[&MANGO].1.bites, 2);
+        let Body::ItemSteer { item, gone, .. } = &out[0].body else {
+            panic!("{out:?}");
+        };
+        assert_eq!((item.bites, *gone), (2, false));
+        out.clear();
         r.item_act(ItemAct::Bite { id: MANGO, left: 0 }, &mut out);
-        assert!(!r.server_items.contains_key(&MANGO));
+        assert!(matches!(out[0].body, Body::ItemSteer { gone: true, .. }));
+        assert!(!r.items.contains_key(&MANGO));
     }
 
     #[test]

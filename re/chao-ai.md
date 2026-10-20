@@ -68,7 +68,7 @@ section's "Corrections to the groundwork" disagrees, the later section is right.
 | W+0x54..0x5C | f32×3 | behaviour target position | `0x5691B0`, `0x562D20` |
 | W+0xDC | f32 | water surface Y for this area | `0x561630` |
 | rec+0x38..0x44 | u16 | stat points; AI reads 0x38 swim, 0x3A, 0x3C, 0x44; ×3 outside areas 6/10/11 | `0x562330`, `0x5A3000`, `0x5A3650`, `0x567830` |
-| rec+0x80 | u8 | type: 2 child; 7,10,13,16,19,22 dark adults; 20..25 excluded from mating | `0x562800`, `0x5A1240`, `0x562950` |
+| rec+0x80 | u8 | type: 2 child; adults 5 normal, 8 swim, 11 fly, 14 run, 17 power, 20 Chaos (+1 hero, +2 dark; `0x568630`); 7,10,13,16,19,22 dark adults; 20..25 excluded from mating | `0x562800`, `0x5A1240`, `0x562950` |
 | rec+0x8A | u16 | lifespan (0 → death) | `0x562A20` |
 | rec+0xB0 | f32 | alignment | `0x59B900` |
 | rec+0xC0 | f32 | evolution progress (> 1.0 → cocoon) | `0x562800` |
@@ -958,7 +958,7 @@ Scope: what changes the save record (`rec` = `Data1+0x5C`) over a Chao's life, o
 
 **Correction to the groundwork:** `rec+0x12A` isn't a dedicated once-latch. It is the needs-tick counter of the life tick (`rec+0x124+6`). It is incremented every life tick, compared with `u16 0x1312DE6`=10 at `0x535957`, and reset to 0 at `0x53596D`. Walk and swim therefore apply their need changes at most once in the 96-frame window after a needs tick, while the counter is still 0. They then set it to 1, so the next needs tick comes one life tick early.
 
-**Grades** (`rec+0x28+i`) are set from DNA in `0x551DA0` (§4.3). Rebirth keeps them (`0x551560` never writes `rec+0x28..0x2F`). No other writer was found.
+**Grades** (`rec+0x28+i`) are set from DNA in `0x551DA0` (§4.3). Rebirth keeps them (`0x551560` never writes `rec+0x28..0x2F`). Evolution raises one by 1 (`0x551780`, see "Evolution (0x568630)").
 
 ### 4.2 Aging and lifespan
 
@@ -1065,6 +1065,24 @@ The egg spawner keeps the record pointer:
 | `rec+0x158` | 0 |
 
 The `0x14A..0x156` writes land on the personality bytes and are overwritten by the personality loop that follows in both callers. At birth, `0x551DA0` also rewrites taste `0x157..0x159` afterwards. At rebirth it doesn't, so after rebirth taste `rec+0x157` = 0x27 (39, the high byte of 10000) and `rec+0x158 = rec+0x159 = 0`. No later writer was found. With 0x157 = 39, the fruit-kind 7/8/9 dislike checks in §4.4 never match.
+
+### Evolution (0x568630)
+
+Only caller: cocoon `0x568D30` mode 2 (`0x568E04`: `EAX=obj; CALL 0x568630; MOVZX EAX,AL; ECX=obj; CALL 0x56CF40`), then mode 3. No rand anywhere. Gate: picker #20 `0x562800` (child, `rec+0xC0 >= 1.0`, clamped to 1.0). Server: `src/chao_sim/evolve.rs` `evolve(&mut Record) -> u8`.
+
+- **Kind** (`0x56865F..0x568737`; f32 `0x1312C94` = 0.5). a8 = `rec+0xA8` (run −/power +), ac = `rec+0xAC` (swim −/fly +).
+  - Directional unless `-0.5 < a8 < 0.5` and `-0.5 < ac < 0.5` (FCOM `TEST AH,0x41` / `TEST AH,5; JP`, so ±0.5 is directional).
+  - Directional (`0x56870B`): `ac <= a8` → power 0x11, but swim 0x08 if `ac <= -a8`; else fly 0x0B, but run 0x0E if `ac <= -a8`. Ties: a8 == ac → power/swim side; ac == −a8 → swim (a8 > 0) or run (a8 < 0).
+  - Normal 0x05, or **Chaos 0x14** when all bits 0..20 of `rec+0x118` (animals) are set **and** `(i16) rec+0x82 > 80` (`JLE`) **and** `(u16) rec+0x8E >= 2` (reincarnations, `JC` vs BX=2) (`0x5686B9..0x5686F4`).
+- **Alignment** (`0x56873C..`; f32 `0x1312C98` = 0.5, `0x8AF004` = 0.0): if `rec+0xB0 <= -0.5` or `>= 0.5`: `> 0` → type+1 (hero; save `0x19F646C[slot] |= 0x10`, jingle `chao_g_born_h2.adx` `0x12BE8BC` via `0x443480`), else type+2 (dark; `|= 0x40`, `chao_g_born_d2.adx` `0x12BEBBC`). If both 0x10 and 0x40 are set (and `0x1DEFAA0 == 0x1A5570C`) → `0x40E850(ECX=7)` (achievement-like). Slot = `0x173D06C == 1`, stride 0xCA6C. `rec+0xB0` itself is kept.
+- **Writes** (`0x56876A..0x568784`): `rec+0xC0 = rec+0xA8 = rec+0xAC = 0.0`; `rec+0x80 = type`. Returns type in AL.
+- **Grade** `0x5517B0` (EDI=rec, ECX=DNA=`rec+0x438`): index by type via byte table `0x551828` / jumps `0x551814`: 8..10 → 0 swim, 11..13 → 1 fly, 14..16 → 2 run, 17..19 → 3 power, 5..7 and 20..22 → 4 stamina. `0x551780`: g = `rec+0x28+i`; if g < 5: if DNA `+0x5C+2i` == g it is incremented, else if `+0x5D+2i` == g it is; then `rec+0x28+i = g+1`. (DNA pairs `+0x5C+2i` are the grade alleles `0x551DA0` picks from at birth.)
+- **`0x56CF40`** (EAX=type, ECX=obj; rejects 0,1,3,4,>25): `0x56CE70` frees shape/palette, `rec+0x80 = type` again, `0x56C9D0` reloads the model `AL_RootObject[type-2]`, `0x539F90` eyes/mouth, `0x53C010`, `0x566B80` re-attaches parts, `0x5904C0` resets perception. Record side effects:
+  - `0x539F90` (`0x53A072..0x53A089`): `(type-7) <= 15 && (type-7)%3 == 0` (dark: 7,10,13,16,19,22) → **`rec+0xD1` (eyes) = 10**. Chaos types use fixed eyes/mouth 0xB/0xC/0xD on Data1 only.
+  - `0x566B80` → `0x5668B0` ×8: part slot `(i8) rec+0x11C+i` outside 0..20 → 0xFF (else rewritten unchanged).
+  - `0x55F0F0`/`0x55E8D0` rewrite `rec+0xD8` with its own value.
+  - Everything else is Data1/model state: a client copy rebuilds it from the new type.
+- Not touched: age, adult age, life/max life, reincarnations, personality, stats, alignment.
 
 ### 4.3 Personality and likes: how they are set
 

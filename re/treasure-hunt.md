@@ -50,7 +50,7 @@ that arrive before their set announcement; reject other stages/outsiders.
 Headless regressions cover fixed fallbacks, duplicate IDs, authoritative replacement,
 repeated announcements preserving credit, early acknowledgements, retries and invalid sets.
 Read-only checks of retail SET files found unique fixed C/B/A candidates in every supported
-normal hunt stage. The user's exact buried/flying reproduction still needs an in-game retest.
+normal hunt stage. The buried/flying case still needs an in-game retest.
 
 Steam `sonic2app.exe`, image base 0x400000. Everything below was read from the objdump listing
 of `re/bin/sonic2app.dumped.exe` plus the game's own SET files in `resource/gd_PC` (parsed

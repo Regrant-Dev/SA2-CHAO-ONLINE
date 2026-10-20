@@ -28,7 +28,7 @@ to do with game progress.**
 players who own the Battle DLC. Treat 0x1A556F4 as read-only. The mod can read it to detect
 ownership and hide or disable Karate features for players who don't own the DLC. These notes
 deliberately leave out a plan to force the flag or patch the menu skip, because that would
-unlock paid DLC content without a purchase. The user needs to own the Battle DLC to see Karate
+unlock paid DLC content without a purchase. Players need to own the Battle DLC to see Karate
 in the Stadium.
 
 ## 2. Chao Race: how racers are created

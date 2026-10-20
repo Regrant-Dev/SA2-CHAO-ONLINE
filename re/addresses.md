@@ -72,7 +72,7 @@ Also capture an already pending request when pause opens on the death frame. Cle
 requests on level/mission changes or any state outside 16/17, so choosing Restart/Quit
 cannot inject a stale death into a new attempt. Unit tests exercise a death surviving many
 pause frames, delivery once, first-event priority, restart and stage/mission changes.
-The user's exact pause/death reproduction still needs an in-game retest.
+The pause/death case still needs an in-game retest.
 
 - **What runs each frame:** WinMain's loop (0x401DFE) calls the game loop **0x433EE0** every
   frame. That function reads input and pads, then:

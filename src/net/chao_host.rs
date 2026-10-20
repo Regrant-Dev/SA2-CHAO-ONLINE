@@ -415,6 +415,10 @@ impl ChaoHost {
     /// the referee has them.
     pub fn tick(&mut self, now: Instant, shared: Shared, out: &mut Vec<Out>) {
         self.items = shared.items;
+        // Gone from the garden (its owner left with it, or it's used up): not in a Chao's hands.
+        let items = &self.items;
+        self.carried
+            .retain(|_, (id, _)| items.iter().any(|(_, _, i)| i.id == *id));
         self.toy_modes = shared.toys;
         self.tree_states = shared.trees;
         self.tree_thirst = shared.thirsty;
@@ -580,7 +584,6 @@ impl ChaoHost {
                         FruitEvent::Dropped { id, vel: None } => {
                             let id = item_id(id);
                             self.acts.push(ItemAct::Drop { id, at: hands });
-                            self.acts.push(ItemAct::Released { id });
                         }
                     }
                 }
@@ -669,7 +672,6 @@ impl ChaoHost {
                         ItemEvent::LetGo => {
                             if let Some((id, _)) = self.carried.remove(&key) {
                                 self.acts.push(ItemAct::Drop { id, at: hands });
-                                self.acts.push(ItemAct::Released { id });
                             }
                         }
                         ItemEvent::Throw(v) => {
@@ -999,7 +1001,6 @@ impl ChaoHost {
             let act = ItemAct::Drop { id, at };
             act.apply(&mut self.items);
             self.acts.push(act);
-            self.acts.push(ItemAct::Released { id });
         }
     }
 
@@ -1120,9 +1121,6 @@ pub enum ItemAct {
     Drop { id: ItemId, at: V3 },
     /// Used up (a hat put on).
     Gone { id: ItemId },
-    /// Let go of and at rest (landed, put down): one that came from a player's save goes back
-    /// to them while they're in the garden.
-    Released { id: ItemId },
     /// A new item of the server's (a hat that fell off).
     New {
         area: u8,
@@ -1156,12 +1154,12 @@ impl ItemAct {
                 chao: (owner, index),
                 ..
             } => {
+                // Whoever's it is stays its owner (a player's item is only borrowed).
                 if let Some(at) = find(items, id) {
-                    let (a, o, item) = &mut items[at];
-                    (*a, *o) = (area, SERVER);
+                    let (a, _, item) = &mut items[at];
+                    *a = area;
                     item.place = ItemPlace::Chao { owner, index };
                     item.position = IN_CHAO_HANDS;
-                    item.unsaved = true;
                 }
             }
             Self::Bite { id, left } => {
@@ -1185,7 +1183,7 @@ impl ItemAct {
                 }
             }
             // The referee gives it its id; the Chao see it from its next look.
-            Self::New { .. } | Self::ToyOn { .. } | Self::Tree { .. } | Self::Released { .. } => {}
+            Self::New { .. } | Self::ToyOn { .. } | Self::Tree { .. } => {}
         }
     }
 }
@@ -1220,7 +1218,8 @@ fn things(
                         None,
                     )
                 }
-                ItemPlace::Chao { owner: o, index } if owner == SERVER => {
+                // In the hands of a Chao the server runs (whoever owns the item).
+                ItemPlace::Chao { owner: o, index } if run.slots.contains_key(&(o, index)) => {
                     let slot = *run.slots.get(&(o, index))?;
                     let c = run.world.chao.get(slot)?.as_ref()?;
                     let pos = in_hands(c.body.pos, i32::from(c.body.rot_y), item.position);
@@ -1568,7 +1567,6 @@ fn fly(flying: &mut Vec<Flying>, garden: &Garden, area: u8, acts: &mut Vec<ItemA
         let floor = on_floor(garden, *pos);
         if (vel[1] < 0.0 && pos[1] <= floor[1]) || *frames > MAX_FLIGHT {
             acts.push(ItemAct::Drop { id: *id, at: floor });
-            acts.push(ItemAct::Released { id: *id });
             return false;
         }
         if frames.is_multiple_of(2) {
@@ -1992,9 +1990,7 @@ mod tests {
             fly(&mut flying, &garden, 1, &mut acts);
         }
         assert!(flying.is_empty());
-        // It lands (and, let go of, may go back to whose it was).
-        assert_eq!(acts.last(), Some(&ItemAct::Released { id }));
-        let Some(ItemAct::Drop { at, .. }) = acts.iter().rev().nth(1) else {
+        let Some(ItemAct::Drop { at, .. }) = acts.last() else {
             panic!("{acts:?}");
         };
         assert!(at[0] > 5.0, "it went somewhere: {at:?}");

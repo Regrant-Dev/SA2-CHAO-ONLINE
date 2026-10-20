@@ -89,7 +89,8 @@ impl Behaviour {
 pub enum LifeEvent {
     /// It went into a cocoon (`0x568D30` started).
     Cocooned,
-    /// The cocoon opens: evolve it now (the game's `0x568630`).
+    /// The cocoon opens: evolve it now (the game's `0x568630`; `evolve::evolve` does it to
+    /// the record).
     Evolve,
     /// It's gone: its record is cleared.
     Died,
