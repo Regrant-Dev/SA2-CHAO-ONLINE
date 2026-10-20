@@ -1727,6 +1727,19 @@ pub fn on_frame() {
     });
 }
 
+/// When the game last removed Chao copies itself (`prune_mirrors`): an area being torn down.
+static TORN_DOWN: Mutex<Option<Instant>> = Mutex::new(None);
+/// No copies are made this soon after: one made then outlives the garden (seen in the lobby).
+const TEAR_DOWN_QUIET: Duration = Duration::from_secs(2);
+
+/// Whether the game is tearing the garden down (it removed copies within `TEAR_DOWN_QUIET`).
+pub fn tearing_down() -> bool {
+    TORN_DOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|at| at.elapsed() < TEAR_DOWN_QUIET)
+}
+
 /// A transition or native behaviour can remove an object before the mod sees the area change.
 /// Forget it without writing to freed memory, even if that address has already been reused.
 fn prune_mirrors(g: &mut Garden) {
@@ -1751,6 +1764,9 @@ fn prune_mirrors(g: &mut Garden) {
             (!valid).then_some(key)
         })
         .collect();
+    if !gone.is_empty() {
+        *TORN_DOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
     for key in gone {
         if let Some(m) = g.mirrors.remove(&key) {
             g.wrapped.remove(&m.object);
@@ -2059,7 +2075,11 @@ fn mirrors_frame(g: &mut Garden, now: Instant) {
                 let rotation = ((d + D_ROTATION_Y) as *const i32).read();
                 let (at, len) = CHAO_MOOD;
                 let mood = std::slice::from_raw_parts((record + at) as *const u8, len).to_vec();
-                let motion = ((d + D_MOTION_CURRENT) as *const i32).read() as u16;
+                // Between motions the current one is -1: send the one it's blending into.
+                let motion = match ((d + D_MOTION_CURRENT) as *const i32).read() {
+                    -1 => ((d + D_MOTION_NEXT) as *const i32).read(),
+                    m => m,
+                } as u16;
                 g.touched_out.retain(|t| (t.0, t.1) != (owner, index));
                 g.touched_out.push((
                     owner,
@@ -3210,7 +3230,8 @@ fn place(g: &mut Garden, object: usize, d: usize) -> Option<(Vector, i32, bool)>
         );
         current == i32::from(t.motion) || next == i32::from(t.motion)
     };
-    if m.motion != Some(t.motion) || !playing {
+    // 0xFFFF: no motion (between two); it keeps the one it has.
+    if t.motion != u16::MAX && (m.motion != Some(t.motion) || !playing) {
         let new = m.motion != Some(t.motion);
         m.motion = Some(t.motion);
         // SAFETY: the Chao's own motion controller; the id comes from the owner's game, which

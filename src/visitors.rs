@@ -293,7 +293,12 @@ pub fn spawn_remote(
     near: game::Vector,
     initial: Option<crate::net::protocol::GardenChao>,
 ) -> bool {
-    if !game::in_garden() || chao.validate().is_err() {
+    // Not while an area is loaded or torn down: a copy made then outlives the garden.
+    if !game::in_garden()
+        || game::between_areas()
+        || crate::garden::tearing_down()
+        || chao.validate().is_err()
+    {
         return false;
     }
     let egg = chao.chao_type() == chao::TYPE_EGG;
