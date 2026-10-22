@@ -54,6 +54,14 @@
         <HelpText>Made by the mod the first time it runs: servers know your Chao by it, so the ones you leave in a shared garden are still yours next time. Leave it as it is and don't share it.</HelpText>
       </Property>
     </Group>
+    <Group name="GBALink" display="GBA link">
+      <Property name="GbaRom" display="GBA ROM (your own, game code BPEE)" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Path to your own GBA ROM (game code BPEE). Empty: the first .gba file in the mod's gba folder. Names, types and pictures are read from it.</HelpText>
+      </Property>
+      <Property name="GbaSave" display="GBA save (.sav)" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Path to the 128 KB save of that game. Empty: the first .sav file in the mod's gba folder. It is only read, never changed. In game: F9 > GBA link.</HelpText>
+      </Property>
+    </Group>
   </Groups>
   <Enums>
     <Enum name="Mode">

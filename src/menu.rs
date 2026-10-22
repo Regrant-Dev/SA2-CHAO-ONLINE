@@ -62,6 +62,8 @@ enum Row {
     MyChao,
     ChaoDetails,
     SaveChao,
+    /// GBA link: the GBA save's creatures, to bring one into the garden (gba_link.rs).
+    GbaLink,
     /// Visitor 1..4: which Chao we bring (Auto, a save slot, or None).
     Visitor(usize),
     /// When others may change our Chao (`ChaoLock`).
@@ -103,7 +105,7 @@ fn rows(mode: usize) -> Vec<Row> {
         rows.push(Row::KarateOpponent);
     }
     // ... then your Chao, the copy-based options (your own game plays friends' Chao), files.
-    rows.extend([Row::MyChao, Row::ChaoDetails, Row::SaveChao]);
+    rows.extend([Row::MyChao, Row::ChaoDetails, Row::SaveChao, Row::GbaLink]);
     rows.extend((0..online::BRING_CHAO).map(Row::Visitor));
     rows.push(Row::Lock);
     rows.extend([Row::Race, Row::Karate]);
@@ -151,6 +153,8 @@ pub struct Settings {
     pub stage_sync: bool,
     /// Our player key as the file has it (online.rs makes and keeps it).
     pub player_key: String,
+    /// GBA link's ROM and save (empty: found in `<mod>/gba/`).
+    pub gba: crate::gba_link::Paths,
 }
 
 impl Settings {
@@ -172,6 +176,7 @@ impl Settings {
             game_volume: 100,
             stage_sync: true,
             player_key: String::new(),
+            gba: crate::gba_link::Paths::default(),
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -206,6 +211,8 @@ impl Settings {
                 "roommode" => s.room_mode = room::Mode::parse(&v),
                 "skin" => s.skin = v.to_ascii_lowercase(),
                 "playerkey" => s.player_key = v,
+                "gbarom" => s.gba.rom = v,
+                "gbasave" => s.gba.save = v,
                 "gamevolume" => s.game_volume = v.parse::<u32>().map_or(100, |p| p.min(100)),
                 "skinvoicevolume" => {
                     s.voice_volume = v.parse::<u32>().map_or(100, |p| p.min(voice::MAX_VOLUME))
@@ -238,7 +245,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -261,17 +268,21 @@ impl Settings {
             online::known_key()
                 .map(|k| crate::net::roster::key_hex(&k))
                 .unwrap_or_else(|| self.player_key.clone()),
+            self.gba.rom,
+            self.gba.save,
         )
     }
 }
 
-fn load(mod_path: &str) -> Settings {
+pub fn load(mod_path: &str) -> Settings {
     let dir = Path::new(mod_path);
-    ["config.ini", "online.ini"]
+    let settings = ["config.ini", "online.ini"]
         .iter()
         .find_map(|f| fs::read_to_string(dir.join(f)).ok())
         .map(|t| Settings::parse(&t))
-        .unwrap_or_else(|| Settings::parse(""))
+        .unwrap_or_else(|| Settings::parse(""));
+    crate::gba_link::set_paths(settings.gba.clone());
+    settings
 }
 
 struct Menu {
@@ -282,6 +293,8 @@ struct Menu {
     /// Which player the Go to row shows.
     goto_choice: usize,
     details: Option<ChaoView>,
+    /// The GBA link page, while it's open.
+    gba: Option<crate::gba_link::Page>,
     settings: Settings,
     message: String,
     keys: Vec<Hotkey>,
@@ -315,6 +328,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
     room_choice: 0,
     goto_choice: 0,
     details: None,
+    gba: None,
     settings: Settings {
         mode: 0,
         name: String::new(),
@@ -331,6 +345,10 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         game_volume: 100,
         stage_sync: true,
         player_key: String::new(),
+        gba: crate::gba_link::Paths {
+            rom: String::new(),
+            save: String::new(),
+        },
     },
     message: String::new(),
     keys: Vec::new(),
@@ -347,6 +365,7 @@ pub fn toggle() {
     m.open = !m.open;
     if m.open {
         m.details = None;
+        m.gba = None;
         m.settings = load(online::mod_path());
         m.row = 0;
         m.message.clear();
@@ -397,6 +416,10 @@ pub fn on_frame() {
     }
     if m.details.is_some() {
         details_frame(&mut m);
+        return;
+    }
+    if m.gba.is_some() {
+        gba_frame(&mut m);
         return;
     }
     if m.pressed(VK_ESCAPE) {
@@ -588,6 +611,10 @@ pub fn on_frame() {
         edit_text(&mut m, row);
     }
     if m.pressed(VK_RETURN) {
+        if row == Row::GbaLink {
+            m.gba = Some(crate::gba_link::Page::open());
+            return;
+        }
         if row == Row::ChaoDetails {
             let choices = online::garden_chao();
             let preferred = crate::garden::held_save_slot()
@@ -788,6 +815,98 @@ fn draw_details(view: &mut ChaoView, choices: &[(usize, crate::chao::ChaoData)])
     }
 }
 
+/// The GBA link page: Up/Down (PgUp/PgDn) pick, Enter brings the one picked, Esc/Backspace
+/// back.
+fn gba_frame(m: &mut Menu) {
+    let Some(mut page) = m.gba.take() else {
+        return;
+    };
+    if m.pressed(VK_ESCAPE) || m.pressed(VK_BACK) {
+        return;
+    }
+    let n = page.rows.len().max(1);
+    if m.pressed(VK_UP) || m.repeating(VK_UP) {
+        page.row = (page.row + n - 1) % n;
+    }
+    if m.pressed(VK_DOWN) || m.repeating(VK_DOWN) {
+        page.row = (page.row + 1) % n;
+    }
+    let size = hud::menu_font();
+    let (w, h) = hud::screen_size();
+    let visible = (((h / size) as usize).saturating_sub(10)).clamp(3, 20);
+    if m.pressed(VK_PRIOR) || m.repeating(VK_PRIOR) {
+        page.row = page.row.saturating_sub(visible);
+    }
+    if m.pressed(VK_NEXT) || m.repeating(VK_NEXT) {
+        page.row = (page.row + visible).min(n - 1);
+    }
+    if m.pressed(VK_RETURN) {
+        let message = match page.rows.get(page.row).map(|(_, a)| a) {
+            Some(crate::gba_link::Action::Bring(c)) => Some(crate::gba_link::import(c)),
+            Some(crate::gba_link::Action::Gift(species)) => {
+                Some(crate::gba_link::take_gift(*species))
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            hud::toast(message);
+            m.open = false;
+            return;
+        }
+    }
+    if page.row < page.scroll {
+        page.scroll = page.row;
+    } else if page.row >= page.scroll + visible {
+        page.scroll = page.row + 1 - visible;
+    }
+    let mut lines: Vec<(String, i32)> = vec![("== GBA link ==".into(), COLOR_TITLE)];
+    for (i, (text, _)) in page.rows.iter().enumerate().skip(page.scroll).take(visible) {
+        let selected = i == page.row;
+        lines.push((
+            format!("{} {text}", if selected { ">" } else { " " }),
+            if selected { COLOR_SELECTED } else { COLOR_TEXT },
+        ));
+    }
+    if page.rows.len() > visible {
+        lines.push((
+            format!(
+                "Showing {}-{} of {}",
+                page.scroll + 1,
+                (page.scroll + visible).min(page.rows.len()),
+                page.rows.len()
+            ),
+            COLOR_HINT,
+        ));
+    }
+    lines.extend([
+        (
+            "Enter brings the one picked into this garden as a partner".into(),
+            COLOR_HINT,
+        ),
+        (
+            "for your Chao (each once a day per garden, 4 at a time).".into(),
+            COLOR_HINT,
+        ),
+        (
+            "Up/Down, PgUp/PgDn pick. Esc/Backspace back. F9 closes.".into(),
+            COLOR_HINT,
+        ),
+    ]);
+    let cols = lines
+        .iter()
+        .map(|(t, _)| t.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let x = ((w / size / 2.0).floor() - (cols / 2) as f32).max(0.0) * size;
+    let y = 3.0 * size;
+    hud::panel(x, y, size, cols, lines.len() + 2);
+    for (i, (text, color)) in lines.iter().enumerate() {
+        hud::text(x + size, y + (i + 1) as f32 * size, size, *color, text);
+    }
+    m.gba = Some(page);
+}
+
 fn edit_text(m: &mut Menu, row: Row) {
     let shift = input::key_down(VK_SHIFT);
     let keys = (0x30..=0x39)
@@ -948,6 +1067,7 @@ fn draw(m: &Menu, rows: &[Row]) {
             ),
             Row::ChaoDetails => "[ Chao details: stats, personality, bonds & more ]".into(),
             Row::SaveChao => "[ Save Chao garden now ] (autosaves every 5 min)".into(),
+            Row::GbaLink => "[ GBA link: bring a partner from your GBA save ]".into(),
             Row::Lock => format!("Others can change my Chao: < {} >", m.settings.lock.label()),
             Row::KarateOpponent => {
                 let options = online::karate_opponents();
@@ -1044,6 +1164,10 @@ mod tests {
             game_volume: 60,
             stage_sync: false,
             player_key: "00112233445566778899aabbccddeeff".into(),
+            gba: crate::gba_link::Paths {
+                rom: "C:\\games\\my rom.gba".into(),
+                save: "saves/mine.sav".into(),
+            },
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.

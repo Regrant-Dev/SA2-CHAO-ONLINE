@@ -278,6 +278,8 @@ fn live_items() -> Vec<(usize, usize)> {
         .flat_map(|&cat| crate::registry::entries(cat))
         // SAFETY: a registry entry's live object.
         .filter(|&(_, object)| unsafe { data1(object) } != 0)
+        // GBA link partners stay in our game only.
+        .filter(|&(_, object)| !crate::gba_link::is_partner(object))
         .collect()
 }
 

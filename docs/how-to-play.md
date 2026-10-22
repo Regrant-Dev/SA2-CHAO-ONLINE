@@ -31,6 +31,7 @@ Pause the game before typing, since letter keys also move your character.
 | My Chao | The Chao you race and fight with |
 | Chao details | Read your Chao's hidden stats, personality, emotions, alignment and bonds |
 | Save Chao garden now | Save your Chao World data immediately while in a garden |
+| GBA link | Bring a partner from your own GBA save into the garden (see Chao > GBA link) |
 | Bring Chao 1-4 | Which of your Chao you bring to a shared garden (4 at most; the rest stay home meanwhile): Auto, a Chao you pick, or None |
 | Others can change my Chao | When what friends do to your Chao counts in your save: Always, While I'm in Chao World, While I'm in that garden, Never |
 | Friends' Chao in races | Friends' Chao fill the other lanes in your Chao Races |
@@ -222,6 +223,29 @@ race entrance races together live.
 against a friend's Chao. Practice karate lets you fight a copy of a friend's Chao on your own.
 
 Races and karate never change your Chao's save, win or lose.
+
+**GBA link:** bring creatures from your own GBA save into a garden, where your Chao can pick
+them up and absorb them like animals. It needs your own ROM of that game (game code BPEE, the
+first release) and its 128 KB save file: nothing from the game comes with the mod. Names, types
+and pictures are read from your ROM, and the save is only read, never changed.
+
+- Put the ROM (`.gba`) and the save (`.sav`) in `mods/sa2-chao-online/gba/`, or set their paths
+  in the Mod Manager (GBA link group; `GbaRom` and `GbaSave` in `config.ini`).
+- In a garden of your own (not a shared online one), F9 > **GBA link** lists the save's party
+  and boxes with each one's level and types. Pick one and press Enter: it appears in the garden
+  as a partner, drawn as its picture, walking about. A Chao that comes close to it picks it up and
+  absorbs it; you can also carry it to a Chao, as with animals.
+- Without a save, the list offers a one-time gift instead: one of the game's three first
+  partners at level 5, picked once and kept by the mod (in `gba/partners.txt`). It can then be
+  brought to a garden like the save's.
+- Each one can come to each garden once a day, and a garden holds 4 waiting partners at most.
+  Waiting partners are still there the next time the garden loads.
+- A Chao that absorbs one gains abilities by its types: each type trains swimming, flying,
+  running, power or stamina, and fast ones also train running. Higher levels give more, never a
+  whole level at once. A little luck and intelligence come with every one.
+- The Chao keeps it as its partner (its types and moves); a later one replaces it, and the
+  ability gains add up. The status balloon's last row shows the partner's types. Partners are
+  kept in `gba/partners.txt`; the Chao save itself is unchanged apart from the abilities.
 
 **Chao files:** your Chao are saved as files in `chao/export`. Put a friend's `.sa2chao` files in
 `chao/import` and they visit your garden, even when you're not online together.

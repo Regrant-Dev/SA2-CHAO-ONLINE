@@ -1,5 +1,6 @@
-//! The Chao status balloon (ParamFukidasi, re/chao-details.md "The status balloon") with four
-//! more rows under the game's five: happiness, alignment, needs and mood. Any Chao's: our own
+//! The Chao status balloon (ParamFukidasi, re/chao-details.md "The status balloon") with five
+//! more rows under the game's five: happiness, alignment, needs, mood and its GBA link partner's
+//! types (gba_link.rs; names from the player's ROM). Any Chao's: our own
 //! from our save, a friend's from the server's live fields (`ChaoLive`, garden.rs).
 //!
 //! The balloon keeps its own display (0x565200) for the five stats and the name; we draw the
@@ -9,7 +10,7 @@
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
 /// Rows we add under the game's five.
-pub const EXTRA_ROWS: usize = 4;
+pub const EXTRA_ROWS: usize = 5;
 /// The game's rows.
 const GAME_ROWS: usize = 5;
 /// Glyph size of our text (the font's own cell, 22) and how far apart we set the letters: the
@@ -47,8 +48,8 @@ fn signed_bar(v: f32, max: f32) -> (i32, i32) {
     if v >= 0.0 { (k, k) } else { (k, 0) }
 }
 
-/// The rows for a Chao record (at least 0x190 bytes).
-pub fn rows(rec: &[u8]) -> [Row; EXTRA_ROWS] {
+/// The rows for a Chao record (at least 0x190 bytes) and its partner's type names.
+pub fn rows(rec: &[u8], partner: Option<&[String]>) -> [Row; EXTRA_ROWS] {
     let happiness = i16::from_le_bytes([rec[0x82], rec[0x83]]).clamp(-100, 100);
     let alignment = f32::from_le_bytes([rec[0xB0], rec[0xB1], rec[0xB2], rec[0xB3]]);
     let alignment = if alignment.is_finite() {
@@ -99,7 +100,30 @@ pub fn rows(rec: &[u8]) -> [Row; EXTRA_ROWS] {
             ],
             bar: None,
         },
+        partner_row(partner),
     ]
+}
+
+/// Longest type name shown (the line is 14 letters wide with "Partner").
+const TYPE_NAME_MAX: usize = 6;
+
+/// "Partner" and its type names, one a line; "none" without one.
+fn partner_row(types: Option<&[String]>) -> Row {
+    let name = |i: usize| {
+        types
+            .and_then(|t| t.get(i))
+            .map(|n| n.chars().take(TYPE_NAME_MAX).collect::<String>())
+    };
+    Row {
+        lines: [
+            (
+                "Partner".to_owned(),
+                name(0).unwrap_or_else(|| "none".to_owned()),
+            ),
+            (String::new(), name(1).unwrap_or_default()),
+        ],
+        bar: None,
+    }
 }
 
 /// Text in the game's font codes (`0x536BE0`): ASCII − 0x20, 0x5F a space, 0 the end.
@@ -289,7 +313,9 @@ mod game {
                 type Bar = extern "C" fn(i32, i32, f32, f32, f32, f32, f32);
                 let bar = std::mem::transmute::<usize, Bar>(BAR);
                 let x0 = x - 72.0;
-                for (k, row) in rows(rec).iter().enumerate() {
+                let partner = crate::chao::ChaoData::from_bytes(rec)
+                    .and_then(|c| crate::gba_link::partner_types(c.identity()));
+                for (k, row) in rows(rec, partner.as_deref()).iter().enumerate() {
                     let i = GAME_ROWS + k;
                     // Only once the frame has grown to it.
                     if (i as i32) >= n {
@@ -337,7 +363,7 @@ mod tests {
 
     #[test]
     fn rows_read_the_record() {
-        let rows = rows(&record());
+        let rows = rows(&record(), None);
         assert_eq!(rows[0].lines[0].1, "+42");
         // Happy is blue, unhappy red; hero blue, dark red: by how far from 0.
         assert_eq!(rows[0].bar, Some((4, 4)));
@@ -353,8 +379,9 @@ mod tests {
     fn a_quiet_chao_is_calm_and_a_broken_alignment_neutral() {
         let mut rec = vec![0u8; 0x800];
         rec[0xB0..0xB4].copy_from_slice(&f32::NAN.to_le_bytes());
-        let rows = rows(&rec);
+        let rows = rows(&rec, None);
         assert_eq!(rows[3].lines[1].1, "Calm");
+        assert_eq!(rows[4].lines[0], ("Partner".into(), "none".into()));
         assert_eq!(rows[1].lines[0].0, "Neutral");
     }
 
@@ -365,14 +392,17 @@ mod tests {
         widest[0xB0..0xB4].copy_from_slice(&0.05f32.to_le_bytes());
         widest[0x13E..0x140].copy_from_slice(&10_000u16.to_le_bytes());
         widest[0x12C + 2] = 200; // sorrow
-        for row in rows(&widest) {
+        let long = ["ABCDEFGHIJ".to_string(), "KLMNOPQRS".to_string()];
+        let partner = rows(&widest, Some(&long));
+        assert_eq!(partner[4].lines[1].1, "KLMNOP");
+        for row in partner {
             for (label, value) in row.lines {
                 let width = (label.len() + value.len() + 1) as f32 * ADVANCE;
                 assert!(width <= 144.0, "{label} {value}");
             }
         }
         // 144 px wide, label and value side by side with a letter between.
-        for row in rows(&record()) {
+        for row in rows(&record(), Some(&["AB".to_string()])) {
             for (label, value) in row.lines {
                 let width = (label.len() + value.len() + 1) as f32 * ADVANCE;
                 assert!(width <= 144.0, "{label} {value}");

@@ -19,6 +19,8 @@ mod enemies;
 pub mod game;
 mod garden;
 mod garden_toys;
+pub mod gba;
+mod gba_link;
 mod goto;
 mod held;
 mod hide;
@@ -147,6 +149,10 @@ pub unsafe extern "C" fn Init(path: *const c_char, helpers: &HelperFunctions) {
     guarded("skins init", || skins::init(&path));
     guarded("audio init", || audio::init(&path));
     guarded("coop init", || coop::init(&path));
+    guarded("gba link init", || {
+        menu::load(&path);
+        gba_link::install();
+    });
     guarded("boot art", || boot_art::install(&path));
     watch::start();
 }
@@ -191,6 +197,8 @@ pub extern "C" fn OnFrame() {
         visitors::on_frame();
         watch::mark("garden::on_frame");
         garden::on_frame();
+        watch::mark("gba_link::on_frame");
+        gba_link::on_frame();
         watch::mark("bring::on_frame");
         bring::on_frame();
         watch::mark("skins::on_frame");
