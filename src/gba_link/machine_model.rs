@@ -1,7 +1,7 @@
 //! The link machine's model data (re/chao-garden-objects.md §1): `convert` turns a triangle
 //! mesh (OBJ with positions, normals and UVs, as tools/link_machine.py writes it) and its
 //! swatch texture (uncompressed 32-bit TGA) into SA2 chunk model pieces in a small container,
-//! the files in `mod/link_machine/`; `Machine::parse` reads and checks one for drawing.
+//! the files in `assets/link_machine/`; `Machine::parse` reads and checks one for drawing.
 //!
 //! Container (little-endian): `LMC1`, the piece count, the screen (centre x, y, front z,
 //! width, height: it faces +Z), the exit point, the collision box (min, max), the texture

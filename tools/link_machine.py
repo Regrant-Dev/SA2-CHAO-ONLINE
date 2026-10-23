@@ -2,7 +2,7 @@
 converter (src/bin/machineconv.rs).
 
     blender -b --python tools/link_machine.py -- <out dir>
-    cargo run --release --target x86_64-unknown-linux-gnu --bin machineconv -- <out dir> mod/link_machine
+    cargo run --release --target x86_64-unknown-linux-gnu --bin machineconv -- <out dir> assets/link_machine
 
 Three variants of one original low-poly kiosk: `neutral` (plain), `hero` (white and gold, a
 halo and wings) and `dark` (dark, with spikes and horns). Each is written as

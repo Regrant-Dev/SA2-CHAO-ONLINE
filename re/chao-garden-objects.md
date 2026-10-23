@@ -217,7 +217,7 @@ colours as they are (a lit screen).
 
 - **Model**: tools/link_machine.py builds the three variants in Blender (Y up and front +Z on
   export, game units, a 32x32 swatch texture of 8x8 colour cells); src/bin/machineconv.rs
-  (src/gba_link/machine_model.rs) writes `mod/link_machine/<variant>.lmc`, which the DLL
+  (src/gba_link/machine_model.rs) writes `assets/link_machine/<variant>.lmc`, which the DLL
   embeds. Each file holds the chunk pieces (one 0x29 block of at most 500 vertices at slot 0,
   `0x2511` material, `0x3008` texture 0, 0x41 one-triangle strips with flags 0x16, padded as in
   §1), the swatch, the screen rectangle, the exit point and the collision box. The draw is a

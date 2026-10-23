@@ -1,8 +1,8 @@
-//! Rebuilds the link machine's model data (`mod/link_machine/`) from what
+//! Rebuilds the link machine's model data (`assets/link_machine/`) from what
 //! tools/link_machine.py exports:
 //!
 //!     blender -b --python tools/link_machine.py -- <dir>
-//!     cargo run --release --target x86_64-unknown-linux-gnu --bin machineconv -- <dir> mod/link_machine
+//!     cargo run --release --target x86_64-unknown-linux-gnu --bin machineconv -- <dir> assets/link_machine
 //!
 //! Reads `<dir>/<variant>.obj` and `<dir>/<variant>.tga` for each garden's variant and writes
 //! `<out>/<variant>.lmc` (src/gba_link/machine_model.rs).

@@ -1,5 +1,5 @@
 //! The link machine (re/chao-garden-objects.md): one machine in each garden, near its
-//! transporter (Neutral plain, Hero white and gold, Dark spiky; models in `mod/link_machine/`,
+//! transporter (Neutral plain, Hero white and gold, Dark spiky; models in `assets/link_machine/`,
 //! `machine_model`). Walking up to it and pressing the action button opens the pick list: the
 //! GBA save's creatures, the ones the mod keeps and, without a save, the one-time gift (the
 //! rows of `Page`). The machine's screen shows the picture of the one highlighted, and the one
@@ -33,9 +33,9 @@ pub fn enabled() -> bool {
 
 /// Each garden's machine (Neutral, Hero, Dark), built by src/bin/machineconv.rs.
 const MODELS: [&[u8]; 3] = [
-    include_bytes!("../../mod/link_machine/neutral.lmc"),
-    include_bytes!("../../mod/link_machine/hero.lmc"),
-    include_bytes!("../../mod/link_machine/dark.lmc"),
+    include_bytes!("../../assets/link_machine/neutral.lmc"),
+    include_bytes!("../../assets/link_machine/hero.lmc"),
+    include_bytes!("../../assets/link_machine/dark.lmc"),
 ];
 
 /// Where each garden's machine stands (its floor) and the Y angle (BAMS) its front faces: 20
