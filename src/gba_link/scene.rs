@@ -357,12 +357,12 @@ mod game {
                 if record == 0 {
                     return;
                 }
-                let rec = std::slice::from_raw_parts_mut(record as *mut u8, crate::chao::CHAO_SIZE);
+                let rec = std::slice::from_raw_parts(record as *const u8, crate::chao::CHAO_SIZE);
                 let Some(identity) = crate::chao::ChaoData::from_bytes(rec).map(|c| c.identity())
                 else {
                     return;
                 };
-                absorbed(s.garden, s.key, identity, rec);
+                absorbed(s.garden, s.key, identity);
                 // Happiness +1 as for an animal; no alignment change.
                 std::arch::asm!(
                     "push esi",

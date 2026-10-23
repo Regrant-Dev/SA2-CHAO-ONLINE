@@ -175,6 +175,15 @@ pub fn stat_gauge(x: f32, y: f32, width: f32, height: f32, fraction: f32) {
     }
 }
 
+/// A gauge like `stat_gauge` with its fill in `color` (HP bars).
+pub fn bar(x: f32, y: f32, width: f32, height: f32, fraction: f32, color: u32) {
+    let rect = |right: f32| [x, y, right, y + height].map(|v| v.round() as i32);
+    rects::push(rect(x + width), 0xFF30_3A48);
+    if fraction.is_finite() && fraction > 0.0 {
+        rects::push(rect(x + width * fraction.min(1.0)), color);
+    }
+}
+
 /// The MULTIPLAYER label: (fill, border, text), lit up while the cursor is on it like the
 /// game's own buttons, dimmer otherwise.
 const LABEL_SELECTED: (u32, u32, u32) = (0xFFF0_C030, 0xFFFF_FFFF, 0xFF0A_1430);

@@ -7,18 +7,22 @@
 //!   a one-time gift of one of the ROM's first partners); Enter brings one into the garden we're
 //!   in (`store`: each once a day per garden, 4 waiting per garden at most).
 //! - In the garden each waiting partner is an animal object drawn as its picture (`scene`).
-//! - A Chao that absorbs one gains stat progress by its type ids (`effect`) and keeps it as its
-//!   partner: the type ids and moves, in `<mod>/gba/partners.txt` by the Chao's identity. The
+//! - A Chao that absorbs one keeps it as its partner, which teaches it the partner's moves (it
+//!   keeps four), type ids and ability, in `<mod>/gba/partners.txt` by the Chao's identity; its
+//!   stats and save don't change. `battle_profile` gives what a battle uses (`profile`). The
 //!   status balloon shows the partner's types (balloon.rs).
+//! - Other players' Chao: what theirs have from partners comes online (`Body::Partners`), and
+//!   exporting Chao files writes `partners.txt` next to them, which is read from `chao/import`.
 
 // Off the game (Linux builds) only the tests use the garden side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
 mod billboard;
-pub mod effect;
+pub mod profile;
 mod scene;
 pub mod store;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +31,9 @@ use crate::gba::rom::Rom;
 use crate::gba::save::{self, Mon, Place, Save};
 
 use crate::log;
-use store::{Partner, Store};
+use crate::net::protocol::SharedPartner;
+pub use profile::Profile;
+use store::{Learned, Partner, Store};
 
 /// The folder in the mod where the ROM and save are looked for when no path is set, and where
 /// `partners.txt` lives.
@@ -57,6 +63,9 @@ static LINK: Mutex<Link> = Mutex::new(Link {
     rom: None,
     store: None,
 });
+
+/// What other players' Chao have from their partners (`Body::Partners`), by Chao identity.
+static OTHERS: Mutex<BTreeMap<u64, Learned>> = Mutex::new(BTreeMap::new());
 
 fn with<R>(f: impl FnOnce(&mut Link) -> R) -> R {
     f(&mut LINK.lock().unwrap_or_else(|e| e.into_inner()))
@@ -174,7 +183,7 @@ pub enum Source {
 }
 
 /// One creature that can come to the garden, whatever its source: its key (one creature, for
-/// the once-a-day rule), species id, level and move ids.
+/// the once-a-day rule), species id, level, move ids and which of its species' abilities it has.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub source: Source,
@@ -182,6 +191,7 @@ pub struct Candidate {
     pub species: u16,
     pub level: u8,
     pub moves: [u16; 4],
+    pub ability_slot: u8,
 }
 
 impl Candidate {
@@ -199,6 +209,7 @@ impl Candidate {
             species: mon.species,
             level: level(rom, mon),
             moves: mon.moves,
+            ability_slot: mon.ability_slot,
         })
     }
 }
@@ -290,7 +301,7 @@ fn import_checked(mon: &Candidate) -> Result<String, String> {
         types: species.types,
         moves: mon.moves,
         level: mon.level.clamp(1, 100),
-        speed: species.base[3],
+        ability: ability_of(&species, mon.ability_slot),
     };
     with_store(|s| s.import(mon.key, garden, today(), partner))
         .map_err(|r| r.message().to_string())?;
@@ -304,37 +315,133 @@ fn import_checked(mon: &Candidate) -> Result<String, String> {
     Ok(ascii(&name))
 }
 
+/// The ability in `slot` of a species' two, or its first when it has no second.
+fn ability_of(species: &crate::gba::rom::Species, slot: u8) -> u8 {
+    match species.abilities[usize::from(slot.min(1))] {
+        0 => species.abilities[0],
+        a => a,
+    }
+}
+
 /// The partner types of the Chao with `identity`, by the ROM's type names, for the status
 /// balloon (`None` when it has none or the ROM isn't loaded).
 pub fn partner_types(identity: u64) -> Option<Vec<String>> {
-    let partner = with_store(|s| s.partners.get(&identity).copied())?;
+    let learned = with_store(|s| s.partners.get(&identity).copied())?;
     let rom = loaded_rom()?;
-    let names: Vec<String> = type_names(&rom, partner.types)
+    let names: Vec<String> = type_names(&rom, learned.partner.types)
         .iter()
         .map(|t| ascii(t))
         .collect();
     (!names.is_empty()).then_some(names)
 }
 
-/// A Chao (`identity`, its live record `rec`) absorbed the partner `key` waiting in `garden`:
-/// it gains its stats and keeps it as its partner.
-fn absorbed(garden: u8, key: u64, identity: u64, rec: &mut [u8]) {
-    let Some(partner) = with_store(|s| s.absorbed(garden, key, identity)) else {
+/// The battle profile of the Chao with `identity`: its partner's types and ability and the
+/// moves it was taught, or Normal type with basic moves without a partner. Ours come from
+/// `partners.txt`, other players' from what they sent, then from `chao/import/partners.txt`.
+/// Loads the ROM if needed.
+pub fn battle_profile(identity: u64) -> Result<Profile, String> {
+    let rom = rom()?;
+    let learned = with_store(|s| s.partners.get(&identity).copied())
+        .or_else(|| {
+            OTHERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&identity)
+                .copied()
+        })
+        .or_else(|| {
+            let path = Path::new(crate::online::mod_path()).join(IMPORTED_PARTNERS);
+            let text = std::fs::read_to_string(path).ok()?;
+            Store::parse(&text).partners.get(&identity).copied()
+        });
+    Ok(profile::profile(&rom, learned.as_ref()))
+}
+
+/// What friends' Chao files carry from partners, under the mod folder.
+const IMPORTED_PARTNERS: &str = "chao/import/partners.txt";
+
+/// What our Chao have from their partners, to send to the others.
+pub fn shared_partners() -> Vec<SharedPartner> {
+    with_store(|s| {
+        s.partners
+            .iter()
+            .map(|(&identity, l)| SharedPartner {
+                identity,
+                species: l.partner.species,
+                types: l.partner.types,
+                ability: l.partner.ability,
+                moves: l.moves,
+            })
+            .collect()
+    })
+}
+
+/// What another player's Chao have from their partners.
+pub fn others_learned(list: &[SharedPartner]) {
+    let mut others = OTHERS.lock().unwrap_or_else(|e| e.into_inner());
+    for p in list {
+        others.insert(
+            p.identity,
+            Learned {
+                partner: Partner {
+                    species: p.species,
+                    types: p.types,
+                    moves: p.moves,
+                    level: 0,
+                    ability: p.ability,
+                },
+                moves: p.moves,
+            },
+        );
+    }
+}
+
+/// Writes `partners.txt` into `dir` with what the Chao with these identities have from their
+/// partners, next to their exported Chao files (none: no file).
+pub fn export_partners(dir: &Path, identities: &[u64]) {
+    let partners: BTreeMap<u64, Learned> = with_store(|s| {
+        identities
+            .iter()
+            .filter_map(|id| s.partners.get(id).map(|l| (*id, *l)))
+            .collect()
+    });
+    let path = dir.join(STORE_FILE);
+    let result = if partners.is_empty() {
+        std::fs::remove_file(&path).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+    } else {
+        let text = Store {
+            partners,
+            ..Store::default()
+        }
+        .to_text();
+        std::fs::write(&path, text)
+    };
+    if let Err(e) = result {
+        log!("gba link: can't write {}: {e}", path.display());
+    }
+}
+
+/// A Chao (`identity`) absorbed the partner `key` waiting in `garden`: it keeps it as its
+/// partner, which teaches it its moves, types and ability (the Chao record isn't changed).
+fn absorbed(garden: u8, key: u64, identity: u64) {
+    let Some(learned) = with_store(|s| s.absorbed(garden, key, identity)) else {
         return;
     };
     write_store();
-    let gain = effect::gain(partner.types, partner.level, partner.speed);
-    let mut seed = (key as u32) ^ (today().wrapping_mul(0x9E37_79B9));
-    let applied = effect::apply(rec, &gain, || {
-        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        ((seed >> 16) & 3) as u8
-    });
+    crate::online::resend_partners();
     log!(
-        "gba link: a Chao absorbed species {} (gain {gain:?}, levels {:?})",
-        partner.species,
-        applied.levels
+        "gba link: a Chao absorbed species {} (types {:?}, ability {}, moves {:?})",
+        learned.partner.species,
+        learned.partner.types,
+        learned.partner.ability,
+        learned.moves
     );
-    crate::saving::changed();
 }
 
 /// Each frame: the garden's waiting partners (scene.rs).
@@ -415,6 +522,7 @@ impl Page {
                         species,
                         level,
                         moves,
+                        ability_slot: 0,
                     };
                     rows.push((label(&rom, &c), Action::Bring(c)));
                 }
@@ -432,6 +540,7 @@ impl Page {
                                 species,
                                 level: GIFT_LEVEL,
                                 moves: [0; 4],
+                                ability_slot: 0,
                             };
                             let text = label(&rom, &c).replacen("Kept", "Gift", 1);
                             rows.push((text, Action::Gift(species)));
@@ -476,11 +585,25 @@ pub fn take_gift(species: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ascii;
+    use super::{ability_of, ascii};
+    use crate::gba::rom::Species;
 
     #[test]
     fn ascii_keeps_letters_and_drops_the_rest() {
         assert_eq!(ascii("Abc-1 é♀"), "Abc-1 ef");
         assert_eq!(ascii("日本"), "");
+    }
+
+    #[test]
+    fn the_ability_follows_the_slot() {
+        let mut s = Species {
+            types: [0, 0],
+            base: [0; 6],
+            growth: 0,
+            abilities: [5, 9],
+        };
+        assert_eq!((ability_of(&s, 0), ability_of(&s, 1)), (5, 9));
+        s.abilities[1] = 0;
+        assert_eq!(ability_of(&s, 1), 5);
     }
 }

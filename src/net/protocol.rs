@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -62,6 +62,8 @@ pub const MAX_BROUGHT: usize = 3 * MAX_CARRIED_CHAO;
 pub const MAX_SAVE_SPANS: usize = 64;
 /// Chao one `ChaoLocked` names: every player's brought rows and every held id.
 pub const MAX_CHAO_LOCKED: usize = 2 * MAX_PLAYERS * MAX_CARRIED_CHAO;
+/// Chao one `Partners` carries.
+pub const MAX_PARTNERS: usize = 32;
 
 /// `GardenLand` parts: at most this many bytes each, this many parts.
 pub const LAND_PART: usize = 16 * 1024;
@@ -591,6 +593,24 @@ pub enum Body {
     ChaoLocked {
         chao: Vec<(u8, u8)>,
     },
+    /// What the sender's Chao have from their GBA link partners, for battles against copies of
+    /// them. Sent on connecting and when someone joins, in lists of up to `MAX_PARTNERS`.
+    Partners {
+        list: Vec<SharedPartner>,
+    },
+}
+
+/// What one Chao has from its GBA link partner (`Body::Partners`): ids from the ROM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedPartner {
+    /// The Chao's `ChaoData::identity`.
+    pub identity: u64,
+    /// The partner's species, types and ability (0: not recorded).
+    pub species: u16,
+    pub types: [u8; 2],
+    pub ability: u8,
+    /// The moves the Chao knows from its partners (0: an empty slot).
+    pub moves: [u16; 4],
 }
 
 /// One Chao a player brings (`Body::Brought`).
@@ -1059,6 +1079,7 @@ mod tag {
     pub const HELD_CHAO: u8 = 61;
     pub const SAVE_CHAO: u8 = 62;
     pub const CHAO_LOCKED: u8 = 63;
+    pub const PARTNERS: u8 = 64;
 }
 
 /// `GardenChao` lists as `GardenChao` and `ServerChao` carry them.
@@ -1898,6 +1919,19 @@ impl Body {
                 w.u8(tag::CHAO_LOCKED).u8(chao.len() as u8);
                 for (owner, index) in chao {
                     w.u8(*owner).u8(*index);
+                }
+            }
+            Self::Partners { list } => {
+                w.u8(tag::PARTNERS).u8(list.len() as u8);
+                for p in list {
+                    w.bytes(&p.identity.to_le_bytes())
+                        .u16(p.species)
+                        .u8(p.types[0])
+                        .u8(p.types[1])
+                        .u8(p.ability);
+                    for m in p.moves {
+                        w.u16(m);
+                    }
                 }
             }
             Self::UpgradeGot {
@@ -2806,6 +2840,37 @@ impl Body {
                     .collect::<Result<Vec<_>>>()?;
                 Self::ChaoLocked { chao }
             }
+            tag::PARTNERS => {
+                use crate::gba::rom::{ABILITY_COUNT, MOVE_COUNT, SPECIES_COUNT, TYPE_COUNT};
+                let count = usize::from(r.u8()?);
+                if count > MAX_PARTNERS {
+                    return Err(WireError::BadValue("partners"));
+                }
+                let list = (0..count)
+                    .map(|_| {
+                        let identity = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
+                        let species = r.u16()?;
+                        let types = [r.u8()?, r.u8()?];
+                        let ability = r.u8()?;
+                        let moves = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
+                        if species >= SPECIES_COUNT
+                            || types.iter().any(|&t| t >= TYPE_COUNT)
+                            || ability >= ABILITY_COUNT
+                            || moves.iter().any(|&m| m >= MOVE_COUNT)
+                        {
+                            return Err(WireError::BadValue("partners"));
+                        }
+                        Ok(SharedPartner {
+                            identity,
+                            species,
+                            types,
+                            ability,
+                            moves,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Self::Partners { list }
+            }
             _ => return Err(WireError::BadTag("body", t)),
         })
     }
@@ -3456,7 +3521,44 @@ mod tests {
                     chao: vec![(0, 3), (HELD_OWNER + 1, 0)],
                 },
             },
+            Message::Game {
+                from: 2,
+                body: Body::Partners {
+                    list: vec![SharedPartner {
+                        identity: 0x0123_4567_89AB_CDEF,
+                        species: 200,
+                        types: [10, 2],
+                        ability: 66,
+                        moves: [33, 45, 0, 0],
+                    }],
+                },
+            },
         ]
+    }
+
+    #[test]
+    fn partners_stay_in_the_roms_ranges() {
+        let one = |ability: u8, count: usize| {
+            Message::Game {
+                from: 1,
+                body: Body::Partners {
+                    list: vec![
+                        SharedPartner {
+                            identity: 1,
+                            species: 1,
+                            types: [0, 0],
+                            ability,
+                            moves: [1, 0, 0, 0],
+                        };
+                        count
+                    ],
+                },
+            }
+            .encode()
+        };
+        assert!(Message::decode(&one(77, MAX_PARTNERS)).is_ok());
+        assert!(Message::decode(&one(78, 1)).is_err());
+        assert!(Message::decode(&one(1, MAX_PARTNERS + 1)).is_err());
     }
 
     #[test]

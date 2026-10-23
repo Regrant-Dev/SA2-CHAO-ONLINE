@@ -1,12 +1,19 @@
 //! Gen 3 GBA western character set.
 
-/// Decodes a Gen 3 western string to UTF-8. Stops at the 0xFF terminator; unmapped bytes become '?'.
+/// Decodes a Gen 3 western string to UTF-8. Stops at the 0xFF terminator; line and paragraph
+/// breaks become '\n'; unmapped bytes become '?'.
 pub fn decode(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take_while(|&&b| b != 0xFF)
-        .map(|&b| char_of(b).unwrap_or('?'))
-        .collect()
+    let mut out = String::new();
+    for &b in bytes.iter().take_while(|&&b| b != 0xFF) {
+        match b {
+            // The game's short word for its creatures, two glyphs: read as "creature".
+            0x53 => out.push_str("creature"),
+            0x54 => {}
+            0xFA | 0xFB | 0xFE => out.push('\n'),
+            _ => out.push(char_of(b).unwrap_or('?')),
+        }
+    }
+    out
 }
 
 /// Character for one byte, or `None` for control codes and unmapped glyphs.
@@ -71,5 +78,11 @@ mod tests {
         assert_eq!(decode(&[0x01, 0x1B, 0xF6, 0xB4]), "Àéü’");
         assert_eq!(decode(&[0x0A, 0x40, 0xFC]), "???");
         assert_eq!(decode(&[]), "");
+    }
+
+    #[test]
+    fn breaks_and_short_word() {
+        assert_eq!(decode(&[0xBB, 0xFE, 0xBC, 0xFB, 0xBD]), "A\nB\nC");
+        assert_eq!(decode(&[0x53, 0x54, 0x00, 0xBB]), "creature A");
     }
 }

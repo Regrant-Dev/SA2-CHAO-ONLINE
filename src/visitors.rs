@@ -1,6 +1,7 @@
 //! Visiting Chao and Chao files.
 //!
-//! - Export (F9): writes every non-empty garden slot to `chao\export\slotNN.sa2chao`.
+//! - Export (F9): writes every non-empty garden slot to `chao\export\slotNN.sa2chao`, and
+//!   what they have from GBA link partners to `chao\export\partners.txt` (gba_link).
 //!   Read-only; never writes game memory.
 //! - Bring visitors from files (F9, in a garden): spawns every `chao\import\*.sa2chao` as a
 //!   visitor. Visitors live in our own buffers, outside the save's Chao slots, so the game's
@@ -199,6 +200,7 @@ fn export_all(mod_path: &str) {
         return;
     }
     let mut count = 0;
+    let mut identities = Vec::new();
     for slot in 0..game::GARDEN_SLOTS {
         let Some(chao) = game::read_chao_slot(slot) else {
             continue;
@@ -208,10 +210,15 @@ fn export_all(mod_path: &str) {
         }
         let path = dir.join(format!("slot{slot:02}.sa2chao"));
         match fs::write(&path, file::encode(&chao)) {
-            Ok(()) => count += 1,
+            Ok(()) => {
+                count += 1;
+                identities.push(chao.identity());
+            }
             Err(e) => log!("export: slot {slot:02} write failed: {e}"),
         }
     }
+    // What they have from GBA link partners, for battles against copies of them.
+    crate::gba_link::export_partners(&dir, &identities);
     log!("export: {count} Chao written to {}", dir.display());
 }
 

@@ -24,7 +24,7 @@ use crate::log;
 use crate::net::files::SkinStore;
 use crate::net::protocol::{
     Body, BroughtChao, CHAO_SLOTS, ChaoLock, GardenChao, HELD_OWNER, MAX_CARRIED_CHAO,
-    MY_CHAO_INDEX, PlayerKey, PlayerState, STATUS_GROUNDED, STATUS_HOLDING,
+    MAX_PARTNERS, MY_CHAO_INDEX, PlayerKey, PlayerState, STATUS_GROUNDED, STATUS_HOLDING,
 };
 use crate::net::session::{Client, Event, Host, Identity, Session};
 use crate::net::udp::Endpoint;
@@ -599,6 +599,7 @@ fn pump(online: &mut Online, now: Instant) {
                 online.resend_chao = true;
                 online.brought = None;
                 RESEND_MY_CHAO.store(true, Ordering::Relaxed);
+                RESEND_PARTNERS.store(true, Ordering::Relaxed);
             }
             Event::Disconnected { reason } => {
                 log!("online: disconnected: {reason}");
@@ -635,6 +636,7 @@ fn pump(online: &mut Online, now: Instant) {
                 );
                 online.resend_chao = true;
                 RESEND_MY_CHAO.store(true, Ordering::Relaxed);
+                RESEND_PARTNERS.store(true, Ordering::Relaxed);
             }
             Event::Left { id } => {
                 let name = online
@@ -849,6 +851,10 @@ fn pump(online: &mut Online, now: Instant) {
                 body: Body::Brought { .. },
                 ..
             } => {}
+            Event::Game {
+                body: Body::Partners { list },
+                ..
+            } => crate::gba_link::others_learned(&list),
             // The Chao locked against us (only the host says so).
             Event::Game {
                 from,
@@ -1528,6 +1534,15 @@ pub fn on_frame() {
             online.session.send(body, true, now);
         }
     }
+    // What our Chao have from GBA link partners, for friends' battles against copies of them.
+    if online.session.my_id().is_some() && RESEND_PARTNERS.swap(false, Ordering::Relaxed) {
+        for list in crate::gba_link::shared_partners().chunks(MAX_PARTNERS) {
+            let body = Body::Partners {
+                list: list.to_vec(),
+            };
+            online.session.send(body, true, now);
+        }
+    }
     // At a Chao Race: friends' games show the Chao we picked for it in our lane, not My Chao.
     if online.session.my_id().is_some() {
         let racing = game::race_chao();
@@ -2163,6 +2178,12 @@ pub fn parse_visitor(text: &str) -> i32 {
 
 static MY_CHAO_SLOT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static RESEND_MY_CHAO: AtomicBool = AtomicBool::new(true);
+static RESEND_PARTNERS: AtomicBool = AtomicBool::new(true);
+
+/// A Chao learned from a GBA link partner: tell the others again (`Body::Partners`).
+pub fn resend_partners() {
+    RESEND_PARTNERS.store(true, Ordering::Relaxed);
+}
 
 /// F9 karate opponent choices while in a room at Karate: (`None` = first free, or a player
 /// id, label).

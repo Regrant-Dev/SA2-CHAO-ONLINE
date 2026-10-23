@@ -240,15 +240,88 @@ and pictures are read from your ROM, and the save is only read, never changed.
   brought to a garden like the save's.
 - Each one can come to each garden once a day, and a garden holds 4 waiting partners at most.
   Waiting partners are still there the next time the garden loads.
-- A Chao that absorbs one gains abilities by its types: each type trains swimming, flying,
-  running, power or stamina, and fast ones also train running. Higher levels give more, never a
-  whole level at once. A little luck and intelligence come with every one.
-- The Chao keeps it as its partner (its types and moves); a later one replaces it, and the
-  ability gains add up. The status balloon's last row shows the partner's types. Partners are
-  kept in `gba/partners.txt`; the Chao save itself is unchanged apart from the abilities.
+- A Chao that absorbs one keeps it as its partner, and the partner teaches it its moves, its
+  types and its special ability for Chao battles. The Chao's own stats don't change.
+- A Chao knows four moves at most: the new partner's moves come first and fill up with the ones
+  it knew before. A later partner replaces the types and ability. A Chao without a partner is
+  Normal type with a few basic moves.
+- The status balloon's last row shows the partner's types. Partners and moves are kept in
+  `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an animal gives.
 
 **Chao files:** your Chao are saved as files in `chao/export`. Put a friend's `.sa2chao` files in
 `chao/import` and they visit your garden, even when you're not online together.
+
+## Chao battles
+
+Chao battle each other in turns, team against team, with the moves, types and ability their
+GBA link partner taught them (Chao > GBA link). Battles need the Battle DLC (they use the
+karate arena) and your own ROM of the GBA game, set up as for the GBA link: every move, type
+and ability name and number is read from it. A GBA save isn't needed.
+
+**Starting one:** go to Chao Karate in the Chao Stadium. On the karate menu, press Down on the
+last button to reach **BATTLE** and press A. Then pick:
+
+1. **Singles** (one Chao a side at a time) or **Doubles** (two a side).
+2. **Your team:** up to 6 of the Chao in your save. A picks or drops the Chao under the cursor;
+   they go out in the order you picked them. The line below the list shows the Chao's types,
+   ability, moves and battle stats. Choose **Done** at the bottom of the list (Up from the top
+   gets there).
+3. **Who to battle:** a team of each online friend's Chao (their My Chao and the Chao they
+   bring), the `.sa2chao` files in `chao/import` (six to a team), or copies of your other Chao
+   (copies of your own team when you have no others).
+
+**Controls:** the game's menu buttons, on a controller or the keyboard: Up/Down moves the
+cursor, A chooses, B goes back. Start pauses the game as usual, and the battle waits.
+
+**A turn:** choose for each of your Chao in the ring:
+
+- **Fight:** pick one of its 4 moves. Each shows its type and PP; below the list is whether
+  the move is physical, special or status, its power and accuracy, who it hits and what it
+  does. Moves that can't be used now (no PP left, or blocked) are greyed out. In doubles, a
+  move aimed at one Chao then asks for its target: either foe, or your other Chao. Moves that
+  hit both foes or everyone don't ask. A move that passes the Chao's stat changes on to a
+  teammate asks who gets them.
+- **Switch:** send in another Chao from your team. The list shows each one's HP and status.
+- **Give up:** ends the battle as a loss, after asking.
+
+In doubles, B on the second Chao's menu goes back to the first one's. The foes choose at the
+same time; the computer runs them, mostly picking moves that hit hard, with some randomness.
+
+The turn then plays out in the ring, with messages at the bottom ("... uses ...!", strong and
+weak hits, critical hits, misses, status, stat changes, weather, fainting); A moves on to the
+next one. A box at the top for each Chao in the ring shows its name, HP bar and status (SLP,
+PSN, BRN, FRZ, PAR); yours also show their HP. When one of your Chao faints you pick who
+replaces it. A team with no Chao left loses; the result screen shows who's still standing,
+and A goes back to the karate menu. A battle that reaches 200 turns is a draw.
+
+**Rules:** the GBA game's battle rules: its type chart, accuracy and evasion, critical hits,
+the same-type bonus, priority, PP, status conditions, stat stages, weather, move effects and
+abilities. Chao hold no items. Every Chao battles at level 50, with stats from its own:
+
+| Chao stat | Battle stat |
+|---|---|
+| Stamina | HP |
+| Power | Attack |
+| Swim | Defense |
+| Run | Speed |
+| Fly | Sp. Defense, and a slight evasion edge (up to 5% off foes' accuracy) |
+| Intelligence | Sp. Attack |
+| Luck | Critical-hit chance |
+
+A stat counts for more the more points it has, up to 3000 points (fully raised); a better
+grade adds a little. A new Chao is weak but can battle, and a well-raised one is strong.
+Intelligence and luck count as at least half the Chao's average of the other five stats.
+Happiness powers the moves that depend on the bond with the owner.
+
+**Moves, types and ability** come from the Chao's partner: absorbing one teaches its moves,
+types and ability, and a Chao keeps 4 moves (Chao > GBA link). A Chao without a partner is
+Normal type with a few basic moves and no ability. A friend's Chao battles with what it
+learned from its partners in their game, sent while you're online together. Exporting Chao
+files also writes `partners.txt` next to them: put it in `chao/import` with their `.sa2chao`
+files (add its lines to the one there when you have Chao from more than one friend).
+
+Battles play in your game only, and never change your save: every Chao in them is a copy,
+win or lose.
 
 ## Problems
 

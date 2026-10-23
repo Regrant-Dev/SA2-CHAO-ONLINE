@@ -127,6 +127,8 @@ pub struct Mon {
     /// Level stored with party records; `None` in boxes.
     pub party_level: Option<u8>,
     pub is_egg: bool,
+    /// Which of its species' two abilities it has (0 or 1).
+    pub ability_slot: u8,
 }
 
 impl Mon {
@@ -218,6 +220,7 @@ fn decode_record(raw: &[u8], place: Place) -> Record {
         evs: ev,
         party_level: None,
         is_egg: iv_word >> 30 & 1 != 0 || flags & 0b100 != 0,
+        ability_slot: (iv_word >> 31) as u8,
     }))
 }
 
@@ -357,6 +360,7 @@ mod tests {
         if m.is_egg {
             iv |= 1 << 30;
         }
+        iv |= u32::from(m.ability_slot) << 31;
         subs[3][4..8].copy_from_slice(&iv.to_le_bytes());
         let pos = substruct_positions(m.personality);
         let mut sec = [0u8; SECURE_LEN];
@@ -382,6 +386,7 @@ mod tests {
             evs: [252, 0, 6, 1, 2, 3],
             party_level: None,
             is_egg: false,
+            ability_slot: 0,
         }
     }
 
@@ -482,7 +487,9 @@ mod tests {
         for n in 0..24u32 {
             let personality = 0xFEDC_BA98u32 / 24 * 24 - 24 + n;
             assert_eq!(personality % 24, n);
-            let m = mon(personality, 0xBEEF_0042, 100 + n as u16);
+            let mut m = mon(personality, 0xBEEF_0042, 100 + n as u16);
+            // The ability bit sits above the egg bit.
+            m.ability_slot = (n % 2) as u8;
             let place = Place::Box { index: 2, slot: 5 };
             let Record::Mon(got) = decode_record(&encode(&m), place) else {
                 panic!("order {n}")

@@ -6,3 +6,4 @@ mod lz77;
 pub mod rom;
 pub mod save;
 pub mod text;
+pub mod world;

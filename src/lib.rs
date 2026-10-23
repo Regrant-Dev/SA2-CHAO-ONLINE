@@ -2,6 +2,7 @@
 
 mod audio;
 mod balloon;
+pub mod battle;
 mod battles;
 mod boot_art;
 mod boss_follow;
@@ -199,6 +200,8 @@ pub extern "C" fn OnFrame() {
         garden::on_frame();
         watch::mark("gba_link::on_frame");
         gba_link::on_frame();
+        watch::mark("battle::game::on_frame");
+        battle::game::on_frame();
         watch::mark("bring::on_frame");
         bring::on_frame();
         watch::mark("skins::on_frame");
