@@ -165,6 +165,9 @@ pub struct Settings {
     pub battle_trainers: bool,
     /// Live battles against friends online (`battle::online`).
     pub battle_online: bool,
+    /// The Black Market restocks every 10 minutes of play (`market_refresh`); off, on the
+    /// game's own 3 to 7 minutes.
+    pub market_refresh: bool,
 }
 
 impl Settings {
@@ -192,6 +195,7 @@ impl Settings {
             link_machine: true,
             battle_trainers: true,
             battle_online: true,
+            market_refresh: false,
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -258,6 +262,10 @@ impl Settings {
                         "off" | "0" | "false" | "no"
                     )
                 }
+                "blackmarketrefresh" => {
+                    s.market_refresh =
+                        matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes")
+                }
                 "gamevolume" => s.game_volume = v.parse::<u32>().map_or(100, |p| p.min(100)),
                 "skinvoicevolume" => {
                     s.voice_volume = v.parse::<u32>().map_or(100, |p| p.min(voice::MAX_VOLUME))
@@ -290,7 +298,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\nWildVisitors={}\nBattleEffects={}\nLinkMachine={}\nBattleTrainers={}\nBattleOnline={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\nWildVisitors={}\nBattleEffects={}\nLinkMachine={}\nBattleTrainers={}\nBattleOnline={}\n\n[ChaoWorld]\nBlackMarketRefresh={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -320,6 +328,7 @@ impl Settings {
             if self.link_machine { "On" } else { "Off" },
             if self.battle_trainers { "On" } else { "Off" },
             if self.battle_online { "On" } else { "Off" },
+            if self.market_refresh { "On" } else { "Off" },
         )
     }
 }
@@ -337,6 +346,7 @@ pub fn load(mod_path: &str) -> Settings {
     crate::gba_link::set_link_machine(settings.link_machine);
     crate::battle::trainers::set_enabled(settings.battle_trainers);
     crate::battle::online::set_enabled(settings.battle_online);
+    crate::market_refresh::set_enabled(settings.market_refresh);
     settings
 }
 
@@ -348,6 +358,10 @@ struct Menu {
     /// Which player the Go to row shows.
     goto_choice: usize,
     details: Option<ChaoView>,
+    /// Chao details has the player's controls off and reads the pad (`details_buttons`).
+    pad_taken: bool,
+    /// This frame's menu buttons for Chao details.
+    pad: u32,
     /// The GBA link page, while it's open.
     gba: Option<crate::gba_link::Page>,
     settings: Settings,
@@ -383,6 +397,8 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
     room_choice: 0,
     goto_choice: 0,
     details: None,
+    pad_taken: false,
+    pad: 0,
     gba: None,
     settings: Settings {
         mode: 0,
@@ -409,6 +425,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
         link_machine: true,
         battle_trainers: true,
         battle_online: true,
+        market_refresh: false,
     },
     message: String::new(),
     keys: Vec::new(),
@@ -471,6 +488,7 @@ const TYPING_KEYS: [i32; 6] = [
 /// Call every frame: handles keys and draws the menu while it's open.
 pub fn on_frame() {
     let mut m = MENU.lock().unwrap_or_else(|e| e.into_inner());
+    m.pad = details_buttons(&mut m);
     if !m.open {
         return;
     }
@@ -733,149 +751,208 @@ pub fn on_frame() {
     draw(&m, &rows);
 }
 
+/// Chao details: Left/Right turn the page, Up/Down scroll, PgUp/PgDn show another of our Chao,
+/// Esc/Backspace go back; on a controller the D-pad or stick, L/R and B.
 fn details_frame(m: &mut Menu) {
     let Some(mut view) = m.details.take() else {
         return;
     };
-    if m.pressed(VK_ESCAPE) || m.pressed(VK_BACK) {
+    let pad = m.pad;
+    // The game's own keys also press the pad: a direction counts once while its arrow is down.
+    let pad_hit = |bit: u32, key: i32| pad & bit != 0 && !input::key_down(key);
+    let escape = m.pressed(VK_ESCAPE);
+    let backspace = m.pressed(VK_BACK);
+    if escape || backspace || pad & PAD_B != 0 {
         return;
     }
     let choices = online::garden_chao();
     let slots: Vec<usize> = choices.iter().map(|(slot, _)| *slot).collect();
     view.retain_slot(&slots);
-    if m.pressed(VK_UP) {
-        view.row = (view.row + 2) % 3;
+    let held = |m: &mut Menu, key: i32| m.pressed(key) || m.repeating(key);
+    let left = held(m, VK_LEFT) || pad_hit(PAD_LEFT, VK_LEFT);
+    let right = held(m, VK_RIGHT) || pad_hit(PAD_RIGHT, VK_RIGHT);
+    let up = held(m, VK_UP) || pad_hit(PAD_UP, VK_UP);
+    let down = held(m, VK_DOWN) || pad_hit(PAD_DOWN, VK_DOWN);
+    let previous = m.pressed(VK_PRIOR) || pad & PAD_L != 0;
+    let next = m.pressed(VK_NEXT) || pad & PAD_R != 0;
+    if left != right {
+        view.turn_page(left);
     }
-    if m.pressed(VK_DOWN) {
-        view.row = (view.row + 1) % 3;
-    }
-    let (left, right) = (m.pressed(VK_LEFT), m.pressed(VK_RIGHT));
-    if left || right {
-        match view.row {
-            0 => view.select(&slots, left),
-            1 => {
-                view.page = view.page.next(left);
-                view.scroll = 0;
-            }
-            _ => {}
-        }
-    }
-    if m.pressed(VK_RETURN) {
-        match view.row {
-            0 => view.row = 1,
-            1 => {
-                view.page = view.page.next(false);
-                view.scroll = 0;
-            }
-            _ => return,
-        }
-    }
-    let (w, h) = hud::screen_size();
-    let (_, visible) = chao_details::layout(w, h);
-    let up = m.pressed(VK_PRIOR) || m.repeating(VK_PRIOR);
-    let down = m.pressed(VK_NEXT) || m.repeating(VK_NEXT);
     if up {
-        view.scroll = view.scroll.saturating_sub(visible);
+        view.scroll = view.scroll.saturating_sub(1);
     }
     if down {
-        view.scroll = view.scroll.saturating_add(visible);
+        // Kept in range when drawn.
+        view.scroll = view.scroll.saturating_add(1);
     }
+    if previous != next {
+        view.select(&slots, previous);
+    }
+    view.pad = m.pad_taken;
     draw_details(&mut view, &choices);
     m.details = Some(view);
 }
 
+/// Menu buttons (`game::menu_buttons_pressed`): B, up, down, left, right, L, R.
+const PAD_B: u32 = 0x02;
+const PAD_UP: u32 = 0x10;
+const PAD_DOWN: u32 = 0x20;
+const PAD_LEFT: u32 = 0x40;
+const PAD_RIGHT: u32 = 0x80;
+const PAD_L: u32 = 0x1_0000;
+const PAD_R: u32 = 0x2_0000;
+/// The pause screen's game state: its menu reads the same buttons.
+const PAUSED: i16 = 17;
+
+/// Player 1's menu buttons for Chao details, with the player's controls off while it's open so
+/// the same presses don't also move them. Taken only in play (a player with their controls, in
+/// a stage or garden, not under one of the game's own screens or menus, which read the same
+/// buttons) while the game isn't paused and has focus. Let go as soon as play ends (the game's
+/// own screens then own the controls), and given back once the details close, unless the game
+/// has meanwhile ended the stage. Ignored while unfocused: the pad still reads in the
+/// background, and `game::run_unfocused` holds the controls then.
+fn details_buttons(m: &mut Menu) -> u32 {
+    use crate::game::{GAME_STATE_INGAME, game_state, local_entity, set_controls};
+    let open = m.open && m.details.is_some();
+    let state = game_state();
+    let paused = state == PAUSED;
+    let player = !local_entity().is_null();
+    let focused = input::game_focused();
+    if m.pad_taken && !(player && (state == GAME_STATE_INGAME || paused)) {
+        m.pad_taken = false;
+        return 0;
+    }
+    if !open {
+        // While unfocused the release waits for focus, so `run_unfocused` has given the
+        // controls back first.
+        if m.pad_taken && focused {
+            m.pad_taken = false;
+            let held = together::is_holding()
+                || crate::race::is_holding()
+                || crate::karate_live::is_holding();
+            if (state == GAME_STATE_INGAME || paused) && !crate::game::stage_cleared() && !held {
+                set_controls(true);
+            }
+        }
+        return 0;
+    }
+    if !m.pad_taken && state == GAME_STATE_INGAME && player && focused {
+        // SAFETY: a static byte the game itself toggles (`game::set_controls`).
+        let controls =
+            unsafe { (crate::game::CONTROLLER_ENABLED as *const u8).read_volatile() } != 0;
+        m.pad_taken = controls;
+    }
+    if !m.pad_taken {
+        return 0;
+    }
+    set_controls(false);
+    if paused || !focused {
+        0
+    } else {
+        crate::game::menu_buttons_pressed()
+    }
+}
+
+/// The highlight behind the current page's tab.
+const TAB_HIGHLIGHT: u32 = 0xFF2C_3C5C;
+
 fn draw_details(view: &mut ChaoView, choices: &[(usize, crate::chao::ChaoData)]) {
     let (w, h) = hud::screen_size();
     let (size, visible) = chao_details::layout(w, h);
-    let chosen = choices.iter().find(|(slot, _)| Some(*slot) == view.slot);
+    let index = choices
+        .iter()
+        .position(|(slot, _)| Some(*slot) == view.slot);
+    let chosen = index.map(|i| &choices[i]);
+    if let Some((_, c)) = chosen {
+        let id = c.identity();
+        if view.battle.as_ref().is_none_or(|(known, _)| *known != id) {
+            view.battle = Some((id, battle_details(c)));
+        }
+    }
     let label = chosen.map_or_else(
         || "No Chao in your save".into(),
         |(slot, c)| chao_label(*slot, c),
     );
-    let mut rows = vec![("== Chao details ==".to_owned(), COLOR_TITLE, None)];
-    for (i, text) in [
-        format!("Your Chao: < {label} >"),
-        format!(
-            "Page: < {} > ({}/{})",
-            view.page.title(),
-            view.page.index() + 1,
-            chao_details::Page::ALL.len()
-        ),
-        "[ Back to F9 menu ]".into(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows.push((
-            format!("{} {text}", if i == view.row { ">" } else { " " }),
-            if i == view.row {
-                COLOR_SELECTED
-            } else {
-                COLOR_TEXT
-            },
-            None,
-        ));
-    }
-    rows.push((String::new(), COLOR_TEXT, None));
-    let content = chosen.map_or_else(
-        || {
-            vec![chao_details::Line {
-                text: "Enter Chao World or load a Chao save first.".into(),
-                gauge: None,
-            }]
-        },
-        |(_, c)| chao_details::lines(c, view.page),
+    let screen = chao_details::screen(
+        chosen.map(|(_, c)| c),
+        &label,
+        index,
+        choices.len(),
+        view,
+        visible,
     );
-    view.scroll = view.scroll.min(content.len().saturating_sub(visible));
-    for line in content.iter().skip(view.scroll).take(visible) {
-        rows.push((line.text.clone(), COLOR_TEXT, line.gauge));
-    }
-    if content.len() > visible {
-        rows.push((
-            format!(
-                "Showing {}-{} of {}",
-                view.scroll + 1,
-                (view.scroll + visible).min(content.len()),
-                content.len()
-            ),
-            COLOR_HINT,
-            None,
-        ));
-    }
-    rows.extend([
-        (
-            "View only. Exact values; gauges show their normal ranges.".into(),
-            COLOR_HINT,
-            None,
-        ),
-        (
-            "Up/Down select, Left/Right change, Enter next page/back.".into(),
-            COLOR_HINT,
-            None,
-        ),
-        (
-            "PgUp/PgDn scroll. Esc/Backspace back. F9 closes.".into(),
-            COLOR_HINT,
-            None,
-        ),
-    ]);
-    let x = ((w - 64.0 * size) / 2.0).max(0.0);
+    // Everything on whole cells of the font size, so the panel, the text and the bars line up.
+    let x = ((w / size / 2.0).floor() - (chao_details::PANEL_COLUMNS / 2) as f32).max(0.0) * size;
     let y = size;
-    hud::panel(x, y, size, 64, rows.len() + 2);
-    for (i, (text, color, gauge)) in rows.iter().enumerate() {
-        let line_y = y + (i + 1) as f32 * size;
-        let max = if gauge.is_some() { 49 } else { 62 };
-        let clipped: String = text.chars().take(max).collect();
-        hud::text(x + size, line_y, size, *color, &clipped);
-        if let Some(fraction) = gauge {
-            hud::stat_gauge(
-                x + 52.0 * size,
-                line_y + size * 0.25,
-                10.0 * size,
-                size * 0.5,
-                *fraction,
+    let cell = |col: usize| x + (col + 1) as f32 * size;
+    let row_y = |row: usize| y + (row + 1) as f32 * size;
+    hud::panel(
+        x,
+        y,
+        size,
+        chao_details::PANEL_COLUMNS,
+        screen.rows.len() + 2,
+    );
+    let (row, col, width) = screen.tab;
+    hud::rect(
+        cell(col) - size * 0.4,
+        row_y(row) - size * 0.1,
+        cell(col + width) + size * 0.4,
+        row_y(row) + size * 1.1,
+        TAB_HIGHLIGHT,
+    );
+    for (i, line) in screen.rows.iter().enumerate() {
+        let line_y = row_y(i);
+        for bar in &line.bars {
+            for ([x1, y1, x2, y2], color) in
+                chao_details::bar_rects(bar, cell(bar.col), line_y, size)
+            {
+                hud::rect(x1, y1, x2, y2, color);
+            }
+        }
+        for span in &line.spans {
+            hud::text(
+                cell(span.col),
+                line_y,
+                size,
+                span.tone.colour() as i32,
+                &span.text,
             );
         }
+    }
+}
+
+/// What the mod keeps of our Chao's battles (`gba_link`), named from the player's ROM.
+fn battle_details(c: &crate::chao::ChaoData) -> chao_details::Battle {
+    let id = c.identity();
+    let (level, xp_known) = crate::gba_link::battle_level(id, true);
+    let rom = crate::gba_link::rom().ok();
+    let partner = if !crate::gba_link::has_partner(id) {
+        chao_details::Partner::None
+    } else {
+        match &rom {
+            None => chao_details::Partner::NoRom,
+            Some(_) => crate::gba_link::partner_types(id)
+                .map_or(chao_details::Partner::NoRom, chao_details::Partner::Types),
+        }
+    };
+    let moves = crate::gba_link::moves_of(id);
+    let name = |m: u16| {
+        rom.as_ref()
+            .and_then(|r| r.move_name(m))
+            .map_or_else(|| format!("Move #{m}"), |n| crate::gba_link::ascii(&n))
+    };
+    chao_details::Battle {
+        level: level.level,
+        xp: xp_known.then(|| (level.xp, crate::battle::levels::step(level.level))),
+        partner,
+        moves: moves
+            .active
+            .iter()
+            .filter(|&&m| m != 0)
+            .map(|&m| name(m))
+            .collect(),
+        known: moves.known.len(),
     }
 }
 
@@ -1240,6 +1317,7 @@ mod tests {
             link_machine: false,
             battle_trainers: false,
             battle_online: false,
+            market_refresh: false,
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.

@@ -372,6 +372,15 @@ fn ability_of(species: &crate::gba::rom::Species, slot: u8) -> u8 {
     }
 }
 
+/// The Chao with `identity` has absorbed a partner (known without the ROM).
+pub fn has_partner(identity: u64) -> bool {
+    with_store(|s| {
+        s.partners
+            .get(&identity)
+            .is_some_and(|l| l.partner.species != 0)
+    })
+}
+
 /// The partner types of the Chao with `identity`, by the ROM's type names, for the status
 /// balloon (`None` when it has none or the ROM isn't loaded).
 pub fn partner_types(identity: u64) -> Option<Vec<String>> {

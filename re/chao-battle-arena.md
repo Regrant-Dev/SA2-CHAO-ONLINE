@@ -314,7 +314,7 @@ hud.rs draws through the Mod Loader's debug text and a rectangle queue:
 - Helpers:
   - `text(x, y, size, colour, line)`;
   - `panel(x, y, size, cols, rows)` (dark panel with border);
-  - `stat_gauge(x, y, w, h, fraction)` (fixed colours: track 0xFF303A48, fill 0xFF70C8B0);
+  - `bar(x, y, w, h, fraction, colour)` (track 0xFF303A48) and `rect(x1, y1, x2, y2, colour)`;
   - `menu_label(cx, cy, w, h, text, selected)` (gold/dark button in 640x480 space);
   - `virtual_screen`, `from_virtual` (640x480 → back buffer);
   - `menu_font`, `center`, `center2`, `banner`, `corner`, `progress`, `toast`, `note`.

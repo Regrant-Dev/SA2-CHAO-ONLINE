@@ -11,9 +11,15 @@ save's records. Inspection makes no AI or mutation calls.
 Field names for personality axes, emotions, symptoms and appearance follow
 [Justin113D/SA2ChaoStatMenu](https://github.com/Justin113D/SA2ChaoStatMenu)'s `ChaoData.h`
 (naming only; the mod's formatting, navigation and HUD drawing are its own, with no
-third-party assets). A name does not prove that a hidden trait affects vanilla gameplay, so
-the view shows exact signed/unsigned values without invented personality categories or
-health diagnoses, and a raw page shows the uninterpreted data.
+third-party assets). A name does not prove that a hidden trait affects vanilla gameplay.
+
+The view opens on a summary page (abilities, alignment and leanings, evolution or time left,
+happiness, battle level and partner), followed by detail pages and a raw page with the
+uninterpreted data. Detail pages show exact values next to their readings: personality words
+bucket the game's −80/−40/0/40/80 trait values, an illness shows as present while its counter
+is non-zero, and time left counts age ticks by the rules in re/chao-ai.md ("Age tick") and
+converts them to garden time. A child's predicted form runs the evolution rules on a copy of
+its record.
 
 ## Native life/emotion tick
 
@@ -182,24 +188,43 @@ UVs are normalized so this does not matter.
 
 ### Extra rows (src/balloon.rs)
 
-The mod adds N = 4 rows (happiness, alignment, needs, mood) under the game's five:
+The mod shows 11 rows: the game's five, Luck and Intelligence drawn like them, and N = 4 of its
+own (happiness/alignment, evolution or form/time left, hunger/mood, partner types/battle level),
+plus a grade letter on each ability row:
 
 1. Display: the imm32 at 0x565A83 points to the mod's cdecl fn, so new balloons call it. It
-   draws the frame, calls 0x565200, then draws the extra rows.
-2. Frame: the imm8s at 0x564CBD and 0x564CC7 are 5 + N, so `+0xC` grows to 5 + N and shrinks
+   draws the frame, calls 0x565200, then draws the rest.
+2. Frame: the imm8s at 0x564CBD and 0x564CC7 are 11, so `+0xC` grows to 11 and shrinks
    back from it. The game's frame is skipped by a 5-byte `JMP 0x5653C4` (`E9 56 01 00 00`) at
    **0x565269** (over `AND EAX,0x80000001`; ESP is back at the frame base there, EBX = data,
    EBP = 0, X/Y locals already set). The mod draws the frame with the four frame sprites above
-   and n = `+0xC`, with its top at Y − 100 so the vanilla rows (Y − 96 + 40i) and name
-   (Y − 124) line up: middle k at top + 40k, bottom at top + 40n. `*0x1AED260 = 0` and colour
-   (0.4,1,1,1) are set first.
-3. To keep it on screen, `+0x14` = 216 − 20N (only the display reads it). N ≤ 4 fits with
-   40-px rows (the cap then starts at y ≈ 4 and the bottom ends at ≈ 408).
-4. Extra row k (y = Y − 96 + 40·(5+k), x0 = X − 72) is drawn only when rec ≠ 0 and
-   alpha `+0x20` > 0.01: label and value text with 0x536BE0, bars with 0x536E80. Each 40-px
-   row has two lines (y and y+20), like the vanilla rows. Sources: happiness `rec+0x82`
-   (s8, −100..100), alignment `rec+0xB0` (f32 ±1), emotions `+0x12C..0x133` (u8 0..200),
-   needs `+0x134..0x148` (u16 0..10000), personality `+0x14A..0x156` (s8).
+   (cap 24 px tall, top edge 8, middle 40, bottom 12) and n = `+0xC`, with its top at Y − 100
+   so the vanilla rows (Y − 96 + 40i) and name (Y − 124) line up: middle k at top + 40k, the
+   last row (10) scaled to 36 px tall, and the bottom under the last middle. Each piece is
+   drawn with scaleX (165 + 24)/165 centred at X − 12: the frame reaches 24 px further left,
+   for the grade column. `*0x1AED260 = 0` and colour (0.4,1,1,1) are set first.
+3. To keep it on screen, `+0x14` = 132 (only the display reads it): the cap starts at y = 0
+   and the bottom edge ends at 480. With the side X of 120 or 520 the widened frame spans
+   X − 106.5 .. X + 82.5.
+4. Everything below is drawn only when rec ≠ 0, alpha `+0x20` > 0.01 and the frame has grown
+   to the row (i < n). x0 = X − 72, row y = Y − 96 + 40i.
+   - Grade letters, rows 0..6: grade `rec+0x28+i` (0..6 = E..X) with 0x536BE0, size 18, at
+     (x0 − 22, y + 7), coloured by grade. Luck and Intelligence can hold a grade byte past X
+     (their grade genes can come from leftover stack bytes in 0x5506B0); 0x535E90 levels them
+     all the same (3·grade + 11 + 0..4 points, capped at 4000), and they show as "?".
+   - Rows 5 and 6 (luck, intelligence) copy 0x565200's row loop (objdump 0x565456..0x565694),
+     reading the record directly (the count-up block `+0x4C + 0x10i` covers rows 0..4 only):
+     the word with 0x536BE0 (size 18; level00 has no word sprite for them); colour
+     (a,1,1,0), "Lv." 0x1312A3C at (x0, y+20) and the level's two digit sprites at x0+24 and
+     x0+36; 0x5369F0 (EAX = points; x0+86, y+5, alpha); 0x536770 (EAX = points; x0+49, y+20,
+     92 (f32 0x906C88), 8, alpha); 0x536E80(s, s, x0+49, y+26, 92, 8, alpha) with
+     s = `(progress + 5) / 10`.
+   - Rows 7..9: label and value text with 0x536BE0 (size 16), two lines each (y+2 and y+22).
+   - Row 10: the partner's type names (text) over "Lv." and the battle level's digits, with
+     0x536E80 at (x0+49, y+26) for the XP toward the next level when it is known.
+   Sources: happiness `rec+0x82` (s16, −100..100), alignment `rec+0xB0` (f32 ±1), evolution
+   `rec+0xC0`, leanings `rec+0xA8/0xAC`, life `rec+0x8A/0x8C`, adult age `rec+0x88`, emotions
+   `+0x12C..0x133` (u8 0..200), needs `+0x134..0x148` (u16 0..10000).
 5. After the rows, `0x12D27A4` is reset to 0xFFFFFFFF.
 
 Constraints: the hook is cdecl(obj), called from the delayed display list; it must keep

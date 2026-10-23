@@ -29,7 +29,7 @@ Pause the game before typing, since letter keys also move your character.
 | Mode | Race or Co-op (set by whoever made the party) |
 | Go to | Jump to a friend |
 | My Chao | The Chao you race and fight with |
-| Chao details | Read your Chao's hidden stats, personality, emotions, alignment and bonds |
+| Chao details | Your Chao's stats: a summary of all seven abilities, evolution, alignment, life and battle level, then pages of details |
 | Save Chao garden now | Save your Chao World data immediately while in a garden |
 | GBA link | Points to the link machine in each garden (with the machine turned off: brings a partner from your own GBA save into the garden; see Chao > GBA link) |
 | Bring Chao 1-4 | Which of your Chao you bring to a shared garden (4 at most; the rest stay home meanwhile): Auto, a Chao you pick, or None |
@@ -117,7 +117,7 @@ menu instead of continuing to update a dead character.
 **Jewel eggs:** built into the mod's Black Market progression. Normal restocks add one
 randomly chosen jewel egg you have unlocked by collecting emblems, when the shop has space.
 No F9 or Mod Manager setting is required.
-Existing stock stays available; offers rotate with the game's usual restock timing.
+The jewel egg comes on top of the usual offers.
 
 | Egg | Emblems | Rings |
 |---|---:|---:|
@@ -138,28 +138,65 @@ Buying, delivery, hatching and saving use the game's normal egg system.
 The added names/descriptions use English in every language. A conflicting shop or message
 mod can prevent activation; the reason appears in `sa2-chao-online.log`.
 
+**Black Market restocks:** the game restocks the Black Market 3 to 7 minutes of play after
+the last restock (stages, menus and Chao World all count). The new stock comes the next time
+you open the market after that, picked by the game's own rules (eggs, fruit, seeds and hats by
+your emblems) plus a jewel egg once you've unlocked them. While the market is open, the top
+right shows "Next restock in m:ss", or "New stock on your next visit" once it's due (leave and
+come back in). Turning on **Black Market restocks every 10 minutes** in the Mod Manager (Chao
+World group; `BlackMarketRefresh` in `config.ini`) gives a steady 10 minutes of play instead:
+time paused doesn't count, and it adds up across play sessions.
+
 **Saving:** F9 > Save Chao garden now updates your active Chao save file, including when save
 redirection is enabled. Gardens also autosave every five minutes spent in them, with a confirmation
 toast. Autosaving waits until loading finishes; a manual save resets the five-minute timer.
 
-**Detailed stats:** F9 > **Chao details** opens a read-only viewer. It starts with the Chao
-you're holding if that Chao belongs to your save, otherwise your selected My Chao or another
-Chao in your save. Select **Your Chao** with Up/Down and use Left/Right to browse. Select
-**Page** and use Left/Right (or Enter for the next page). Esc/Backspace returns to F9.
+**Detailed stats:** F9 > **Chao details** shows one of your Chao's stats. It starts with the
+Chao you're holding if that Chao belongs to your save, otherwise your selected My Chao or another
+Chao in your save. Left/Right turn the page, Up/Down scroll a long page, PgUp/PgDn show your
+next or previous Chao and Esc/Backspace returns to F9. In a stage or garden a controller works
+too: the D-pad or stick, L/R for another Chao and B to go back (while it's open your character
+stands still).
 
-Pages cover abilities (including luck and intelligence), happiness and evolution, emotions,
-needs, temperament/personality, bonds with all six characters, appearance and health counters.
-Values refresh while you look. Numbers are exact; gauges show each field's normal range.
-Life counters use game units. Some hidden traits are unused or have limited effects in the
-base game; a larger number isn't always better. Eggs have no traits until they hatch.
-**Raw record** shows every saved byte, including unknown fields; PgUp/PgDn scrolls. Viewing
-any page does not edit, export or save the Chao.
+The **Summary** page comes first:
+- all seven abilities (Swim, Fly, Run, Power, Stamina, Luck and Intelligence), each with its
+  grade letter in the grade's colour (E, D, C, B, A, S, X), level, points and a bar of its
+  progress to the next level (some Chao have a Luck or Intelligence grade past X, which shows
+  as "?" and still levels up);
+- happiness and mood;
+- alignment, and for a child its Run/Power and Swim/Fly leanings, each as a bar from its
+  middle, with marks at 0.50 where the game starts counting it;
+- a child's evolution progress and what it would become if its cocoon started now; an adult's
+  form and how many times it has reincarnated;
+- an adult's time left (in garden time) and whether it reincarnates or dies when it ends;
+- its battle level with a bar of the XP toward the next, and its GBA link partner's types.
+
+The other pages: **Stats** (the points each level adds at each grade; points stop at 4000),
+**Growth** (the evolution rules, the Chaos checklist, age, lifespan and what rebirth needs:
+happiness above 50 and stress under 7%), **Mood** (emotions and needs as percentages),
+**Traits** (personality in words, which can change when it reincarnates, and the shop fruit
+it refuses), **Bonds** (like and fear for each
+of the six characters; above 75 fear it is scared), **Battle** (level, XP, partner types and
+the moves it battles with), **Looks** (appearance and animal parts), **Health** and **Raw**
+(every saved byte). Values refresh while you look. Eggs have no stats until they hatch. Type
+and move names come from your own GBA ROM. Viewing a page doesn't change, export or save the
+Chao.
 
 **Quick look:** in a garden, press **C** (or **D-pad up** on a controller) to open a Chao's
 status balloon without picking it up: the Chao in front of you, or the nearest one close by.
 Press again for the next nearest Chao; after the last one it closes. It also closes by itself
 after 6 seconds. Works on friends' Chao too (with their live stats). It doesn't open while
 you're holding something or another balloon is showing.
+
+**Status balloon:** the balloon that opens when you pick up or look at a Chao shows all seven
+abilities: Luck and Intelligence come after the game's five, the same way (level, points and
+progress bar), and each ability has its grade letter at the left. Under them:
+- happiness (blue when happy, red when not) and alignment (Hero from +0.50, Dark from -0.50);
+- for a child, its evolution progress and what it would become now; for an adult, its form and
+  its time left (red when it wouldn't reincarnate);
+- hunger and mood (a pressing need such as Sleepy, Lonely or Bored, else its strongest
+  feeling, else Calm);
+- its GBA link partner's types over its battle level.
 
 **Visiting:** when you're in a garden with friends, you each bring up to 4 of your Chao from that
 garden. Pick them in F9 > Bring Chao 1 to 4, or leave them on Auto (your My Chao first,
@@ -267,7 +304,7 @@ and pictures are read from your ROM, and the save is only read, never changed.
   and the last one can't go off. Changes are kept at once; **Done** or B goes back. The battle
   team screen has the same choice (Chao battles, below). A slot left empty battles with a basic
   move.
-- The status balloon's last two rows show the partner's types and the Chao's battle level, with
+- The status balloon's last row shows the partner's types over the Chao's battle level, with
   a bar of its XP toward the next level for your own Chao (a friend's shows the level their
   game sent) (Chao battles, below). Partners, moves and battle levels
   are kept in `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an

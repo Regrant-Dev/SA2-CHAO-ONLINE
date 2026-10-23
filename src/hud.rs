@@ -166,16 +166,13 @@ pub fn panel(x: f32, y: f32, size: f32, cols: usize, rows: usize) {
     rects::push(rect(x, y, x2, y2), PANEL_COLOR);
 }
 
-/// A read-only stat gauge. The caller prints the exact value; only the drawn fill is clamped.
-pub fn stat_gauge(x: f32, y: f32, width: f32, height: f32, fraction: f32) {
-    let rect = |right: f32| [x, y, right, y + height].map(|v| v.round() as i32);
-    rects::push(rect(x + width), 0xFF30_3A48);
-    if fraction.is_finite() {
-        rects::push(rect(x + width * fraction.clamp(0.0, 1.0)), 0xFF70_C8B0);
-    }
+/// A filled rectangle (x1, y1)..(x2, y2) in pixels, under this frame's text (menu bars and
+/// highlights).
+pub fn rect(x1: f32, y1: f32, x2: f32, y2: f32, color: u32) {
+    rects::push([x1, y1, x2, y2].map(|v| v.round() as i32), color);
 }
 
-/// A gauge like `stat_gauge` with its fill in `color` (HP bars).
+/// A gauge (`fraction` 0..1, clamped) with its fill in `color` (HP bars).
 pub fn bar(x: f32, y: f32, width: f32, height: f32, fraction: f32, color: u32) {
     let rect = |right: f32| [x, y, right, y + height].map(|v| v.round() as i32);
     rects::push(rect(x + width), 0xFF30_3A48);

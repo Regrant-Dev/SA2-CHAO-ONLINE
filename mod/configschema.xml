@@ -77,6 +77,11 @@
         <HelpText>In the Chao battle menu, challenge a friend who is online at Chao Karate to a live battle: each of you picks a team and chooses your own moves. Off: friends' challenges are turned down and none can be sent.</HelpText>
       </Property>
     </Group>
+    <Group name="ChaoWorld" display="Chao World">
+      <Property name="BlackMarketRefresh" display="Black Market restocks every 10 minutes" type="bool" defaultvalue="False" alwaysinclude="true">
+        <HelpText>Off (the default): the game's own restock, new stock on your first visit 3 to 7 minutes of play after the last. On: new stock every 10 minutes of play instead (pausing doesn't count, and time played carries over between sessions), picked by the game's own rules, jewel eggs included. The market shows the time to the next restock either way.</HelpText>
+      </Property>
+    </Group>
   </Groups>
   <Enums>
     <Enum name="Mode">

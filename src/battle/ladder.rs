@@ -245,7 +245,7 @@ pub fn save(progress: &Progress) {
 }
 
 /// Writes `text` to `path` through a temporary file beside it (also for `gba_link`'s
-/// `partners.txt`).
+/// `partners.txt` and `market_refresh`'s file).
 pub(crate) fn write(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
