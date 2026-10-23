@@ -60,3 +60,6 @@ tools/        small analysis scripts
 
 MIT, see [LICENSE](LICENSE). Sonic Adventure 2 is © SEGA. This project isn't affiliated with SEGA
 and contains no game files.
+
+Emerald is © Nintendo / Game Freak. This project isn't affiliated with Nintendo or Game Freak
+and contains no data from that game: it reads the player's own copy at runtime.
