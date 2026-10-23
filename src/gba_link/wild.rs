@@ -1,4 +1,4 @@
-//! Wild visitors (re/chao-wild-visitors.md): creatures of the garden's area of the day
+//! Wild visitors (re/chao-wild-visitors.md): creatures of the garden's area for this visit
 //! (`rotation`) come by now and then, picked from the area's wild tables with their chances and
 //! level ranges: land ones walk on the grass, water ones swim in the pond, and now and then one
 //! is shiny (the ROM's shiny colours). Each is an animal object made like a partner's
@@ -440,7 +440,7 @@ mod game {
     use super::super::rotation::{self, Area};
     use super::super::scene::{
         D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1,
-        enable_touch, hooked, room, to_come,
+        enable_touch, hooked, quietly, room, to_come,
     };
     use super::super::store::Partner;
     use super::*;
@@ -476,8 +476,10 @@ mod game {
     struct Wild {
         /// The garden the visitors are in (0: none).
         garden: u8,
-        /// The day `area` is for (0: not chosen yet).
-        day: u32,
+        /// `area` is chosen for this visit.
+        chosen: bool,
+        /// Each garden's visits so far (from a random start), which pick its areas in turn.
+        visits: [u32; 3],
         area: Option<Area>,
         title: Option<(String, Instant)>,
         areas: Option<Arc<Vec<Area>>>,
@@ -510,7 +512,8 @@ mod game {
                 .map_or(1, |d| d.as_nanos() as u64);
             Wild {
                 garden: 0,
-                day: 0,
+                chosen: false,
+                visits: [0, 1, 2].map(|g| rotation::mix(seed ^ g) as u32 >> 8),
                 area: None,
                 title: None,
                 areas: None,
@@ -683,16 +686,17 @@ mod game {
             return;
         }
         let alone = *w.alone_since.get_or_insert(now);
-        if now.duration_since(alone) < Duration::from_millis(ALONE_MILLIS) {
+        // Offline no friend can turn up, so there's nothing to wait for.
+        let online = crate::online::my_id().is_some();
+        if online && now.duration_since(alone) < Duration::from_millis(ALONE_MILLIS) {
             return;
         }
-        let day = super::super::today();
-        if w.day != day && !choose_area(w, garden, day, now) {
+        if !w.chosen && !choose_area(w, garden, now) {
             return;
         }
         if let Some((name, until)) = &w.title {
             if now < *until {
-                crate::hud::center2(name, "Wild visitors come from here today");
+                crate::hud::center2(name, "Wild visitors come from here this visit");
             } else {
                 w.title = None;
             }
@@ -717,7 +721,10 @@ mod game {
             w.pending = Some(c);
         }
         w.garden = garden;
-        w.day = 0;
+        w.chosen = false;
+        if let Some(n) = w.visits.get_mut(usize::from(garden.saturating_sub(1))) {
+            *n = n.wrapping_add(1);
+        }
         w.spots = w
             .known_spots
             .get(usize::from(garden.saturating_sub(1)))
@@ -730,9 +737,9 @@ mod game {
         w.alone_since = None;
     }
 
-    /// The garden's area for `day`, and its name as the title. False while the ROM isn't
+    /// The garden's area for this visit, and its name as the title. False while the ROM isn't
     /// there (or has no area for this garden).
-    fn choose_area(w: &mut Wild, garden: u8, day: u32, now: Instant) -> bool {
+    fn choose_area(w: &mut Wild, garden: u8, now: Instant) -> bool {
         if w.areas.is_none() {
             if w.areas_failed {
                 return false;
@@ -752,17 +759,22 @@ mod game {
         let (Some(areas), Some(rom)) = (w.areas.clone(), super::super::loaded_rom()) else {
             return false;
         };
-        let Some(area) = rotation::area_of_day(&areas, garden, day) else {
+        let nth = w
+            .visits
+            .get(usize::from(garden.saturating_sub(1)))
+            .copied()
+            .unwrap_or(0);
+        let Some(area) = rotation::area_at(&areas, garden, nth) else {
             return false;
         };
         let name = super::super::ascii(&rom.map_section_name(area.section).unwrap_or_default());
         log!(
-            "gba link: garden {garden}'s wild area today is section {}",
+            "gba link: garden {garden}'s wild area this visit is section {}",
             area.section
         );
         w.title = (!name.is_empty()).then(|| (name, now + Duration::from_secs(TITLE_SECS)));
         w.area = Some(area.clone());
-        w.day = day;
+        w.chosen = true;
         true
     }
 
@@ -979,7 +991,7 @@ mod game {
             return;
         };
         // SAFETY: the animal's own main with its object, on the game thread.
-        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(main)(object) };
+        quietly(|| unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(main)(object) });
         // SAFETY: as above; the main may have deleted it (MainSub changed, mode 3).
         unsafe {
             if ((object + OBJ_MAIN) as *const usize).read()

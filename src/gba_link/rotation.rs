@@ -1,8 +1,8 @@
-//! Each garden's wild area of the day (re/chao-wild-visitors.md §5): an area is a region section
-//! of the ROM's wild tables (the first wild header of each of its maps), and each goes to one
-//! garden by what its maps and creatures are like. Every UTC day each garden takes one of its
-//! areas, the same for everyone with the same ROM: a shuffle of the garden's areas seeded by
-//! the day, so each comes once before any comes again.
+//! Each garden's wild area (re/chao-wild-visitors.md §5): an area is a region section of the
+//! ROM's wild tables (the first wild header of each of its maps), and each goes to one garden by
+//! what its maps and creatures are like. Each visit to a garden takes the next of its areas from
+//! a shuffle of them (from a random start each time the game starts), so each comes once before
+//! any comes again.
 
 use crate::gba::rom::Rom;
 use crate::gba::terrain::{
@@ -171,18 +171,18 @@ pub fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Which of `count` areas garden `garden` has on `day` (Unix days, UTC): the days run through a
+/// Which of `count` areas garden `garden` has for its `nth` visit: the visits run through a
 /// shuffle of all of them, a new shuffle each round, which never starts with the area the round
 /// before ended on.
-pub fn pick(count: usize, day: u32, garden: u8) -> usize {
+pub fn pick(count: usize, nth: u32, garden: u8) -> usize {
     if count < 2 {
         return 0;
     }
     if count == 2 {
-        return (day as usize + usize::from(garden)) % 2;
+        return (nth as usize + usize::from(garden)) % 2;
     }
     let n = count as u64;
-    let (round, at) = (u64::from(day) / n, (u64::from(day) % n) as usize);
+    let (round, at) = (u64::from(nth) / n, (u64::from(nth) % n) as usize);
     let mut order = shuffle(count, round, garden);
     if round > 0 && order[0] == shuffle(count, round - 1, garden)[count - 1] {
         order.swap(0, 1);
@@ -201,14 +201,14 @@ fn shuffle(count: usize, round: u64, garden: u8) -> Vec<usize> {
     order
 }
 
-/// Garden `garden`'s area on `day`.
-pub fn area_of_day(areas: &[Area], garden: u8, day: u32) -> Option<&Area> {
+/// Garden `garden`'s area for its `nth` visit.
+pub fn area_at(areas: &[Area], garden: u8, nth: u32) -> Option<&Area> {
     let theme = Theme::of_garden(garden)?;
     let mine: Vec<&Area> = areas.iter().filter(|a| a.theme == theme).collect();
     if mine.is_empty() {
         return None;
     }
-    Some(mine[pick(mine.len(), day, garden)])
+    Some(mine[pick(mine.len(), nth, garden)])
 }
 
 #[cfg(test)]
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(pick(1, 5, 1), 0);
         for count in [2, 13, 19, 32] {
             for garden in 1..=3 {
-                // Each round of `count` days has each area once.
+                // Each round of `count` visits has each area once.
                 for round in [0u32, 1, 700] {
                     let mut seen: Vec<usize> = (0..count as u32)
                         .map(|d| pick(count, round * count as u32 + d, garden))
@@ -311,7 +311,7 @@ mod tests {
                 }
             }
         }
-        // Never the same area two days running.
+        // Never the same area two visits running.
         for count in [2, 8, 13, 19] {
             for garden in 1..=3 {
                 for day in 20_000..22_000 {
@@ -323,7 +323,7 @@ mod tests {
                 }
             }
         }
-        // The same day gives the same, and the gardens differ in order.
+        // The same visit gives the same, and the gardens differ in order.
         assert_eq!(pick(19, 20_500, 3), pick(19, 20_500, 3));
         let a: Vec<usize> = (0..19).map(|d| pick(19, d, 1)).collect();
         let b: Vec<usize> = (0..19).map(|d| pick(19, d, 3)).collect();
@@ -353,10 +353,10 @@ mod tests {
                 assert!(!a.water.is_empty() || !a.fishing.is_empty());
             }
         }
-        // Each garden has an area every day, and they change from day to day.
+        // Each garden has an area every visit, and they change from visit to visit.
         for garden in 1..=3 {
             let days: Vec<u8> = (20_000..20_040)
-                .map(|d| area_of_day(&all, garden, d).unwrap().section)
+                .map(|d| area_at(&all, garden, d).unwrap().section)
                 .collect();
             let theme = Theme::of_garden(garden).unwrap();
             for s in &days {
@@ -367,7 +367,7 @@ mod tests {
             distinct.dedup();
             assert!(distinct.len() > 10, "{garden}: {days:?}");
         }
-        assert!(area_of_day(&all, 0, 20_000).is_none());
-        assert!(area_of_day(&all, 4, 20_000).is_none());
+        assert!(area_at(&all, 0, 20_000).is_none());
+        assert!(area_at(&all, 4, 20_000).is_none());
     }
 }

@@ -172,11 +172,12 @@ of flying creatures), rule 6 thirteen.
   them, each with its maps' land, water, rock and fishing tables (each rod's table on its own),
   and the theme by the rules of §5. Map types and block behaviours come from
   `gba::terrain` (map header +0x17; layout and tileset attributes).
-- **The day's area** (`rotation::pick`): with `n` areas for the garden, day `d` (Unix days,
-  UTC) is position `d mod n` of a Fisher-Yates shuffle of them seeded by splitmix64 of
-  `(d / n) << 8 | garden`, so each area comes once per round of `n` days. When a round's
+- **The visit's area** (`rotation::pick`): with `n` areas for the garden, visit `v` is
+  position `v mod n` of a Fisher-Yates shuffle of them seeded by splitmix64 of
+  `(v / n) << 8 | garden`, so each area comes once per round of `n` visits. When a round's
   first area is the one the round before ended on, its first two swap, so no area comes two
-  days running; with 2 areas they alternate, `(d + garden) mod 2`.
+  visits running; with 2 areas they alternate, `(v + garden) mod 2`. `v` goes up by one each
+  time the player walks into that garden, from a random start each time the game starts.
 - **Spots** (`wild::Spots`): land cells whose middle's highest probe hit is solid, and water
   cells whose highest hit is water with solid floor at least 3 below it (the surface height is
   kept per cell). Visitors come into the pond at water cells with at least three water
@@ -192,7 +193,10 @@ of flying creatures), rule 6 thirteen.
   the partners have theirs). A partner picked at the link machine when that leaves no room has
   the roaming visitor farthest from the player go first (it is deleted); only with no visitor to
   go does it take one of the 2 entries. A carried visitor handed over in the next garden does
-  the same. The main wrapper runs the animal's own main; in mode 0 a visitor in a
+  the same. The main wrapper runs the animal's own main, silenced: the animal code's five calls
+  to the positional sound call 0x4372E0 (0x57B43D, 0x57BF3B, 0x57C4B3, 0x57C5FB, 0x57C6E9:
+  ids 0x1011, 0x1010 twice, 0x1031, 0x1020) go through a check that skips them while one of our
+  creatures' mains runs (partners too); in mode 0 a visitor in a
   pond cell below that cell's surface swims: its position is set each frame to the surface
   − 1.5 (bobbing 0.2), moving 0.06 a frame between neighbouring pond cells, its `Data1+0xC`
   turned along its way and its Data2 velocity zeroed. The absorb hook (§2) treats a visitor as a

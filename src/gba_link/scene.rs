@@ -10,7 +10,7 @@ pub(super) use game::creatures;
 #[cfg(target_arch = "x86")]
 pub(super) use game::{
     D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1,
-    enable_touch, hooked, room, to_come,
+    enable_touch, hooked, quietly, room, to_come,
 };
 #[cfg(target_arch = "x86")]
 pub use game::{install, is_partner_object, on_frame};
@@ -156,7 +156,65 @@ mod game {
         SCENE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The positional sound call (EDI = id, ESI = &position, 3 cdecl arguments the caller pops)
+    /// and the animal code's calls to it: its splashes and other sounds (ids 0x1010, 0x1011,
+    /// 0x1020, 0x1031).
+    const PLAY_AT: usize = 0x0043_72E0;
+    const ANIMAL_SOUNDS: [usize; 5] = [
+        0x0057_B43D,
+        0x0057_BF3B,
+        0x0057_C4B3,
+        0x0057_C5FB,
+        0x0057_C6E9,
+    ];
+
+    /// The animal code is running for one of our creatures: its sounds are left out.
+    static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Runs `f` (an animal's own main for one of our creatures) without its sounds.
+    pub fn quietly(f: impl FnOnce()) {
+        QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+        f();
+        QUIET.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // In place of the animal code's sound calls: nothing while `QUIET` (the caller pops the
+    // arguments), else the call itself with the registers and stack as they came.
+    #[unsafe(naked)]
+    unsafe extern "C" fn quiet_play() {
+        std::arch::naked_asm!(
+            "cmp byte ptr [{quiet}], 0",
+            "jne 2f",
+            "push {play}",
+            "ret",
+            "2:",
+            "ret",
+            quiet = sym QUIET,
+            play = const PLAY_AT,
+        )
+    }
+
+    fn silence_animal_sounds() {
+        let target = quiet_play as unsafe extern "C" fn() as usize;
+        let mut done = 0;
+        for site in ANIMAL_SOUNDS {
+            match crate::patch::redirect_call(site, target) {
+                Some(PLAY_AT) => done += 1,
+                Some(other) => {
+                    // Not the call we expected (another mod's): put it back.
+                    crate::patch::redirect_call(site, other);
+                }
+                None => {}
+            }
+        }
+        log!(
+            "gba link: {done} of {} animal sounds quiet for our creatures",
+            ANIMAL_SOUNDS.len()
+        );
+    }
+
     pub fn install() {
+        silence_animal_sounds();
         let target = absorb_hook as unsafe extern "C" fn() as usize;
         let mut jump = [0xE9, 0, 0, 0, 0, 0x90];
         jump[1..5].copy_from_slice(&(target.wrapping_sub(ABSORB_SITE + 5) as u32).to_le_bytes());
@@ -398,7 +456,7 @@ mod game {
             return;
         };
         // SAFETY: the animal's own main with its object, on the game thread.
-        unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(main)(object) };
+        quietly(|| unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(main)(object) });
         // SAFETY: as above; the main may have deleted it (MainSub changed, mode 3).
         unsafe {
             if ((object + OBJ_MAIN) as *const usize).read()

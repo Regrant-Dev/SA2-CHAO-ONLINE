@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::machine_model::Machine;
 use super::{Action, Page};
+use crate::chao_sim::land::{Tri, probe};
 
 /// config.ini `LinkMachine`.
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -40,25 +41,142 @@ const MODELS: [&[u8]; 3] = [
     include_bytes!("../../assets/link_machine/dark.lmc"),
 ];
 
-/// Where each garden's machine stands (its floor) and the Y angle (BAMS) its front faces: 20
-/// to 25 units from the transporter on flat ground, the front toward the garden.
+/// Where each garden's machine stands (its floor) and the Y angle (BAMS) its front faces when
+/// the garden's ground can't be searched (`find_spot`): 20 to 25 units from the transporter on
+/// flat ground, the front toward the garden.
 const SPOTS: [([f32; 3], i32); 3] = [
     ([50.0, 10.0, 22.0], 0x96F8),
     ([117.0, 0.0, 117.0], 0xA6C0),
     ([-98.0, 3.5, -98.0], 0x10D9),
 ];
 
-/// The player can use the machine from this far from its box (across, any side) and this far
-/// from its floor (up).
-const REACH: f32 = 4.0;
+/// The player can use the machine from this far from the circle round its box (across, any
+/// side) and this far from its floor (up).
+const REACH: f32 = 3.5;
 const REACH_UP: f32 = 5.0;
 /// The picture fills this much of the screen's height, and stands this far in front of it.
 const PICTURE_FILL: f32 = 0.9;
 const PICTURE_OUT: f32 = 0.06;
 
+/// Each garden's transporter (re/chao-garden-objects.md §2) and the middle of its Chao land.
+const TRANSPORTERS: [[f32; 3]; 3] = [
+    [72.0, 10.0, 28.0],
+    [135.0, 0.0, 133.0],
+    [-116.0, 3.5, -113.0],
+];
+const MIDDLES: [[f32; 2]; 3] = [[-5.0, -65.0], [-75.0, -20.0], [-55.0, 0.0]];
+
+/// Where `find_spot` looks: this far from the transporter, and turned this far (degrees, either
+/// way) from the line toward the garden's middle, where the transporter's doorway is.
+const SPOT_RADII: (u32, u32) = (24, 40);
+const SPOT_TURNS: (u32, u32) = (70, 110);
+/// The machine's footprint (across) must be flat floor this far round its spot, at most this
+/// far from the transporter's floor (up), clear of trees and toys, with no roof over it.
+const FOOT: f32 = 4.5;
+const FLAT: f32 = 0.6;
+const LEVEL: f32 = 2.0;
+const TREE_CLEAR: f32 = 12.0;
+const TOY_CLEAR: f32 = 8.0;
+const ROOF_CLEAR: f32 = 15.0;
+
+/// The spots found in each garden's ground (`find_spot`), used over `SPOTS` once known.
+static FOUND: std::sync::Mutex<[Option<Spot>; 3]> = std::sync::Mutex::new([None; 3]);
+
+/// A machine's floor position and the Y angle (BAMS) its front faces.
+type Spot = ([f32; 3], i32);
+
 /// The garden's machine spot: (floor position, angle), for gardens 1..=3.
 pub fn spot(garden: u8) -> Option<([f32; 3], i32)> {
-    SPOTS.get(usize::from(garden).checked_sub(1)?).copied()
+    let i = usize::from(garden).checked_sub(1)?;
+    let found = FOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(i)
+        .copied()
+        .flatten();
+    found.or_else(|| SPOTS.get(i).copied())
+}
+
+/// Garden `garden`'s spot has been decided (searched for, or given up on).
+pub fn decided(garden: u8) -> bool {
+    usize::from(garden).checked_sub(1).is_some_and(|i| {
+        FOUND
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(i)
+            .is_some_and(Option::is_some)
+    })
+}
+
+/// Sets garden `garden`'s spot from its ground (`None`: the fixed one).
+pub fn set_found(garden: u8, spot: Option<([f32; 3], i32)>) {
+    if let Some(i) = usize::from(garden).checked_sub(1) {
+        let mut f = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = f.get_mut(i) {
+            *slot = spot.or_else(|| SPOTS.get(i).copied());
+        }
+    }
+}
+
+/// The floor under (x, z) seen from `y` (down): its height, if it's solid, level ground (not
+/// water).
+fn floor(tris: &[Tri], x: f32, y: f32, z: f32) -> Option<f32> {
+    let hit = probe(tris, [x, y, z])[2]?;
+    (!hit.water() && hit.normal[1].abs() > 0.97).then_some(hit.at)
+}
+
+/// The Y angle (BAMS) that turns a model's +Z from `at` toward `to` (as `turn`).
+fn facing(at: [f32; 3], to: [f32; 2]) -> i32 {
+    let a = (to[0] - at[0]).atan2(to[1] - at[2]);
+    ((a * 65536.0 / std::f32::consts::TAU) as i32) & 0xFFFF
+}
+
+/// A spot for garden `garden`'s machine in its ground `tris` (with its trees and toys): beside
+/// the transporter, not in front of its doorway, on flat solid floor at the transporter's level
+/// with room round it and no roof, its front toward the garden's middle. The one nearest a
+/// quarter turn from the doorway and a short walk from the transporter.
+pub fn find_spot(
+    garden: u8,
+    tris: &[Tri],
+    trees: &[[f32; 3]],
+    toys: &[[f32; 3]],
+) -> Option<([f32; 3], i32)> {
+    let i = usize::from(garden).checked_sub(1)?;
+    let (t, middle) = (*TRANSPORTERS.get(i)?, *MIDDLES.get(i)?);
+    let toward = (middle[0] - t[0]).atan2(middle[1] - t[2]);
+    let mut best: Option<(f32, [f32; 3])> = None;
+    for r in (SPOT_RADII.0..=SPOT_RADII.1).step_by(2) {
+        for turn in (SPOT_TURNS.0..=SPOT_TURNS.1).step_by(10) {
+            for side in [-1.0f32, 1.0] {
+                let a = toward + side * (turn as f32).to_radians();
+                let (x, z) = (t[0] + a.sin() * r as f32, t[2] + a.cos() * r as f32);
+                let Some(y) = floor(tris, x, t[1] + 8.0, z) else {
+                    continue;
+                };
+                if (y - t[1]).abs() > LEVEL {
+                    continue;
+                }
+                let flat = (0..8).all(|k| {
+                    let b = k as f32 * std::f32::consts::TAU / 8.0;
+                    floor(tris, x + b.sin() * FOOT, y + 3.0, z + b.cos() * FOOT)
+                        .is_some_and(|h| (h - y).abs() < FLAT)
+                });
+                let roof = probe(tris, [x, y + 0.5, z])[3].is_some_and(|h| h.at < y + ROOF_CLEAR);
+                let near = |list: &[[f32; 3]], clear: f32| {
+                    list.iter()
+                        .any(|p| (p[0] - x).powi(2) + (p[2] - z).powi(2) < clear * clear)
+                };
+                if !flat || roof || near(trees, TREE_CLEAR) || near(toys, TOY_CLEAR) {
+                    continue;
+                }
+                let score = (turn as f32 - 90.0).abs() / 10.0 + (r as f32 - 28.0).abs() / 2.0;
+                if best.is_none_or(|(s, _)| score < s) {
+                    best = Some((score, [x, y, z]));
+                }
+            }
+        }
+    }
+    best.map(|(_, at)| (at, facing(at, middle)))
 }
 
 /// The machine model of garden `garden` (1..=3).
@@ -83,16 +201,14 @@ pub fn world(at: [f32; 3], angle: i32, p: [f32; 3]) -> [f32; 3] {
 
 /// The player at `player` is within reach of the machine at `at` (facing `angle`, its box
 /// `min`..`max` in its own axes), on any side and whichever way they face: how far they are
-/// from its box.
+/// from the circle round its box (across). The circle doesn't depend on which way the box
+/// turns, so the reach matches the machine as drawn whatever its turn.
 pub fn in_reach(at: [f32; 3], angle: i32, (min, max): Bounds, player: [f32; 3]) -> Option<f32> {
-    let (dx, dz) = (player[0] - at[0], player[2] - at[2]);
-    let a = angle as f32 * std::f32::consts::TAU / 65536.0;
-    let (s, c) = a.sin_cos();
-    // Back into the machine's own axes (`turn` the other way).
-    let (x, z) = (dx * c - dz * s, dx * s + dz * c);
-    let ox = (min[0] - x).max(x - max[0]).max(0.0);
-    let oz = (min[2] - z).max(z - max[2]).max(0.0);
-    let out = (ox * ox + oz * oz).sqrt();
+    let mid = world(at, angle, std::array::from_fn(|i| (min[i] + max[i]) / 2.0));
+    let half = [(max[0] - min[0]) / 2.0, (max[2] - min[2]) / 2.0];
+    let radius = (half[0] * half[0] + half[1] * half[1]).sqrt();
+    let (dx, dz) = (player[0] - mid[0], player[2] - mid[2]);
+    let out = ((dx * dx + dz * dz).sqrt() - radius).max(0.0);
     (out < REACH && (player[1] - at[1]).abs() < REACH_UP).then_some(out)
 }
 
@@ -331,9 +447,9 @@ mod game {
     /// Registry categories the player can pick up: Chao, eggs, animals and drives, fruit,
     /// seeds, hats.
     const LIFTABLE: [usize; 6] = [0, 1, 2, 3, 7, 9];
-    /// Something to pick up this much farther from the player than the machine's face is still
-    /// closer than the machine.
-    const LIFT_MARGIN: f32 = 1.0;
+    /// Something to pick up this close to the player (across) takes the action button instead
+    /// of the machine.
+    const LIFT_NEAR: f32 = 2.0;
     /// The swatch textures' global index (billboard's pictures and battle effects are below).
     const GBIX: u32 = 0x7E5C_0000;
     const PLAY_SOUND: usize = 0x0043_7260;
@@ -566,7 +682,50 @@ mod game {
         false
     }
 
+    /// Frames the garden's ground has been unreadable while its spot waits for it.
+    static GROUND_WAIT: AtomicUsize = AtomicUsize::new(0);
+    /// Frames to wait for the ground before taking the fixed spot.
+    const GROUND_WAIT_MAX: usize = 300;
+
+    /// Searches garden `garden`'s ground for the machine's spot once: false while the ground
+    /// can't be read yet.
+    fn decide_spot(garden: u8) -> bool {
+        if super::decided(garden) {
+            return true;
+        }
+        match crate::land_share::read(usize::from(garden - 1)) {
+            Some(g) => {
+                let toys: Vec<[f32; 3]> = g.toys.iter().map(|t| t.pos).collect();
+                let found = super::find_spot(garden, &g.tris, &g.tree_spots, &toys);
+                match found {
+                    Some((at, angle)) => log!(
+                        "gba link: link machine spot in garden {garden}: ({:.0}, {:.1}, {:.0}) {angle:#x}",
+                        at[0],
+                        at[1],
+                        at[2]
+                    ),
+                    None => log!(
+                        "gba link: no free ground found in garden {garden}; machine at its fixed spot"
+                    ),
+                }
+                super::set_found(garden, found);
+                GROUND_WAIT.store(0, Ordering::Relaxed);
+                true
+            }
+            None if GROUND_WAIT.fetch_add(1, Ordering::Relaxed) >= GROUND_WAIT_MAX => {
+                log!("gba link: garden {garden}'s ground can't be read; machine at its fixed spot");
+                super::set_found(garden, None);
+                GROUND_WAIT.store(0, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn spawn(s: &mut State, garden: u8) -> bool {
+        if !decide_spot(garden) {
+            return false;
+        }
         let Some((at, angle)) = spot(garden) else {
             return false;
         };
@@ -669,14 +828,14 @@ mod game {
             return false;
         };
         let player = [p.x, p.y, p.z];
-        let Some(out) = super::in_reach(at, angle, bounds, player) else {
+        if super::in_reach(at, angle, bounds, player).is_none() {
             return false;
-        };
+        }
         crate::garden::player_held() == 0
             && !crate::menu::is_open()
             && !crate::chat::typing()
             && sa2::game_state() != PAUSED
-            && !liftable_near(player, out + LIFT_MARGIN)
+            && !liftable_near(player, LIFT_NEAR)
     }
 
     /// Something the player can pick up is within `distance` of them (across).
@@ -1239,22 +1398,28 @@ mod tests {
             assert!(m.screen.centre[2] < m.box_max[2] && m.screen.centre[2] > m.box_min[2]);
             assert!(m.exit[2] > m.box_max[2]);
             assert!(m.box_min[1] == 0.0 && m.box_max[1] > 8.0);
-            // The player reaches it from any side, whichever way they face.
+            // The player reaches it from every side alike, however the box turns.
             let bounds = (m.box_min, m.box_max);
-            let front = world(at, angle, [0.0, 0.0, m.box_max[2] + 2.0]);
-            let out = in_reach(at, angle, bounds, front).unwrap();
-            assert!((out - 2.0).abs() < 1e-3);
-            let beside = world(at, angle, [m.box_max[0] + 2.0, 0.0, 0.0]);
-            assert!(in_reach(at, angle, bounds, beside).is_some());
-            let behind = world(at, angle, [0.0, 0.0, m.box_min[2] - 2.0]);
-            assert!(in_reach(at, angle, bounds, behind).is_some());
-            // Not too far, nor up high.
-            let far = world(at, angle, [0.0, 0.0, m.box_max[2] + 6.0]);
-            assert!(in_reach(at, angle, bounds, far).is_none());
-            let corner = world(at, angle, [m.box_max[0] + 3.0, 0.0, m.box_max[2] + 3.0]);
-            assert!(in_reach(at, angle, bounds, corner).is_none());
-            let high = world(at, angle, [0.0, 6.0, m.box_max[2] + 2.0]);
-            assert!(in_reach(at, angle, bounds, high).is_none());
+            let mid = world(
+                at,
+                angle,
+                std::array::from_fn(|i| (m.box_min[i] + m.box_max[i]) / 2.0),
+            );
+            let (hx, hz) = (
+                (m.box_max[0] - m.box_min[0]) / 2.0,
+                (m.box_max[2] - m.box_min[2]) / 2.0,
+            );
+            let radius = (hx * hx + hz * hz).sqrt();
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::TAU / 8.0;
+                let around = |d: f32| [mid[0] + a.sin() * d, at[1], mid[2] + a.cos() * d];
+                let out = in_reach(at, angle, bounds, around(radius + 2.0)).unwrap();
+                assert!((out - 2.0).abs() < 1e-3, "{k}");
+                assert!(in_reach(at, angle, bounds, around(radius + 5.0)).is_none());
+                let mut high = around(radius + 1.0);
+                high[1] += 6.0;
+                assert!(in_reach(at, angle, bounds, high).is_none());
+            }
             assert_eq!(machine_box(garden), Some(bounds));
             let (feet, height) = picture(&m);
             assert!(feet[2] > m.screen.centre[2] && height <= m.screen.height);
@@ -1275,6 +1440,96 @@ mod tests {
         let (dx, dz) = (-5.0 - at[0], -65.0 - at[2]);
         let len = (dx * dx + dz * dz).sqrt();
         assert!((f[0] - dx / len).abs() < 1e-3 && (f[2] - dz / len).abs() < 1e-3);
+    }
+
+    /// A square of ground `half` across round (cx, cz) at height `y`, with `flags`.
+    fn square(cx: f32, cz: f32, half: f32, y: f32, flags: u32) -> Vec<Tri> {
+        let (a, b) = ([cx - half, y, cz - half], [cx + half, y, cz - half]);
+        let (c, d) = ([cx + half, y, cz + half], [cx - half, y, cz + half]);
+        vec![
+            Tri {
+                v: [a, b, c],
+                flags,
+            },
+            Tri {
+                v: [a, c, d],
+                flags,
+            },
+        ]
+    }
+
+    /// The turn (degrees) from the line toward the garden's middle to `at`, seen from the
+    /// transporter, and the distance.
+    fn from_doorway(garden: u8, at: [f32; 3]) -> (f32, f32) {
+        let i = usize::from(garden - 1);
+        let (t, m) = (TRANSPORTERS[i], MIDDLES[i]);
+        let toward = (m[0] - t[0]).atan2(m[1] - t[2]);
+        let to = (at[0] - t[0]).atan2(at[2] - t[2]);
+        let mut d = (to - toward).to_degrees();
+        while d > 180.0 {
+            d -= 360.0;
+        }
+        while d < -180.0 {
+            d += 360.0;
+        }
+        (
+            d.abs(),
+            ((at[0] - t[0]).powi(2) + (at[2] - t[2]).powi(2)).sqrt(),
+        )
+    }
+
+    #[test]
+    fn the_spot_is_beside_the_transporter_not_in_its_doorway() {
+        for garden in 1..=3u8 {
+            let t = TRANSPORTERS[usize::from(garden - 1)];
+            let ground = square(t[0], t[2], 120.0, t[1], 0);
+            let (at, angle) = find_spot(garden, &ground, &[], &[]).unwrap();
+            assert!((at[1] - t[1]).abs() < 1e-3);
+            let (turn, r) = from_doorway(garden, at);
+            assert!((turn - 90.0).abs() < 1.0, "{garden}: {turn}");
+            assert!((r - 28.0).abs() < 1.0, "{garden}: {r}");
+            // Its front faces the garden's middle.
+            let m = MIDDLES[usize::from(garden - 1)];
+            let f = turn_front(angle);
+            let (dx, dz) = (m[0] - at[0], m[1] - at[2]);
+            let len = (dx * dx + dz * dz).sqrt();
+            assert!(f[0] * dx / len + f[2] * dz / len > 0.999, "{garden}");
+        }
+    }
+
+    fn turn_front(angle: i32) -> [f32; 3] {
+        turn([0.0, 0.0, 1.0], angle)
+    }
+
+    #[test]
+    fn the_spot_keeps_off_water_trees_toys_slopes_and_roofs() {
+        let garden = 2u8;
+        let t = TRANSPORTERS[1];
+        let ground = square(t[0], t[2], 120.0, t[1], 0);
+        let (first, _) = find_spot(garden, &ground, &[], &[]).unwrap();
+        // A pond over the first spot: the other side.
+        let mut wet = square(
+            first[0],
+            first[2],
+            12.0,
+            t[1] + 0.5,
+            crate::chao_sim::land::WATER,
+        );
+        wet.extend(ground.clone());
+        let (other, _) = find_spot(garden, &wet, &[], &[]).unwrap();
+        assert!((other[0] - first[0]).powi(2) + (other[2] - first[2]).powi(2) > 400.0);
+        // A tree or a toy there does the same.
+        let (by_tree, _) = find_spot(garden, &ground, &[first], &[]).unwrap();
+        assert!((by_tree[0] - first[0]).powi(2) + (by_tree[2] - first[2]).powi(2) > 100.0);
+        let (by_toy, _) = find_spot(garden, &ground, &[], &[first]).unwrap();
+        assert!((by_toy[0] - first[0]).powi(2) + (by_toy[2] - first[2]).powi(2) > 50.0);
+        // A roof over everything, or ground far below the transporter: nowhere.
+        let mut roofed = ground.clone();
+        roofed.extend(square(t[0], t[2], 120.0, t[1] + 6.0, 0));
+        assert!(find_spot(garden, &roofed, &[], &[]).is_none());
+        let low = square(t[0], t[2], 120.0, t[1] - 10.0, 0);
+        assert!(find_spot(garden, &low, &[], &[]).is_none());
+        assert!(find_spot(4, &ground, &[], &[]).is_none());
     }
 
     #[test]

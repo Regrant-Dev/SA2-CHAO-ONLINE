@@ -232,8 +232,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
 
 - Put the ROM (`.gba`) and the save (`.sav`) in `mods/sa2-chao-online/gba/`, or set their paths
   in the Mod Manager (GBA link group; `GbaRom` and `GbaSave` in `config.ini`).
-- Each garden of your own (not a shared online one) has a **link machine** near its
-  transporter: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
+- Each garden of your own (not a shared online one) has a **link machine** beside its
+  transporter, a short walk to one side of its doorway: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
   Garden, dark and spiky in the Dark Garden. Stand next to it (any side), with empty hands and
   nothing to pick up closer to you, and press the action button to open its list of
   the save's party and boxes and the ones the mod keeps, with each one's level and types. The
@@ -273,8 +273,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
   are kept in `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an
   animal gives.
 
-**Wild visitors:** each garden is linked to one area of the GBA game, a different one each day
-(the day changes at midnight UTC, and everyone with the same ROM gets the same areas). The
+**Wild visitors:** each garden is linked to one area of the GBA game, a different one each time
+you walk into it (each of its areas comes once before any comes again). The
 Neutral Garden gets grassy routes and woods, the Hero Garden sea, sky and shore areas, and the
 Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, not a save.
 

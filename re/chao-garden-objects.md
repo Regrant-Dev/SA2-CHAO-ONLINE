@@ -231,10 +231,17 @@ colours as they are (a lit screen).
 - **Collision**: one box per garden as a basic model (8 points already turned by the angle, one
   material, one type-0 meshset of 12 triangles wound outward), its `NJS_OBJECT` at the spot with
   eval flags 0x14 and no angles, registered with flag 1.
-- **Spots**: the §2 ones (Neutral (50, 10, 22) 0x96F8, Hero (117, 0, 117) 0xA6C0, Dark
-  (-98, 3.5, -98) 0x10D9). In reach within 4 units of the box (across, any side, whichever way
-  the player faces) and 5 up of the spot, and with nothing the player can pick up (registry
-  categories 0, 1, 2, 3, 7, 9) closer than the box plus 1 unit;
+- **Spots** (`find_spot`, once per garden from the garden's LandTable, trees and toys): beside
+  the transporter, 24 to 40 units from it and turned 70 to 110 degrees either way from the line
+  toward the Chao land's middle (the doorway side), on solid level floor (not water, normal y
+  above 0.97) within 2 of the transporter's floor and within 0.6 across a 4.5-unit circle, no
+  roof within 15 above, 12 from tree spots and 8 from toys; the candidate nearest a quarter turn
+  and 28 units wins, its front toward the Chao land's middle. When the ground can't be read
+  within 300 frames, or nothing fits, the §2 spots (Neutral (50, 10, 22) 0x96F8, Hero
+  (117, 0, 117) 0xA6C0, Dark (-98, 3.5, -98) 0x10D9). In reach within 3.5 units of the circle
+  round the box (across, any side, whichever way the player faces) and 5 up of the spot, and
+  with nothing the player can pick up (registry categories 0, 1, 2, 3, 7, 9) within 2 units of
+  the player;
   otherwise the press stays the game's.
 - **Pick**: the list opens with the controls off (§3). A pick is brought in with
   `scene::arrive_at` at the model's exit point: the animal hops out along the machine's angle.
