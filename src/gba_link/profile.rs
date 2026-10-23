@@ -1,11 +1,11 @@
-//! A Chao's side in a battle: its types, ability and four moves. A Chao that absorbed a partner
-//! has the partner's types and ability and the moves its partners taught it (`store::Learned`);
-//! one without is Normal type with no ability and basic moves read from the ROM. Every id is the
-//! ROM's own.
+//! A Chao's side in a battle: its types, ability, four moves and battle level. A Chao that
+//! absorbed a partner has the partner's types and ability; its moves are the four it battles
+//! with of every move it learned (`store::Moves`). One without a partner is Normal type with no
+//! ability, and empty move slots take basic moves read from the ROM. Every id is the ROM's own.
 
 use crate::gba::rom::{ABILITY_COUNT, MOVE_COUNT, Rom, SPECIES_COUNT};
 
-use super::store::Learned;
+use super::store::{Moves, Partner};
 
 /// The Normal type's id.
 pub const NORMAL: u8 = 0;
@@ -18,51 +18,64 @@ pub struct Profile {
     pub types: [u8; 2],
     /// 0 for none.
     pub ability: u8,
-    /// Move ids, the known ones first; 0 for an empty slot.
+    /// Move ids, the ones it battles with first; 0 for an empty slot.
     pub moves: [u16; 4],
     /// The species of the partner it has these from.
     pub partner: Option<u16>,
+    /// Its battle level (`battle::levels`).
+    pub level: u8,
 }
 
-/// The profile of a Chao that has `learned` (`None` without a partner). Moves the ROM doesn't
-/// have are dropped and empty slots are filled with basic moves it doesn't know yet. Without
-/// `save_partners` (a live battle's rule), moves a partner from a GBA save taught are left out,
-/// and a partner from a GBA save gives no types or ability (Normal, none).
-pub fn profile(rom: &Rom, learned: Option<&Learned>, save_partners: bool) -> Profile {
-    let mut moves = [0u16; 4];
+/// The profile of a Chao at `level` with `partner` (`None`, or species 0: none) that knows
+/// `moves`. It battles with its active moves; moves the ROM doesn't have are dropped and empty
+/// slots are filled with basic moves it doesn't know yet. Without `save_partners` (a live
+/// battle's rule), moves only partners from a GBA save taught are left out (their slots taking
+/// the Chao's other moves, newest first, then basic moves), and a partner from a GBA save gives
+/// no types or ability (Normal, none).
+pub fn profile(
+    rom: &Rom,
+    partner: Option<&Partner>,
+    moves: &Moves,
+    save_partners: bool,
+    level: u8,
+) -> Profile {
+    let counts = |id: u16| save_partners || !moves.only_from_saves(id);
+    let active: Vec<u16> = moves.active.iter().copied().filter(|&id| id != 0).collect();
+    let left_out = active.iter().filter(|&&id| !counts(id)).count();
+    let others = moves
+        .known
+        .iter()
+        .rev()
+        .map(|&(id, _)| id)
+        .filter(|&id| !moves.is_active(id) && counts(id))
+        .take(left_out);
+    let mut picked = [0u16; 4];
     let mut n = 0;
-    let known = learned.map_or([0; 4], |l| {
-        let mut known = l.moves;
-        if !save_partners {
-            for (i, id) in known.iter_mut().enumerate() {
-                if l.save_moves & 1 << i != 0 {
-                    *id = 0;
-                }
-            }
-        }
-        known
-    });
-    let learned = learned.filter(|l| save_partners || !l.partner.from_save);
-    for id in known.into_iter().chain(basic_moves(rom)) {
-        if n < moves.len()
+    let candidates = active
+        .iter()
+        .copied()
+        .filter(|&id| counts(id))
+        .chain(others);
+    for id in candidates.chain(basic_moves(rom)) {
+        if n < picked.len()
             && id != 0
             && id < MOVE_COUNT
             && rom.move_info(id).is_some()
-            && !moves[..n].contains(&id)
+            && !picked[..n].contains(&id)
         {
-            moves[n] = id;
+            picked[n] = id;
             n += 1;
         }
     }
-    let Some(l) = learned else {
+    let Some(p) = partner.filter(|p| p.species != 0 && (save_partners || !p.from_save)) else {
         return Profile {
             types: [NORMAL; 2],
             ability: 0,
-            moves,
+            moves: picked,
             partner: None,
+            level,
         };
     };
-    let p = l.partner;
     let ability = if (1..ABILITY_COUNT).contains(&p.ability) {
         p.ability
     } else {
@@ -71,8 +84,9 @@ pub fn profile(rom: &Rom, learned: Option<&Learned>, save_partners: bool) -> Pro
     Profile {
         types: p.types,
         ability,
-        moves,
+        moves: picked,
         partner: Some(p.species),
+        level,
     }
 }
 
@@ -161,75 +175,88 @@ mod tests {
     fn profiles_with_and_without_a_partner() {
         let Some(rom) = rom() else { return };
         let basic = basic_moves(&rom);
-        let none = profile(&rom, None, true);
+        let none = profile(&rom, None, &Moves::default(), true, 5);
         assert_eq!(none.types, [NORMAL; 2]);
         assert_eq!(none.ability, 0);
         assert_eq!(none.moves, basic);
         assert_eq!(none.partner, None);
+        assert_eq!(none.level, 5);
 
         // The first gift species, as it comes at level 5 with no ability recorded.
         let species = rom.starters().unwrap()[0];
         let info = rom.species(species).unwrap();
         let taught = rom.moves_at_level(species, 5);
-        let learned = Learned {
-            partner: Partner {
-                species,
-                types: info.types,
-                moves: taught,
-                level: 5,
-                ability: 0,
-                from_save: false,
-            },
-            moves: super::super::store::teach([0; 4], taught),
-            save_moves: 0,
+        let partner = Partner {
+            species,
+            types: info.types,
+            moves: taught,
+            level: 5,
+            ability: 0,
+            from_save: false,
         };
-        let p = profile(&rom, Some(&learned), true);
-        assert_eq!(profile(&rom, Some(&learned), false), p);
+        let mut moves = Moves::default();
+        moves.learn(taught, false);
+        let p = profile(&rom, Some(&partner), &moves, true, 30);
+        assert_eq!(profile(&rom, Some(&partner), &moves, false, 30), p);
         assert_eq!(p.types, info.types);
         assert_ne!(p.ability, 0);
         assert_eq!(p.ability, info.abilities[0]);
         assert_eq!(p.partner, Some(species));
+        assert_eq!(p.level, 30);
         let n = taught.iter().filter(|&&id| id != 0).count();
         assert!(n >= 1);
-        assert_eq!(p.moves[..n], learned.moves[..n]);
+        assert_eq!(p.moves[..n], moves.active[..n]);
         // Its empty slots take basic moves, never twice the same.
         assert!(p.moves.iter().all(|&id| id != 0));
         for i in 0..4 {
             assert!(!p.moves[..i].contains(&p.moves[i]));
         }
 
-        // A recorded ability is kept; moves the ROM doesn't have are dropped.
-        let odd = Learned {
-            partner: Partner {
-                ability: 3,
-                ..learned.partner
-            },
-            moves: [MOVE_COUNT + 5, 0, 0, 0],
-            save_moves: 0,
+        // A recorded ability is kept; moves the ROM doesn't have are dropped; species 0 is no
+        // partner.
+        let odd = Partner {
+            ability: 3,
+            ..partner
         };
-        let p = profile(&rom, Some(&odd), true);
+        let unknown = Moves {
+            known: vec![(MOVE_COUNT + 5, false)],
+            active: [MOVE_COUNT + 5, 0, 0, 0],
+        };
+        let p = profile(&rom, Some(&odd), &unknown, true, 5);
         assert_eq!(p.ability, 3);
         assert_eq!(p.moves, basic);
+        let p = profile(
+            &rom,
+            Some(&Partner { species: 0, ..odd }),
+            &unknown,
+            true,
+            5,
+        );
+        assert_eq!((p.partner, p.types, p.ability), (None, [NORMAL; 2], 0));
 
         // From a GBA save: all of it with save partners allowed; without, its moves and its
-        // partner's types and ability go, and the moves a wild one taught stay.
-        let wild = basic[0];
-        let saved = Learned {
-            partner: Partner {
-                from_save: true,
-                ..learned.partner
-            },
-            moves: [taught[0], wild, 0, 0],
-            save_moves: 0b01,
+        // partner's types and ability go, the moves a wild one taught stay, and the Chao's
+        // other moves fill in for the ones left out.
+        let mut spare = basic.into_iter().filter(|m| !taught.contains(m));
+        let (wild, other) = (spare.next().unwrap(), spare.next().unwrap());
+        let mut saved_moves = Moves::default();
+        saved_moves.learn([other, 0, 0, 0], false);
+        saved_moves.learn([taught[0], wild, 0, 0], true);
+        saved_moves.learn([wild, 0, 0, 0], false);
+        saved_moves.toggle(other).unwrap();
+        assert_eq!(saved_moves.active, [0, taught[0], wild, 0]);
+        let saved = Partner {
+            from_save: true,
+            ..partner
         };
-        let with = profile(&rom, Some(&saved), true);
+        let with = profile(&rom, Some(&saved), &saved_moves, true, 5);
         assert_eq!(with.types, info.types);
         assert_eq!(with.moves[..2], [taught[0], wild]);
-        let without = profile(&rom, Some(&saved), false);
+        let without = profile(&rom, Some(&saved), &saved_moves, false, 5);
         assert_eq!(without.types, [NORMAL; 2]);
         assert_eq!(without.ability, 0);
         assert_eq!(without.partner, None);
-        assert_eq!(without.moves[0], wild);
+        assert_eq!(without.moves[..2], [wild, other]);
         assert!(!without.moves.contains(&taught[0]) || basic.contains(&taught[0]));
     }
 }

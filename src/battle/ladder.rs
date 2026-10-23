@@ -5,28 +5,26 @@
 //! champion. Each leader, league trainer and the champion opens once the one before is beaten
 //! (the first leader is open from the start); route tier k opens with leader k (tier 0 from
 //! the start). Beating a leader earns their badge and the TM move their gym gives, which any of
-//! the player's Chao can then be taught in place of one of its moves.
+//! the player's Chao can then be taught in place of one of its moves (it joins the Chao's move
+//! list, `gba_link::store::Moves`). Trainers fight at their own levels and the player's Chao at
+//! theirs, so the ladder is the level check; any trainer can be battled again.
 //!
 //! Progress is the mod's own file, `<mod>/gba/trainers.txt`, one record a line (the Chao save
 //! is never changed for it):
 //!
 //! - `beaten <trainer id>`: a trainer the player beat.
-//! - `taught <chao identity> <move> <move> <move> <move>`: the TM moves taught to a Chao, by its
-//!   `ChaoData::identity` (hex), one per move slot; 0 leaves the slot to the Chao's own move.
+//! - `taught <chao identity> <move> <move> <move> <move>`: TM moves taught to a Chao by older
+//!   versions, by its `ChaoData::identity` (hex), one per move slot (0: none). They join the
+//!   Chao's move list in `partners.txt` the first time it's read (`Store::parse_with_taught`);
+//!   TM moves are kept there now.
 //!
 //! Saving adds to what the file holds (it's written whole through a temporary file, and not at
-//! all while it can't be read). The TM moves go along with the Chao's partner record to
-//! friends (`Body::Partners`) and into exported Chao's `partners.txt`, so copies of it fight
-//! with them too.
+//! all while it can't be read).
 //!
 //! No game access here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-
-use crate::gba_link::Profile;
-use crate::gba_link::store::{Learned, Partner, Store};
-use crate::net::protocol::SharedPartner;
 
 /// The progress file, in the mod's `gba` folder.
 pub const FILE: &str = "trainers.txt";
@@ -129,7 +127,7 @@ impl Plan {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
     pub beaten: BTreeSet<u16>,
-    /// Chao identity -> the TM move in each move slot (0: its own move).
+    /// Chao identity -> the TM move in each move slot (0: none), from older versions.
     pub taught: BTreeMap<u64, [u16; SLOTS]>,
 }
 
@@ -204,24 +202,6 @@ impl Progress {
             }
         }
     }
-
-    /// A Chao's battle profile with its TM moves in their slots. A TM move it already knows
-    /// in another slot changes places with the move in the TM's slot.
-    pub fn apply(&self, identity: u64, mut profile: Profile) -> Profile {
-        let Some(taught) = self.taught.get(&identity) else {
-            return profile;
-        };
-        for (slot, &id) in taught.iter().enumerate() {
-            if id == 0 {
-                continue;
-            }
-            if let Some(j) = profile.moves.iter().position(|&m| m == id) {
-                profile.moves[j] = profile.moves[slot];
-            }
-            profile.moves[slot] = id;
-        }
-        profile
-    }
 }
 
 fn path() -> PathBuf {
@@ -264,8 +244,9 @@ pub fn save(progress: &Progress) {
     }
 }
 
-/// Writes `text` to `path` through a temporary file beside it.
-fn write(path: &Path, text: &str) -> std::io::Result<()> {
+/// Writes `text` to `path` through a temporary file beside it (also for `gba_link`'s
+/// `partners.txt`).
+pub(crate) fn write(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -275,86 +256,6 @@ fn write(path: &Path, text: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result
-}
-
-/// Our Chao that were taught TM moves (of `only`, if given), with their battle profiles (TM
-/// moves in); none while `BattleTrainers` is off or without the ROM.
-fn taught_profiles(only: Option<&[u64]>) -> Vec<(u64, Profile)> {
-    if !super::trainers::enabled() {
-        return Vec::new();
-    }
-    let progress = load();
-    progress
-        .taught
-        .keys()
-        .copied()
-        .filter(|id| only.is_none_or(|o| o.contains(id)))
-        .filter_map(|id| {
-            let profile = crate::gba_link::battle_profile(id, true).ok()?;
-            Some((id, progress.apply(id, profile)))
-        })
-        .collect()
-}
-
-/// What our Chao have from partners (`Body::Partners`) with their TM moves: a Chao's record
-/// carries its battle moves, and a Chao taught a TM move without a partner gets one (Normal,
-/// no ability).
-pub fn shared_partners(mut list: Vec<SharedPartner>) -> Vec<SharedPartner> {
-    for (identity, p) in taught_profiles(None) {
-        let shared = SharedPartner {
-            identity,
-            species: p.partner.unwrap_or(0),
-            types: p.types,
-            ability: p.ability,
-            moves: p.moves,
-        };
-        match list.iter_mut().find(|s| s.identity == identity) {
-            Some(s) => *s = shared,
-            None => list.push(shared),
-        }
-    }
-    list
-}
-
-/// Puts the TM moves of the exported Chao with `identities` into the `partners.txt` beside
-/// them in `dir` (the same way as `shared_partners`).
-pub fn export_taught(dir: &Path, identities: &[u64]) {
-    let taught = taught_profiles(Some(identities));
-    if taught.is_empty() {
-        return;
-    }
-    let path = dir.join("partners.txt");
-    let mut store = match std::fs::read_to_string(&path) {
-        Ok(text) => Store::parse(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
-        Err(e) => {
-            crate::log!("battle: can't read {}: {e}", path.display());
-            return;
-        }
-    };
-    for (identity, p) in taught {
-        let before = store.partners.get(&identity);
-        let partner = Partner {
-            species: p.partner.unwrap_or(0),
-            types: p.types,
-            moves: p.moves,
-            level: before.map_or(0, |l| l.partner.level),
-            ability: p.ability,
-            from_save: before.is_some_and(|l| l.partner.from_save),
-        };
-        let save_moves = before.map_or(0, |l| l.marks_for(p.moves));
-        store.partners.insert(
-            identity,
-            Learned {
-                partner,
-                moves: p.moves,
-                save_moves,
-            },
-        );
-    }
-    if let Err(e) = write(&path, &store.to_text()) {
-        crate::log!("battle: can't write {}: {e}", path.display());
-    }
 }
 
 #[cfg(test)]
@@ -504,24 +405,5 @@ mod tests {
         assert!(!path.with_extension("txt.tmp").exists());
         assert_eq!(read(&dir.join("none.txt")).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn taught_moves_go_into_the_profile() {
-        let profile = Profile {
-            types: [0, 0],
-            ability: 0,
-            moves: [1, 2, 3, 4],
-            partner: None,
-        };
-        let mut p = Progress::default();
-        assert_eq!(p.apply(7, profile), profile);
-        p.teach(7, 0, 9);
-        assert_eq!(p.apply(7, profile).moves, [9, 2, 3, 4]);
-        // A taught move the Chao knows already changes places.
-        p.teach(7, 1, 4);
-        assert_eq!(p.apply(7, profile).moves, [9, 4, 3, 2]);
-        // Other Chao keep theirs.
-        assert_eq!(p.apply(8, profile), profile);
     }
 }

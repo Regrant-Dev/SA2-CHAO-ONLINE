@@ -22,6 +22,7 @@
 //! - `session`: the picker and the turns, driven by the menu buttons.
 //! - `online`: live battles against a friend online, turns synced through the host; `mirror`
 //!   shows the accepter's game the battle from their side.
+//! - `levels`: battle levels and the XP battles give.
 //! - `trainers` and `ladder`: the GBA game's trainers as opponents, their order and locks, and
 //!   the progress and TM moves won; `figures` shows their creatures in the arena.
 //! - `visuals`: how the arena shows each cue (motions by kind of move, status signs, effect
@@ -44,6 +45,7 @@ pub mod fighter;
 mod figures;
 pub mod game;
 pub mod ladder;
+pub mod levels;
 mod mirror;
 pub mod narrate;
 pub mod online;

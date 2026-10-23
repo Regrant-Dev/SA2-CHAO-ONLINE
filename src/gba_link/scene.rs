@@ -512,13 +512,13 @@ mod game {
                     return;
                 }
                 let rec = std::slice::from_raw_parts(record as *const u8, crate::chao::CHAO_SIZE);
-                let Some(identity) = crate::chao::ChaoData::from_bytes(rec).map(|c| c.identity())
-                else {
+                let Some(data) = crate::chao::ChaoData::from_bytes(rec) else {
                     return;
                 };
+                let (identity, name) = (data.identity(), crate::karate::chao_name(&data));
                 match took {
-                    Took::Partner { garden, key } => absorbed(garden, key, identity),
-                    Took::Wild(partner) => learned_wild(identity, partner),
+                    Took::Partner { garden, key } => absorbed(garden, key, identity, &name),
+                    Took::Wild(partner) => learned_wild(identity, partner, &name),
                 }
                 // Happiness +1 as for an animal; no alignment change.
                 std::arch::asm!(

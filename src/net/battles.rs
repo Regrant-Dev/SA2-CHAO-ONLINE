@@ -137,6 +137,7 @@ impl Battles {
                 to,
                 format,
                 save_partners,
+                actual_levels,
                 dex,
                 team,
             } => {
@@ -164,6 +165,7 @@ impl Battles {
                             from,
                             format: *format,
                             save_partners: *save_partners,
+                            actual_levels: *actual_levels,
                         },
                     });
                 }
@@ -432,6 +434,7 @@ mod tests {
             types: [0, 0],
             ability: 0,
             moves: [1, 0, 0, 0],
+            level: 5,
         }]
     }
 
@@ -470,6 +473,7 @@ mod tests {
             to: 2,
             format: 0,
             save_partners: false,
+            actual_levels: true,
             dex: 9,
             team: team(),
         };
@@ -482,7 +486,8 @@ mod tests {
                 body: Body::BattleOffer {
                     from: 1,
                     format: 0,
-                    save_partners: false
+                    save_partners: false,
+                    actual_levels: true,
                 }
             }]
         ));
@@ -716,6 +721,7 @@ mod tests {
             to,
             format: 1,
             save_partners: true,
+            actual_levels: false,
             dex: 1,
             team: team(),
         };

@@ -3,7 +3,9 @@
 //! `machine_model`). Walking up to it and pressing the action button opens the pick list: the
 //! GBA save's creatures, the ones the mod keeps and, without a save, the one-time gift (the
 //! rows of `Page`). The machine's screen shows the picture of the one highlighted, and the one
-//! picked hops out of the machine's hatch into the garden (`super::bring_out`).
+//! picked hops out of the machine's hatch into the garden (`super::bring_out`). Its first row,
+//! "Moves", lists the player's Chao by name and then one's moves, to choose the four it battles
+//! with (`Page::chao_list`, `Page::chao_moves`).
 //!
 //! The machine is an object of list 0, which runs after the pads are read and before the
 //! player: the press that opens the list is taken out of the frame's input there, so the
@@ -269,7 +271,7 @@ impl List {
         match self.page.rows.get(self.page.row)?.1 {
             Action::Bring(ref c) => Some(c.species),
             Action::Gift(s) => Some(s),
-            Action::None => None,
+            _ => None,
         }
     }
 }
@@ -395,6 +397,8 @@ mod game {
         /// Textures that failed in this scene (not tried again).
         textures_failed: Option<Scene>,
         list: Option<List>,
+        /// The rows picked to open the pages over the first one ("Moves", then a Chao).
+        trail: Vec<Action>,
         /// Frames since the list opened or the game was last paused (the opening and resuming
         /// presses aren't picks).
         age: u32,
@@ -415,6 +419,7 @@ mod game {
         textures: None,
         textures_failed: None,
         list: None,
+        trail: Vec::new(),
         age: 0,
         paused: false,
         shown: None,
@@ -926,9 +931,49 @@ mod game {
         }
     }
 
-    fn open(s: &mut State) {
-        let list = List::new(Page::open());
+    /// The page that `opened` (the last of the trail) opens; the first page without one.
+    fn page(opened: Option<&Action>) -> Page {
+        match opened {
+            Some(Action::Moves) => Page::chao_list(),
+            Some(&Action::ChaoMoves(identity)) => Page::chao_moves(identity),
+            _ => {
+                let mut page = Page::open();
+                page.rows.insert(
+                    0,
+                    (
+                        "Moves: choose the four moves each Chao battles with".into(),
+                        Action::Moves,
+                    ),
+                );
+                page.hints = vec![
+                    "A / Enter: it comes out of the machine as a partner".into(),
+                    "for your Chao (each once a day per garden, 4 at a time).".into(),
+                    "Up/Down (PgUp/PgDn) pick. B / Esc / Backspace close.".into(),
+                ];
+                page
+            }
+        }
+    }
+
+    /// Back to the page before, its cursor on the row that left it; closes from the first.
+    /// Whether the list is still open.
+    fn up(s: &mut State) -> bool {
+        let Some(left) = s.trail.pop() else {
+            close(s);
+            return false;
+        };
+        let mut list = List::new(page(s.trail.last()));
+        if let Some(row) = list.page.rows.iter().position(|(_, a)| *a == left) {
+            list.page.row = row;
+        }
         s.list = Some(list);
+        play(sound::CURSOR);
+        true
+    }
+
+    fn open(s: &mut State) {
+        s.trail.clear();
+        s.list = Some(List::new(page(None)));
         s.age = 0;
         OPEN.store(true, Ordering::Relaxed);
         sa2::set_controls(false);
@@ -966,9 +1011,21 @@ mod game {
                     Outcome::Stay => {}
                     Outcome::Moved => play(sound::CURSOR),
                     Outcome::Close => {
-                        close(s);
-                        return;
+                        if !up(s) {
+                            return;
+                        }
                     }
+                    Outcome::Chose(Action::Back) => {
+                        if !up(s) {
+                            return;
+                        }
+                    }
+                    Outcome::Chose(action @ (Action::Moves | Action::ChaoMoves(_))) => {
+                        s.list = Some(List::new(page(Some(&action))));
+                        s.trail.push(action);
+                        play(sound::CONFIRM);
+                    }
+                    Outcome::Chose(Action::Toggle { identity, id }) => toggle(s, identity, id),
                     Outcome::Chose(action) => {
                         if chose(s, garden, action) {
                             close(s);
@@ -981,6 +1038,25 @@ mod game {
         if let Some(list) = s.list.as_mut() {
             list.scroll_to(visible);
             draw(list, visible);
+        }
+    }
+
+    /// Switches a Chao's move on or off for battles (kept at once); the page stays as it was
+    /// with the change, or says why it can't.
+    fn toggle(s: &mut State, identity: u64, id: u16) {
+        let result = super::super::toggle_move(identity, id);
+        let Some(list) = s.list.as_mut() else {
+            return;
+        };
+        match result {
+            Ok(on) => {
+                let (row, scroll) = (list.page.row, list.page.scroll);
+                *list = List::new(page(s.trail.last()));
+                list.page.row = row.min(list.page.rows.len().saturating_sub(1));
+                list.page.scroll = scroll;
+                play(if on { sound::CONFIRM } else { sound::CURSOR });
+            }
+            Err(why) => list.message = Some(why.message().to_string()),
         }
     }
 
@@ -1000,7 +1076,7 @@ mod game {
             Action::Bring(c) => super::super::bring_out(&c, exit, angle),
             Action::Gift(species) => super::super::take_gift_candidate(species)
                 .and_then(|c| super::super::bring_out(&c, exit, angle)),
-            Action::None => return false,
+            _ => return false,
         };
         match result {
             Ok(message) => {
@@ -1012,7 +1088,7 @@ mod game {
             Err(e) => {
                 if gift {
                     // A gift taken but not brought out is among the kept ones now.
-                    s.list = Some(List::new(Page::open()));
+                    s.list = Some(List::new(page(None)));
                 }
                 if let Some(list) = s.list.as_mut() {
                     list.message = Some(e);
@@ -1025,7 +1101,7 @@ mod game {
     fn draw(list: &List, visible: usize) {
         let size = hud::menu_font();
         let page = &list.page;
-        let mut lines: Vec<(String, i32)> = vec![("== Link machine ==".into(), COLOR_TITLE)];
+        let mut lines: Vec<(String, i32)> = vec![(format!("== {} ==", page.title), COLOR_TITLE)];
         for (i, (text, _)) in page.rows.iter().enumerate().skip(page.scroll).take(visible) {
             let selected = i == page.row;
             lines.push((
@@ -1047,20 +1123,7 @@ mod game {
         if let Some(m) = &list.message {
             lines.push((m.clone(), COLOR_MESSAGE));
         }
-        lines.extend([
-            (
-                "A / Enter: it comes out of the machine as a partner".into(),
-                COLOR_HINT,
-            ),
-            (
-                "for your Chao (each once a day per garden, 4 at a time).".into(),
-                COLOR_HINT,
-            ),
-            (
-                "Up/Down (PgUp/PgDn) pick. B / Esc / Backspace close.".into(),
-                COLOR_HINT,
-            ),
-        ]);
+        lines.extend(page.hints.iter().map(|h| (h.clone(), COLOR_HINT)));
         let cols = lines
             .iter()
             .map(|(t, _)| t.chars().count())
@@ -1093,6 +1156,8 @@ mod tests {
 
     fn list(rows: Vec<Action>) -> List {
         List::new(Page {
+            title: String::new(),
+            hints: Vec::new(),
             rows: rows
                 .into_iter()
                 .enumerate()

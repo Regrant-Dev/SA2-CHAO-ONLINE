@@ -1,12 +1,20 @@
 //! What GBA link keeps in `<mod>/gba/partners.txt`, one record a line:
 //!
 //! - `partner <chao identity> <species> <type> <type> <move> <move> <move> <move> <level>
-//!   <ability> <known move> <known move> <known move> <known move> <from a save> <save moves>`:
-//!   the partner a Chao absorbed last and the four moves the Chao knows from its partners, by its
-//!   `ChaoData::identity` (the SA2 save is never changed for this). `<from a save>` is 1 when that
-//!   partner came from a GBA save, and `<save moves>` has bit `i` set when known move `i` was
-//!   taught by one. Lines without the last two fields load with neither; lines without the last
-//!   seven also load with no ability recorded and the partner's moves as the known ones.
+//!   <ability> <active move> <active move> <active move> <active move> <from a save>
+//!   <save moves>`: the partner a Chao absorbed last and the four moves the Chao battles with,
+//!   by its `ChaoData::identity` (the SA2 save is never changed for this). `<from a save>` is 1
+//!   when that partner came from a GBA save, and `<save moves>` has bit `i` set when active move
+//!   `i` was only taught by ones from a save. Lines without the last two fields load with
+//!   neither; lines without the last seven also load with no ability recorded and the partner's
+//!   moves as the active ones.
+//! - `moves <chao identity> <active move> <active move> <active move> <active move> [<move>
+//!   <only from saves>]...`: every move the Chao has learned (from partners, wild visitors, the
+//!   gift and TM moves), oldest first, each with 1 when only partners from a GBA save taught it,
+//!   and the four it battles with (0: an empty slot). A Chao with a `partner` line and no
+//!   `moves` line knows the partner line's active moves.
+//! - `level <chao identity> <level> <xp>`: its battle level (1..=100) and the XP it has toward
+//!   the next (`battle::levels`). A Chao without one is at level 5 with none.
 //! - `import <key> <garden> <day>`: a creature brought into a garden, by `save::Mon::key`, and
 //!   the day (Unix days); each comes to each garden once a day.
 //! - `brought <garden> <key> <species> <type> <type> <move>... <level> <ability> <from a save>`:
@@ -22,6 +30,8 @@
 //! battle profile takes the species' first ability from the ROM then (`profile`).
 
 use std::collections::BTreeMap;
+
+use crate::battle::levels::Level;
 
 /// Most partners waiting in one garden at once.
 pub const PER_GARDEN: usize = 4;
@@ -39,31 +49,192 @@ pub struct Partner {
     pub from_save: bool,
 }
 
-/// What a Chao has from absorbing: its last partner and the four moves it knows (0 for an empty
-/// slot), the newest first.
+/// What a Chao has from absorbing: its last partner and the four moves it battles with (0 for
+/// an empty slot).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Learned {
     pub partner: Partner,
     pub moves: [u16; 4],
-    /// Bit `i`: `moves[i]` was taught by a partner from a GBA save.
+    /// Bit `i`: `moves[i]` was only taught by partners from a GBA save.
     pub save_moves: u8,
 }
 
-impl Learned {
-    /// The save marks (as `save_moves`) of `moves`: those it has with a mark here.
-    pub fn marks_for(&self, moves: [u16; 4]) -> u8 {
-        let mut marks = 0;
-        for (i, id) in moves.into_iter().enumerate() {
-            let marked = self
-                .moves
-                .iter()
-                .position(|&m| m == id && id != 0)
-                .is_some_and(|at| self.save_moves & 1 << at != 0);
-            if marked {
-                marks |= 1 << i;
+/// Every move a Chao has learned, and the four it battles with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Moves {
+    /// Each move it learned, oldest first, and whether only partners from a GBA save taught it.
+    pub known: Vec<(u16, bool)>,
+    /// The ones it battles with, each one it knows (0: an empty slot).
+    pub active: [u16; 4],
+}
+
+/// Why a move can't be switched on or off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveRefused {
+    /// The Chao doesn't know it.
+    Unknown,
+    /// It's the only one it battles with.
+    LastOne,
+    /// It battles with four already.
+    Full,
+}
+
+impl MoveRefused {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unknown => "It doesn't know that move",
+            Self::LastOne => "A Chao needs at least one move",
+            Self::Full => "4 moves already: turn one off first",
+        }
+    }
+}
+
+impl Moves {
+    /// What a Chao known only by its partner record knows: the record's moves (its marks), all
+    /// of them active.
+    pub fn from_learned(l: &Learned) -> Moves {
+        let known = l
+            .moves
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|&(_, &id)| id != 0)
+            .map(|(i, &id)| (id, l.save_moves & 1 << i != 0))
+            .collect();
+        Moves {
+            known,
+            active: l.moves,
+        }
+        .tidy()
+    }
+
+    pub fn knows(&self, id: u16) -> bool {
+        id != 0 && self.known.iter().any(|&(k, _)| k == id)
+    }
+
+    /// Whether only partners from a GBA save taught it.
+    pub fn only_from_saves(&self, id: u16) -> bool {
+        self.known.iter().any(|&(k, marked)| k == id && marked)
+    }
+
+    pub fn is_active(&self, id: u16) -> bool {
+        id != 0 && self.active.contains(&id)
+    }
+
+    /// The active moves' save marks (bit `i` for `active[i]`, as `Learned::save_moves`).
+    pub fn active_marks(&self) -> u8 {
+        self.active
+            .iter()
+            .enumerate()
+            .filter(|&(_, &id)| self.only_from_saves(id))
+            .fold(0, |marks, (i, _)| marks | 1 << i)
+    }
+
+    /// Adds `id` to the known moves (`from_save`: taught by a partner from a GBA save); a move
+    /// it knew keeps its mark only when taught by one again. Whether it's new.
+    fn add(&mut self, id: u16, from_save: bool) -> bool {
+        if id == 0 {
+            return false;
+        }
+        match self.known.iter_mut().find(|(k, _)| *k == id) {
+            Some((_, marked)) => {
+                *marked &= from_save;
+                false
+            }
+            None => {
+                self.known.push((id, from_save));
+                true
             }
         }
-        marks
+    }
+
+    /// Puts `id` in the first empty active slot; whether there was one.
+    fn fill(&mut self, id: u16) -> bool {
+        if self.is_active(id) {
+            return true;
+        }
+        match self.active.iter_mut().find(|m| **m == 0) {
+            Some(slot) => {
+                *slot = id;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A partner (`from_save`: from a GBA save) teaches `taught`: the new ones join the known
+    /// moves and fill empty active slots; the active ones stay otherwise, and a known move
+    /// switched off stays off. The moves new to it.
+    pub fn learn(&mut self, taught: [u16; 4], from_save: bool) -> Vec<u16> {
+        let mut new = Vec::new();
+        for id in taught {
+            if self.add(id, from_save) {
+                new.push(id);
+                self.fill(id);
+            }
+        }
+        new
+    }
+
+    /// A TM move `id` is taught in place of active move `replacing` (or into an empty slot, or
+    /// the last one): it's known (never only from a save) and active. Whether it's new.
+    pub fn teach_tm(&mut self, id: u16, replacing: u16) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let new = self.add(id, false);
+        if let Some(m) = self.known.iter_mut().find(|(k, _)| *k == id) {
+            m.1 = false;
+        }
+        if self.is_active(id) {
+            return new;
+        }
+        match self.active.iter().position(|&m| m == replacing && m != 0) {
+            Some(at) => self.active[at] = id,
+            None => {
+                if !self.fill(id) {
+                    self.active[3] = id;
+                }
+            }
+        }
+        new
+    }
+
+    /// Switches move `id` on (into an empty slot) or off (at least one stays on). Whether it's
+    /// on now.
+    pub fn toggle(&mut self, id: u16) -> Result<bool, MoveRefused> {
+        if !self.knows(id) {
+            return Err(MoveRefused::Unknown);
+        }
+        if let Some(at) = self.active.iter().position(|&m| m == id) {
+            if self.active.iter().filter(|&&m| m != 0).count() <= 1 {
+                return Err(MoveRefused::LastOne);
+            }
+            self.active[at] = 0;
+            return Ok(false);
+        }
+        if self.fill(id) {
+            Ok(true)
+        } else {
+            Err(MoveRefused::Full)
+        }
+    }
+
+    /// Without empty or repeated known moves, and active ones it doesn't know or has twice.
+    fn tidy(mut self) -> Moves {
+        let mut seen = Vec::new();
+        self.known.retain(|&(id, _)| {
+            let keep = id != 0 && !seen.contains(&id);
+            seen.push(id);
+            keep
+        });
+        for i in 0..self.active.len() {
+            let id = self.active[i];
+            if !self.knows(id) || self.active[..i].contains(&id) {
+                self.active[i] = 0;
+            }
+        }
+        self
     }
 }
 
@@ -78,6 +249,10 @@ pub struct Waiting {
 pub struct Store {
     /// Chao identity -> what it has from its partners.
     pub partners: BTreeMap<u64, Learned>,
+    /// Chao identity -> every move it learned (`moves_of` for the ones with a partner only).
+    pub moves: BTreeMap<u64, Moves>,
+    /// Chao identity -> its battle level (`level` for the ones without).
+    pub levels: BTreeMap<u64, Level>,
     /// (key, garden, day).
     pub imports: Vec<(u64, u8, u32)>,
     pub waiting: Vec<Waiting>,
@@ -111,39 +286,26 @@ impl Refused {
 /// The moves a Chao knows after a partner with `taught` moves: those first, then the ones it
 /// knew that still fit, four at most, no repeats and no empty slots between.
 pub fn teach(known: [u16; 4], taught: [u16; 4]) -> [u16; 4] {
-    teach_marked(known, 0, taught, false).0
-}
-
-/// `teach`, with the moves' save marks (bit `i` for move `i`, as `Learned::save_moves`): known
-/// moves keep theirs, taught ones are marked when `from_save`. A move it knew that is taught
-/// again takes the teacher's mark.
-pub fn teach_marked(
-    known: [u16; 4],
-    known_marks: u8,
-    taught: [u16; 4],
-    from_save: bool,
-) -> ([u16; 4], u8) {
     let mut out = [0u16; 4];
-    let mut marks = 0u8;
     let mut n = 0;
-    let known = known
-        .into_iter()
-        .enumerate()
-        .map(|(i, id)| (id, known_marks & 1 << i != 0));
-    for (id, marked) in taught.into_iter().map(|id| (id, from_save)).chain(known) {
+    for id in taught.into_iter().chain(known) {
         if n < out.len() && id != 0 && !out[..n].contains(&id) {
             out[n] = id;
-            if marked {
-                marks |= 1 << n;
-            }
             n += 1;
         }
     }
-    (out, marks)
+    out
 }
 
 impl Store {
     pub fn parse(text: &str) -> Self {
+        Self::parse_with_taught(text, &BTreeMap::new())
+    }
+
+    /// `parse`, with the TM moves an older trainer progress file taught (Chao identity -> the
+    /// TM move in each active slot, 0 for none) added to the Chao that have no `moves` line
+    /// yet.
+    pub fn parse_with_taught(text: &str, taught: &BTreeMap<u64, [u16; 4]>) -> Self {
         let mut s = Self::default();
         for line in text.lines() {
             let mut w = line.split_whitespace();
@@ -237,9 +399,48 @@ impl Store {
                         s.kept.push((key, species, level, m));
                     }
                 }
+                Some("moves") if rest.len() >= 5 && (rest.len() - 5).is_multiple_of(2) => {
+                    let known: Option<Vec<(u16, bool)>> = rest[5..]
+                        .chunks(2)
+                        .map(|p| Some((p[0].parse().ok()?, flag(p[1])?)))
+                        .collect();
+                    if let (Ok(id), Some(active), Some(known)) =
+                        (u64::from_str_radix(rest[0], 16), moves(&rest[1..5]), known)
+                    {
+                        s.moves.insert(id, Moves { known, active }.tidy());
+                    }
+                }
+                Some("level") if rest.len() == 3 => {
+                    if let (Ok(id), Ok(level), Ok(xp)) = (
+                        u64::from_str_radix(rest[0], 16),
+                        rest[1].parse::<u8>(),
+                        rest[2].parse::<u32>(),
+                    ) {
+                        s.levels.insert(id, Level::new(level, xp));
+                    }
+                }
                 Some("gift") if rest.len() == 1 => s.gift = rest[0].parse().ok(),
                 _ => {}
             }
+        }
+        for (&identity, tms) in taught {
+            if s.moves.contains_key(&identity) || tms.iter().all(|&m| m == 0) {
+                continue;
+            }
+            let mut m = s.moves_of(identity);
+            for (slot, &id) in tms.iter().enumerate() {
+                if id == 0 {
+                    continue;
+                }
+                // As the progress file put them: a TM move it battles with elsewhere changes
+                // places with the move in the TM's slot.
+                m.add(id, false);
+                if let Some(j) = m.active.iter().position(|&a| a == id) {
+                    m.active[j] = m.active[slot];
+                }
+                m.active[slot] = id;
+            }
+            s.set_moves(identity, m);
         }
         s
     }
@@ -283,6 +484,17 @@ impl Store {
                 u8::from(l.partner.from_save),
                 l.save_moves
             );
+        }
+        for (id, m) in &self.moves {
+            let a = m.active;
+            out += &format!("moves {id:016x} {} {} {} {}", a[0], a[1], a[2], a[3]);
+            for &(move_id, marked) in &m.known {
+                out += &format!(" {move_id} {}", u8::from(marked));
+            }
+            out += "\n";
+        }
+        for (id, l) in &self.levels {
+            out += &format!("level {id:016x} {} {}\n", l.level, l.xp);
         }
         for (key, garden, day) in &self.imports {
             out += &format!("import {key:016x} {garden} {day}\n");
@@ -353,8 +565,8 @@ impl Store {
 
     /// A Chao (`identity`) absorbed the waiting partner `key` of `garden`: it's gone from the
     /// garden and is that Chao's partner now (replacing any before), which teaches it its moves.
-    /// Returns what the Chao has now.
-    pub fn absorbed(&mut self, garden: u8, key: u64, identity: u64) -> Option<Learned> {
+    /// Returns what the Chao has now and the moves new to it.
+    pub fn absorbed(&mut self, garden: u8, key: u64, identity: u64) -> Option<(Learned, Vec<u16>)> {
         let at = self
             .waiting
             .iter()
@@ -364,20 +576,69 @@ impl Store {
     }
 
     /// A Chao (`identity`) absorbed `partner`, which never waited here (a wild visitor): as
-    /// `absorbed`. Returns what the Chao has now.
-    pub fn learn(&mut self, identity: u64, partner: Partner) -> Learned {
-        let (known, marks) = self
-            .partners
-            .get(&identity)
-            .map_or(([0; 4], 0), |l| (l.moves, l.save_moves));
-        let (moves, save_moves) = teach_marked(known, marks, partner.moves, partner.from_save);
+    /// `absorbed`. Its moves join the ones the Chao knows (`Moves::learn`). Returns what the
+    /// Chao has now and the moves new to it.
+    pub fn learn(&mut self, identity: u64, partner: Partner) -> (Learned, Vec<u16>) {
+        let mut m = self.moves_of(identity);
+        let new = m.learn(partner.moves, partner.from_save);
         let learned = Learned {
             partner,
-            moves,
-            save_moves,
+            moves: m.active,
+            save_moves: m.active_marks(),
         };
         self.partners.insert(identity, learned);
-        learned
+        self.moves.insert(identity, m);
+        (learned, new)
+    }
+
+    /// Every move the Chao with `identity` learned (from its partner record when it has no list
+    /// yet; none at all for one that learned none).
+    pub fn moves_of(&self, identity: u64) -> Moves {
+        self.moves
+            .get(&identity)
+            .cloned()
+            .or_else(|| self.partners.get(&identity).map(Moves::from_learned))
+            .unwrap_or_default()
+    }
+
+    /// Keeps `moves` as the Chao's (active ones it doesn't know left out); its partner record
+    /// carries the active ones.
+    pub fn set_moves(&mut self, identity: u64, moves: Moves) {
+        let moves = moves.tidy();
+        if let Some(l) = self.partners.get_mut(&identity) {
+            l.moves = moves.active;
+            l.save_moves = moves.active_marks();
+        }
+        self.moves.insert(identity, moves);
+    }
+
+    /// The Chao's battle level (a new Chao's when it has none).
+    pub fn level(&self, identity: u64) -> Level {
+        self.levels.get(&identity).copied().unwrap_or_default()
+    }
+
+    /// What this file has of the Chao with `identity`: its partner, moves and level (`None` when
+    /// it has nothing of it).
+    pub fn record(&self, identity: u64) -> Option<(Option<Partner>, Moves, Level)> {
+        let partner = self.partners.get(&identity).map(|l| l.partner);
+        let known = partner.is_some()
+            || self.moves.contains_key(&identity)
+            || self.levels.contains_key(&identity);
+        known.then(|| (partner, self.moves_of(identity), self.level(identity)))
+    }
+
+    /// The Chao it has anything of (a partner, moves or a level).
+    pub fn identities(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .partners
+            .keys()
+            .chain(self.moves.keys())
+            .chain(self.levels.keys())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     pub fn waiting_in(&self, garden: u8) -> impl Iterator<Item = &Waiting> {
@@ -473,12 +734,34 @@ mod tests {
         assert!(s.take_gift(0x55, 7, 5, [1, 2, 0, 0]));
         assert!(!s.take_gift(0x56, 8, 5, [1, 0, 0, 0]));
         assert_eq!(s.kept.len(), 1);
-        let back = Store::parse(&s.to_text());
+        s.set_moves(
+            0x77,
+            Moves {
+                known: vec![(9, false), (1, true), (2, false), (3, true), (4, false)],
+                active: [1, 2, 3, 4],
+            },
+        );
+        // A Chao with TM moves and no partner, and levels.
+        s.set_moves(
+            0x88,
+            Moves {
+                known: vec![(40, false)],
+                active: [0, 40, 0, 0],
+            },
+        );
+        s.levels.insert(0x77, Level::new(23, 150));
+        s.levels.insert(0x99, Level::new(100, 0));
+        assert_eq!(s.partners[&0x77].save_moves, 0b0101);
+        let text = s.to_text();
+        assert!(text.contains("moves 0000000000000077 1 2 3 4 9 0 1 1 2 0 3 1 4 0\n"));
+        assert!(text.contains("level 0000000000000077 23 150\n"));
+        let back = Store::parse(&text);
         assert_eq!(back, s);
         // Junk lines are skipped.
         let junk = Store::parse(
             "partner zz 1\nwaiting 1\nbrought 1 2\nimport 12 1 x\nhello\n\
-             partner 1 2 3 4 5 6 7 8 9 10 11 12 13 x\n",
+             partner 1 2 3 4 5 6 7 8 9 10 11 12 13 x\nmoves 1 2 3 4 5 6\nmoves 1 1 2 3 4 5 2\n\
+             level 1 5\nlevel 1 x 0\n",
         );
         assert_eq!(junk, Store::default());
     }
@@ -531,39 +814,144 @@ mod tests {
     }
 
     #[test]
-    fn save_marks_follow_the_moves() {
-        // Taught by a save partner: marked; known ones keep their marks as they move down.
-        assert_eq!(
-            teach_marked([0; 4], 0, [5, 6, 0, 0], true),
-            ([5, 6, 0, 0], 0b0011)
+    fn a_chao_without_a_moves_line_knows_its_partner_lines_moves() {
+        let s = Store::parse("partner 00000000000000aa 25 13 13 84 0 45 0 12 0 84 45 7 0 1 5\n");
+        let m = s.moves_of(0xAA);
+        assert_eq!(m.active, [84, 45, 7, 0]);
+        assert_eq!(m.known.len(), 3);
+        assert!(m.only_from_saves(84) && m.only_from_saves(7) && !m.only_from_saves(45));
+        assert_eq!(s.level(0xAA), Level::default());
+        // Nothing is written for it until it changes.
+        assert!(!s.to_text().contains("moves"));
+        assert_eq!(s.moves_of(0xBB), Moves::default());
+        assert_eq!(s.record(0xBB), None);
+        assert!(s.record(0xAA).is_some());
+        // Bad levels are kept in range.
+        let s = Store::parse("level 1 0 5\nlevel 2 250 99999999\n");
+        assert_eq!(s.level(1), Level::new(1, 5));
+        assert_eq!(s.level(2), Level::new(100, 0));
+    }
+
+    #[test]
+    fn tm_moves_from_an_older_progress_file_join_the_list() {
+        let taught = BTreeMap::from([
+            (0xAA, [0, 0, 9, 0]),
+            (0xCC, [50, 0, 0, 0]),
+            (0xDD, [7, 0, 0, 0]),
+        ]);
+        let s = Store::parse_with_taught(
+            "partner 00000000000000aa 25 13 13 84 0 45 0 12 0 84 45 0 0 0 0\n\
+             moves 00000000000000dd 3 0 0 0 3 0\n",
+            &taught,
         );
-        assert_eq!(
-            teach_marked([5, 6, 0, 0], 0b0011, [7, 0, 0, 0], false),
-            ([7, 5, 6, 0], 0b0110)
-        );
-        // Taught again by a wild one: the mark goes.
-        assert_eq!(
-            teach_marked([7, 5, 6, 0], 0b0110, [5, 0, 0, 0], false),
-            ([5, 7, 6, 0], 0b0100)
-        );
-        // Pushed out: its mark goes with it.
-        assert_eq!(
-            teach_marked([1, 2, 3, 4], 0b1000, [8, 9, 0, 0], false),
-            ([8, 9, 1, 2], 0)
-        );
+        // In the TM's slot, as the progress file put it; the move there is still known.
+        let m = s.moves_of(0xAA);
+        assert_eq!(m.active, [84, 45, 9, 0]);
+        assert!(m.knows(9) && !m.only_from_saves(9));
+        assert_eq!(s.partners[&0xAA].moves, [84, 45, 9, 0]);
+        // A TM-only Chao gets a list without a partner.
+        assert_eq!(s.moves_of(0xCC).active, [50, 0, 0, 0]);
+        assert!(!s.partners.contains_key(&0xCC));
+        // A Chao with a list already keeps it.
+        assert_eq!(s.moves_of(0xDD).active, [3, 0, 0, 0]);
+        // Once written, the list is what loads.
+        let again = Store::parse_with_taught(&s.to_text(), &taught);
+        assert_eq!(again, s);
+    }
+
+    #[test]
+    fn a_chao_keeps_every_move_it_learns() {
         let mut s = Store::default();
         let saved = Partner {
             from_save: true,
             moves: [5, 6, 0, 0],
             ..p(1)
         };
-        assert_eq!(s.learn(77, saved).save_moves, 0b0011);
+        let (l, new) = s.learn(77, saved);
+        assert_eq!(new, [5, 6]);
+        assert_eq!((l.moves, l.save_moves), ([5, 6, 0, 0], 0b0011));
+        // Fewer than four active: the new ones fill in.
         let wild = Partner {
-            moves: [7, 0, 0, 0],
+            moves: [7, 8, 9, 0],
             ..p(2)
         };
-        let l = s.learn(77, wild);
-        assert_eq!((l.moves, l.save_moves), ([7, 5, 6, 0], 0b0110));
+        let (l, new) = s.learn(77, wild);
+        assert_eq!(new, [7, 8, 9]);
+        assert_eq!((l.moves, l.save_moves), ([5, 6, 7, 8], 0b0011));
+        let m = s.moves_of(77);
+        assert_eq!(m.known.len(), 5);
+        assert!(m.knows(9) && !m.is_active(9));
+        // Four active: they stay; a move taught again by a wild one loses its save mark, and
+        // one taught again by a save one keeps none.
+        let (l, new) = s.learn(
+            77,
+            Partner {
+                moves: [5, 0, 0, 0],
+                ..p(3)
+            },
+        );
+        assert!(new.is_empty());
+        assert_eq!((l.moves, l.save_moves), ([5, 6, 7, 8], 0b0010));
+        let (l, _) = s.learn(77, saved);
+        assert_eq!(l.save_moves, 0b0010);
+        assert_eq!(s.partners[&77].partner.species, 1);
+    }
+
+    #[test]
+    fn choosing_the_active_moves() {
+        let mut m = Moves::default();
+        m.learn([1, 2, 3, 4], false);
+        m.learn([5, 0, 0, 0], true);
+        assert_eq!(m.active, [1, 2, 3, 4]);
+        assert_eq!(m.toggle(5), Err(MoveRefused::Full));
+        assert_eq!(m.toggle(99), Err(MoveRefused::Unknown));
+        assert_eq!(m.toggle(2), Ok(false));
+        assert_eq!(m.active, [1, 0, 3, 4]);
+        assert_eq!(m.toggle(5), Ok(true));
+        assert_eq!(m.active, [1, 5, 3, 4]);
+        assert_eq!(m.active_marks(), 0b0010);
+        for id in [1, 5, 3] {
+            assert_eq!(m.toggle(id), Ok(false));
+        }
+        assert_eq!(m.toggle(4), Err(MoveRefused::LastOne));
+        // A known move switched off stays off when it's taught again; a new one fills in.
+        let mut m = Moves::default();
+        m.learn([1, 2, 3, 4], false);
+        m.toggle(4).unwrap();
+        assert_eq!(m.learn([4, 7, 0, 0], false), [7]);
+        assert_eq!(m.active, [1, 2, 3, 7]);
+        // A TM move goes in place of the one picked, and is never only from a save.
+        let mut m = Moves::default();
+        m.learn([1, 2, 3, 4], true);
+        assert!(m.teach_tm(9, 3));
+        assert_eq!(m.active, [1, 2, 9, 4]);
+        assert!(m.knows(3) && !m.only_from_saves(9));
+        assert!(!m.teach_tm(1, 4));
+        assert!(!m.only_from_saves(1));
+        assert_eq!(m.active, [1, 2, 9, 4]);
+        // In place of a move it doesn't battle with: an empty slot, else the last one.
+        m.toggle(2).unwrap();
+        m.teach_tm(10, 77);
+        assert_eq!(m.active, [1, 10, 9, 4]);
+        m.teach_tm(11, 0);
+        assert_eq!(m.active, [1, 10, 9, 11]);
+        // Kept in the store, the partner record follows.
+        let mut s = Store::default();
+        s.learn(
+            5,
+            Partner {
+                moves: [1, 2, 0, 0],
+                from_save: true,
+                ..p(1)
+            },
+        );
+        let mut m = s.moves_of(5);
+        m.learn([3, 0, 0, 0], false);
+        m.toggle(1).unwrap();
+        m.active[3] = 444; // not known: left out
+        s.set_moves(5, m);
+        assert_eq!(s.partners[&5].moves, [0, 2, 3, 0]);
+        assert_eq!(s.partners[&5].save_moves, 0b0010);
     }
 
     #[test]
@@ -575,9 +963,10 @@ mod tests {
         // Another garden is fine.
         s.import(1, 2, today, p(1)).unwrap();
         // Absorbed: gone from the garden, but not again today.
-        let learned = s.absorbed(1, 1, 77).unwrap();
+        let (learned, new) = s.absorbed(1, 1, 77).unwrap();
         assert_eq!(learned.partner, p(1));
         assert_eq!(learned.moves, [1, 2, 300, 0]);
+        assert_eq!(new, [1, 2, 300]);
         assert_eq!(s.partners.get(&77), Some(&learned));
         assert_eq!(s.can_import(1, 1, today), Err(Refused::Today));
         assert_eq!(s.can_import(1, 1, today + 1), Ok(()));
@@ -593,11 +982,11 @@ mod tests {
         assert_eq!(s.import(14, 1, today, other), Err(Refused::Full));
         s.forget_old(today + 1);
         assert!(s.imports.is_empty());
-        // A later absorb replaces the partner and teaches its moves on top of the ones known.
-        let learned = s.absorbed(1, 10, 77).unwrap();
+        // A later absorb replaces the partner and its moves join the ones known.
+        let (learned, _) = s.absorbed(1, 10, 77).unwrap();
         assert_eq!(s.partners.len(), 1);
         assert_eq!(learned.partner.species, 2);
-        assert_eq!(learned.moves, [50, 1, 2, 300]);
+        assert_eq!(learned.moves, [1, 2, 300, 50]);
         assert_eq!(s.absorbed(1, 999, 77), None);
     }
 
@@ -605,14 +994,14 @@ mod tests {
     fn a_visitor_teaches_without_waiting() {
         let mut s = Store::default();
         s.import(1, 1, 20_100, p(1)).unwrap();
-        let learned = s.learn(77, p(2));
+        let (learned, _) = s.learn(77, p(2));
         assert_eq!(learned.partner, p(2));
         assert_eq!(learned.moves, [1, 2, 300, 0]);
         let wild = Partner {
             moves: [7, 0, 0, 0],
             ..p(3)
         };
-        assert_eq!(s.learn(77, wild).moves, [7, 1, 2, 300]);
+        assert_eq!(s.learn(77, wild).0.moves, [1, 2, 300, 7]);
         // The waiting partner and the day's imports are untouched.
         assert_eq!(s.waiting.len(), 1);
         assert_eq!(s.imports.len(), 1);

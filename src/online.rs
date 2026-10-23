@@ -1563,9 +1563,10 @@ pub fn on_frame() {
             online.session.send(body, true, now);
         }
     }
-    // What our Chao have from GBA link partners, for friends' battles against copies of them.
+    // What our Chao have from GBA link partners, their moves and battle levels, for friends'
+    // battles against copies of them.
     if online.session.my_id().is_some() && RESEND_PARTNERS.swap(false, Ordering::Relaxed) {
-        let shared = crate::battle::ladder::shared_partners(crate::gba_link::shared_partners());
+        let shared = crate::gba_link::shared_partners();
         for list in shared.chunks(MAX_PARTNERS) {
             let body = Body::Partners {
                 list: list.to_vec(),
@@ -2217,7 +2218,8 @@ static MY_CHAO_SLOT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32
 static RESEND_MY_CHAO: AtomicBool = AtomicBool::new(true);
 static RESEND_PARTNERS: AtomicBool = AtomicBool::new(true);
 
-/// A Chao learned from a GBA link partner: tell the others again (`Body::Partners`).
+/// A Chao learned from a GBA link partner, its moves changed or it gained battle XP: tell the
+/// others again (`Body::Partners`).
 pub fn resend_partners() {
     RESEND_PARTNERS.store(true, Ordering::Relaxed);
 }

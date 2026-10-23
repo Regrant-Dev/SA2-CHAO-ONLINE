@@ -3,9 +3,11 @@
 //! level ranges: land ones walk on the grass, water ones swim in the pond, and now and then one
 //! is shiny (the ROM's shiny colours). Each is an animal object made like a partner's
 //! (`scene::create`), so Chao notice it, pick it up and absorb it, which teaches them its moves,
-//! types and ability as a partner does (`Store::learn`). Visitors are never saved: they go when
-//! the player leaves, except one the player carries out, which comes back in their hands in the
-//! next garden.
+//! types and ability as a partner does (`Store::learn`). Each visitor knows four moves picked at
+//! random from the ones its kind learns by its level (`random_moves`), so two of a kind can teach
+//! different ones. Up to 5 are in a garden at once. Visitors are never saved: they go when the
+//! player leaves, except one the player carries out, which comes back in their hands in the next
+//! garden.
 
 // Off the game (Linux builds) only the tests use the garden side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
@@ -30,12 +32,13 @@ pub fn enabled() -> bool {
 }
 
 /// Most visitors in a garden at once; each visit to a garden allows `MIN_CAP..=MAX_VISITORS`.
-pub const MAX_VISITORS: usize = 8;
-const MIN_CAP: usize = 6;
+pub const MAX_VISITORS: usize = 5;
+const MIN_CAP: usize = 4;
 /// Category-2 entries left for the game's own animals and drives.
 const RESERVE: u32 = 2;
 /// Visitors that come at once when the garden loads; the others come one by one.
-const ON_ENTRY: usize = 4;
+const ON_ENTRY: usize = 3;
+const _: () = assert!(ON_ENTRY <= MIN_CAP && MIN_CAP <= MAX_VISITORS);
 /// Nothing comes (nor the area's name) until the garden has been up and not shared this long:
 /// a shared garden is only known once friends' states or the server's Chao arrive.
 const ALONE_MILLIS: u64 = 2500;
@@ -107,21 +110,48 @@ pub struct Visitor {
     pub shiny: bool,
     /// Which of its species' two abilities it has.
     pub ability_slot: u8,
+    /// Picks its moves (`random_moves`).
+    pub seed: u64,
 }
 
 impl Visitor {
-    /// What a Chao that absorbs it gets: its types, ability and the moves it knows at its level.
+    /// What a Chao that absorbs it gets: its types, ability and its four moves.
     pub fn partner(&self, rom: &Rom) -> Option<Partner> {
         let species = rom.species(self.species)?;
         Some(Partner {
             species: self.species,
             types: species.types,
-            moves: rom.moves_at_level(self.species, self.level),
+            moves: random_moves(&rom.learnset(self.species), self.level, self.seed),
             level: self.level,
             ability: super::ability_of(&species, self.ability_slot),
             from_save: false,
         })
     }
+}
+
+/// Four different moves at random (by `seed`) of the ones `learnset` (level, move) teaches by
+/// `level`, in the learnset's order; all of them when there are four or fewer.
+pub fn random_moves(learnset: &[(u8, u16)], level: u8, seed: u64) -> [u16; 4] {
+    let mut ids: Vec<u16> = Vec::new();
+    for &(at, id) in learnset {
+        if at <= level && id != 0 && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let mut rng = Rng::new(seed);
+    // The first four of a partial shuffle, put back in learnset order.
+    let mut order: Vec<usize> = (0..ids.len()).collect();
+    for i in 0..order.len().min(4) {
+        let j = i + rng.below((order.len() - i) as u64) as usize;
+        order.swap(i, j);
+    }
+    order.truncate(4);
+    order.sort_unstable();
+    let mut out = [0u16; 4];
+    for (slot, i) in out.iter_mut().zip(order) {
+        *slot = ids[i];
+    }
+    out
 }
 
 /// One slot of `slots` that `keep` allows, by the slots' chances.
@@ -185,6 +215,7 @@ pub fn pick(
         level: rng.between(u64::from(slot.min_level), u64::from(slot.max_level)) as u8,
         shiny: rng.below(SHINY_ODDS) == 0,
         ability_slot: rng.below(2) as u8,
+        seed: rng.next(),
     })
 }
 
@@ -1161,6 +1192,42 @@ mod tests {
     }
 
     #[test]
+    fn visitors_roll_their_moves() {
+        let learnset = [
+            (1, 10),
+            (1, 11),
+            (4, 12),
+            (7, 13),
+            (9, 11),
+            (12, 14),
+            (20, 15),
+        ];
+        // Up to four known by the level: all of them, in order.
+        assert_eq!(random_moves(&learnset, 4, 1), [10, 11, 12, 0]);
+        assert_eq!(random_moves(&learnset, 9, 1), [10, 11, 12, 13]);
+        assert_eq!(random_moves(&[], 9, 1), [0; 4]);
+        // More: four different ones from those by the level, the same for the same seed.
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..200 {
+            let m = random_moves(&learnset, 15, seed);
+            assert_eq!(m, random_moves(&learnset, 15, seed));
+            assert!(m.iter().all(|&id| (10..=14).contains(&id)), "{m:?}");
+            for i in 0..4 {
+                assert!(!m[..i].contains(&m[i]));
+            }
+            assert!(m.windows(2).all(|w| w[0] < w[1]), "learnset order: {m:?}");
+            seen.insert(m);
+        }
+        // Each of the five ways to leave one out comes up.
+        assert_eq!(seen.len(), 5);
+        // Visitors get their own seeds.
+        let mut rng = Rng::new(4);
+        let a = pick(&area(true), false, types, &mut rng).unwrap();
+        let b = pick(&area(true), false, types, &mut rng).unwrap();
+        assert_ne!(a.seed, b.seed);
+    }
+
+    #[test]
     fn shinies_are_rare() {
         let mut rng = Rng::new(99);
         let n = 200_000;
@@ -1278,6 +1345,11 @@ mod tests {
                 assert_ne!(p.ability, 0);
                 assert_ne!(p.moves[0], 0);
                 assert!((1..=100).contains(&p.level));
+                // Moves its kind learns by its level.
+                let learnset = rom.learnset(v.species);
+                for m in p.moves.into_iter().filter(|&m| m != 0) {
+                    assert!(learnset.iter().any(|&(at, id)| id == m && at <= v.level));
+                }
             }
         }
     }

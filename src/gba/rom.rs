@@ -54,8 +54,8 @@ const TMHM_MOVES: usize = 0x616040;
 /// Experience tables (pret `gExperienceTables`): 6 growth rates × 101 LE u32 (index = level).
 const EXP_TABLES: usize = 0x31F72C;
 const GROWTH_COUNT: u8 = 6;
-/// Species records (pret `gSpeciesInfo`): 28 bytes; base stats @0..6, types @6..8, growth rate
-/// @0x13, abilities @0x16..0x18.
+/// Species records (pret `gSpeciesInfo`): 28 bytes; base stats @0..6, types @6..8, XP yield
+/// @9, growth rate @0x13, abilities @0x16..0x18.
 const SPECIES_INFO: usize = 0x3203CC;
 const SPECIES_INFO_SIZE: usize = 28;
 /// Front pics (pret `gMonFrontPicTable`): 8 bytes {u32 ptr to LZ77 4bpp tiles, u16 size, u16 tag}.
@@ -132,6 +132,8 @@ pub struct Species {
     pub growth: u8,
     /// Ability ids for the two ability slots; the second is 0 when there is only one.
     pub abilities: [u8; 2],
+    /// The XP a defeated one gives (before its level counts).
+    pub exp_yield: u8,
 }
 
 /// A move record.
@@ -366,6 +368,7 @@ impl Rom {
                 rec[0x16],
                 if rec[0x17] == rec[0x16] { 0 } else { rec[0x17] },
             ],
+            exp_yield: rec[9],
         })
     }
 

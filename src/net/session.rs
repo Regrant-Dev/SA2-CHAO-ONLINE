@@ -899,6 +899,7 @@ mod tests {
                 types: [0, 0],
                 ability: 0,
                 moves: [1, 0, 0, 0],
+                level: 5,
             };
             6
         ];
@@ -913,6 +914,7 @@ mod tests {
             to: a_id,
             format: 1,
             save_partners: true,
+            actual_levels: false,
             dex: 77,
             team: team.clone(),
         };
@@ -922,7 +924,8 @@ mod tests {
             == Body::BattleOffer {
                 from: 0,
                 format: 1,
-                save_partners: true
+                save_partners: true,
+                actual_levels: false,
             }));
         // The challenge itself reaches nobody.
         assert!(!lobby.client_events[a].iter().any(|e| matches!(

@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chao::{self, ChaoData};
 use crate::gba::rom::Rom;
 use crate::gba_link::Profile;
+use crate::gba_link::store::Moves;
 use crate::hud;
 use crate::log;
 
@@ -36,7 +37,9 @@ use super::engine::Format;
 use super::event::Slot;
 use super::narrate::{Cue, Sound};
 use super::online::{self, Incoming};
-use super::session::{self, Command, Entry, Friend, Lineup, Screen, Session, buttons};
+use super::session::{
+    self, Command, Entry, Friend, Lineup, Screen, Session, VISIBLE_ITEMS, buttons,
+};
 use super::team::Dex;
 use super::trainers::{self, Roster};
 use super::visuals::{self, Director, Order};
@@ -447,7 +450,8 @@ fn open(g: &mut Game) {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64);
-    let mut session = Session::open(dex, own, lineups, Box::new(profile_of), seed);
+    let mut session = Session::open(dex, own, lineups, Box::new(profile_of), seed)
+        .with_levels(crate::gba_link::levels());
     if trainers::enabled() {
         session = match g.roster.clone() {
             Some(roster) => session.with_trainers(roster, ladder::load()),
@@ -459,16 +463,20 @@ fn open(g: &mut Game) {
     g.bars = [[f32::NAN; session::TEAM_SIZE]; 2];
 }
 
-/// A Chao's types, ability and moves (Normal with no moves if the ROM can't be read); without
-/// `save_partners`, leaving out what partners from a GBA save gave.
-fn profile_of(chao: &ChaoData, save_partners: bool) -> Profile {
-    crate::gba_link::battle_profile(chao.identity(), save_partners).unwrap_or_else(|e| {
+/// A Chao's types, ability, moves (of `moves` when given) and battle level (Normal with no
+/// moves at a new Chao's level if the ROM can't be read); without `save_partners`, leaving out
+/// what partners from a GBA save gave.
+fn profile_of(chao: &ChaoData, moves: Option<&Moves>, save_partners: bool) -> Profile {
+    crate::gba_link::battle_profile(chao.identity(), moves, save_partners).unwrap_or_else(|e| {
         log!("battle: no profile ({e})");
         Profile {
             types: [0, 0],
             ability: 0,
             moves: [0; 4],
             partner: None,
+            level: crate::gba_link::battle_level(chao.identity(), moves.is_some())
+                .0
+                .level,
         }
     })
 }
@@ -478,19 +486,24 @@ fn usable(chao: &ChaoData) -> bool {
     chao.chao_type() > chao::TYPE_EGG && chao.validate().is_ok()
 }
 
+/// Another player's Chao (its moves are their game's).
 fn entry(chao: ChaoData) -> Entry {
     Entry {
         name: crate::karate::chao_name(&chao),
         chao,
+        moves: None,
     }
 }
 
-/// Copies of the Chao in our save.
+/// Copies of the Chao in our save, with every move each one learned.
 fn own_chao() -> Vec<Entry> {
     (0..crate::game::GARDEN_SLOTS)
         .filter_map(crate::game::read_chao_slot)
         .filter(usable)
-        .map(entry)
+        .map(|chao| Entry {
+            moves: Some(crate::gba_link::moves_of(chao.identity())),
+            ..entry(chao)
+        })
         .collect()
 }
 
@@ -618,8 +631,17 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
             Command::Progress => {
                 if let Some(s) = &g.session {
                     ladder::save(s.progress());
-                    // Friends' copies of our Chao take the TM moves too.
-                    crate::online::resend_partners();
+                }
+            }
+            Command::Levels => {
+                // Friends' copies of our Chao take the levels too (`set_levels` tells them).
+                if let Some(s) = &g.session {
+                    crate::gba_link::set_levels(s.levels());
+                }
+            }
+            Command::Moves(identity) => {
+                if let Some(moves) = g.session.as_ref().and_then(|s| s.own_moves(identity)) {
+                    crate::gba_link::set_moves(identity, moves.clone());
                 }
             }
         }
@@ -793,10 +815,14 @@ const DETAIL: i32 = 0xFFB0_D0F0u32 as i32;
 const HP_HIGH: u32 = 0xFF40_C060;
 const HP_MID: u32 = 0xFFE8_C030;
 const HP_LOW: u32 = 0xFFE0_4030;
+/// XP bar fill (toward the next battle level).
+const XP_FILL: u32 = 0xFF50_A0F0;
 /// A fighter box's width in text cells.
 const BOX_COLS: usize = 20;
-/// Menu items shown at once (longer lists scroll with the cursor).
-const VISIBLE_ITEMS: usize = 7;
+/// An XP bar beside a menu item: at most this many cells wide, and none narrower than
+/// `MIN_XP_COLS`.
+const XP_COLS: usize = 10;
+const MIN_XP_COLS: usize = 4;
 /// How far a drawn HP bar moves toward the real HP each frame (a full bar in about a second).
 const BAR_STEP: f32 = 1.0 / 60.0;
 
@@ -873,7 +899,8 @@ fn first_visible(len: usize, cursor: usize) -> usize {
 }
 
 /// A box per fighter in the ring: the player's on the left, the foes on the right (as they
-/// stand), each with its name, status and HP bar, and the HP for the player's own.
+/// stand), each with its name, status, HP bar and level, and for the player's own the HP and a
+/// thin bar of the XP toward the next battle level.
 fn draw_fighters(screen: &Screen, bars: &mut Bars) {
     let (w, _) = hud::screen_size();
     let size = hud::menu_font();
@@ -886,7 +913,7 @@ fn draw_fighters(screen: &Screen, bars: &mut Bars) {
         } else {
             cols.saturating_sub(BOX_COLS + 2)
         };
-        let rows = if ours { 3 } else { 2 };
+        let rows = 3;
         let (x, y) = (col as f32 * size, (1 + pos * 5) as f32 * size);
         hud::panel(x - size * 0.5, y - size * 0.5, size, BOX_COLS + 1, rows + 1);
 
@@ -933,6 +960,23 @@ fn draw_fighters(screen: &Screen, bars: &mut Bars) {
                 &format!(" HP {hp}/{}", line.max_hp),
             );
         }
+        let level = format!("Lv {}", line.level);
+        let lx = if ours {
+            x + (BOX_COLS - level.len()) as f32 * size
+        } else {
+            x + size
+        };
+        hud::text(lx, y + size * 2.0, size, TEXT, &level);
+        if let Some(xp) = line.xp {
+            hud::bar(
+                x,
+                y + size * 3.0,
+                BOX_COLS as f32 * size,
+                size * 0.2,
+                f32::from(xp) / 1000.0,
+                XP_FILL,
+            );
+        }
     }
 }
 
@@ -950,12 +994,32 @@ fn draw_menu(screen: &Screen) {
     if !screen.title.is_empty() {
         lines.push((screen.title.clone(), GOLD));
     }
-    let first = first_visible(screen.items.len(), screen.cursor.unwrap_or(0));
+    let first = match screen.cursor {
+        Some(cursor) => first_visible(screen.items.len(), cursor),
+        None => screen
+            .scroll
+            .min(screen.items.len().saturating_sub(VISIBLE_ITEMS)),
+    };
     let last = (first + VISIBLE_ITEMS).min(screen.items.len());
     if first > 0 {
         lines.push(("  ...".into(), DIM));
     }
+    // XP bars start past the longest item that has one.
+    let bar_col = screen
+        .bars
+        .iter()
+        .filter_map(|&(i, _)| screen.items.get(i))
+        .map(|item| item.chars().count() + 4)
+        .max()
+        .unwrap_or(0);
+    let bar_cols = XP_COLS.min(cols.saturating_sub(bar_col));
+    let mut bars = Vec::new();
     for (i, item) in screen.items.iter().enumerate().take(last).skip(first) {
+        if let Some(&(_, xp)) = screen.bars.iter().find(|(b, _)| *b == i)
+            && bar_cols >= MIN_XP_COLS
+        {
+            bars.push((lines.len(), xp));
+        }
         let selected = screen.cursor == Some(i);
         let disabled = screen.disabled.contains(&i);
         let mark = if selected { "> " } else { "  " };
@@ -985,6 +1049,16 @@ fn draw_menu(screen: &Screen) {
     for (i, (line, color)) in lines.iter().enumerate() {
         let clipped: String = line.chars().take(cols).collect();
         hud::text(x, top + size * i as f32, size, *color, &clipped);
+    }
+    for (row, xp) in bars {
+        hud::bar(
+            x + bar_col as f32 * size,
+            top + size * (row as f32 + 0.3),
+            bar_cols as f32 * size,
+            size * 0.4,
+            f32::from(xp) / 1000.0,
+            XP_FILL,
+        );
     }
 }
 

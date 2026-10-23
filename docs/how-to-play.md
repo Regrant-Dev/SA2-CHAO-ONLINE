@@ -236,7 +236,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
   transporter: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
   Garden, dark and spiky in the Dark Garden. Stand next to it (any side), with empty hands and
   nothing to pick up closer to you, and press the action button to open its list of
-  the save's party and boxes and the ones the mod keeps, with each one's level and types.
+  the save's party and boxes and the ones the mod keeps, with each one's level and types. The
+  list's first row, **Moves**, is for choosing your Chao's moves (below).
 - Move through the list with Up/Down on the controller or keyboard (PgUp/PgDn jump), and the
   machine's screen shows the picture of the one highlighted. A or Enter picks it: it pops out of
   the machine's hatch as a partner, drawn as its picture, and walks into the garden. B, Esc or
@@ -254,11 +255,23 @@ and pictures are read from your ROM, and the save is only read, never changed.
   Enter brings the one picked in front of you.
 - A Chao that absorbs one keeps it as its partner, and the partner teaches it its moves, its
   types and its special ability for Chao battles. The Chao's own stats don't change.
-- A Chao knows four moves at most: the new partner's moves come first and fill up with the ones
-  it knew before. A later partner replaces the types and ability. A Chao without a partner is
-  Normal type with a few basic moves.
-- The status balloon's last row shows the partner's types. Partners and moves are kept in
-  `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an animal gives.
+- A Chao remembers every move it has learned (from partners, wild visitors, the gift and TM
+  moves) and battles with four of them. New moves fill its four when it has fewer; otherwise
+  its four stay as they are. Either way "<Chao> learned <move>!" shows for each move new to it.
+  A later partner replaces the types and ability. A Chao without a partner is Normal type with
+  a few basic moves.
+- **Choosing moves:** pick **Moves** at the link machine, then one of your Chao by name. Its list
+  shows every move it has learned with the move's type and power; `[x]` marks the four (at most)
+  it battles with, and `(GBA save)` marks moves only a partner from a GBA save taught it. A or
+  Enter switches the move under the cursor on or off: a fifth one can't go on until one is off,
+  and the last one can't go off. Changes are kept at once; **Done** or B goes back. The battle
+  team screen has the same choice (Chao battles, below). A slot left empty battles with a basic
+  move.
+- The status balloon's last two rows show the partner's types and the Chao's battle level, with
+  a bar of its XP toward the next level for your own Chao (a friend's shows the level their
+  game sent) (Chao battles, below). Partners, moves and battle levels
+  are kept in `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an
+  animal gives.
 
 **Wild visitors:** each garden is linked to one area of the GBA game, a different one each day
 (the day changes at midnight UTC, and everyone with the same ROM gets the same areas). The
@@ -267,15 +280,17 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
 
 - The area's name shows for a few seconds when you walk into the garden.
 - Wild creatures of that area come by now and then, picked with the same chances and levels as
-  in the GBA game: four when you arrive, then one every 20 to 50 seconds, up to 6 to 8 at a
-  time (fewer when the garden is full of other animals).
+  in the GBA game: three when you arrive, then one every 20 to 50 seconds, up to 4 or 5 at a
+  time and never more than 5 (fewer when the garden is full of other animals).
   Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
   shiny, in the GBA game's shiny colours.
-- Your Chao pick them up and absorb them like partners: a wild one teaches a Chao the moves it
-  knows at its level, its types and its ability. You can carry one to a Chao too.
+- Your Chao pick them up and absorb them like partners: a wild one teaches a Chao its four
+  moves, its types and its ability. Its moves are picked at random from the ones its kind
+  learns by its level, so two of a kind can teach different moves. Absorbing gives no battle
+  XP. You can carry one to a Chao too.
 - Stand next to one, or pick it up, and a card at the top right shows it: name, level, types,
-  ability, its stats at that level and the moves a Chao that absorbs it learns. Partners brought
-  from the link machine get the same card.
+  ability, its stats at that level and the four moves a Chao that absorbs it learns. Partners
+  brought from the link machine get the same card.
 - Carry one through the transporter and it comes along: it is in your hands when you reach
   the next garden, ready to give to a Chao there.
 - Wild visitors are never saved; one that has been about for a few minutes leaves once you are
@@ -300,10 +315,12 @@ last button to reach **BATTLE** and press A. Then pick:
 
 1. **Singles** (one Chao a side at a time) or **Doubles** (two a side), or **Trainers** to
    battle the GBA game's trainers (below).
-2. **Your team:** up to 6 of the Chao in your save. A picks or drops the Chao under the cursor;
-   they go out in the order you picked them. The line below the list shows the Chao's types,
-   ability, moves and battle stats. Choose **Done** at the bottom of the list (Up from the top
-   gets there).
+2. **Your team:** up to 6 of the Chao in your save, each with its battle level and a bar of
+   its XP toward the next. A picks or drops the Chao under the cursor; they go out in the order
+   you picked them. The line below the list shows the Chao's battle level and XP, types,
+   ability, moves and battle stats. **Choose moves** picks a Chao, then switches its moves on
+   or off as at the link machine (Chao > GBA link). Choose **Done** at the bottom of the list
+   (Up from the top gets there).
 3. **Who to battle:** a friend online at Chao Karate for a live battle (below), a team of each
    online friend's Chao (their My Chao and the Chao they bring), the `.sa2chao` files in
    `chao/import` (six to a team), or copies of your other Chao (copies of your own team when
@@ -320,7 +337,8 @@ cursor, A chooses, B goes back. Start pauses the game as usual, and the battle w
   move aimed at one Chao then asks for its target: either foe, or your other Chao. Moves that
   hit both foes or everyone don't ask. A move that passes the Chao's stat changes on to a
   teammate asks who gets them.
-- **Switch:** send in another Chao from your team. The list shows each one's HP and status.
+- **Switch:** send in another Chao from your team. The list shows each one's level, HP and
+  status.
 - **Give up:** ends the battle as a loss, after asking.
 
 In doubles, B on the second Chao's menu goes back to the first one's. The foes choose at the
@@ -328,10 +346,12 @@ same time; the computer runs them, mostly picking moves that hit hard, with some
 
 The turn then plays out in the ring, with messages at the bottom ("... uses ...!", strong and
 weak hits, critical hits, misses, status, stat changes, weather, fainting); A moves on to the
-next one. A box at the top for each Chao in the ring shows its name, HP bar and status (SLP,
-PSN, BRN, FRZ, PAR); yours also show their HP. When one of your Chao faints you pick who
-replaces it. A team with no Chao left loses; the result screen shows who's still standing,
-and A goes back to the karate menu. A battle that reaches 200 turns is a draw.
+next one. A box at the top for each Chao in the ring shows its name, HP bar, status (SLP,
+PSN, BRN, FRZ, PAR) and level; yours also show their HP and a thin bar of their XP toward the
+next level. When one of your Chao faints you pick who replaces it. A team with no Chao left
+loses; the result screen shows who's still standing and the XP your Chao earned (Up/Down
+scrolls a long one), and A goes back to the karate menu. A battle that reaches 200 turns is a
+draw.
 
 **In the ring:** each Chao moves by the kind of move it uses: karate punches and kicks for
 moves that touch the foe, a throw or a hop and stomp for other physical moves, a swim stroke
@@ -347,7 +367,8 @@ in the mod's settings (GBA link group) turns all this off, leaving the karate pu
 
 **Rules:** the GBA game's battle rules: its type chart, accuracy and evasion, critical hits,
 the same-type bonus, priority, PP, status conditions, stat stages, weather, move effects and
-abilities. Chao hold no items. Every Chao battles at level 50, with stats from its own:
+abilities. Chao hold no items. Every Chao battles at its battle level (below), with stats from
+its own:
 
 | Chao stat | Battle stat |
 |---|---|
@@ -360,16 +381,41 @@ abilities. Chao hold no items. Every Chao battles at level 50, with stats from i
 | Luck | Critical-hit chance |
 
 A stat counts for more the more points it has, up to 3000 points (fully raised); a better
-grade adds a little. A new Chao is weak but can battle, and a well-raised one is strong.
+grade adds a little. Each counts as a base stat from 20 to 160 in the GBA game's stat formula at
+the Chao's level. A new Chao is weak but can battle, and a well-raised one clearly beats a
+poorly raised one at the same level.
 Intelligence and luck count as at least half the Chao's average of the other five stats.
 Happiness powers the moves that depend on the bond with the owner.
 
-**Moves, types and ability** come from the Chao's partner: absorbing one teaches its moves,
-types and ability, and a Chao keeps 4 moves (Chao > GBA link). A Chao without a partner is
-Normal type with a few basic moves and no ability. A friend's Chao battles with what it
-learned from its partners in their game, sent while you're online together. Exporting Chao
-files also writes `partners.txt` next to them: put it in `chao/import` with their `.sa2chao`
-files (add its lines to the one there when you have Chao from more than one friend).
+**Levels and XP:** each Chao has a battle level from 1 to 100, starting at 5, kept by the mod
+in `gba/partners.txt` (never in your save). XP comes only from battles:
+
+- Trainer battles give the GBA game's trainer XP for each foe that fainted (by its kind and
+  level), shared among your Chao that were sent out. A loss gives only what the fainted foes
+  were worth. Beaten trainers can be battled again for more.
+- Live battles give both players XP, by each Chao's own level, more for the winner and more
+  for each of the other team's Chao that fainted (less for one below your Chao's battle level,
+  whatever the level rule). Against a team of fewer than three, each of its Chao counts as one
+  of a team of three, so a smaller team gives less.
+- Only a battle played to the end gives XP: none when either player gives up, leaves or runs
+  out of time, and none for a live battle whose two games went apart.
+
+After the battle's last messages "<Chao> grew to Lv 23!" shows for each Chao that went up (A
+moves on, as with the other messages), and the result screen lists the XP each one earned. The
+first levels come quickly; level 100 takes about seven to eight hours of trainer and live
+battles for a Chao that fights them alone (Chao that are sent out together share the XP, so
+each takes longer). A Chao's level and XP show on the team screen, its box in the ring and its
+status balloon. Under the Level 50 rule the box shows Lv 50 without the XP bar, and when you
+answer such a challenge the team screen shows the stats at level 50.
+
+**Moves, types and ability** come from the Chao's partners: absorbing one teaches its moves,
+types and ability, and a Chao battles with 4 of the moves it has learned, chosen at the link
+machine or with **Choose moves** on the team screen (Chao > GBA link). A Chao without a partner
+is Normal type with a few basic moves and no ability. A friend's Chao battles with its
+partner's types and ability, its four moves and its battle level from their game, sent while
+you're online together; your own Chao only ever use what your game keeps for them. Exporting
+Chao files also writes `partners.txt` next to them: put it in `chao/import` with their
+`.sa2chao` files (add its lines to the one there when you have Chao from more than one friend).
 
 **Trainers:** the GBA game's own trainers with their teams from your ROM. The list has the
 route trainers first (warm-ups, in groups by strength), then the 8 gym leaders, the league's
@@ -379,13 +425,14 @@ opens with the gym leader before it. The line below the list shows the trainer's
 prize, and beaten trainers have a `*`. Pick a trainer, then your team: the battle is the
 trainer's own kind, singles or doubles. Their creatures stand on the far side of the ring as
 their pictures from the GBA game, at their own levels with their own moves, types and
-abilities; they hop when they act, shake when hit and sink away when they faint.
+abilities, against your Chao at theirs: the ladder is the level check. They hop when they act,
+shake when hit and sink away when they faint.
 
 Beating a gym leader earns their badge and the TM move their gym gives. **Teach a TM move** at
-the bottom of the list teaches a won move to any of your Chao in place of one of its moves; it
-stays in that move slot, also after new partners, until another TM move goes there. Friends'
-copies of that Chao, online or exported, battle with it too. Your progress and the taught
-moves are kept in the mod's `gba/trainers.txt`, never in your save.
+the bottom of the list teaches a won move to any of your Chao in place of one of the moves it
+battles with; the TM move joins the Chao's move list, and the one it replaced stays there.
+Friends' copies of that Chao, online or exported, battle with it too. Your progress is kept in
+the mod's `gba/trainers.txt` and the Chao's moves in `gba/partners.txt`, never in your save.
 **Battle the GBA game's trainers** in the mod's settings (GBA link group) turns Trainers off.
 
 **Live battles:** friends who are online and at Chao Karate too are at the top of the "Battle
@@ -404,8 +451,14 @@ too. Both games need the same GBA ROM.
 (A switches it) says whether your challenges allow what partners from a GBA save taught.
 **Not allowed** means both teams battle without it: moves a partner from a GBA save taught are
 left out, and a Chao whose partner came from a GBA save battles as Normal type with no ability
-(basic moves fill the empty slots). Moves from wild visitors, the gift and trainers' TMs always
-count. The challenge shows the rule to your friend, and each game applies it to its own team.
+(its other moves, then basic moves, fill the empty slots). Moves from wild visitors, the gift
+and trainers' TMs always count. The challenge shows the rule to your friend, and each game
+applies it to its own team.
+
+**Live rule, levels:** the next row says whether your challenges are **Level 50** (every Chao
+on both teams battles at level 50; the default) or **actual levels** (each Chao battles at its
+own battle level). The challenge shows the rule to your friend, and both games apply it to
+both teams. The XP a live battle gives doesn't depend on it.
 
 A challenge that comes while you're elsewhere, in
 another battle or in live karate is turned down on its own. **Live battles with friends

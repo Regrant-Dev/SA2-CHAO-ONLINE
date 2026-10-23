@@ -68,6 +68,8 @@ pub fn stats(base: [u8; 6], iv: u8, level: u8, nature: u8) -> Stats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Creature {
     pub species: u16,
+    /// Its species' XP yield (`levels::trainer_xp`).
+    pub exp_yield: u8,
     pub fighter: Fighter,
 }
 
@@ -138,6 +140,7 @@ fn foe(rom: &Rom, dex: &Dex, id: u16) -> Option<Foe> {
         .map(|m| {
             Some(Creature {
                 species: m.mon.species,
+                exp_yield: rom.species(m.mon.species)?.exp_yield,
                 fighter: creature(rom, dex, m)?,
             })
         })
@@ -293,7 +296,7 @@ pub struct Ctx<'a> {
     pub progress: &'a Progress,
     pub dex: &'a Dex,
     pub own: &'a [Entry],
-    /// `own`'s battle profiles, with their TM moves.
+    /// `own`'s battle profiles (their moves and levels).
     pub profiles: &'a [Profile],
 }
 
@@ -507,9 +510,9 @@ impl Picker {
                 let name = ctx.own.get(chao).map_or("?", |e| e.name.as_str());
                 self.notice = Some(match old {
                     Some(old) => format!(
-                        "{name} forgot {} and learned {}!",
-                        ctx.dex.move_name(old),
-                        ctx.dex.move_name(move_id)
+                        "{name} learned {} in place of {}!",
+                        ctx.dex.move_name(move_id),
+                        ctx.dex.move_name(old)
                     ),
                     None => format!("{name} learned {}!", ctx.dex.move_name(move_id)),
                 });
@@ -772,6 +775,7 @@ mod tests {
             name: format!("T{id}"),
             double,
             party: vec![Creature {
+                exp_yield: 50,
                 species: 1,
                 fighter: Fighter::new(
                     "Mon",
@@ -818,6 +822,7 @@ mod tests {
             chao: crate::chao::ChaoData {
                 bytes: [0; crate::chao::CHAO_SIZE],
             },
+            moves: None,
         }
     }
 
@@ -831,6 +836,7 @@ mod tests {
             ability: 0,
             moves: [1, 0, 0, 0],
             partner: None,
+            level: 5,
         }];
         let ctx = Ctx {
             roster: &roster,
@@ -892,12 +898,14 @@ mod tests {
                 ability: 0,
                 moves: [2, 0, 0, 0],
                 partner: None,
+                level: 5,
             },
             Profile {
                 types: [0, 0],
                 ability: 0,
                 moves: [1, 0, 0, 0],
                 partner: None,
+                level: 5,
             },
         ];
         let ctx = Ctx {
@@ -939,7 +947,7 @@ mod tests {
         );
         assert_eq!(
             p.screen(&ctx).message.as_deref(),
-            Some("Bo forgot Move 1 and learned Move 2!")
+            Some("Bo learned Move 2 in place of Move 1!")
         );
     }
 

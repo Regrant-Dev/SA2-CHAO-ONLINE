@@ -1,16 +1,17 @@
-//! The Chao status balloon (ParamFukidasi, re/chao-details.md "The status balloon") with five
-//! more rows under the game's five: happiness, alignment, needs, mood and its GBA link partner's
-//! types (gba_link.rs; names from the player's ROM). Any Chao's: our own
-//! from our save, a friend's from the server's live fields (`ChaoLive`, garden.rs).
+//! The Chao status balloon (ParamFukidasi, re/chao-details.md "The status balloon") with six
+//! more rows under the game's five: happiness, alignment, needs, mood, its GBA link partner's
+//! types (gba_link.rs; names from the player's ROM) and its battle level with the XP toward the
+//! next (battle/levels.rs). Any Chao's: our own from our save, a friend's from the server's live
+//! fields (`ChaoLive`, garden.rs) and what their game sent (`Body::Partners`).
 //!
 //! The balloon keeps its own display (0x565200) for the five stats and the name; we draw the
-//! frame ourselves, 9 rows tall, and our rows after it, in the game's font and bars.
+//! frame ourselves, 11 rows tall, and our rows after it, in the game's font and bars.
 
 // Off the game (Linux builds) only the tests use the rows.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
 /// Rows we add under the game's five.
-pub const EXTRA_ROWS: usize = 5;
+pub const EXTRA_ROWS: usize = 6;
 /// The game's rows.
 const GAME_ROWS: usize = 5;
 /// Glyph size of our text (the font's own cell, 22) and how far apart we set the letters: the
@@ -48,8 +49,14 @@ fn signed_bar(v: f32, max: f32) -> (i32, i32) {
     if v >= 0.0 { (k, k) } else { (k, 0) }
 }
 
-/// The rows for a Chao record (at least 0x190 bytes) and its partner's type names.
-pub fn rows(rec: &[u8], partner: Option<&[String]>) -> [Row; EXTRA_ROWS] {
+/// The rows for a Chao record (at least 0x190 bytes), its partner's type names and its battle
+/// level with the part of the way to the next (0..=1; `None` when it isn't known: another
+/// player's Chao).
+pub fn rows(
+    rec: &[u8],
+    partner: Option<&[String]>,
+    battle: (u8, Option<f32>),
+) -> [Row; EXTRA_ROWS] {
     let happiness = i16::from_le_bytes([rec[0x82], rec[0x83]]).clamp(-100, 100);
     let alignment = f32::from_le_bytes([rec[0xB0], rec[0xB1], rec[0xB2], rec[0xB3]]);
     let alignment = if alignment.is_finite() {
@@ -101,7 +108,22 @@ pub fn rows(rec: &[u8], partner: Option<&[String]>) -> [Row; EXTRA_ROWS] {
             bar: None,
         },
         partner_row(partner),
+        level_row(battle),
     ]
+}
+
+/// "Battle Lv" and the level, over a bar of the XP toward the next when it's known.
+fn level_row((level, toward): (u8, Option<f32>)) -> Row {
+    Row {
+        lines: [
+            ("Battle Lv".to_owned(), level.to_string()),
+            (String::new(), String::new()),
+        ],
+        bar: toward.map(|t| {
+            let k = (t.clamp(0.0, 1.0) * 10.0).floor() as i32;
+            (k, k)
+        }),
+    }
 }
 
 /// Longest type name shown (the line is 14 letters wide with "Partner").
@@ -138,6 +160,7 @@ pub fn font_codes(text: &str) -> Vec<u8> {
 #[cfg(target_arch = "x86")]
 mod game {
     use super::{ADVANCE, EXTRA_ROWS, GAME_ROWS, TEXT_SIZE, font_codes, rows};
+    use std::sync::Mutex;
 
     /// The balloon's display (`obj+0x1C`, written by `mov [esi+0x1C], imm32` at 0x565A80).
     const DISPLAY_IMM: usize = 0x0056_5A83;
@@ -168,8 +191,10 @@ mod game {
     const D_Y: usize = 0x14;
     const D_ALPHA: usize = 0x20;
     const D_RECORD: usize = 0x3C;
-    /// Its Y with our rows: the game's 216 less half of them, so it stays on screen.
-    const Y: f32 = 216.0 - 20.0 * EXTRA_ROWS as f32;
+    /// Its Y with our rows: higher than the game's 216 so all 11 rows stay on screen. The name
+    /// is drawn at Y − 124 (4 to 25 of 480), the cap from Y − 132 and the frame's bottom edge
+    /// ends at Y − 100 + 40 * 11 + 12 (480).
+    const Y: f32 = 128.0;
     const ROW: f32 = 40.0;
     const Z: f32 = -1.5;
     const RECORD_SIZE: usize = 0x800;
@@ -277,6 +302,32 @@ mod game {
         }
     }
 
+    /// The battle level row's level and XP (`rows`).
+    type Battle = (u8, Option<f32>);
+
+    /// The last Chao's battle level for the balloon (identity, frames it's kept, the row):
+    /// looked up again for another Chao or after a second.
+    static LEVEL: Mutex<Option<(u64, u16, Battle)>> = Mutex::new(None);
+
+    /// The battle level of the Chao with `identity` whose record is at `record`, and how far it
+    /// is toward the next when that's known (ours: its record is one of our save's slots).
+    fn battle_level(identity: u64, record: usize) -> Battle {
+        let mut last = LEVEL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((id, frames, row)) = last.as_mut()
+            && *id == identity
+            && *frames > 0
+        {
+            *frames -= 1;
+            return *row;
+        }
+        let own = (0..crate::game::GARDEN_SLOTS)
+            .any(|slot| crate::game::chao_slot_address(slot) == record);
+        let (level, known) = crate::gba_link::battle_level(identity, own);
+        let row = (level.level, known.then(|| level.fraction()));
+        *last = Some((identity, 60, row));
+        row
+    }
+
     /// The balloon's display: our frame, the game's rows, ours.
     extern "C" fn display(object: usize) {
         crate::watch::mark("balloon");
@@ -291,8 +342,8 @@ mod game {
             let x = ((d + D_X) as *const f32).read();
             type SetColour = extern "C" fn(f32, f32, f32, f32);
             let set_colour = std::mem::transmute::<usize, SetColour>(SET_COLOUR);
-            // The frame, as the game draws it but 9 rows tall and its top where the game's 5
-            // rows have it (Y − 100), so they line up.
+            // The frame, as the game draws it but as tall as all the rows and its top where the
+            // game's 5 rows have it (Y − 100), so they line up.
             (BLEND as *mut u32).write(0);
             set_colour(0.4, 1.0, 1.0, 1.0);
             let top = Y - 100.0;
@@ -313,9 +364,13 @@ mod game {
                 type Bar = extern "C" fn(i32, i32, f32, f32, f32, f32, f32);
                 let bar = std::mem::transmute::<usize, Bar>(BAR);
                 let x0 = x - 72.0;
-                let partner = crate::chao::ChaoData::from_bytes(rec)
-                    .and_then(|c| crate::gba_link::partner_types(c.identity()));
-                for (k, row) in rows(rec, partner.as_deref()).iter().enumerate() {
+                let identity = crate::chao::ChaoData::from_bytes(rec).map(|c| c.identity());
+                let partner = identity.and_then(crate::gba_link::partner_types);
+                let level = identity
+                    .map_or((crate::battle::levels::START_LEVEL, Some(0.0)), |id| {
+                        battle_level(id, record)
+                    });
+                for (k, row) in rows(rec, partner.as_deref(), level).iter().enumerate() {
                     let i = GAME_ROWS + k;
                     // Only once the frame has grown to it.
                     if (i as i32) >= n {
@@ -363,7 +418,7 @@ mod tests {
 
     #[test]
     fn rows_read_the_record() {
-        let rows = rows(&record(), None);
+        let rows = rows(&record(), None, (5, Some(0.0)));
         assert_eq!(rows[0].lines[0].1, "+42");
         // Happy is blue, unhappy red; hero blue, dark red: by how far from 0.
         assert_eq!(rows[0].bar, Some((4, 4)));
@@ -376,10 +431,23 @@ mod tests {
     }
 
     #[test]
+    fn the_battle_level_shows_with_its_xp_bar() {
+        let rows = rows(&record(), None, (23, Some(0.46)));
+        assert_eq!(rows[5].lines[0], ("Battle Lv".into(), "23".into()));
+        assert_eq!(rows[5].bar, Some((4, 4)));
+        // A bar row leaves its second line to the bar.
+        assert_eq!(rows[5].lines[1], (String::new(), String::new()));
+        assert_eq!(level_row((100, Some(1.0))).bar, Some((10, 10)));
+        assert_eq!(level_row((5, Some(0.0))).bar, Some((0, 0)));
+        // Another player's Chao: the level only.
+        assert_eq!(level_row((40, None)).bar, None);
+    }
+
+    #[test]
     fn a_quiet_chao_is_calm_and_a_broken_alignment_neutral() {
         let mut rec = vec![0u8; 0x800];
         rec[0xB0..0xB4].copy_from_slice(&f32::NAN.to_le_bytes());
-        let rows = rows(&rec, None);
+        let rows = rows(&rec, None, (5, Some(0.0)));
         assert_eq!(rows[3].lines[1].1, "Calm");
         assert_eq!(rows[4].lines[0], ("Partner".into(), "none".into()));
         assert_eq!(rows[1].lines[0].0, "Neutral");
@@ -393,7 +461,7 @@ mod tests {
         widest[0x13E..0x140].copy_from_slice(&10_000u16.to_le_bytes());
         widest[0x12C + 2] = 200; // sorrow
         let long = ["ABCDEFGHIJ".to_string(), "KLMNOPQRS".to_string()];
-        let partner = rows(&widest, Some(&long));
+        let partner = rows(&widest, Some(&long), (100, Some(1.0)));
         assert_eq!(partner[4].lines[1].1, "KLMNOP");
         for row in partner {
             for (label, value) in row.lines {
@@ -402,7 +470,7 @@ mod tests {
             }
         }
         // 144 px wide, label and value side by side with a letter between.
-        for row in rows(&record(), Some(&["AB".to_string()])) {
+        for row in rows(&record(), Some(&["AB".to_string()]), (23, Some(0.5))) {
             for (label, value) in row.lines {
                 let width = (label.len() + value.len() + 1) as f32 * ADVANCE;
                 assert!(width <= 144.0, "{label} {value}");

@@ -220,6 +220,8 @@ fn main() {
         _ => None,
     };
     let mut duel: Option<Duel> = None;
+    // The live battle's level rule (the challenge's: ours is Level 50).
+    let mut actual_levels = false;
     let mut battle_seen: Option<(u8, Instant)> = None;
     let mut last_challenge: Option<Instant> = None;
 
@@ -454,10 +456,16 @@ fn main() {
                         | Body::BattleStep { .. }
                         | Body::BattleEnd { .. }),
                 } => match live::incoming(body, |id| format!("player {id}")) {
-                    Some(Incoming::Offer { from, format, .. }) => {
+                    Some(Incoming::Offer {
+                        from,
+                        format,
+                        actual_levels: levels,
+                        ..
+                    }) => {
                         let body = match &battle_setup {
                             Some((dex, team)) if duel.is_none() => {
                                 println!("battle: accepting player {from}'s {format:?} challenge");
+                                actual_levels = levels;
                                 Body::BattleAnswer {
                                     to: from,
                                     answer: ANSWER_ACCEPT,
@@ -480,7 +488,7 @@ fn main() {
                                 "battle: {} starts against player {} as side {}",
                                 start.battle, start.opponent, start.side
                             );
-                            duel = Duel::new(dex, &start, team);
+                            duel = Duel::new(dex, &start, team, actual_levels);
                         }
                     }
                     Some(Incoming::Step {
@@ -572,10 +580,12 @@ fn main() {
             && last_challenge.is_none_or(|at| now.duration_since(at) > Duration::from_secs(60))
         {
             println!("battle: challenging player {player}");
+            actual_levels = false;
             let body = Body::BattleChallenge {
                 to: player,
                 format,
                 save_partners: true,
+                actual_levels,
                 dex: live::dex_print(dex),
                 team: team.clone(),
             };

@@ -1,7 +1,8 @@
 //! Chao as fighters: the stat mapping, and the ROM data a battle needs (moves, names, the type
 //! chart), read once from the player's own ROM.
 //!
-//! Every battle is at level 50. A Chao's stats map onto the battle stats:
+//! A Chao battles at its battle level (`levels`: 1 to 100, 5 for a new Chao; every Chao at
+//! `FAIR_LEVEL` under a live battle's "Level 50" rule). A Chao's stats map onto the battle stats:
 //!
 //! | Chao stat | battle stat |
 //! |---|---|
@@ -15,8 +16,10 @@
 //!
 //! Each stat's points count as a base stat between 20 (a new Chao) and 160 (3000 points, a
 //! fully raised stat), straight in between, and its grade as the IV (E 0, D 5, ... S 25, X 30);
-//! the battle stat is then Gen 3's formula at level 50 with no EVs. A new Chao's stats come out
-//! near 30 (HP near 85) and a fully raised one's near 175 (HP near 230). Luck and intelligence
+//! the battle stat is then Gen 3's formula at the Chao's battle level with no EVs. At level 50
+//! a new Chao's stats come out near 30 (HP near 85) and a fully raised one's near 175 (HP near
+//! 230), so a well-raised Chao clearly beats a poorly raised one at the same level, and the
+//! level scales both the same way (Gen 3's stats grow with the level). Luck and intelligence
 //! are hidden stats that few things raise, so each counts as at least half the Chao's average
 //! points over the five shown stats. A stat the record doesn't fill in (egg filler) counts as 0.
 
@@ -28,8 +31,8 @@ use super::data::{MoveData, Target, TypeChart, TypeEntry};
 use super::engine::Rules;
 use super::fighter::{Fighter, Stats, stat_from_base};
 
-/// Every battle is at this level.
-pub const LEVEL: u8 = 50;
+/// Every Chao's level under a live battle's "Level 50" rule.
+pub const FAIR_LEVEL: u8 = 50;
 /// Points at which a stat counts as fully raised (an S-grade stat near level 99).
 pub const POINTS_FULL: u32 = 3000;
 /// Base stats a stat's points map onto.
@@ -79,12 +82,13 @@ fn base(points: u32) -> u16 {
     (BASE_MIN + points.min(POINTS_FULL) * (BASE_MAX - BASE_MIN) / POINTS_FULL) as u16
 }
 
-fn battle_stat(points: u32, grade: u8, hp: bool) -> u16 {
-    stat_from_base(base(points), u16::from(grade) * IV_PER_GRADE, 0, LEVEL, hp)
+fn battle_stat(points: u32, grade: u8, hp: bool, level: u8) -> u16 {
+    stat_from_base(base(points), u16::from(grade) * IV_PER_GRADE, 0, level, hp)
 }
 
-/// The Chao's battle stats at `LEVEL` (see the module docs).
-pub fn chao_stats(chao: &ChaoData) -> ChaoStats {
+/// The Chao's battle stats at `level` (see the module docs).
+pub fn chao_stats(chao: &ChaoData, level: u8) -> ChaoStats {
+    let level = level.clamp(super::levels::MIN_LEVEL, super::levels::MAX_LEVEL);
     let shown_average = stat::SHOWN.iter().map(|&s| raw(chao, s).0).sum::<u32>() / 5;
     let hidden = |index: usize| {
         let (points, grade) = raw(chao, index);
@@ -92,7 +96,7 @@ pub fn chao_stats(chao: &ChaoData) -> ChaoStats {
     };
     let get = |index: usize, hp: bool| {
         let (points, grade) = raw(chao, index);
-        battle_stat(points, grade, hp)
+        battle_stat(points, grade, hp, level)
     };
     let (intelligence, intelligence_grade) = hidden(stat::INTELLIGENCE);
     let (luck, _) = hidden(stat::LUCK);
@@ -103,7 +107,7 @@ pub fn chao_stats(chao: &ChaoData) -> ChaoStats {
             attack: get(stat::POWER, false),
             defense: get(stat::SWIM, false),
             speed: get(stat::RUN, false),
-            sp_attack: battle_stat(intelligence, intelligence_grade, false),
+            sp_attack: battle_stat(intelligence, intelligence_grade, false, level),
             sp_defense: get(stat::FLY, false),
         },
         luck: (luck.min(POINTS_FULL) * 255 / POINTS_FULL) as u8,
@@ -116,16 +120,19 @@ fn friendship(happiness: i16) -> u8 {
     ((i32::from(happiness.clamp(-100, 100)) + 100) * 255 / 200) as u8
 }
 
-/// A Chao as a fighter: its stats, its battle profile's types, ability and moves (the ones the
-/// dex doesn't have are left out), at full HP.
+/// A Chao as a fighter: its stats at its battle profile's level, the profile's types, ability
+/// and moves (the ones the dex doesn't have are left out), at full HP.
 pub fn fighter(name: &str, chao: &ChaoData, profile: &Profile, dex: &Dex) -> Fighter {
-    let s = chao_stats(chao);
+    let level = profile
+        .level
+        .clamp(super::levels::MIN_LEVEL, super::levels::MAX_LEVEL);
+    let s = chao_stats(chao, level);
     let moves: Vec<MoveData> = profile
         .moves
         .iter()
         .filter_map(|&id| dex.move_data(id))
         .collect();
-    let mut f = Fighter::new(name, LEVEL, s.stats, profile.types, profile.ability, &moves);
+    let mut f = Fighter::new(name, level, s.stats, profile.types, profile.ability, &moves);
     f.luck = s.luck;
     f.evasion_edge = s.evasion_edge;
     f.friendship = friendship(chao.happiness());
@@ -323,24 +330,27 @@ mod tests {
 
     #[test]
     fn a_new_chao_is_weak_but_usable_and_a_raised_one_is_strong() {
-        let new = chao_stats(&chao([(2, 1, 30); 7]));
+        let new = chao_stats(&chao([(2, 1, 30); 7]), FAIR_LEVEL);
         assert!((25..=40).contains(&new.stats.attack), "{new:?}");
         assert!((75..=100).contains(&new.stats.hp), "{new:?}");
         assert_eq!(new.evasion_edge, 0);
 
-        let raised = chao_stats(&chao([(5, 99, 3000); 7]));
+        let raised = chao_stats(&chao([(5, 99, 3000); 7]), FAIR_LEVEL);
         assert!((160..=190).contains(&raised.stats.attack), "{raised:?}");
         assert!((210..=250).contains(&raised.stats.hp), "{raised:?}");
         assert_eq!(raised.luck, 255);
         assert_eq!(raised.evasion_edge, 5);
         // More points never go past the full mark.
-        assert_eq!(chao_stats(&chao([(5, 99, 9999); 7])).stats, raised.stats);
+        assert_eq!(
+            chao_stats(&chao([(5, 99, 9999); 7]), FAIR_LEVEL).stats,
+            raised.stats
+        );
     }
 
     #[test]
     fn each_chao_stat_drives_its_battle_stat() {
         let mut stats = [(2u8, 10u8, 200i16); 7];
-        let plain = chao_stats(&chao(stats)).stats;
+        let plain = chao_stats(&chao(stats), FAIR_LEVEL).stats;
         for (index, pick) in [
             (stat::STAMINA, (|s: &Stats| s.hp) as fn(&Stats) -> u16),
             (stat::POWER, |s| s.attack),
@@ -350,14 +360,14 @@ mod tests {
             (stat::INTELLIGENCE, |s| s.sp_attack),
         ] {
             stats[index] = (2, 40, 1500);
-            let raised = chao_stats(&chao(stats)).stats;
+            let raised = chao_stats(&chao(stats), FAIR_LEVEL).stats;
             assert!(pick(&raised) > pick(&plain), "stat {index}");
             stats[index] = (2, 10, 200);
         }
         // A better grade is a little stronger with the same points.
         let mut graded = [(2u8, 10u8, 200i16); 7];
         graded[stat::POWER] = (5, 10, 200);
-        assert!(chao_stats(&chao(graded)).stats.attack > plain.attack);
+        assert!(chao_stats(&chao(graded), FAIR_LEVEL).stats.attack > plain.attack);
     }
 
     #[test]
@@ -365,14 +375,82 @@ mod tests {
         let mut stats = [(3u8, 50u8, 2000i16); 7];
         stats[stat::INTELLIGENCE] = (0, 0, 0);
         stats[stat::LUCK] = (0x48, 0xC4, -5);
-        let s = chao_stats(&chao(stats));
+        let s = chao_stats(&chao(stats), FAIR_LEVEL);
         // Half of 2000 points: base 66.
-        assert_eq!(s.stats.sp_attack, stat_from_base(66, 0, 0, LEVEL, false));
+        assert_eq!(
+            s.stats.sp_attack,
+            stat_from_base(66, 0, 0, FAIR_LEVEL, false)
+        );
         assert_eq!(s.luck, (1000 * 255 / POINTS_FULL) as u8);
         // A filler stat among the shown ones counts as 0 points.
         stats[stat::POWER] = (0x48, 0xC4, 300);
-        let s = chao_stats(&chao(stats));
-        assert_eq!(s.stats.attack, stat_from_base(20, 0, 0, LEVEL, false));
+        let s = chao_stats(&chao(stats), FAIR_LEVEL);
+        assert_eq!(s.stats.attack, stat_from_base(20, 0, 0, FAIR_LEVEL, false));
+    }
+
+    #[test]
+    fn stats_grow_with_the_level() {
+        let c = chao([(3, 30, 1200); 7]);
+        let mut last = chao_stats(&c, 1).stats;
+        for level in [5, 20, 50, 100] {
+            let s = chao_stats(&c, level).stats;
+            assert!(s.hp > last.hp && s.attack > last.attack, "{level}");
+            last = s;
+        }
+        // Out-of-range levels count as the nearest.
+        assert_eq!(chao_stats(&c, 0), chao_stats(&c, 1));
+        assert_eq!(chao_stats(&c, 255), chao_stats(&c, 100));
+    }
+
+    #[test]
+    fn a_raised_chao_beats_a_poorly_raised_one_at_the_same_level() {
+        use super::super::ai;
+        use super::super::engine::{Battle, Format, Phase};
+        use super::super::event::Outcome;
+        use super::super::rng::Rng;
+        let dex = Dex::for_tests(
+            &[MoveData::plain(1, 0, 60), MoveData::plain(2, 10, 60)],
+            TypeChart::default(),
+        );
+        let profile = |level| Profile {
+            types: [0, 0],
+            ability: 0,
+            moves: [1, 2, 0, 0],
+            partner: None,
+            level,
+        };
+        let raised = chao([(4, 50, 1800); 7]);
+        let poor = chao([(1, 8, 250); 7]);
+        for level in [10, 30, 50, 80] {
+            let (r, p) = (chao_stats(&raised, level), chao_stats(&poor, level));
+            assert!(r.stats.hp > p.stats.hp * 13 / 10, "{level}: {r:?} {p:?}");
+            assert!(
+                r.stats.attack > p.stats.attack * 3 / 2,
+                "{level}: {r:?} {p:?}"
+            );
+            for seed in 0..10 {
+                let teams = [
+                    vec![fighter("R", &raised, &profile(level), &dex)],
+                    vec![fighter("P", &poor, &profile(level), &dex)],
+                ];
+                let mut b = Battle::new(
+                    Format::Singles,
+                    teams,
+                    dex.chart().clone(),
+                    dex.rules(),
+                    seed,
+                )
+                .unwrap();
+                b.start();
+                let mut rng = Rng::new(seed);
+                while !matches!(b.phase(), Phase::Over(_)) {
+                    let mut c = ai::choose(&b, 0, &mut rng);
+                    c.extend(ai::choose(&b, 1, &mut rng));
+                    b.play_turn(&c).unwrap();
+                }
+                assert_eq!(b.phase(), Phase::Over(Outcome::Won(0)), "{level} {seed}");
+            }
+        }
     }
 
     #[test]
@@ -394,11 +472,13 @@ mod tests {
             ability: 7,
             moves: [2, 1, 300, 0],
             partner: Some(4),
+            level: 23,
         };
         let c = chao([(2, 10, 300); 7]);
         let f = fighter("Pip", &c, &profile, &dex);
         assert_eq!(f.name, "Pip");
-        assert_eq!(f.level, LEVEL);
+        assert_eq!(f.level, 23);
+        assert_eq!(f.stats, chao_stats(&c, 23).stats);
         assert_eq!((f.types, f.ability), ([10, 2], 7));
         let ids: Vec<u16> = f.moves.iter().map(|m| m.data.id).collect();
         assert_eq!(ids, [2, 1]);

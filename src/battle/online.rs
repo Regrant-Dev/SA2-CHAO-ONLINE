@@ -5,8 +5,10 @@
 //! checksums and gives the step's rolls a new seed, so neither game can know the other's choice
 //! or the rolls ahead.
 //!
-//! - Teams go as `BattleMember`s (a copy of each Chao's record and its battle profile) and both
-//!   games build both teams' fighters from them the same way (`fighter_of`).
+//! - Teams go as `BattleMember`s (a copy of each Chao's record and its battle profile, with its
+//!   battle level) and both games build both teams' fighters from them the same way
+//!   (`fighter_of`), under the challenge's level rule: every Chao at level 50, or each at its
+//!   own level.
 //! - Choices go as `BattlePick`s; a step plays the same in both games (`apply_step`), a side
 //!   whose choices the battle refuses getting the computer's instead.
 //! - The mailbox between the network thread (online.rs) and the battle menu (game.rs, on the
@@ -28,6 +30,7 @@ use super::ai;
 use super::engine::{Action, Battle, BattleError, Choice, Format, Phase};
 use super::event::{Event, Outcome, Slot};
 use super::fighter::Fighter;
+use super::levels::{MAX_LEVEL, MIN_LEVEL};
 use super::rng::Rng;
 use super::team::{self, Dex};
 
@@ -127,6 +130,7 @@ pub fn member(chao: &ChaoData, profile: &Profile) -> BattleMember {
         types: profile.types,
         ability: profile.ability,
         moves: profile.moves,
+        level: profile.level.clamp(MIN_LEVEL, MAX_LEVEL),
     }
 }
 
@@ -137,17 +141,22 @@ pub fn profile_of(m: &BattleMember) -> Profile {
         ability: m.ability,
         moves: m.moves,
         partner: (m.species != 0).then_some(m.species),
+        level: m.level,
     }
 }
 
-/// A team member's fighter, the same in both games.
-pub fn fighter_of(m: &BattleMember, dex: &Dex) -> Fighter {
-    team::fighter(
-        &crate::karate::chao_name(&m.chao),
-        &m.chao,
-        &profile_of(m),
-        dex,
-    )
+/// A team member's fighter, the same in both games: at its own battle level with
+/// `actual_levels` (the challenge's rule), else at `team::FAIR_LEVEL`.
+pub fn fighter_of(m: &BattleMember, dex: &Dex, actual_levels: bool) -> Fighter {
+    let profile = Profile {
+        level: if actual_levels {
+            m.level
+        } else {
+            team::FAIR_LEVEL
+        },
+        ..profile_of(m)
+    };
+    team::fighter(&crate::karate::chao_name(&m.chao), &m.chao, &profile, dex)
 }
 
 fn target_wire(t: Option<Slot>) -> u8 {
@@ -297,10 +306,16 @@ pub fn apply_step(battle: &mut Battle, seed: u64, picks: &[(u8, BattlePick)]) ->
     Vec::new()
 }
 
-/// A team of `chao` with no partners (Normal, the basic moves), for a test player
+/// A team of `chao` with no partners (Normal, the basic moves) at level 50, for a test player
 /// (`fakepeer`).
 pub fn plain_team(rom: &crate::gba::rom::Rom, chao: &[ChaoData]) -> Vec<BattleMember> {
-    let profile = crate::gba_link::profile::profile(rom, None, true);
+    let profile = crate::gba_link::profile::profile(
+        rom,
+        None,
+        &crate::gba_link::store::Moves::default(),
+        true,
+        team::FAIR_LEVEL,
+    );
     chao.iter()
         .take(crate::net::protocol::MAX_BATTLE_TEAM)
         .map(|c| member(c, &profile))
@@ -319,10 +334,19 @@ pub struct Duel {
 }
 
 impl Duel {
-    /// The battle `start` begins, with `mine` (the team this side sent).
-    pub fn new(dex: &Dex, start: &Start, mine: &[BattleMember]) -> Option<Duel> {
-        let team =
-            |t: &[BattleMember]| -> Vec<Fighter> { t.iter().map(|m| fighter_of(m, dex)).collect() };
+    /// The battle `start` begins, with `mine` (the team this side sent), under the challenge's
+    /// level rule.
+    pub fn new(
+        dex: &Dex,
+        start: &Start,
+        mine: &[BattleMember],
+        actual_levels: bool,
+    ) -> Option<Duel> {
+        let team = |t: &[BattleMember]| -> Vec<Fighter> {
+            t.iter()
+                .map(|m| fighter_of(m, dex, actual_levels))
+                .collect()
+        };
         let (mine, theirs) = (team(mine), team(&start.team));
         let teams = if start.side == 0 {
             [mine, theirs]
@@ -399,8 +423,9 @@ pub enum Incoming {
         from: u8,
         name: String,
         format: Format,
-        /// The challenge's rule (`Body::BattleChallenge`).
+        /// The challenge's rules (`Body::BattleChallenge`).
         save_partners: bool,
+        actual_levels: bool,
     },
     Start(Start),
     Step {
@@ -465,11 +490,13 @@ pub fn incoming(body: Body, name: impl Fn(u8) -> String) -> Option<Incoming> {
             from,
             format,
             save_partners,
+            actual_levels,
         } => Incoming::Offer {
             from,
             name: name(from),
             format: format_of(format),
             save_partners,
+            actual_levels,
         },
         Body::BattleStart {
             battle,
@@ -754,6 +781,7 @@ mod tests {
                         types: [0, 0],
                         ability: 0,
                         moves: [1, 2, 3, 4],
+                        level: 5,
                     }
                 })
                 .collect()
@@ -768,6 +796,7 @@ mod tests {
             to: 2,
             format: 1,
             save_partners: true,
+            actual_levels: false,
             dex: dex_print(&dex),
             team: teams[0].clone(),
         };
@@ -784,7 +813,7 @@ mod tests {
             .drain(..)
             .map(|o| match incoming(o.body, |_| String::new()) {
                 Some(Incoming::Start(start)) => {
-                    Duel::new(&dex, &start, &teams[start.side]).unwrap()
+                    Duel::new(&dex, &start, &teams[start.side], false).unwrap()
                 }
                 other => panic!("{other:?}"),
             })
@@ -821,6 +850,7 @@ mod tests {
             from: 1,
             format: 1,
             save_partners: false,
+            actual_levels: true,
         };
         received(2, offer.clone(), |_| "x".into());
         assert!(take_incoming().is_empty());
@@ -832,7 +862,39 @@ mod tests {
                 name: "P1".into(),
                 format: Format::Doubles,
                 save_partners: false,
+                actual_levels: true,
             }]
         );
+    }
+
+    #[test]
+    fn the_level_rule_sets_every_fighters_level() {
+        use crate::chao::CHAO_SIZE;
+        let dex = Dex::for_tests(&moves(), TypeChart::default());
+        let mut chao = ChaoData {
+            bytes: [0; CHAO_SIZE],
+        };
+        chao.bytes[0x80] = 2;
+        let profile = Profile {
+            types: [0, 0],
+            ability: 0,
+            moves: [1, 0, 0, 0],
+            partner: None,
+            level: 12,
+        };
+        let m = member(&chao, &profile);
+        assert_eq!(m.level, 12);
+        assert_eq!(profile_of(&m), profile);
+        assert_eq!(fighter_of(&m, &dex, true).level, 12);
+        assert_eq!(fighter_of(&m, &dex, false).level, team::FAIR_LEVEL);
+        // Only levels in range go out.
+        let m = member(
+            &chao,
+            &Profile {
+                level: 0,
+                ..profile
+            },
+        );
+        assert_eq!(m.level, MIN_LEVEL);
     }
 }

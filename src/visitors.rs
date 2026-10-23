@@ -217,9 +217,9 @@ fn export_all(mod_path: &str) {
             Err(e) => log!("export: slot {slot:02} write failed: {e}"),
         }
     }
-    // What they have from GBA link partners, for battles against copies of them.
+    // What they have from GBA link partners, their moves and battle levels, for battles against
+    // copies of them.
     crate::gba_link::export_partners(&dir, &identities);
-    crate::battle::ladder::export_taught(&dir, &identities);
     log!("export: {count} Chao written to {}", dir.display());
 }
 

@@ -1,17 +1,18 @@
 //! One battle from the karate menu to the result: picking singles or doubles, your team and the
 //! opponents (or a trainer from the GBA game, `trainers`, or a friend online, `online`), then the
 //! turns (your choices from menus, the opponents' from the AI or the friend's game) played out
-//! beat by beat.
+//! beat by beat, and the XP the player's Chao earn from trainer and live battles (`levels`).
 //!
 //! No game access here: `update` takes the buttons pressed this frame and returns `Command`s for
 //! the arena (game.rs), and `screen` says what the HUD shows. A live battle's messages come in
 //! through `network` and go out through `take_outgoing`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::chao::ChaoData;
 use crate::gba_link::Profile;
+use crate::gba_link::store::{MoveRefused, Moves};
 use crate::log;
 use crate::net::protocol::{
     ANSWER_ACCEPT, ANSWER_BUSY, ANSWER_DECLINE, BattleMember, BattlePick, Body, END_BUSY,
@@ -26,6 +27,7 @@ use super::engine::{Action, Battle, Choice, Format, Phase};
 use super::event::{Event, Outcome, Slot};
 use super::fighter::{Fighter, MoveSlot};
 use super::ladder::Progress;
+use super::levels::{self, Level};
 use super::mirror;
 use super::narrate::{self, Beat, Cue, Names, Sound, View};
 use super::online::{self, Incoming};
@@ -46,6 +48,8 @@ pub mod buttons {
 pub const TEAM_SIZE: usize = 6;
 /// A beat with a message can be skipped with A after this many frames.
 const SKIP_AFTER: u16 = 10;
+/// How long "<Chao> grew to Lv N!" shows after a battle.
+const LEVEL_UP_FRAMES: u16 = 90;
 /// The result screen ignores A and B for this many frames, so presses that skip the last
 /// messages don't close it at once.
 const RESULT_WAIT: u16 = 30;
@@ -57,11 +61,13 @@ const END_LOST: u8 = 0xFF;
 /// (the host's own limit is shorter).
 const WAIT_LIMIT: u32 = 150 * 60;
 
-/// A Chao to battle with: a copy of its record (the save is never touched) and its name.
+/// A Chao to battle with: a copy of its record (the save is never touched), its name and, for
+/// the player's own, every move it learned (`None` for other players' Chao: their game's).
 #[derive(Clone)]
 pub struct Entry {
     pub name: String,
     pub chao: ChaoData,
+    pub moves: Option<Moves>,
 }
 
 /// A ready-made opponent team: a friend's Chao, the imported ones.
@@ -86,6 +92,8 @@ enum Against {
     Live(usize),
     /// Not a team: switches whether partners from a GBA save count in live battles.
     SaveRule,
+    /// Not a team: switches live battles between "Level 50" and the Chao's actual levels.
+    LevelRule,
     Lineup(usize),
     /// Copies of these of the player's Chao.
     Copies(Vec<usize>),
@@ -156,8 +164,13 @@ pub enum Command {
     /// A challenge that opened the menu by itself ended unanswered or turned down: the menu
     /// closes and the mode select goes on as before it (`Session::take_farewell` says why).
     Released,
-    /// The trainer ladder's progress changed (`Session::progress`): a win or a taught move.
+    /// The trainer ladder's progress changed (`Session::progress`): a win.
     Progress,
+    /// The player's Chao earned battle XP (`Session::levels`).
+    Levels,
+    /// The moves of the player's Chao with this identity changed (`Session::own_moves`): a TM
+    /// move taught or the four it battles with chosen.
+    Moves(u64),
 }
 
 /// One fighter's box on the HUD.
@@ -169,6 +182,21 @@ pub struct FighterLine {
     pub hp: u16,
     pub max_hp: u16,
     pub ailment: Option<&'static str>,
+    /// The level it battles at.
+    pub level: u8,
+    /// For the player's own Chao: how far its battle level is toward the next, in thousandths.
+    pub xp: Option<u16>,
+}
+
+/// The XP one of the player's Chao earned from a battle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gain {
+    pub name: String,
+    pub identity: u64,
+    pub xp: u32,
+    /// Its level after it, and whether it went up.
+    pub level: u8,
+    pub grew: bool,
 }
 
 /// What the HUD shows now.
@@ -189,17 +217,25 @@ pub struct Screen {
     /// The fighter the target menu's cursor is on.
     pub aimed: Option<Slot>,
     pub hint: &'static str,
+    /// XP bars beside items: (item, thousandths of the way to the next battle level).
+    pub bars: Vec<(usize, u16)>,
+    /// A list without a cursor: the first of its items shown (`VISIBLE_ITEMS` at once).
+    pub scroll: usize,
 }
 
-/// A Chao's profile; the flag is a live battle's rule (`Body::BattleChallenge::save_partners`).
-pub type ProfileOf = Box<dyn Fn(&ChaoData, bool) -> Profile + Send>;
+/// Menu items shown at once (longer lists scroll).
+pub const VISIBLE_ITEMS: usize = 7;
+
+/// A Chao's profile: of the moves given (the player's own Chao's), else of the moves it's known
+/// by; the flag is a live battle's rule (`Body::BattleChallenge::save_partners`).
+pub type ProfileOf = Box<dyn Fn(&ChaoData, Option<&Moves>, bool) -> Profile + Send>;
 
 pub struct Session {
     dex: Arc<Dex>,
     /// `online::dex_print` of `dex`, for live battles.
     dex_print: u32,
     own: Vec<Entry>,
-    /// `own`'s types, ability and moves (with their TM moves), for the picker.
+    /// `own`'s types, ability, moves and levels, for the picker.
     own_profiles: Vec<Profile>,
     lineups: Vec<Lineup>,
     profile_of: ProfileOf,
@@ -224,6 +260,12 @@ pub struct Session {
     save_partners: bool,
     /// The rule of the challenge being answered.
     offer_save_partners: bool,
+    /// Our challenges' level rule: each Chao at its own level (else all at level 50).
+    actual_levels: bool,
+    /// The level rule of the challenge being answered.
+    offer_actual_levels: bool,
+    /// The player's Chao's battle levels, by identity (the ones not here are at a new Chao's).
+    levels: BTreeMap<u64, Level>,
     /// The notice to show as the menu closes after `Command::Released`.
     farewell: Option<String>,
 }
@@ -240,6 +282,8 @@ struct Waiting {
     picked: Vec<usize>,
     team: Vec<BattleMember>,
     challenger: bool,
+    /// The challenge's level rule.
+    actual_levels: bool,
     /// Frames waited.
     waited: u32,
 }
@@ -257,6 +301,8 @@ enum State {
         foe: Option<u16>,
         /// Answering this friend's challenge (id, name).
         live: Option<(u8, String)>,
+        /// Choosing a Chao's moves ("Choose moves").
+        moves: Option<Choosing>,
     },
     Opponent {
         format: Format,
@@ -275,6 +321,14 @@ enum State {
     Waiting(Box<Waiting>),
     Fight(Box<Fight>),
     Done,
+}
+
+/// Choosing the four moves one of the player's Chao battles with, from every move it learned:
+/// which Chao (`chao` none), then its moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Choosing {
+    chao: Option<usize>,
+    cursor: usize,
 }
 
 /// Moves `cursor` up or down a list of `len` (wrapping); whether it moved.
@@ -304,8 +358,9 @@ fn type_names(dex: &Dex, types: [u8; 2]) -> String {
     }
 }
 
-/// A Chao for the picker: its types, ability, moves and battle stats.
-fn chao_detail(dex: &Dex, chao: &ChaoData, profile: &Profile) -> String {
+/// A Chao for the picker: its battle level and XP, types, ability, moves and battle stats (at
+/// the level it battles at, `profile.level`).
+fn chao_detail(dex: &Dex, chao: &ChaoData, profile: &Profile, level: Level) -> String {
     let ability = if profile.ability == 0 {
         "no ability".to_string()
     } else {
@@ -317,9 +372,19 @@ fn chao_detail(dex: &Dex, chao: &ChaoData, profile: &Profile) -> String {
         .filter(|&&id| dex.move_data(id).is_some())
         .map(|&id| dex.move_name(id))
         .collect();
-    let s = team::chao_stats(chao).stats;
+    let s = team::chao_stats(chao, profile.level).stats;
+    let xp = match levels::step(level.level) {
+        0 => String::new(),
+        step => format!(" (XP {}/{step})", level.xp),
+    };
+    let at = if profile.level == level.level {
+        String::new()
+    } else {
+        format!(", battling at Lv {}", profile.level)
+    };
     format!(
-        "{}, {ability}. Moves: {}. HP {} Atk {} Def {} SpA {} SpD {} Spe {}",
+        "Lv {}{xp}{at}. {}, {ability}. Moves: {}. HP {} Atk {} Def {} SpA {} SpD {} Spe {}",
+        level.level,
         type_names(dex, profile.types),
         if moves.is_empty() {
             "none".to_string()
@@ -380,7 +445,10 @@ impl Session {
         profile_of: ProfileOf,
         seed: u64,
     ) -> Session {
-        let own_profiles = own.iter().map(|e| profile_of(&e.chao, true)).collect();
+        let own_profiles = own
+            .iter()
+            .map(|e| profile_of(&e.chao, e.moves.as_ref(), true))
+            .collect();
         Session {
             dex_print: online::dex_print(&dex),
             dex,
@@ -400,6 +468,9 @@ impl Session {
             offer_opened: false,
             save_partners: true,
             offer_save_partners: true,
+            actual_levels: false,
+            offer_actual_levels: false,
+            levels: BTreeMap::new(),
             farewell: None,
         }
     }
@@ -525,11 +596,16 @@ impl Session {
                     name,
                     format,
                     save_partners,
+                    actual_levels,
                 },
             ) if online::enabled() => {
-                log!("battle: {name} challenges us ({format:?}, save partners {save_partners})");
+                log!(
+                    "battle: {name} challenges us ({format:?}, save partners {save_partners}, \
+                     actual levels {actual_levels})"
+                );
                 drop(state);
                 self.offer_save_partners = save_partners;
+                self.offer_actual_levels = actual_levels;
                 self.queued.push(Command::Cue(Cue::Sound(Sound::Confirm)));
                 State::Offer {
                     from,
@@ -591,22 +667,32 @@ impl Session {
         picked
             .iter()
             .filter_map(|&i| {
-                let chao = &self.own.get(i)?.chao;
+                let e = self.own.get(i)?;
                 Some(online::member(
-                    chao,
-                    &self.profile_ruled(chao, save_partners),
+                    &e.chao,
+                    &self.profile_ruled(e, save_partners),
                 ))
             })
             .collect()
     }
 
-    fn live_members(&self, team: &[BattleMember]) -> Vec<Member> {
+    /// A live team's fighters under the challenge's level rule.
+    fn live_members(&self, team: &[BattleMember], actual_levels: bool) -> Vec<Member> {
         team.iter()
             .map(|m| Member {
-                fighter: online::fighter_of(m, &self.dex),
+                fighter: online::fighter_of(m, &self.dex, actual_levels),
                 record: Some((*m.chao).clone()),
                 species: None,
+                exp_yield: 0,
             })
+            .collect()
+    }
+
+    /// The identities of the picked Chao, in order.
+    fn own_ids(&self, picked: &[usize]) -> Vec<u64> {
+        picked
+            .iter()
+            .filter_map(|&i| Some(self.own.get(i)?.chao.identity()))
             .collect()
     }
 
@@ -621,7 +707,7 @@ impl Session {
     ) -> State {
         let mine: Vec<Entry> = picked.iter().map(|&i| self.own[i].clone()).collect();
         let theirs: Vec<Entry> = match against {
-            Against::Live(_) | Against::SaveRule => Vec::new(),
+            Against::Live(_) | Against::SaveRule | Against::LevelRule => Vec::new(),
             Against::Lineup(l) => self.lineups[l]
                 .members
                 .iter()
@@ -673,6 +759,7 @@ impl Session {
             to: friend.id,
             format: online::format_wire(format),
             save_partners: self.save_partners,
+            actual_levels: self.actual_levels,
             dex: self.dex_print,
             team: team.clone(),
         });
@@ -685,6 +772,7 @@ impl Session {
             picked,
             team,
             challenger: true,
+            actual_levels: self.actual_levels,
             waited: 0,
         }))
     }
@@ -692,8 +780,8 @@ impl Session {
     /// The host started the live battle we waited for.
     fn start_live(&mut self, w: Waiting, start: online::Start) -> State {
         self.live_battle = Some(start.battle);
-        let mine = self.live_members(&w.team);
-        let theirs = self.live_members(&start.team);
+        let mine = self.live_members(&w.team, w.actual_levels);
+        let theirs = self.live_members(&start.team, w.actual_levels);
         let teams = if start.side == 0 {
             [mine, theirs]
         } else {
@@ -714,6 +802,9 @@ impl Session {
         ) {
             Some(mut fight) => {
                 fight.intro = Some(format!("A live battle against {}!", w.name));
+                fight.foe_levels = start.team.iter().map(|m| m.level).collect();
+                fight.fair = !w.actual_levels;
+                self.take_part(&mut fight, &w.picked);
                 fight.link = Some(Link {
                     battle: start.battle,
                     opponent: start.opponent,
@@ -757,19 +848,220 @@ impl Session {
         &self.progress
     }
 
-    /// A Chao's types, ability and moves, with the TM moves it was taught.
-    fn profile(&self, chao: &ChaoData) -> Profile {
-        self.profile_ruled(chao, true)
+    /// The player's Chao's battle levels (by identity), which battles add XP to.
+    pub fn with_levels(mut self, levels: BTreeMap<u64, Level>) -> Session {
+        self.levels = levels;
+        self.refresh_profiles();
+        self
     }
 
-    /// `profile`, under a live battle's rule.
-    fn profile_ruled(&self, chao: &ChaoData, save_partners: bool) -> Profile {
-        self.progress
-            .apply(chao.identity(), (self.profile_of)(chao, save_partners))
+    /// The player's Chao's battle levels, to keep after `Command::Levels`.
+    pub fn levels(&self) -> &BTreeMap<u64, Level> {
+        &self.levels
+    }
+
+    /// The battle level of the player's Chao with `identity`.
+    pub fn level_of(&self, identity: u64) -> Level {
+        self.levels.get(&identity).copied().unwrap_or_default()
+    }
+
+    /// Every move the player's Chao with `identity` learned, to keep after `Command::Moves`.
+    pub fn own_moves(&self, identity: u64) -> Option<&Moves> {
+        self.own
+            .iter()
+            .find(|e| e.chao.identity() == identity)?
+            .moves
+            .as_ref()
+    }
+
+    /// Every move the player's Chao `own[chao]` learned, oldest first, and whether only
+    /// partners from a GBA save taught it.
+    fn known_moves(&self, chao: usize) -> Vec<(u16, bool)> {
+        self.own
+            .get(chao)
+            .and_then(|e| e.moves.as_ref())
+            .map_or_else(Vec::new, |m| m.known.clone())
+    }
+
+    /// A frame of "Choose moves" on the team screen: which Chao, then its moves, where A
+    /// switches one on or off. `None` once it's back to the team.
+    fn choose_moves(
+        &mut self,
+        mut c: Choosing,
+        pressed: u32,
+        out: &mut Vec<Command>,
+    ) -> Option<Choosing> {
+        let Some(chao) = c.chao else {
+            if step(&mut c.cursor, self.own.len(), pressed) {
+                out.push(sound(Sound::Cursor));
+            }
+            if pressed & buttons::B != 0 {
+                out.push(sound(Sound::Back));
+                return None;
+            }
+            if pressed & buttons::A != 0 && c.cursor < self.own.len() {
+                out.push(sound(Sound::Confirm));
+                return Some(Choosing {
+                    chao: Some(c.cursor),
+                    cursor: 0,
+                });
+            }
+            return Some(c);
+        };
+        let known = self.known_moves(chao);
+        // Its moves, then "Done".
+        if step(&mut c.cursor, known.len() + 1, pressed) {
+            out.push(sound(Sound::Cursor));
+        }
+        let back = Choosing {
+            chao: None,
+            cursor: chao,
+        };
+        if pressed & buttons::B != 0 {
+            out.push(sound(Sound::Back));
+            return Some(back);
+        }
+        if pressed & buttons::A != 0 {
+            let Some(&(id, _)) = known.get(c.cursor) else {
+                out.push(sound(Sound::Confirm));
+                return Some(back);
+            };
+            match self.toggle_move(chao, id) {
+                Ok(on) => out.push(sound(if on { Sound::Confirm } else { Sound::Back })),
+                Err(why) => self.notice = Some(format!("{}.", why.message())),
+            }
+        }
+        Some(c)
+    }
+
+    /// The screen of "Choose moves" (`choose_moves`).
+    fn choosing_screen(&self, c: &Choosing) -> Screen {
+        let Some(chao) = c.chao else {
+            return Screen {
+                title: "Choose moves for which Chao?".into(),
+                items: self
+                    .own
+                    .iter()
+                    .map(|e| {
+                        let m = e.moves.clone().unwrap_or_default();
+                        let on = m.active.iter().filter(|&&id| id != 0).count();
+                        format!("{:<7}  {on} of {} moves", e.name, m.known.len())
+                    })
+                    .collect(),
+                cursor: Some(c.cursor),
+                detail: self.own_profiles.get(c.cursor).map(|p| {
+                    let names: Vec<String> = p
+                        .moves
+                        .iter()
+                        .filter(|&&id| self.dex.move_data(id).is_some())
+                        .map(|&id| self.dex.move_name(id))
+                        .collect();
+                    format!("Battles with: {}.", names.join(", "))
+                }),
+                hint: "A: choose  B: back",
+                ..Screen::default()
+            };
+        };
+        let known = self.known_moves(chao);
+        let moves = self.own.get(chao).and_then(|e| e.moves.as_ref());
+        let mut items: Vec<String> = known
+            .iter()
+            .map(|&(id, marked)| {
+                let on = if moves.is_some_and(|m| m.is_active(id)) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let about = match self.dex.move_data(id) {
+                    Some(d) if d.power > 1 => {
+                        format!("{} {}", self.dex.type_name(d.type_id), d.power)
+                    }
+                    Some(d) => self.dex.type_name(d.type_id),
+                    None => String::new(),
+                };
+                let save = if marked { "  (GBA save)" } else { "" };
+                format!("{on} {}  {about}{save}", self.dex.move_name(id))
+            })
+            .collect();
+        items.push("Done".into());
+        let detail = match known.get(c.cursor) {
+            Some(&(id, marked)) => {
+                let mut d = self
+                    .dex
+                    .move_data(id)
+                    .map(|m| move_detail(&self.dex, &m))
+                    .unwrap_or_default();
+                if marked {
+                    d.push_str(
+                        " Only partners from a GBA save taught it: live battles without GBA \
+                         save partners leave it out.",
+                    );
+                }
+                d
+            }
+            None if known.is_empty() => {
+                "It hasn't learned any moves yet, so it battles with basic moves.".into()
+            }
+            None => "Up to four moves on; empty slots take basic moves.".into(),
+        };
+        Screen {
+            title: format!(
+                "{}'s moves (4 at most)",
+                self.own.get(chao).map_or("", |e| e.name.as_str())
+            ),
+            items,
+            cursor: Some(c.cursor),
+            detail: Some(detail),
+            hint: "A: use or drop  B: back",
+            ..Screen::default()
+        }
+    }
+
+    /// Switches move `id` of the player's Chao `own[chao]` on or off for battles
+    /// (`Moves::toggle`); whether it's on now. The change goes out as `Command::Moves`.
+    pub fn toggle_move(&mut self, chao: usize, id: u16) -> Result<bool, MoveRefused> {
+        let e = self.own.get_mut(chao).ok_or(MoveRefused::Unknown)?;
+        let on = e.moves.as_mut().ok_or(MoveRefused::Unknown)?.toggle(id)?;
+        let identity = self.moves_changed(chao);
+        self.queued.push(Command::Moves(identity));
+        Ok(on)
+    }
+
+    /// After `own[chao]`'s moves changed: copies of that Chao (the same identity) take them
+    /// too. Its identity.
+    fn moves_changed(&mut self, chao: usize) -> u64 {
+        let identity = self.own[chao].chao.identity();
+        let moves = self.own[chao].moves.clone();
+        for e in &mut self.own {
+            if e.chao.identity() == identity {
+                e.moves.clone_from(&moves);
+            }
+        }
+        self.refresh_profiles();
+        identity
+    }
+
+    /// A Chao's types, ability, moves and level.
+    fn profile(&self, e: &Entry) -> Profile {
+        self.profile_ruled(e, true)
+    }
+
+    /// `profile`, under a live battle's rule. The player's own Chao are at the levels here.
+    fn profile_ruled(&self, e: &Entry, save_partners: bool) -> Profile {
+        let mut p = (self.profile_of)(&e.chao, e.moves.as_ref(), save_partners);
+        p.level = self.level_of(e.chao.identity()).level;
+        p
     }
 
     fn refresh_profiles(&mut self) {
-        self.own_profiles = self.own.iter().map(|e| self.profile(&e.chao)).collect();
+        self.own_profiles = self.own.iter().map(|e| self.profile(e)).collect();
+    }
+
+    /// Notes the player's Chao on `fight`'s side (the `picked` ones, in order), so the ones that
+    /// take part earn XP.
+    fn take_part(&self, fight: &mut Fight, picked: &[usize]) {
+        fight.own_ids = self.own_ids(picked);
+        fight.own_levels = fight.own_ids.iter().map(|&id| self.level_of(id)).collect();
     }
 
     /// The format menu's items: singles, doubles, and the trainers when on.
@@ -782,9 +1074,10 @@ impl Session {
         entries
             .iter()
             .map(|e| Member {
-                fighter: team::fighter(&e.name, &e.chao, &self.profile(&e.chao), &self.dex),
+                fighter: team::fighter(&e.name, &e.chao, &self.profile(e), &self.dex),
                 record: Some(e.chao.clone()),
                 species: None,
+                exp_yield: 0,
             })
             .collect()
     }
@@ -809,6 +1102,7 @@ impl Session {
                 fighter: c.fighter.clone(),
                 record: None,
                 species: Some(c.species),
+                exp_yield: c.exp_yield,
             })
             .collect();
         let mut fight = Fight::new(
@@ -819,22 +1113,64 @@ impl Session {
         )?;
         fight.foe = Some(id);
         fight.intro = Some(format!("{} wants to battle!", foe.name));
+        self.take_part(&mut fight, picked);
         Some(fight)
     }
 
-    /// After a frame of a trainer battle: a first win records progress and its reward.
-    fn record_win(&mut self, fight: &mut Fight, out: &mut Vec<Command>) {
-        let Some(id) = fight.foe else { return };
-        if fight.recorded || !fight.won() {
+    /// After a frame of a battle, once it's decided (once): a trainer win records progress and
+    /// its reward, and the player's Chao that took part in a trainer or live battle earn XP
+    /// (`levels`), with "<Chao> grew to Lv N!" after the battle's last messages.
+    fn record_result(&mut self, fight: &mut Fight, out: &mut Vec<Command>) {
+        if fight.recorded {
             return;
         }
+        let Some(decided) = fight.decided() else {
+            return;
+        };
         fight.recorded = true;
-        let first = self.progress.beat(id);
-        if let Some(roster) = &self.trainers {
-            fight.reward = roster.reward(id, first, &self.progress, &self.dex);
+        let won = decided == Decided::Won;
+        if let Some(id) = fight.foe.filter(|_| won) {
+            let first = self.progress.beat(id);
+            if let Some(roster) = &self.trainers {
+                fight.reward = roster.reward(id, first, &self.progress, &self.dex);
+            }
+            if first {
+                out.push(Command::Progress);
+            }
         }
-        if first {
-            out.push(Command::Progress);
+        if !matches!(decided, Decided::Won | Decided::Lost) {
+            return;
+        }
+        let gains = fight.earn(won, &mut self.levels);
+        if gains.is_empty() {
+            return;
+        }
+        out.push(Command::Levels);
+        // At the end of the beats when the battle ended by itself (its last ones are queued).
+        let playing = fight.stage != Stage::Result;
+        for g in &gains {
+            fight.xp_lines.push(if g.grew {
+                format!("{} gained {} XP and grew to Lv {}!", g.name, g.xp, g.level)
+            } else {
+                format!("{} gained {} XP.", g.name, g.xp)
+            });
+            if g.grew && playing {
+                fight.queue.push_back(Beat {
+                    text: Some(format!("{} grew to Lv {}!", g.name, g.level)),
+                    cues: Vec::new(),
+                    updates: Vec::new(),
+                    frames: LEVEL_UP_FRAMES,
+                });
+            }
+        }
+        fight.gains = gains;
+    }
+
+    /// What the player's Chao earned in the battle shown now (none before it's decided).
+    pub fn gains(&self) -> &[Gain] {
+        match &self.state {
+            State::Fight(f) => &f.gains,
+            _ => &[],
         }
     }
 
@@ -884,6 +1220,7 @@ impl Session {
             .collect();
         if !out.is_empty() {
             out.push((self.save_rule_label(), Against::SaveRule));
+            out.push((self.level_rule_label(), Against::LevelRule));
         }
         out.extend(self.lineups.iter().enumerate().map(|(i, l)| {
             (
@@ -919,9 +1256,24 @@ impl Session {
         )
     }
 
+    /// The live-challenge level rule's row.
+    fn level_rule_label(&self) -> String {
+        if self.actual_levels {
+            "Live rule: actual levels".into()
+        } else {
+            "Live rule: Level 50".into()
+        }
+    }
+
     /// About an opponent team: its Chao's names, or who a live battle is against.
     fn opponent_detail(&self, against: &Against) -> String {
         match against {
+            Against::LevelRule => if self.actual_levels {
+                "A: switch. In your live challenges, each Chao battles at its own battle level."
+            } else {
+                "A: switch. In your live challenges, every Chao on both teams battles at level 50."
+            }
+            .into(),
             Against::SaveRule => if self.save_partners {
                 "A: switch. In your live challenges, Chao use what partners from a GBA save taught them."
             } else {
@@ -991,6 +1343,7 @@ impl Session {
                             picked: Vec::new(),
                             foe: None,
                             live: None,
+                            moves: None,
                         }
                     }
                 } else {
@@ -1022,6 +1375,7 @@ impl Session {
                                 picked: Vec::new(),
                                 foe: Some(id),
                                 live: None,
+                                moves: None,
                             }
                         }
                         trainers::Step::Taught {
@@ -1029,10 +1383,17 @@ impl Session {
                             slot,
                             move_id,
                         } => {
-                            if let Some(e) = self.own.get(chao) {
-                                self.progress.teach(e.chao.identity(), slot, move_id);
-                                self.refresh_profiles();
-                                out.push(Command::Progress);
+                            let replacing = self
+                                .own_profiles
+                                .get(chao)
+                                .and_then(|p| p.moves.get(slot))
+                                .copied()
+                                .unwrap_or(0);
+                            if let Some(e) = self.own.get_mut(chao) {
+                                e.moves
+                                    .get_or_insert_with(Moves::default)
+                                    .teach_tm(move_id, replacing);
+                                out.push(Command::Moves(self.moves_changed(chao)));
                             }
                             State::Trainers(picker)
                         }
@@ -1041,13 +1402,30 @@ impl Session {
             },
             State::Team {
                 format,
+                cursor,
+                picked,
+                foe,
+                live,
+                moves: Some(choosing),
+            } => State::Team {
+                format,
+                cursor,
+                picked,
+                foe,
+                live,
+                moves: self.choose_moves(choosing, pressed, &mut out),
+            },
+            State::Team {
+                format,
                 mut cursor,
                 mut picked,
                 foe,
                 live,
+                moves: None,
             } => {
-                // The Chao, then "Done".
-                let len = self.own.len() + 1;
+                // The Chao, "Choose moves", then "Done".
+                let (moves_row, done) = (self.own.len(), self.own.len() + 1);
+                let len = done + 1;
                 if step(&mut cursor, len, pressed) {
                     out.push(sound(Sound::Cursor));
                 }
@@ -1057,6 +1435,7 @@ impl Session {
                     picked,
                     foe,
                     live,
+                    moves: None,
                 };
                 if pressed & buttons::B != 0 {
                     out.push(sound(Sound::Back));
@@ -1073,7 +1452,20 @@ impl Session {
                             cursor: usize::from(format == Format::Doubles),
                         },
                     }
-                } else if pressed & buttons::A != 0 && cursor == self.own.len() {
+                } else if pressed & buttons::A != 0 && cursor == moves_row {
+                    out.push(sound(Sound::Confirm));
+                    State::Team {
+                        format,
+                        cursor,
+                        picked,
+                        foe,
+                        live,
+                        moves: Some(Choosing {
+                            chao: None,
+                            cursor: 0,
+                        }),
+                    }
+                } else if pressed & buttons::A != 0 && cursor == done {
                     if picked.is_empty() {
                         self.notice = Some("Pick at least one Chao.".into());
                         stay(cursor, picked, foe, live)
@@ -1094,6 +1486,7 @@ impl Session {
                             picked,
                             team,
                             challenger: false,
+                            actual_levels: self.offer_actual_levels,
                             waited: 0,
                         }))
                     } else if let Some(id) = foe {
@@ -1124,7 +1517,7 @@ impl Session {
                         out.push(sound(Sound::Confirm));
                         // A full team goes straight to "Done".
                         if picked.len() == TEAM_SIZE {
-                            cursor = self.own.len();
+                            cursor = done;
                         }
                     } else {
                         self.notice = Some(format!("A team has at most {TEAM_SIZE} Chao."));
@@ -1147,15 +1540,25 @@ impl Session {
                     out.push(sound(Sound::Back));
                     State::Team {
                         format,
-                        cursor: self.own.len(),
+                        cursor: self.own.len() + 1,
                         picked,
                         foe: None,
                         live: None,
+                        moves: None,
                     }
                 } else if pressed & buttons::A != 0 && cursor < options.len() {
                     match options.swap_remove(cursor).1 {
                         Against::SaveRule => {
                             self.save_partners = !self.save_partners;
+                            out.push(sound(Sound::Cursor));
+                            State::Opponent {
+                                format,
+                                picked,
+                                cursor,
+                            }
+                        }
+                        Against::LevelRule => {
+                            self.actual_levels = !self.actual_levels;
                             out.push(sound(Sound::Cursor));
                             State::Opponent {
                                 format,
@@ -1203,6 +1606,7 @@ impl Session {
                         picked: Vec::new(),
                         foe: None,
                         live: Some((from, name)),
+                        moves: None,
                     }
                 } else if pressed & (buttons::A | buttons::B) != 0 {
                     self.outbox.push(answer(from, ANSWER_DECLINE));
@@ -1242,7 +1646,7 @@ impl Session {
             }
             State::Fight(mut fight) => {
                 let over = fight.update(pressed, arena_ready, &mut out);
-                self.record_win(&mut fight, &mut out);
+                self.record_result(&mut fight, &mut out);
                 if over {
                     State::Done
                 } else {
@@ -1292,6 +1696,7 @@ impl Session {
                 }),
                 None => Screen::default(),
             },
+            State::Team { moves: Some(c), .. } => self.choosing_screen(c),
             State::Team {
                 cursor,
                 picked,
@@ -1299,19 +1704,37 @@ impl Session {
                 live,
                 ..
             } => {
-                let mut items: Vec<String> = self
-                    .own
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| match picked.iter().position(|&p| p == i) {
-                        Some(n) => format!("{} {}", n + 1, e.name),
-                        None => format!("- {}", e.name),
-                    })
-                    .collect();
+                let mut items: Vec<String> = Vec::new();
+                let mut bars = Vec::new();
+                for (i, e) in self.own.iter().enumerate() {
+                    let mark = picked
+                        .iter()
+                        .position(|&p| p == i)
+                        .map_or_else(|| "-".to_string(), |n| (n + 1).to_string());
+                    let level = self.level_of(e.chao.identity());
+                    items.push(format!("{mark} {:<7}  Lv {}", e.name, level.level));
+                    bars.push((i, (level.fraction() * 1000.0) as u16));
+                }
+                items.push("Choose moves".into());
                 items.push(format!("Done ({} picked)", picked.len()));
                 let against = foe.and_then(|id| self.trainers.as_ref()?.foes.get(&id));
+                // Answering a challenge under the Level 50 rule: the stats at 50.
+                let fair = live.is_some() && !self.offer_actual_levels;
                 let detail = match (self.own.get(*cursor), self.own_profiles.get(*cursor)) {
-                    (Some(e), Some(p)) => Some(chao_detail(&self.dex, &e.chao, p)),
+                    (Some(e), Some(p)) => Some(chao_detail(
+                        &self.dex,
+                        &e.chao,
+                        &Profile {
+                            level: if fair { team::FAIR_LEVEL } else { p.level },
+                            ..*p
+                        },
+                        self.level_of(e.chao.identity()),
+                    )),
+                    _ if *cursor == self.own.len() => Some(
+                        "Choose the four moves each of your Chao battles with, from every move \
+                         it has learned."
+                            .into(),
+                    ),
                     _ => Some(match (against, live) {
                         (Some(f), _) => format!(
                             "Start with the Chao you picked, in that order, against {} ({}).",
@@ -1338,6 +1761,7 @@ impl Session {
                     cursor: Some(*cursor),
                     detail,
                     hint: "A: pick or drop  B: back",
+                    bars,
                     ..Screen::default()
                 }
             }
@@ -1378,11 +1802,16 @@ impl Session {
                 items: vec!["Accept".into(), "Decline".into()],
                 cursor: Some(*cursor),
                 detail: Some(format!(
-                    "Accept, then pick your team. {name} chooses their own moves from their game.{}",
+                    "Accept, then pick your team. {name} chooses their own moves from their game.{} {}",
                     if self.offer_save_partners {
                         ""
                     } else {
                         " Rule: GBA save partners not allowed (what they taught is left out)."
+                    },
+                    if self.offer_actual_levels {
+                        "Rule: actual levels (each Chao at its own battle level)."
+                    } else {
+                        "Rule: Level 50 (every Chao at level 50)."
                     }
                 )),
                 hint: "A: choose  B: decline",
@@ -1522,11 +1951,23 @@ impl Link {
 }
 
 /// A team member as a fight takes it: a Chao (its record, for the arena) or a trainer's
-/// creature (its species, for its picture).
+/// creature (its species, for its picture, and its XP yield).
 struct Member {
     fighter: Fighter,
     record: Option<ChaoData>,
     species: Option<u16>,
+    exp_yield: u8,
+}
+
+/// How a battle ended for the player, for its XP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decided {
+    Won,
+    /// Lost, or a draw.
+    Lost,
+    GaveUp,
+    /// A live battle that doesn't count (the games went apart, or it was cut short).
+    Void,
 }
 
 struct Fight {
@@ -1546,6 +1987,22 @@ struct Fight {
     intro: Option<String>,
     reward: Vec<String>,
     recorded: bool,
+    /// Each side's members' XP yields (trainers' creatures), in the battle's side order.
+    yields: [Vec<u8>; 2],
+    /// The other team's own battle levels in a live battle (whatever the level rule), for XP.
+    foe_levels: Vec<u8>,
+    /// A live battle under the Level 50 rule (every Chao at `team::FAIR_LEVEL`).
+    fair: bool,
+    /// The identities of the player's Chao on side `me` (none for a battle that gives no XP),
+    /// their battle levels, and which ones were sent out.
+    own_ids: Vec<u64>,
+    own_levels: Vec<Level>,
+    took_part: Vec<bool>,
+    /// What they earned, and the result screen's lines for it.
+    gains: Vec<Gain>,
+    xp_lines: Vec<String>,
+    /// The first of the result screen's lines shown.
+    result_top: usize,
     shown: View,
     planned: View,
     queue: VecDeque<Beat>,
@@ -1593,6 +2050,8 @@ impl Fight {
         });
         let records = [0, 1].map(|s| teams[shown(s)].iter().map(|m| m.record.clone()).collect());
         let species = [0, 1].map(|s| teams[shown(s)].iter().map(|m| m.species).collect());
+        let yields = [0, 1].map(|s| teams[s].iter().map(|m| m.exp_yield).collect());
+        let took_part = vec![false; teams[me].len()];
         let [mine, theirs] = teams;
         let fighters = [mine, theirs].map(|t| t.into_iter().map(|m| m.fighter).collect());
         let mut battle = match Battle::new(format, fighters, dex.chart().clone(), dex.rules(), seed)
@@ -1619,6 +2078,15 @@ impl Fight {
             intro: None,
             reward: Vec::new(),
             recorded: false,
+            yields,
+            foe_levels: Vec::new(),
+            fair: false,
+            own_ids: Vec::new(),
+            own_levels: Vec::new(),
+            took_part,
+            gains: Vec::new(),
+            xp_lines: Vec::new(),
+            result_top: 0,
             shown: view.clone(),
             planned: view,
             queue: VecDeque::new(),
@@ -1647,6 +2115,14 @@ impl Fight {
     }
 
     fn enqueue(&mut self, events: &[Event]) {
+        for e in events {
+            if let Event::SwitchedIn { at, member } = e
+                && at.side == self.me
+                && let Some(t) = self.took_part.get_mut(*member)
+            {
+                *t = true;
+            }
+        }
         let swapped: Vec<Event>;
         let events = if self.me == 0 {
             events
@@ -1691,6 +2167,19 @@ impl Fight {
             } => self.replace(slots, picks, cursor, pressed, out),
             Stage::Remote { give_up } => self.remote(give_up, pressed, out),
             Stage::Result => {
+                // A long result scrolls.
+                let more = self.result_items().len().saturating_sub(VISIBLE_ITEMS);
+                let top = if pressed & buttons::UP != 0 {
+                    self.result_top.saturating_sub(1)
+                } else if pressed & buttons::DOWN != 0 {
+                    (self.result_top + 1).min(more)
+                } else {
+                    self.result_top
+                };
+                if top != self.result_top {
+                    self.result_top = top;
+                    out.push(sound(Sound::Cursor));
+                }
                 if self.result_wait > 0 {
                     self.result_wait -= 1;
                 } else if pressed & (buttons::A | buttons::B) != 0 {
@@ -1703,11 +2192,83 @@ impl Fight {
         false
     }
 
-    /// Over with the player's side the winner (not given up).
-    fn won(&self) -> bool {
-        self.stage == Stage::Result
-            && !self.gave_up
-            && self.battle.phase() == Phase::Over(Outcome::Won(self.me))
+    /// How the battle ended for the player, once it has.
+    fn decided(&self) -> Option<Decided> {
+        if self.gave_up {
+            return Some(Decided::GaveUp);
+        }
+        // A live battle counts only when it's played to the end here: not when the games went
+        // apart, and not when it was cut short (a give-up, a disconnect, a timeout).
+        let ended = self.link.as_ref().and_then(|l| l.ended);
+        if matches!(ended, Some((END_DESYNC, _))) {
+            return Some(Decided::Void);
+        }
+        match self.battle.phase() {
+            Phase::Over(Outcome::Won(w)) if w == self.me => Some(Decided::Won),
+            Phase::Over(_) => Some(Decided::Lost),
+            _ => ended.map(|_| Decided::Void),
+        }
+    }
+
+    /// The XP the player's Chao that took part earn (`won`: the player won), added to `levels`:
+    /// a trainer battle's by its foes, a live battle's by each Chao's level step; none for
+    /// other battles or Chao at level 100.
+    fn earn(&mut self, won: bool, levels: &mut BTreeMap<u64, Level>) -> Vec<Gain> {
+        let takers: Vec<usize> = (0..self.own_ids.len())
+            .filter(|&m| self.took_part.get(m) == Some(&true))
+            .collect();
+        let k = takers.len();
+        let foe_side = self.foe();
+        let foes = self.battle.team(foe_side);
+        let fainted: Vec<u8> = foes
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.fainted())
+            .map(|(i, f)| self.foe_levels.get(i).copied().unwrap_or(f.level))
+            .collect();
+        let foe_count = foes.len();
+        let trainer_xp = self.foe.map(|_| {
+            let list: Vec<levels::Foe> = foes
+                .iter()
+                .enumerate()
+                .map(|(i, f)| levels::Foe {
+                    exp_yield: self.yields[foe_side].get(i).copied().unwrap_or(0),
+                    level: f.level,
+                    fainted: f.fainted(),
+                })
+                .collect();
+            levels::trainer_xp(&list, won, k)
+        });
+        let live = self.link.is_some();
+        let mut out = Vec::new();
+        for m in takers {
+            let identity = self.own_ids[m];
+            let mut level = levels.get(&identity).copied().unwrap_or_default();
+            if level.level >= levels::MAX_LEVEL {
+                continue;
+            }
+            let xp = match trainer_xp {
+                Some(xp) => xp,
+                None if live => levels::online_xp(level.level, won, &fainted, foe_count, k),
+                None => 0,
+            };
+            if xp == 0 {
+                continue;
+            }
+            let grew = level.gain(xp) > 0;
+            levels.insert(identity, level);
+            if let Some(l) = self.own_levels.get_mut(m) {
+                *l = level;
+            }
+            out.push(Gain {
+                name: self.names.fighter(0, m),
+                identity,
+                xp,
+                level: level.level,
+                grew,
+            });
+        }
+        out
     }
 
     /// Waiting for the friend's choice: the step once it's here, or the player giving up.
@@ -2252,6 +2813,12 @@ impl Fight {
                 let Some((hp, max_hp)) = self.shown.hp_at(slot) else {
                     continue;
                 };
+                let battle_side = if side == 0 { self.me } else { self.foe() };
+                let level = self
+                    .battle
+                    .team(battle_side)
+                    .get(member)
+                    .map_or(0, |f| f.level);
                 out.push(FighterLine {
                     slot,
                     member,
@@ -2263,6 +2830,13 @@ impl Fight {
                         .copied()
                         .flatten()
                         .map(narrate::ailment_tag),
+                    level,
+                    // Only at the Chao's own level (not under the Level 50 rule).
+                    xp: (side == 0)
+                        .then(|| self.own_levels.get(member))
+                        .flatten()
+                        .filter(|_| !self.fair)
+                        .map(|l| (l.fraction() * 1000.0) as u16),
                 });
             }
         }
@@ -2272,7 +2846,7 @@ impl Fight {
     /// A team member in the switch and send-in lists: HP, status, and why it can't come in.
     fn member_line(&self, member: usize, taken: &[usize]) -> String {
         let f = &self.battle.team(self.me)[member];
-        let mut line = format!("{}  HP {}/{}", f.name, f.hp, f.stats.hp);
+        let mut line = format!("{}  Lv {}  HP {}/{}", f.name, f.level, f.hp, f.stats.hp);
         if let Some(a) = f.ailment.filter(|_| !f.fainted()) {
             line.push_str("  ");
             line.push_str(narrate::ailment_tag(a));
@@ -2321,6 +2895,33 @@ impl Fight {
         (team.iter().filter(|f| !f.fainted()).count(), team.len())
     }
 
+    /// The result screen's lines: who's left standing, the turns, how a live battle ended, the
+    /// trainer's reward and the XP earned.
+    fn result_items(&self) -> Vec<String> {
+        let ended = self.link.as_ref().and_then(|l| Some((l.ended?, &l.name)));
+        let (mine, my_team) = self.standing(self.me);
+        let (theirs, their_team) = self.standing(self.foe());
+        let foes = if self.foe.is_some() { "team" } else { "Chao" };
+        let mut items = vec![
+            format!("Your Chao standing: {mine} of {my_team}"),
+            format!("Foe's {foes} standing: {theirs} of {their_team}"),
+            format!("Turns: {}", self.battle.turn()),
+        ];
+        if let Some(((reason, winner), name)) = ended {
+            items.push(match (reason, winner) {
+                (END_TIMEOUT, Some(w)) if w == self.me => {
+                    format!("{name} took too long to choose.")
+                }
+                (END_TIMEOUT, Some(_)) => "You took too long to choose.".into(),
+                (END_TIMEOUT, None) => "Nobody chose for too long.".into(),
+                _ => end_note(reason, name),
+            });
+        }
+        items.extend(self.reward.iter().cloned());
+        items.extend(self.xp_lines.iter().cloned());
+        items
+    }
+
     fn screen(&self) -> Screen {
         let mut s = Screen {
             fighters: self.fighter_lines(),
@@ -2344,27 +2945,14 @@ impl Fight {
                         _ => "You lost...".into(),
                     },
                 };
-                let (mine, my_team) = self.standing(self.me);
-                let (theirs, their_team) = self.standing(self.foe());
-                let foes = if self.foe.is_some() { "team" } else { "Chao" };
-                s.items = vec![
-                    format!("Your Chao standing: {mine} of {my_team}"),
-                    format!("Foe's {foes} standing: {theirs} of {their_team}"),
-                    format!("Turns: {}", self.battle.turn()),
-                ];
-                if let Some(((reason, winner), name)) = ended {
-                    s.items.push(match (reason, winner) {
-                        (END_TIMEOUT, Some(w)) if w == self.me => {
-                            format!("{name} took too long to choose.")
-                        }
-                        (END_TIMEOUT, Some(_)) => "You took too long to choose.".into(),
-                        (END_TIMEOUT, None) => "Nobody chose for too long.".into(),
-                        _ => end_note(reason, name),
-                    });
-                }
-                s.items.extend(self.reward.iter().cloned());
+                s.items = self.result_items();
+                s.scroll = self.result_top;
                 s.message = None;
-                s.hint = "A: back to the menu";
+                s.hint = if s.items.len() > VISIBLE_ITEMS {
+                    "A: back to the menu  Up/Down: more"
+                } else {
+                    "A: back to the menu"
+                };
             }
             Stage::Remote { give_up } => {
                 let name = self.link.as_ref().map_or("", |l| l.name.as_str());
@@ -2498,6 +3086,8 @@ mod tests {
             c.bytes[0x30 + i] = 10;
             c.bytes[0x38 + i * 2..0x3A + i * 2].copy_from_slice(&points.to_le_bytes());
         }
+        // Its own DNA, so Chao with other points are other Chao.
+        c.bytes[0x438 + 2..0x438 + 4].copy_from_slice(&points.to_le_bytes());
         c
     }
 
@@ -2505,6 +3095,7 @@ mod tests {
         Entry {
             name: name.into(),
             chao: chao(points),
+            moves: None,
         }
     }
 
@@ -2524,18 +3115,31 @@ mod tests {
         let mut all = vec![MoveData::plain(1, 0, 60), MoveData::plain(2, 0, 90), spread];
         all.extend_from_slice(extra);
         let dex = Dex::for_tests(&all, TypeChart::default());
+        let known = Moves {
+            known: moves
+                .iter()
+                .filter(|&&m| m != 0)
+                .map(|&m| (m, false))
+                .collect(),
+            active: moves,
+        };
         let own = (0..own)
-            .map(|i| entry(&format!("Own{i}"), 200 + i as i16 * 100))
+            .map(|i| Entry {
+                moves: Some(known.clone()),
+                ..entry(&format!("Own{i}"), 200 + i as i16 * 100)
+            })
             .collect();
+        // The game's profile at level 50; the player's own Chao are at their levels.
         Session::open(
             Arc::new(dex),
             own,
             lineups,
-            Box::new(move |_, _| Profile {
+            Box::new(move |_, chosen, _| Profile {
                 types: [0, 0],
                 ability: 0,
-                moves,
+                moves: chosen.map_or(moves, |m| m.active),
                 partner: None,
+                level: team::FAIR_LEVEL,
             }),
             7,
         )
@@ -2620,7 +3224,7 @@ mod tests {
         let mut s = session(3, vec![lineup]);
         s.update(buttons::DOWN, false);
         s.update(buttons::A, false); // doubles
-        assert_eq!(s.screen().items.len(), 4);
+        assert_eq!(s.screen().items.len(), 5);
         // The highlighted Chao's types, moves and stats.
         let detail = s.screen().detail.unwrap();
         assert!(detail.contains("Move 1, Move 2, Move 3") && detail.contains("HP "));
@@ -2636,8 +3240,12 @@ mod tests {
         s.update(buttons::A, false); // Own2
         s.update(buttons::A, false); // Own2 again: dropped
         s.update(buttons::A, false); // and back
-        assert_eq!(s.screen().items[0], "1 Own0");
-        assert_eq!(s.screen().items[2], "2 Own2");
+        // With each one's battle level and XP bar.
+        assert_eq!(s.screen().items[0], "1 Own0     Lv 5");
+        assert_eq!(s.screen().items[2], "2 Own2     Lv 5");
+        assert_eq!(s.screen().items[3], "Choose moves");
+        assert_eq!(s.screen().bars, [(0, 0), (1, 0), (2, 0)]);
+        s.update(buttons::DOWN, false);
         s.update(buttons::DOWN, false);
         s.update(buttons::A, false); // Done
         let screen = s.screen();
@@ -2648,7 +3256,7 @@ mod tests {
         assert_eq!(screen.detail.as_deref(), Some("F0, F1"));
         // B goes back to the team with the cursor on "Done".
         s.update(buttons::B, false);
-        assert_eq!(s.screen().cursor, Some(3));
+        assert_eq!(s.screen().cursor, Some(4));
         s.update(buttons::A, false);
         // The friend's team.
         let out = s.update(buttons::A, false);
@@ -2670,6 +3278,73 @@ mod tests {
     }
 
     #[test]
+    fn choosing_the_moves_a_chao_battles_with_on_the_team_screen() {
+        let mut s = session_with(2, Vec::new(), &[MoveData::plain(4, 0, 70)], [1, 2, 3, 0]);
+        let id = s.own[0].chao.identity();
+        // One more it learned but doesn't battle with, taught by a GBA save's partner.
+        s.own[0].moves.as_mut().unwrap().known.push((4, true));
+        s.update(buttons::A, false); // singles
+        s.update(buttons::UP, false);
+        s.update(buttons::UP, false);
+        assert_eq!(s.screen().items[2], "Choose moves");
+        assert!(
+            s.screen()
+                .detail
+                .unwrap()
+                .starts_with("Choose the four moves")
+        );
+        s.update(buttons::A, false);
+        let screen = s.screen();
+        assert_eq!(screen.title, "Choose moves for which Chao?");
+        assert_eq!(screen.items[0], "Own0     3 of 4 moves");
+        s.update(buttons::A, false); // Own0
+        let screen = s.screen();
+        assert_eq!(screen.title, "Own0's moves (4 at most)");
+        assert_eq!(screen.items.len(), 5);
+        assert!(screen.items[0].starts_with("[x] Move 1"));
+        assert!(
+            screen.items[3].starts_with("[ ] Move 4") && screen.items[3].ends_with("(GBA save)")
+        );
+        assert_eq!(screen.items[4], "Done");
+        // Move 4 joins the empty slot; then four are on.
+        s.update(buttons::UP, false);
+        s.update(buttons::UP, false);
+        let out = s.update(buttons::A, false);
+        assert!(out.contains(&Command::Cue(Cue::Sound(Sound::Confirm))));
+        let out = s.update(0, false);
+        assert_eq!(out, [Command::Moves(id)]);
+        assert_eq!(s.own_moves(id).unwrap().active, [1, 2, 3, 4]);
+        assert_eq!(s.own_profiles[0].moves, [1, 2, 3, 4]);
+        assert!(s.screen().items[3].starts_with("[x] Move 4"));
+        // Move 1 off, and on again into its slot.
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false); // Move 1 off
+        assert_eq!(s.own_moves(id).unwrap().active, [0, 2, 3, 4]);
+        s.update(buttons::A, false); // and on again
+        assert_eq!(s.own_moves(id).unwrap().active, [1, 2, 3, 4]);
+        // Four on: one more is refused, with why.
+        s.own[0].moves.as_mut().unwrap().known.push((5, false));
+        s.update(buttons::UP, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        assert_eq!(
+            s.screen().message.as_deref(),
+            Some("4 moves already: turn one off first.")
+        );
+        // B: back to the Chao, then to the team on "Choose moves"; Own1 kept its moves.
+        s.update(buttons::B, false);
+        assert_eq!(s.screen().cursor, Some(0));
+        s.update(buttons::B, false);
+        assert_eq!(s.screen().cursor, Some(2));
+        assert!(s.screen().title.starts_with("Your team"));
+        assert_eq!(
+            s.own_moves(s.own[1].chao.identity()).unwrap().active,
+            [1, 2, 3, 0]
+        );
+    }
+
+    #[test]
     fn a_full_team_moves_the_cursor_to_done() {
         let mut s = session(8, Vec::new());
         s.update(buttons::A, false);
@@ -2680,8 +3355,8 @@ mod tests {
         assert_eq!(s.screen().cursor, Some(TEAM_SIZE - 1));
         s.update(buttons::A, false);
         let screen = s.screen();
-        assert_eq!(screen.cursor, Some(8));
-        assert_eq!(screen.items[8], "Done (6 picked)");
+        assert_eq!(screen.cursor, Some(9));
+        assert_eq!(screen.items[9], "Done (6 picked)");
     }
 
     #[test]
@@ -2886,6 +3561,7 @@ mod tests {
             double,
             party: vec![Creature {
                 species: 7,
+                exp_yield: 64,
                 fighter: Fighter::new(
                     "Mon",
                     1,
@@ -2996,6 +3672,120 @@ mod tests {
         let out = s.update(buttons::A, true);
         assert!(!out.contains(&Command::Progress));
         assert!(!s.progress().beaten.contains(&200));
+        // Nor XP.
+        assert!(!out.contains(&Command::Levels));
+        assert!(s.gains().is_empty() && s.levels().is_empty());
+    }
+
+    #[test]
+    fn trainer_battles_give_the_chao_that_took_part_xp() {
+        let ids: Vec<u64> = (0..2).map(|i| chao(200 + i * 100).identity()).collect();
+        assert_ne!(ids[0], ids[1]);
+        // Own0 one XP short of level 6.
+        let near = Level::new(5, levels::step(5) - 1);
+        let mut s = session(2, Vec::new())
+            .with_trainers(Arc::new(roster()), Progress::default())
+            .with_levels(BTreeMap::from([(ids[0], near)]));
+        assert_eq!(s.own_profiles[0].level, 5);
+        // Without a level: a new Chao's, whatever the game's profile says.
+        assert_eq!(s.own_profiles[1].level, levels::START_LEVEL);
+        assert!(s.screen().detail.is_some());
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        s.update(buttons::A, false); // the first leader
+        assert!(s.screen().detail.unwrap().starts_with("Lv 5 (XP 20/21)."));
+        s.update(buttons::A, false); // Own0
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false); // Own1
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false); // Done
+        let mut out = Vec::new();
+        let mut grew = false;
+        for _ in 0..20_000 {
+            if matches!(&s.state, State::Fight(f) if f.stage == Stage::Result) {
+                break;
+            }
+            out.extend(s.update(buttons::A, true));
+            grew |= s.screen().message.as_deref() == Some("Own0 grew to Lv 6!");
+        }
+        assert!(grew, "no level-up message");
+        // The weak foe fell to Own0 alone: 64 * 1 / 7 = 9, times 1.5.
+        assert_eq!(out.iter().filter(|&&c| c == Command::Levels).count(), 1);
+        assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 12 });
+        assert!(!s.levels().contains_key(&ids[1]));
+        let screen = s.screen();
+        assert!(
+            screen
+                .items
+                .contains(&"Own0 gained 13 XP and grew to Lv 6!".to_string()),
+            "{screen:?}"
+        );
+        // The HP box shows the level and the XP toward the next.
+        let box0 = &screen.fighters[0];
+        assert_eq!(box0.level, 5);
+        assert_eq!(
+            box0.xp,
+            Some((12.0 / levels::step(6) as f32 * 1000.0) as u16)
+        );
+        assert_eq!(screen.fighters[1].level, 1);
+        assert_eq!(screen.fighters[1].xp, None);
+        // A long result scrolls.
+        let more = screen.items.len().saturating_sub(VISIBLE_ITEMS);
+        s.update(buttons::DOWN, true);
+        assert_eq!(s.screen().scroll, more.min(1));
+        s.update(buttons::UP, true);
+        assert_eq!(s.screen().scroll, 0);
+        let (_, _) = run(&mut s, &[buttons::A], 100);
+        // A rematch gives XP again (and no new progress).
+        let (progress, levels) = (s.progress().clone(), s.levels().clone());
+        let mut s = session(2, Vec::new())
+            .with_trainers(Arc::new(roster()), progress)
+            .with_levels(levels);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        s.update(buttons::UP, false); // back up to the leader
+        s.update(buttons::A, false);
+        assert_eq!(
+            s.screen().title,
+            format!("Your team against T100 (up to {TEAM_SIZE})")
+        );
+        s.update(buttons::A, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        let (out, _) = run(&mut s, &[buttons::A], 20_000);
+        assert!(out.contains(&Command::Levels) && !out.contains(&Command::Progress));
+        assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 25 });
+    }
+
+    #[test]
+    fn the_moves_a_chao_battles_with_can_be_switched() {
+        let mut s = session_with(1, Vec::new(), &[], [1, 2, 0, 0]);
+        let id = s.own[0].chao.identity();
+        s.own[0].moves.as_mut().unwrap().known.push((3, false));
+        assert_eq!(s.toggle_move(0, 3), Ok(true));
+        assert_eq!(s.own_profiles[0].moves, [1, 2, 3, 0]);
+        assert_eq!(s.toggle_move(0, 1), Ok(false));
+        assert_eq!(s.own_profiles[0].moves, [0, 2, 3, 0]);
+        assert_eq!(s.toggle_move(0, 9), Err(MoveRefused::Unknown));
+        assert_eq!(s.toggle_move(5, 1), Err(MoveRefused::Unknown));
+        let out = s.update(0, false);
+        assert_eq!(out.iter().filter(|&&c| c == Command::Moves(id)).count(), 2);
+        assert_eq!(s.own_moves(id).unwrap().active, [0, 2, 3, 0]);
+    }
+
+    #[test]
+    fn copies_of_a_chao_share_its_moves() {
+        let mut s = session_with(2, Vec::new(), &[], [1, 2, 0, 0]);
+        s.own[1].chao = s.own[0].chao.clone();
+        let id = s.own[0].chao.identity();
+        for e in &mut s.own {
+            e.moves.as_mut().unwrap().known.push((3, false));
+        }
+        // Switched on for the second copy: the first has it too, and that's what's kept.
+        assert_eq!(s.toggle_move(1, 3), Ok(true));
+        assert_eq!(s.own_moves(id).unwrap().active, [1, 2, 3, 0]);
+        assert_eq!(s.own_profiles[0].moves, s.own_profiles[1].moves);
     }
 
     #[test]
@@ -3029,8 +3819,12 @@ mod tests {
         s.update(buttons::A, false);
         s.update(buttons::DOWN, false); // slot 2
         let out = s.update(buttons::A, false);
-        assert!(out.contains(&Command::Progress));
-        assert_eq!(s.progress().taught[&identity], [0, 2, 0, 0]);
+        // In place of move 3, which stays in its move list.
+        assert!(out.contains(&Command::Moves(identity)));
+        assert!(!out.contains(&Command::Progress));
+        let moves = s.own_moves(identity).unwrap();
+        assert_eq!(moves.active, [1, 2, 0, 0]);
+        assert!(moves.knows(3) && moves.knows(2));
         assert_eq!(s.own_profiles[0].moves, [1, 2, 0, 0]);
     }
 
@@ -3167,10 +3961,23 @@ mod tests {
         }
     }
 
+    /// Every Chao in the lobby at `level`.
+    fn at_level(l: &mut Lobby, level: u8) {
+        for s in &mut l.s {
+            let ids: Vec<u64> = s.own.iter().map(|e| e.chao.identity()).collect();
+            s.levels = ids
+                .into_iter()
+                .map(|id| (id, Level::new(level, 0)))
+                .collect();
+            s.refresh_profiles();
+        }
+    }
+
     #[test]
     fn a_live_battle_plays_the_same_in_both_games() {
         for doubles in [false, true] {
             let mut l = Lobby::new(3);
+            at_level(&mut l, 30);
             l.start(doubles, 3);
             assert_eq!((l.fight(0).me, l.fight(1).me), (0, 1));
             // Each game shows its own Chao on its side: player 2's stronger ones.
@@ -3204,6 +4011,10 @@ mod tests {
             );
             // The stronger team won.
             assert_eq!(titles[1], "You won!");
+            // Both earned XP, the winner more.
+            let xp = |i: usize| l.s[i].gains().iter().map(|g| g.xp).sum::<u32>();
+            assert!(xp(1) > xp(0) && xp(0) > 0, "{} {}", xp(1), xp(0));
+            assert!(l.out.iter().all(|o| o.contains(&Command::Levels)));
             // Both say so in the arena, from their own side.
             for (i, out) in l.out.iter().enumerate() {
                 let won = usize::from(i == 0);
@@ -3257,6 +4068,11 @@ mod tests {
             screen.items.contains(&"P1 gave up.".to_string()),
             "{screen:?}"
         );
+        // No XP for either: a battle cut short doesn't count.
+        l.frame([0, 0]);
+        for i in 0..2 {
+            assert!(l.s[i].gains().is_empty() && !l.out[i].contains(&Command::Levels));
+        }
         // Player 2 leaves the area mid-battle (its session is dropped).
         let mut l = Lobby::new(2);
         l.start(false, 1);
@@ -3264,6 +4080,8 @@ mod tests {
         l.s[1].abandon();
         l.pump();
         assert_eq!(l.s[0].screen().title, "You won!");
+        l.frame([0, 0]);
+        assert!(l.s[0].gains().is_empty() && !l.out[0].contains(&Command::Levels));
         // Player 2's game drops out of the lobby.
         let mut l = Lobby::new(2);
         l.start(true, 2);
@@ -3280,6 +4098,61 @@ mod tests {
         l.start(false, 1);
         l.s[1].network(Incoming::Lost);
         assert_eq!(l.s[1].screen().title, "The battle ended.");
+        // It doesn't count.
+        l.s[1].update(0, true);
+        assert!(l.s[1].gains().is_empty());
+    }
+
+    #[test]
+    fn the_level_rule_goes_with_the_challenge_to_both_teams() {
+        // The rule's row switches.
+        let mut l = Lobby::new(1);
+        let s = &mut l.s[0];
+        s.update(buttons::A, false);
+        s.update(buttons::A, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().items[2], "Live rule: Level 50");
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        assert!(s.screen().detail.unwrap().contains("level 50"));
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().items[2], "Live rule: actual levels");
+        assert!(s.take_outgoing().is_empty());
+        for actual in [false, true] {
+            // Player 1's Chao at level 12, player 2's at 70.
+            let mut l = Lobby::new(1);
+            for (s, level) in l.s.iter_mut().zip([12, 70]) {
+                let id = s.own[0].chao.identity();
+                s.levels.insert(id, Level::new(level, 0));
+                s.refresh_profiles();
+            }
+            l.s[0].actual_levels = actual;
+            l.start(false, 1);
+            assert_eq!(l.s[1].offer_actual_levels, actual);
+            let want = if actual { [12, 70] } else { [50, 50] };
+            for i in 0..2 {
+                let b = &l.fight(i).battle;
+                assert_eq!([b.team(0)[0].level, b.team(1)[0].level], want, "{actual}");
+            }
+            assert_eq!(
+                online::checksum(&l.fight(0).battle),
+                online::checksum(&l.fight(1).battle)
+            );
+            // Each box shows the level fought at.
+            l.frame([0, 0]);
+            l.frame([0, 0]);
+            for _ in 0..200 {
+                if !l.s[0].screen().fighters.is_empty() {
+                    break;
+                }
+                l.frame([0, 0]);
+            }
+            let boxes = l.s[0].screen().fighters;
+            assert_eq!(boxes[0].level, want[0]);
+            // The XP bar only at the Chao's own level.
+            assert_eq!(boxes[0].xp.is_some(), actual);
+        }
     }
 
     #[test]
@@ -3289,6 +4162,7 @@ mod tests {
             name: "P1".into(),
             format: Format::Singles,
             save_partners: true,
+            actual_levels: false,
         };
         // Turned down.
         let mut s = session(1, Vec::new());
@@ -3402,7 +4276,7 @@ mod tests {
         }]);
         s.update(buttons::A, false);
         s.update(buttons::A, false);
-        s.update(buttons::DOWN, false);
+        s.update(buttons::UP, false);
         s.update(buttons::A, false);
         assert_eq!(s.screen().items[0], "Busy (live, busy)");
         assert_eq!(s.screen().disabled, [0]);
@@ -3416,11 +4290,12 @@ mod tests {
         let mut l = Lobby::new(1);
         // Type 1 marks a profile made without save partners.
         for s in &mut l.s {
-            s.profile_of = Box::new(|_, save_partners| Profile {
+            s.profile_of = Box::new(|_, _, save_partners| Profile {
                 types: [u8::from(!save_partners); 2],
                 ability: 0,
                 moves: [1, 0, 0, 0],
                 partner: None,
+                level: team::FAIR_LEVEL,
             });
         }
         let s = &mut l.s[0];
@@ -3455,12 +4330,9 @@ mod tests {
         l.host.observe(IDS[0], &sent[0], l.now, &mut out);
         l.deliver(out);
         let s = &mut l.s[1];
-        assert!(
-            s.screen()
-                .detail
-                .unwrap()
-                .contains("GBA save partners not allowed")
-        );
+        let detail = s.screen().detail.unwrap();
+        assert!(detail.contains("GBA save partners not allowed"));
+        assert!(detail.contains("Rule: Level 50"));
         see_offer(s);
         s.update(buttons::A, false);
         s.update(buttons::A, false);

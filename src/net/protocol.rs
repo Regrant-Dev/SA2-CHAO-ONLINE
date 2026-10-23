@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -593,27 +593,31 @@ pub enum Body {
     ChaoLocked {
         chao: Vec<(u8, u8)>,
     },
-    /// What the sender's Chao have from their GBA link partners, for battles against copies of
-    /// them. Sent on connecting and when someone joins, in lists of up to `MAX_PARTNERS`.
+    /// What the sender's Chao have from their GBA link partners, the four moves they battle with
+    /// and their battle levels, for battles against copies of them. Sent on connecting, when
+    /// someone joins and when one of them changes, in lists of up to `MAX_PARTNERS`.
     Partners {
         list: Vec<SharedPartner>,
     },
     /// To the host only (net/battles.rs): the sender challenges player `to` to a live battle
     /// (`format` 0 singles, 1 doubles) with this team; `dex` fingerprints the ROM data their
     /// battle runs on (`battle::online::dex_print`). Without `save_partners`, both teams leave
-    /// out what partners from a GBA save taught (each game applies it to its own team).
+    /// out what partners from a GBA save taught (each game applies it to its own team). Without
+    /// `actual_levels`, every Chao fights at level 50 (both games apply it to both teams).
     BattleChallenge {
         to: u8,
         format: u8,
         save_partners: bool,
+        actual_levels: bool,
         dex: u32,
         team: Vec<BattleMember>,
     },
-    /// From the host: player `from` challenges the receiver, with the challenge's rule.
+    /// From the host: player `from` challenges the receiver, with the challenge's rules.
     BattleOffer {
         from: u8,
         format: u8,
         save_partners: bool,
+        actual_levels: bool,
     },
     /// To the host only: the answer to `to`'s challenge (`ANSWER_*`), with the sender's team
     /// when they accept.
@@ -708,6 +712,8 @@ pub struct BattleMember {
     pub ability: u8,
     /// 0: an empty slot.
     pub moves: [u16; 4],
+    /// Its battle level (1..=100).
+    pub level: u8,
 }
 
 /// One fighter's choice in a live battle step.
@@ -734,8 +740,10 @@ pub struct SharedPartner {
     pub species: u16,
     pub types: [u8; 2],
     pub ability: u8,
-    /// The moves the Chao knows from its partners (0: an empty slot).
+    /// The four moves the Chao battles with (0: an empty slot).
     pub moves: [u16; 4],
+    /// Its battle level (1..=100).
+    pub level: u8,
 }
 
 /// One Chao a player brings (`Body::Brought`).
@@ -1226,6 +1234,7 @@ fn write_battle_team(w: &mut Writer, team: &[BattleMember]) {
         for id in m.moves {
             w.u16(id);
         }
+        w.u8(m.level);
     }
 }
 
@@ -1243,10 +1252,12 @@ fn read_battle_team(r: &mut Reader, min: usize) -> Result<Vec<BattleMember>> {
             let types = [r.u8()?, r.u8()?];
             let ability = r.u8()?;
             let moves = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
+            let level = r.u8()?;
             if species >= SPECIES_COUNT
                 || types.iter().any(|&t| t >= TYPE_COUNT)
                 || ability >= ABILITY_COUNT
                 || moves.iter().any(|&m| m >= MOVE_COUNT)
+                || !(1..=100).contains(&level)
             {
                 return Err(WireError::BadValue("battle team"));
             }
@@ -1256,6 +1267,7 @@ fn read_battle_team(r: &mut Reader, min: usize) -> Result<Vec<BattleMember>> {
                 types,
                 ability,
                 moves,
+                level,
             })
         })
         .collect()
@@ -2156,12 +2168,14 @@ impl Body {
                     for m in p.moves {
                         w.u16(m);
                     }
+                    w.u8(p.level);
                 }
             }
             Self::BattleChallenge {
                 to,
                 format,
                 save_partners,
+                actual_levels,
                 dex,
                 team,
             } => {
@@ -2169,6 +2183,7 @@ impl Body {
                     .u8(*to)
                     .u8(*format)
                     .u8(u8::from(*save_partners))
+                    .u8(u8::from(*actual_levels))
                     .u32(*dex);
                 write_battle_team(w, team);
             }
@@ -2176,11 +2191,13 @@ impl Body {
                 from,
                 format,
                 save_partners,
+                actual_levels,
             } => {
                 w.u8(tag::BATTLE_OFFER)
                     .u8(*from)
                     .u8(*format)
-                    .u8(u8::from(*save_partners));
+                    .u8(u8::from(*save_partners))
+                    .u8(u8::from(*actual_levels));
             }
             Self::BattleAnswer {
                 to,
@@ -3167,10 +3184,12 @@ impl Body {
                         let types = [r.u8()?, r.u8()?];
                         let ability = r.u8()?;
                         let moves = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
+                        let level = r.u8()?;
                         if species >= SPECIES_COUNT
                             || types.iter().any(|&t| t >= TYPE_COUNT)
                             || ability >= ABILITY_COUNT
                             || moves.iter().any(|&m| m >= MOVE_COUNT)
+                            || !(1..=100).contains(&level)
                         {
                             return Err(WireError::BadValue("partners"));
                         }
@@ -3180,6 +3199,7 @@ impl Body {
                             types,
                             ability,
                             moves,
+                            level,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -3189,6 +3209,7 @@ impl Body {
                 to: player_id(r)?,
                 format: battle_format(r)?,
                 save_partners: wire_flag(r, "battle rule")?,
+                actual_levels: wire_flag(r, "battle rule")?,
                 dex: r.u32()?,
                 team: read_battle_team(r, 1)?,
             },
@@ -3196,6 +3217,7 @@ impl Body {
                 from: player_id(r)?,
                 format: battle_format(r)?,
                 save_partners: wire_flag(r, "battle rule")?,
+                actual_levels: wire_flag(r, "battle rule")?,
             },
             tag::BATTLE_ANSWER => {
                 let to = player_id(r)?;
@@ -3955,6 +3977,7 @@ mod tests {
                         types: [10, 2],
                         ability: 66,
                         moves: [33, 45, 0, 0],
+                        level: 23,
                     }],
                 },
             },
@@ -3964,6 +3987,7 @@ mod tests {
                     to: 2,
                     format: 1,
                     save_partners: false,
+                    actual_levels: true,
                     dex: 0xDEAD_BEEF,
                     team: vec![battle_member(); 2],
                 },
@@ -3974,6 +3998,7 @@ mod tests {
                     from: 1,
                     format: 0,
                     save_partners: true,
+                    actual_levels: false,
                 },
             },
             Message::Game {
@@ -4072,6 +4097,7 @@ mod tests {
             types: [13, 13],
             ability: 9,
             moves: [84, 98, 0, 0],
+            level: 37,
         }
     }
 
@@ -4083,22 +4109,27 @@ mod tests {
             to: 2,
             format,
             save_partners: true,
+            actual_levels: false,
             dex: 0,
             team,
         };
-        // The rule is a flag.
-        let mut bytes = Message::Game {
+        // The rules are flags.
+        let bytes = Message::Game {
             from: 1,
             body: Body::BattleOffer {
                 from: 2,
                 format: 0,
                 save_partners: false,
+                actual_levels: true,
             },
         }
         .encode();
-        let last = bytes.len() - 1;
-        bytes[last] = 2;
-        assert!(Message::decode(&bytes).is_err());
+        for back in [1, 2] {
+            let mut bytes = bytes.clone();
+            let at = bytes.len() - back;
+            bytes[at] = 2;
+            assert!(Message::decode(&bytes).is_err());
+        }
         assert!(decodes(challenge(vec![battle_member(); 6], 0)));
         assert!(!decodes(challenge(vec![battle_member(); 7], 0)));
         assert!(!decodes(challenge(Vec::new(), 0)));
@@ -4112,6 +4143,11 @@ mod tests {
         let mut bad = battle_member();
         bad.ability = crate::gba::rom::ABILITY_COUNT;
         assert!(!decodes(challenge(vec![bad], 0)));
+        for level in [0, 101] {
+            let mut bad = battle_member();
+            bad.level = level;
+            assert!(!decodes(challenge(vec![bad], 0)));
+        }
         // An accept comes with a team, the other answers without.
         let answer = |answer: u8, team: Vec<BattleMember>| Body::BattleAnswer {
             to: 2,
@@ -4191,7 +4227,7 @@ mod tests {
 
     #[test]
     fn partners_stay_in_the_roms_ranges() {
-        let one = |ability: u8, count: usize| {
+        let some = |ability: u8, level: u8, count: usize| {
             Message::Game {
                 from: 1,
                 body: Body::Partners {
@@ -4202,6 +4238,7 @@ mod tests {
                             types: [0, 0],
                             ability,
                             moves: [1, 0, 0, 0],
+                            level,
                         };
                         count
                     ],
@@ -4209,9 +4246,13 @@ mod tests {
             }
             .encode()
         };
+        let one = |ability: u8, count: usize| some(ability, 5, count);
         assert!(Message::decode(&one(77, MAX_PARTNERS)).is_ok());
         assert!(Message::decode(&one(78, 1)).is_err());
         assert!(Message::decode(&one(1, MAX_PARTNERS + 1)).is_err());
+        assert!(Message::decode(&some(1, 100, 1)).is_ok());
+        assert!(Message::decode(&some(1, 0, 1)).is_err());
+        assert!(Message::decode(&some(1, 101, 1)).is_err());
     }
 
     #[test]
