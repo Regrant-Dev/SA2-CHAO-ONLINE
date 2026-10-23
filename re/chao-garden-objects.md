@@ -232,10 +232,9 @@ colours as they are (a lit screen).
   material, one type-0 meshset of 12 triangles wound outward), its `NJS_OBJECT` at the spot with
   eval flags 0x14 and no angles, registered with flag 1.
 - **Spots**: the §2 ones (Neutral (50, 10, 22) 0x96F8, Hero (117, 0, 117) 0xA6C0, Dark
-  (-98, 3.5, -98) 0x10D9). In reach from in front of the box's front face (up to 4 units out,
-  0.5 inside), no more than 1 unit past its sides and 5 up of the spot, facing it within 60
-  degrees (the player's `Data1+0xC` against the machine's angle + 0x8000), and with nothing the
-  player can pick up (registry categories 0, 1, 2, 3, 7, 9) closer than the face plus 1 unit;
+  (-98, 3.5, -98) 0x10D9). In reach within 4 units of the box (across, any side, whichever way
+  the player faces) and 5 up of the spot, and with nothing the player can pick up (registry
+  categories 0, 1, 2, 3, 7, 9) closer than the box plus 1 unit;
   otherwise the press stays the game's.
 - **Pick**: the list opens with the controls off (§3). A pick is brought in with
   `scene::arrive_at` at the model's exit point: the animal hops out along the machine's angle.

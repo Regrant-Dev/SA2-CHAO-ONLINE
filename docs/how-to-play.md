@@ -234,8 +234,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
   in the Mod Manager (GBA link group; `GbaRom` and `GbaSave` in `config.ini`).
 - Each garden of your own (not a shared online one) has a **link machine** near its
   transporter: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
-  Garden, dark and spiky in the Dark Garden. Stand in front of it facing its screen, with empty
-  hands and nothing to pick up closer to you, and press the action button to open its list of
+  Garden, dark and spiky in the Dark Garden. Stand next to it (any side), with empty hands and
+  nothing to pick up closer to you, and press the action button to open its list of
   the save's party and boxes and the ones the mod keeps, with each one's level and types.
 - Move through the list with Up/Down on the controller or keyboard (PgUp/PgDn jump), and the
   machine's screen shows the picture of the one highlighted. A or Enter picks it: it pops out of
@@ -267,11 +267,15 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
 
 - The area's name shows for a few seconds when you walk into the garden.
 - Wild creatures of that area come by now and then, picked with the same chances and levels as
-  in the GBA game: two when you arrive, then one every minute or two, up to 4 to 6 at a time.
+  in the GBA game: four when you arrive, then one every 20 to 50 seconds, up to 6 to 8 at a
+  time (fewer when the garden is full of other animals).
   Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
   shiny, in the GBA game's shiny colours.
 - Your Chao pick them up and absorb them like partners: a wild one teaches a Chao the moves it
   knows at its level, its types and its ability. You can carry one to a Chao too.
+- Stand next to one, or pick it up, and a card at the top right shows it: name, level, types,
+  ability, its stats at that level and the moves a Chao that absorbs it learns. Partners brought
+  from the link machine get the same card.
 - Carry one through the transporter and it comes along: it is in your hands when you reach
   the next garden, ready to give to a Chao there.
 - Wild visitors are never saved; one that has been about for a few minutes leaves once you are

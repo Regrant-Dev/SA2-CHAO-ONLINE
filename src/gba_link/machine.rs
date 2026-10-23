@@ -46,15 +46,10 @@ const SPOTS: [([f32; 3], i32); 3] = [
     ([-98.0, 3.5, -98.0], 0x10D9),
 ];
 
-/// The player can use the machine from this far in front of its box's front face, this far
-/// past its sides, this far from its floor (up), and facing it within `FACING` (BAMS, 60
-/// degrees).
-const FRONT_REACH: f32 = 4.0;
-const SIDE_MARGIN: f32 = 1.0;
+/// The player can use the machine from this far from its box (across, any side) and this far
+/// from its floor (up).
+const REACH: f32 = 4.0;
 const REACH_UP: f32 = 5.0;
-const FACING: u16 = 0x2AAA;
-/// Standing against the box puts the player a little past the face; a little inside counts.
-const FACE_SLACK: f32 = 0.5;
 /// The picture fills this much of the screen's height, and stands this far in front of it.
 const PICTURE_FILL: f32 = 0.9;
 const PICTURE_OUT: f32 = 0.06;
@@ -84,30 +79,19 @@ pub fn world(at: [f32; 3], angle: i32, p: [f32; 3]) -> [f32; 3] {
     [at[0] + t[0], at[1] + t[1], at[2] + t[2]]
 }
 
-/// The player at `player` facing `facing` (BAMS) stands in front of the machine at `at`
-/// (facing `angle`, its box `min`..`max` in its own axes) and faces it: how far they are from
-/// its front face.
-pub fn at_front(
-    at: [f32; 3],
-    angle: i32,
-    (min, max): Bounds,
-    player: [f32; 3],
-    facing: i32,
-) -> Option<f32> {
+/// The player at `player` is within reach of the machine at `at` (facing `angle`, its box
+/// `min`..`max` in its own axes), on any side and whichever way they face: how far they are
+/// from its box.
+pub fn in_reach(at: [f32; 3], angle: i32, (min, max): Bounds, player: [f32; 3]) -> Option<f32> {
     let (dx, dz) = (player[0] - at[0], player[2] - at[2]);
     let a = angle as f32 * std::f32::consts::TAU / 65536.0;
     let (s, c) = a.sin_cos();
     // Back into the machine's own axes (`turn` the other way).
     let (x, z) = (dx * c - dz * s, dx * s + dz * c);
-    let out = z - max[2];
-    let half = max[0].max(-min[0]) + SIDE_MARGIN;
-    let off = (facing.wrapping_sub(angle).wrapping_sub(0x8000) as u16 as i16).unsigned_abs();
-    (out > -FACE_SLACK
-        && out < FRONT_REACH
-        && x.abs() < half
-        && (player[1] - at[1]).abs() < REACH_UP
-        && off < FACING)
-        .then_some(out.max(0.0))
+    let ox = (min[0] - x).max(x - max[0]).max(0.0);
+    let oz = (min[2] - z).max(z - max[2]).max(0.0);
+    let out = (ox * ox + oz * oz).sqrt();
+    (out < REACH && (player[1] - at[1]).abs() < REACH_UP).then_some(out)
 }
 
 /// A machine's collision box: its corners (min, max) in its own axes.
@@ -305,8 +289,7 @@ mod game {
     use super::super::machine_model::Machine;
     use super::super::{Action, Page};
     use super::{
-        Key, List, Outcome, REACH_UP, at_front, box_mesh, enabled, machine_box, model, picture,
-        spot, world,
+        Key, List, Outcome, REACH_UP, box_mesh, enabled, machine_box, model, picture, spot, world,
     };
     use crate::game as sa2;
     use crate::hud;
@@ -668,19 +651,20 @@ mod game {
             (PAD_PRESSED as *mut u32).write_volatile(pressed & !ACTION_BUTTONS);
         }
         REQUESTED.store(true, Ordering::Relaxed);
+        log!("gba link: link machine pressed");
     }
 
     /// The player stands at the machine's front facing it, hands empty, nothing to pick up
     /// closer to them, no other menu open.
     fn usable() -> bool {
         let garden = sa2::current_chao_area() as u8;
-        let (Some((at, angle)), Some(bounds), Some((p, facing))) =
+        let (Some((at, angle)), Some(bounds), Some((p, _))) =
             (spot(garden), machine_box(garden), sa2::player_position())
         else {
             return false;
         };
         let player = [p.x, p.y, p.z];
-        let Some(out) = at_front(at, angle, bounds, player, facing) else {
+        let Some(out) = super::in_reach(at, angle, bounds, player) else {
             return false;
         };
         crate::garden::player_held() == 0
@@ -885,6 +869,9 @@ mod game {
         ((h / size) as usize).saturating_sub(12).clamp(3, 16)
     }
 
+    /// The player was in reach last frame (for the log).
+    static NEAR: AtomicBool = AtomicBool::new(false);
+
     pub fn on_frame() {
         let mut s = lock();
         let garden = sa2::current_chao_area();
@@ -925,8 +912,17 @@ mod game {
         }
         if s.list.is_some() {
             list_frame(&mut s, garden);
-        } else if usable() {
-            hud::banner("Link machine: press the action button");
+        } else {
+            let near = usable();
+            if near {
+                hud::banner("Link machine: press the action button");
+            }
+            if NEAR.swap(near, Ordering::Relaxed) != near {
+                log!(
+                    "gba link: {} the link machine",
+                    if near { "at" } else { "away from" }
+                );
+            }
         }
     }
 
@@ -1178,24 +1174,22 @@ mod tests {
             assert!(m.screen.centre[2] < m.box_max[2] && m.screen.centre[2] > m.box_min[2]);
             assert!(m.exit[2] > m.box_max[2]);
             assert!(m.box_min[1] == 0.0 && m.box_max[1] > 8.0);
-            // The player reaches it standing in front of the box, facing it.
+            // The player reaches it from any side, whichever way they face.
             let bounds = (m.box_min, m.box_max);
-            let toward = angle.wrapping_add(0x8000);
             let front = world(at, angle, [0.0, 0.0, m.box_max[2] + 2.0]);
-            let out = at_front(at, angle, bounds, front, toward).unwrap();
+            let out = in_reach(at, angle, bounds, front).unwrap();
             assert!((out - 2.0).abs() < 1e-3);
-            assert!(at_front(at, angle, bounds, front, toward.wrapping_add(0x2000)).is_some());
-            // Not facing it, too far, beside or behind it.
-            assert!(at_front(at, angle, bounds, front, angle).is_none());
-            assert!(at_front(at, angle, bounds, front, toward.wrapping_add(0x4000)).is_none());
-            let far = world(at, angle, [0.0, 0.0, m.box_max[2] + 6.0]);
-            assert!(at_front(at, angle, bounds, far, toward).is_none());
             let beside = world(at, angle, [m.box_max[0] + 2.0, 0.0, 0.0]);
-            assert!(at_front(at, angle, bounds, beside, angle.wrapping_add(0xC000)).is_none());
+            assert!(in_reach(at, angle, bounds, beside).is_some());
             let behind = world(at, angle, [0.0, 0.0, m.box_min[2] - 2.0]);
-            assert!(at_front(at, angle, bounds, behind, angle).is_none());
+            assert!(in_reach(at, angle, bounds, behind).is_some());
+            // Not too far, nor up high.
+            let far = world(at, angle, [0.0, 0.0, m.box_max[2] + 6.0]);
+            assert!(in_reach(at, angle, bounds, far).is_none());
+            let corner = world(at, angle, [m.box_max[0] + 3.0, 0.0, m.box_max[2] + 3.0]);
+            assert!(in_reach(at, angle, bounds, corner).is_none());
             let high = world(at, angle, [0.0, 6.0, m.box_max[2] + 2.0]);
-            assert!(at_front(at, angle, bounds, high, toward).is_none());
+            assert!(in_reach(at, angle, bounds, high).is_none());
             assert_eq!(machine_box(garden), Some(bounds));
             let (feet, height) = picture(&m);
             assert!(feet[2] > m.screen.centre[2] && height <= m.screen.height);

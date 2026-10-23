@@ -30,17 +30,17 @@ pub fn enabled() -> bool {
 }
 
 /// Most visitors in a garden at once; each visit to a garden allows `MIN_CAP..=MAX_VISITORS`.
-pub const MAX_VISITORS: usize = 6;
-const MIN_CAP: usize = 4;
+pub const MAX_VISITORS: usize = 8;
+const MIN_CAP: usize = 6;
 /// Category-2 entries left for the game's own animals and drives.
 const RESERVE: u32 = 2;
 /// Visitors that come at once when the garden loads; the others come one by one.
-const ON_ENTRY: usize = 2;
+const ON_ENTRY: usize = 4;
 /// Nothing comes (nor the area's name) until the garden has been up and not shared this long:
 /// a shared garden is only known once friends' states or the server's Chao arrive.
 const ALONE_MILLIS: u64 = 2500;
 /// Seconds between visitors, and how long one stays before it goes once out of the way.
-const NEXT_SECS: (u64, u64) = (45, 120);
+const NEXT_SECS: (u64, u64) = (20, 50);
 const STAY_SECS: (u64, u64) = (300, 480);
 /// A visitor that stayed long enough goes once the player is this far away.
 const GONE_FAR: f32 = 60.0;
@@ -381,7 +381,7 @@ pub fn land_spot(spots: &Spots, from: (f32, f32), rng: &mut Rng) -> Option<V3> {
 }
 
 #[cfg(target_arch = "x86")]
-pub use game::{is_visitor, on_frame, room_for_partner, take};
+pub use game::{creatures, is_visitor, on_frame, room_for_partner, take};
 
 #[cfg(not(target_arch = "x86"))]
 pub fn is_visitor(_object: usize) -> bool {
@@ -1033,6 +1033,26 @@ mod game {
             )
         };
         super::super::billboard::draw_picture(v.species, v.shiny, at, held);
+    }
+
+    /// Our visitors: (object, position, what it teaches, shiny), for their info card.
+    pub fn creatures() -> Vec<(usize, [f32; 3], Partner, bool)> {
+        with(|w| {
+            w.live
+                .iter()
+                .filter_map(|v| {
+                    // SAFETY: our live visitor's Data1, on the game thread.
+                    let at = unsafe {
+                        let d = data1(v.object);
+                        if d == 0 {
+                            return None;
+                        }
+                        ((d + D_POSITION) as *const [f32; 3]).read_unaligned()
+                    };
+                    Some((v.object, at, v.partner, v.visitor.shiny))
+                })
+                .collect()
+        })
     }
 
     /// One of our visitors' objects.

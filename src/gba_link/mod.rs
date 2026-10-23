@@ -21,6 +21,7 @@
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
 pub(crate) mod billboard;
+mod card;
 mod machine;
 mod machine_model;
 pub mod profile;
@@ -461,6 +462,7 @@ pub fn on_frame() {
     scene::on_frame();
     wild::on_frame();
     machine::on_frame();
+    card::on_frame();
 }
 
 pub fn install() {

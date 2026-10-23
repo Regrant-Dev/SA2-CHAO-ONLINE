@@ -6,6 +6,8 @@
 //! wild visitor (`super::wild`), which makes its objects with the same helpers.
 
 #[cfg(target_arch = "x86")]
+pub(super) use game::creatures;
+#[cfg(target_arch = "x86")]
 pub(super) use game::{
     D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1,
     enable_touch, hooked, room, to_come,
@@ -433,6 +435,25 @@ mod game {
             )
         };
         super::super::billboard::draw(species, at, held);
+    }
+
+    /// Our partners in the garden: (object, position, key), for their info card.
+    pub fn creatures() -> Vec<(usize, [f32; 3], u64)> {
+        lock()
+            .spawned
+            .iter()
+            .filter_map(|s| {
+                // SAFETY: our live partner's Data1, on the game thread.
+                let at = unsafe {
+                    let d = data1(s.object);
+                    if d == 0 {
+                        return None;
+                    }
+                    ((d + D_POSITION) as *const [f32; 3]).read_unaligned()
+                };
+                Some((s.object, at, s.key))
+            })
+            .collect()
     }
 
     /// One of our partners' objects.
