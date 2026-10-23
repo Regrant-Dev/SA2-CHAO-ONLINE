@@ -62,6 +62,8 @@ const SPECIES_INFO_SIZE: usize = 28;
 const FRONT_PICS: usize = 0x30A18C;
 /// Normal palettes (pret `gMonPaletteTable`): 8 bytes {u32 ptr to LZ77 BGR555 colours, u16 tag, pad}.
 const PALETTES: usize = 0x303678;
+/// Shiny palettes (pret `gMonShinyPaletteTable`), the same layout, right after the normal ones.
+const SHINY_PALETTES: usize = 0x304438;
 /// Level-up learnsets (pret `gLevelUpLearnsets`): a u32 pointer per species id to LE u16 entries
 /// `level << 9 | move id`, ended by 0xFFFF.
 const LEARNSETS: usize = 0x32937C;
@@ -219,7 +221,8 @@ impl Rom {
 
     /// Checks size, header and table plausibility.
     pub fn from_bytes(data: Vec<u8>) -> Result<Rom, String> {
-        const UNSUPPORTED: &str = "not a supported GBA ROM (needs game code BPEE, version 0)";
+        const UNSUPPORTED: &str =
+            "not a supported GBA ROM (needs Emerald, US release, game code BPEE, version 0)";
         if data.len() != ROM_SIZE || &data[0xAC..0xB0] != GAME_CODE || data[0xBC] != VERSION {
             return Err(UNSUPPORTED.into());
         }
@@ -567,12 +570,21 @@ impl Rom {
     /// several 16-colour palettes stores one form per palette, and only the first form is returned.
     /// Colour index 0 is transparent.
     pub fn front_sprite(&self, species: u16) -> Option<Sprite> {
+        self.front_sprite_in(species, PALETTES)
+    }
+
+    /// The front sprite in the species' shiny colours.
+    pub fn shiny_front_sprite(&self, species: u16) -> Option<Sprite> {
+        self.front_sprite_in(species, SHINY_PALETTES)
+    }
+
+    fn front_sprite_in(&self, species: u16, palettes: usize) -> Option<Sprite> {
         if !self.species_exists(species) {
             return None;
         }
         let i = usize::from(species);
         let tiles = lz77::decompress(self.data.get(self.ptr_at(FRONT_PICS + i * 8)?..)?)?;
-        let pal = lz77::decompress(self.data.get(self.ptr_at(PALETTES + i * 8)?..)?)?;
+        let pal = lz77::decompress(self.data.get(self.ptr_at(palettes + i * 8)?..)?)?;
         let forms = pal.len() / PALETTE_BYTES;
         let total = tiles.len() / FRAME_BYTES;
         if forms == 0 || total == 0 {
@@ -728,8 +740,18 @@ mod tests {
                     .front_sprite(id)
                     .unwrap_or_else(|| panic!("sprite {id}"));
                 assert!((1..=2).contains(&s.frames.len()), "{id}");
+                // The shiny one has the same shape in other colours.
+                let shiny = rom.shiny_front_sprite(id).unwrap();
+                assert_eq!(shiny.frames.len(), s.frames.len(), "{id}");
+                let alpha = |f: &Vec<u8>| f.chunks(4).map(|p| p[3]).collect::<Vec<_>>();
+                assert_eq!(alpha(&shiny.frames[0]), alpha(&s.frames[0]), "{id}");
             }
         }
+        let differ = (1..SPECIES_COUNT)
+            .filter(|&id| rom.species(id).is_some())
+            .filter(|&id| rom.front_sprite(id) != rom.shiny_front_sprite(id))
+            .count();
+        assert!(differ > 300, "{differ}");
     }
 
     #[test]

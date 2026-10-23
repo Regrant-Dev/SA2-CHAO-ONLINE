@@ -173,6 +173,11 @@ impl Battle {
         self.sound_moves = ids;
     }
 
+    /// From now on the rolls come from `seed` (a live battle takes a new seed each step).
+    pub fn reseed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
+    }
+
     /// Sends out the first fighters able to battle and runs their entry abilities.
     pub fn start(&mut self) -> Vec<Event> {
         let mut ev = Vec::new();

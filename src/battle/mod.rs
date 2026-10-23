@@ -20,6 +20,13 @@
 //! - `team`: Chao as fighters (the stat mapping) and the ROM data a battle needs.
 //! - `narrate`: a turn's events as beats (messages, what the Chao do, HUD changes).
 //! - `session`: the picker and the turns, driven by the menu buttons.
+//! - `online`: live battles against a friend online, turns synced through the host; `mirror`
+//!   shows the accepter's game the battle from their side.
+//! - `trainers` and `ladder`: the GBA game's trainers as opponents, their order and locks, and
+//!   the progress and TM moves won; `figures` shows their creatures in the arena.
+//! - `visuals`: how the arena shows each cue (motions by kind of move, status signs, effect
+//!   sprites, flash and shake), with `effects_gfx` reading the ROM's effect sprites and drawing
+//!   them.
 //! - `arena`: the karate arena's menu, Chao, camera and motions.
 //! - `game`: ties the session to the arena and the HUD each frame.
 
@@ -29,15 +36,22 @@ mod arena;
 pub mod damage;
 pub mod data;
 pub mod effects;
+pub mod effects_gfx;
 pub mod engine;
 pub mod event;
 pub mod field;
 pub mod fighter;
+mod figures;
 pub mod game;
+pub mod ladder;
+mod mirror;
 pub mod narrate;
+pub mod online;
 pub mod rng;
 pub mod session;
 pub mod team;
+pub mod trainers;
+pub mod visuals;
 
 pub use data::{Effectiveness, MoveData, Target, TypeChart};
 pub use engine::{Action, Battle, BattleError, Choice, Format, Phase, Rules};

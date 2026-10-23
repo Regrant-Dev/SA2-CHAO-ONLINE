@@ -878,6 +878,116 @@ mod tests {
     }
 
     #[test]
+    fn a_live_battle_goes_through_the_hosts_referee() {
+        use crate::chao::{CHAO_SIZE, ChaoData};
+        use crate::net::protocol::{
+            ANSWER_ACCEPT, BattleMember, BattlePick, PICK_MOVE, PICK_NONE, SERVER,
+        };
+        let mut lobby = Lobby::new();
+        let a = lobby.join(&identity("a"));
+        lobby.run(300);
+        let a_id = lobby.clients[a].my_id().unwrap();
+        let mut chao = ChaoData {
+            bytes: [0; CHAO_SIZE],
+        };
+        chao.bytes[0x80] = 5;
+        chao.bytes[0x81] = 1;
+        let team = vec![
+            BattleMember {
+                chao: Box::new(chao),
+                species: 0,
+                types: [0, 0],
+                ability: 0,
+                moves: [1, 0, 0, 0],
+            };
+            6
+        ];
+        let from_host = |events: &[Event], f: &dyn Fn(&Body) -> bool| {
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Game { from: SERVER, body } if f(body)))
+        };
+        // The hosting player challenges a; a's game hears the offer from the host.
+        let now = lobby.now;
+        let challenge = Body::BattleChallenge {
+            to: a_id,
+            format: 1,
+            save_partners: true,
+            dex: 77,
+            team: team.clone(),
+        };
+        lobby.host.send(challenge, true, now);
+        lobby.run(200);
+        assert!(from_host(&lobby.client_events[a], &|b| *b
+            == Body::BattleOffer {
+                from: 0,
+                format: 1,
+                save_partners: true
+            }));
+        // The challenge itself reaches nobody.
+        assert!(!lobby.client_events[a].iter().any(|e| matches!(
+            e,
+            Event::Game {
+                body: Body::BattleChallenge { .. },
+                ..
+            }
+        )));
+        // a accepts: both games start the same battle, each with the other's team.
+        let now = lobby.now;
+        let answer = Body::BattleAnswer {
+            to: 0,
+            answer: ANSWER_ACCEPT,
+            dex: 77,
+            team: team.clone(),
+        };
+        lobby.clients[a].send(answer, true, now);
+        lobby.run(300);
+        let start = |events: &[Event]| {
+            events.iter().find_map(|e| match e {
+                Event::Game {
+                    from: SERVER,
+                    body:
+                        Body::BattleStart {
+                            battle,
+                            side,
+                            seed,
+                            team,
+                            ..
+                        },
+                } => Some((*battle, *side, *seed, team.len())),
+                _ => None,
+            })
+        };
+        let host_start = start(&lobby.host_events).expect("host start");
+        let a_start = start(&lobby.client_events[a]).expect("client start");
+        assert_eq!((host_start.1, a_start.1), (0, 1));
+        assert_eq!((host_start.0, host_start.2), (a_start.0, a_start.2));
+        assert_eq!(a_start.3, 6);
+        // A step once both chose.
+        let pick = BattlePick {
+            pos: 0,
+            kind: PICK_MOVE,
+            value: 0,
+            target: PICK_NONE,
+            pass: PICK_NONE,
+        };
+        let choice = Body::BattleChoice {
+            battle: host_start.0,
+            step: 1,
+            check: 9,
+            picks: vec![pick],
+        };
+        let now = lobby.now;
+        lobby.host.send(choice.clone(), true, now);
+        lobby.clients[a].send(choice, true, now);
+        lobby.run(300);
+        let stepped =
+            |b: &Body| matches!(b, Body::BattleStep { step: 1, picks, .. } if picks.len() == 2);
+        assert!(from_host(&lobby.host_events, &stepped));
+        assert!(from_host(&lobby.client_events[a], &stepped));
+    }
+
+    #[test]
     fn game_messages_are_relayed_with_true_sender() {
         let mut lobby = Lobby::new();
         let a = lobby.join(&identity("a"));

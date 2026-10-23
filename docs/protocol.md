@@ -1,4 +1,4 @@
-# Network protocol (v22)
+# Network protocol (v24)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -111,7 +111,15 @@ Game bodies:
 | 61 | HeldChao | from the host (0xFF), reliable, when it changes | owner u8 (8..=15), index u8 (< 4), has u8, then if 1: area u8 (1..=3), asleep u8 (0/1), locked u8 (0/1: its owner's lock keeps what others do to it from their save; sent again when that changes), name str (its owner's), 0x800 bytes `ChaoData`: a Chao the host holds for a player who isn't in that garden is shown there under this owner id (asleep: its owner is offline; awake: online elsewhere), or (has 0) not any more. To everyone but its owner. Copies follow its ServerChao (`held.rs`) |
 | 62 | SaveChao | from the host (0xFF) to a Chao's owner only, reliable, about once a second while it changes | identity u64 (`ChaoData::identity`), nth u8, count u8 (≤ 64), count × (offset u16, len u8, bytes): what that Chao's life changed in a garden its owner isn't in (it lives there while they're online elsewhere), absolute record bytes, each span inside `SAVE_CHAO_FIELDS` (stats, type, happiness, age and life, abilities and evolution, eyes, hat, animals, emotions, needs, personality, illnesses, bonds, DNA grade alleles). The owner's game writes them into the save slot holding the `nth` copy of that identity and has the save written out |
 | 63 | ChaoLocked | from the host (0xFF), reliable, when it changes for that player and on (re)connecting | count u8 (≤ 64), count × (owner u8 (≤ 15), index u8 (< 4)): the Chao locked against the receiver now (see Locked Chao), present players' and held ones; never their own. Their game keeps its copies of these from taking items and undoes what touches change on them |
-| 64 | Partners | reliable, on connecting and when someone joins or a Chao absorbs a partner | count u8 (≤ 32), count × (identity u64 (`ChaoData::identity`), species u16, types u8×2, ability u8 (0: not recorded), moves u16×4): what the sender's Chao have from their GBA link partners (ROM ids, checked against the ROM's id ranges), in as many lists as needed. Battles against copies of their Chao use it |
+| 64 | Partners | reliable, on connecting and when someone joins, a Chao absorbs a partner or is taught a TM move | count u8 (≤ 32), count × (identity u64 (`ChaoData::identity`), species u16, types u8×2, ability u8 (0: not recorded), moves u16×4): what the sender's Chao have from their GBA link partners (ROM ids, checked against the ROM's id ranges), in as many lists as needed. A Chao taught TM moves on the trainer ladder carries its four battle moves with them in their slots (one taught without a partner: species 0, Normal type). Battles against copies of their Chao use it |
+| 65 | BattleChallenge | to the host only, reliable | to u8, format u8 (0 singles, 1 doubles), save partners u8 (1: what partners from a GBA save taught counts; 0: both teams leave it out, each game its own), dex u32, team: the sender challenges player `to` to a live battle (see Live battles). `dex` is a fingerprint of the ROM data the battle runs on. A team is count u8 (1..=6), count × (0x800 bytes `ChaoData` (must pass `ChaoData::validate`), species u16, types u8×2, ability u8, moves u16×4: the Chao's battle profile, ROM ids checked against the ROM's id ranges, 0 for none) |
+| 66 | BattleOffer | from the host, reliable | from u8, format u8, save partners u8 (as the challenge's): player `from` challenges the receiver |
+| 67 | BattleAnswer | to the host only, reliable | to u8 (the challenger), answer u8 (0 decline, 1 accept, 2 busy: their game can't take a challenge now), dex u32, team (with count 1..=6 when accepting, 0 otherwise) |
+| 68 | BattleStart | from the host, to both players, reliable | battle u16, format u8, side u8 (the receiver's: 0 the challenger, 1 the accepter), opponent u8, seed u64, the opponent's team |
+| 69 | BattleChoice | to the host only, reliable | battle u16, step u16, check u32 (the sender's battle checksum before this step), count u8 (≤ 2), count × pick: the sender's choices for this step (none when they have nothing to choose). A pick is pos u8 (0..=1), kind u8 (0 move, 1 the out-of-PP move, 2 switch, 3 send in for a fainted fighter), value u8 (a move index 0..=3, 0 for kind 1, a team member 0..=5), target u8 (side × 2 + pos, 0xFF none), pass u8 (the team member a passing move hands on to, 0xFF none) |
+| 70 | BattleStep | from the host, to both players, reliable | battle u16, step u16, seed u64, count u8 (≤ 4), count × (side u8 (0..=1), pick): both players' choices for the step and its rolls' seed |
+| 71 | BattleLeave | to the host only, reliable | battle u16 (0: before a battle starts, taking back the sender's challenge or turning down one to them), reason u8 (0 the battle reached its end, 1 gave up, 2 left the battle) |
+| 72 | BattleEnd | from the host, reliable | battle u16 (0: a challenge that never started a battle), reason u8 (0 busy, 1 declined, 2 the ROM data differs, 3 forfeit: the opponent gave up, 4 disconnect: the opponent left the battle or the lobby, 5 timeout, 6 desync, 7 withdrawn), winner u8 (the winning side, 2 nobody) |
 
 ## Skins (`net/files.rs`, `skin_sync.rs`)
 
@@ -133,7 +141,8 @@ skins built on a character's skeleton (rigged) show the character to others.
 
 `PlayerState.flags` (`game::POSE_*`): 1 spin ball (jump), 2 blending into `anim`, 4 waiting at
 a synced start, 8 "start now", 16 in a Chao Race the state is the player's racing Chao (position
-and rotation y are the Chao's, `frame` its race progress), 32 in a live karate fight (busy).
+and rotation y are the Chao's, `frame` its race progress), 32 busy: in a live karate fight, a
+Chao battle or a live battle's challenge.
 
 `PlayerState.room`: (0xFF, 0) = none, (creator id, kind) = in that player's room; kind 1 =
 Race, 2 = Co-op (the creator's setting; any non-zero kind is a room). A room exists
@@ -161,6 +170,42 @@ Co-op messages (`StageKills`, `KeyUsed`, `Shot`, `Switch`, `Checkpoint`, `BossHp
 from players in the receiver's room. BossHp values are at most 1000.
 
 Referee answers are sent with a stand-in `from` (a client ignores messages "from" itself).
+
+### Live battles (net/battles.rs, battle/online.rs)
+
+The host has no ROM and runs no battle: both players' games run the same battle, and the host
+pairs them up, holds each step's choices and decides its rolls. All its battle messages come
+from 0xFF; the same bodies from a player are dropped, and players' battle messages are never
+passed on.
+- `BattleChallenge` from a player who is in no challenge or battle, to a player in the lobby who
+  is in none either, goes to the target as `BattleOffer`; otherwise the challenger gets
+  `BattleEnd` busy. So does a challenge to the same player within 5 seconds of the last one.
+  An offer waits 2 minutes for its answer (then `BattleEnd` timeout to both).
+- `BattleAnswer`: declined or busy ends the challenge for the challenger. An accept with a
+  different `dex` ends it for both (the ROM data differs). Otherwise the battle starts:
+  `BattleStart` to both, with one battle id and seed, the challenger as side 0 and each with
+  the other's team.
+- Both games build the battle the same way: side 0's team, then side 1's, each Chao's fighter
+  from its record and profile, the seed from `BattleStart`, then the battle's start. The
+  accepter's game shows it with the sides swapped.
+- Each later decision point (every turn's choices, every round of sending in for fainted
+  fighters) is a step, numbered from 1. Both games send `BattleChoice` for it. Once both are in,
+  different checksums end the battle for both (desync, no winner); otherwise both get
+  `BattleStep` with a new random seed. Each game then reseeds the battle with it and plays both
+  sides' picks; a side whose picks the battle refuses gets the battle AI's choices, from that
+  seed, in both games.
+- A player who gives up (`BattleLeave` 1) loses: the other gets `BattleEnd` forfeit with them
+  the winner. Leaving the battle (`BattleLeave` 2) or the lobby is a disconnect, also a loss,
+  except before anyone chose for step 1: then the other gets `BattleEnd` withdrawn (the
+  challenger left) or declined (the accepter left), with no winner. Once one player has chosen
+  for a step, the other has 2 minutes however long the step was open (then `BattleEnd` timeout
+  to both, the one who chose winning); a step nobody chooses for in 10 minutes ends with no
+  winner.
+- `BattleLeave` 0 with a battle id says the sender's game reached the battle's end; nothing is
+  sent for it, as each game knows the result. That player is free for other challenges at once,
+  and the battle ends on the host once both games have said so. If the other game has chosen
+  for a step, or chooses after, it gets `BattleEnd` desync with no winner.
+- The battle never touches either save.
 
 ## Held Chao (net/roster.rs, net/chao_host.rs, held.rs)
 

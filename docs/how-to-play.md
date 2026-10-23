@@ -31,7 +31,7 @@ Pause the game before typing, since letter keys also move your character.
 | My Chao | The Chao you race and fight with |
 | Chao details | Read your Chao's hidden stats, personality, emotions, alignment and bonds |
 | Save Chao garden now | Save your Chao World data immediately while in a garden |
-| GBA link | Bring a partner from your own GBA save into the garden (see Chao > GBA link) |
+| GBA link | Points to the link machine in each garden (with the machine turned off: brings a partner from your own GBA save into the garden; see Chao > GBA link) |
 | Bring Chao 1-4 | Which of your Chao you bring to a shared garden (4 at most; the rest stay home meanwhile): Auto, a Chao you pick, or None |
 | Others can change my Chao | When what friends do to your Chao counts in your save: Always, While I'm in Chao World, While I'm in that garden, Never |
 | Friends' Chao in races | Friends' Chao fill the other lanes in your Chao Races |
@@ -225,21 +225,33 @@ against a friend's Chao. Practice karate lets you fight a copy of a friend's Cha
 Races and karate never change your Chao's save, win or lose.
 
 **GBA link:** bring creatures from your own GBA save into a garden, where your Chao can pick
-them up and absorb them like animals. It needs your own ROM of that game (game code BPEE, the
-first release) and its 128 KB save file: nothing from the game comes with the mod. Names, types
+them up and absorb them like animals. It needs your own copy of Emerald for the Game Boy
+Advance: a ROM of the US release (game code BPEE, the first version) dumped from a cartridge you
+own. Its 128 KB save file is optional. Nothing from the game comes with the mod: names, types
 and pictures are read from your ROM, and the save is only read, never changed.
 
 - Put the ROM (`.gba`) and the save (`.sav`) in `mods/sa2-chao-online/gba/`, or set their paths
   in the Mod Manager (GBA link group; `GbaRom` and `GbaSave` in `config.ini`).
-- In a garden of your own (not a shared online one), F9 > **GBA link** lists the save's party
-  and boxes with each one's level and types. Pick one and press Enter: it appears in the garden
-  as a partner, drawn as its picture, walking about. A Chao that comes close to it picks it up and
-  absorbs it; you can also carry it to a Chao, as with animals.
+- Each garden of your own (not a shared online one) has a **link machine** near its
+  transporter: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
+  Garden, dark and spiky in the Dark Garden. Stand in front of it facing its screen, with empty
+  hands and nothing to pick up closer to you, and press the action button to open its list of
+  the save's party and boxes and the ones the mod keeps, with each one's level and types.
+- Move through the list with Up/Down on the controller or keyboard (PgUp/PgDn jump), and the
+  machine's screen shows the picture of the one highlighted. A or Enter picks it: it pops out of
+  the machine's hatch as a partner, drawn as its picture, and walks into the garden. B, Esc or
+  Backspace closes the list. While it is open your character stands still and the game doesn't
+  take the presses. When the garden is full of animals, a wild visitor leaves to make room.
+- A Chao that comes close to a partner picks it up and absorbs it; you can also carry it to a
+  Chao, as with animals.
 - Without a save, the list offers a one-time gift instead: one of the game's three first
-  partners at level 5, picked once and kept by the mod (in `gba/partners.txt`). It can then be
-  brought to a garden like the save's.
+  partners at level 5, picked once and kept by the mod (in `gba/partners.txt`). The link machine
+  brings it out right away; after that it is on the list like the save's.
 - Each one can come to each garden once a day, and a garden holds 4 waiting partners at most.
   Waiting partners are still there the next time the garden loads.
+- Turn the machines off with **Link machine in the gardens** in the Mod Manager (GBA link
+  group; `LinkMachine` in `config.ini`): F9 > **GBA link** then lists the same creatures, and
+  Enter brings the one picked in front of you.
 - A Chao that absorbs one keeps it as its partner, and the partner teaches it its moves, its
   types and its special ability for Chao battles. The Chao's own stats don't change.
 - A Chao knows four moves at most: the new partner's moves come first and fill up with the ones
@@ -247,6 +259,27 @@ and pictures are read from your ROM, and the save is only read, never changed.
   Normal type with a few basic moves.
 - The status balloon's last row shows the partner's types. Partners and moves are kept in
   `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an animal gives.
+
+**Wild visitors:** each garden is linked to one area of the GBA game, a different one each day
+(the day changes at midnight UTC, and everyone with the same ROM gets the same areas). The
+Neutral Garden gets grassy routes and woods, the Hero Garden sea, sky and shore areas, and the
+Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, not a save.
+
+- The area's name shows for a few seconds when you walk into the garden.
+- Wild creatures of that area come by now and then, picked with the same chances and levels as
+  in the GBA game: two when you arrive, then one every minute or two, up to 4 to 6 at a time.
+  Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
+  shiny, in the GBA game's shiny colours.
+- Your Chao pick them up and absorb them like partners: a wild one teaches a Chao the moves it
+  knows at its level, its types and its ability. You can carry one to a Chao too.
+- Carry one through the transporter and it comes along: it is in your hands when you reach
+  the next garden, ready to give to a Chao there.
+- Wild visitors are never saved; one that has been about for a few minutes leaves once you are
+  away from it, and new ones keep coming. They don't come to shared online gardens, and the ones
+  about leave when a friend joins you (one in your hands stays until you put it down; one you
+  carry in waits for your next garden that isn't shared).
+- Turn them off with **Wild visitors in the gardens** in the Mod Manager (GBA link group;
+  `WildVisitors` in `config.ini`).
 
 **Chao files:** your Chao are saved as files in `chao/export`. Put a friend's `.sa2chao` files in
 `chao/import` and they visit your garden, even when you're not online together.
@@ -261,14 +294,16 @@ and ability name and number is read from it. A GBA save isn't needed.
 **Starting one:** go to Chao Karate in the Chao Stadium. On the karate menu, press Down on the
 last button to reach **BATTLE** and press A. Then pick:
 
-1. **Singles** (one Chao a side at a time) or **Doubles** (two a side).
+1. **Singles** (one Chao a side at a time) or **Doubles** (two a side), or **Trainers** to
+   battle the GBA game's trainers (below).
 2. **Your team:** up to 6 of the Chao in your save. A picks or drops the Chao under the cursor;
    they go out in the order you picked them. The line below the list shows the Chao's types,
    ability, moves and battle stats. Choose **Done** at the bottom of the list (Up from the top
    gets there).
-3. **Who to battle:** a team of each online friend's Chao (their My Chao and the Chao they
-   bring), the `.sa2chao` files in `chao/import` (six to a team), or copies of your other Chao
-   (copies of your own team when you have no others).
+3. **Who to battle:** a friend online at Chao Karate for a live battle (below), a team of each
+   online friend's Chao (their My Chao and the Chao they bring), the `.sa2chao` files in
+   `chao/import` (six to a team), or copies of your other Chao (copies of your own team when
+   you have no others).
 
 **Controls:** the game's menu buttons, on a controller or the keyboard: Up/Down moves the
 cursor, A chooses, B goes back. Start pauses the game as usual, and the battle waits.
@@ -293,6 +328,18 @@ next one. A box at the top for each Chao in the ring shows its name, HP bar and 
 PSN, BRN, FRZ, PAR); yours also show their HP. When one of your Chao faints you pick who
 replaces it. A team with no Chao left loses; the result screen shows who's still standing,
 and A goes back to the karate menu. A battle that reaches 200 turns is a draw.
+
+**In the ring:** each Chao moves by the kind of move it uses: karate punches and kicks for
+moves that touch the foe, a throw or a hop and stomp for other physical moves, a swim stroke
+for water moves, flapping up for flying moves, a focus pose for other special moves, singing
+for sound moves, cheering for raising its own stats, taunts for lowering the foe's, a guard
+for shielding, lying down for resting and eating for healing. The move's own effect from the
+GBA game (read from your ROM) flies from the user to its target or bursts on it, with
+sparkles, splashes, flames or snow where they fit. A critical or strong hit flashes the
+screen white and shakes the view. Status shows on the Chao: an asleep Chao sleeps between
+turns, a confused one stumbles under a swirl, a flinching one shows "!", a paralyzed one
+shivers, a frozen one sits in ice, and a fainting one falls over and cries. **Battle effects**
+in the mod's settings (GBA link group) turns all this off, leaving the karate punches and hits.
 
 **Rules:** the GBA game's battle rules: its type chart, accuracy and evasion, critical hits,
 the same-type bonus, priority, PP, status conditions, stat stages, weather, move effects and
@@ -320,8 +367,48 @@ learned from its partners in their game, sent while you're online together. Expo
 files also writes `partners.txt` next to them: put it in `chao/import` with their `.sa2chao`
 files (add its lines to the one there when you have Chao from more than one friend).
 
-Battles play in your game only, and never change your save: every Chao in them is a copy,
-win or lose.
+**Trainers:** the GBA game's own trainers with their teams from your ROM. The list has the
+route trainers first (warm-ups, in groups by strength), then the 8 gym leaders, the league's
+four and the champion. The first gym leader is open from the start, and each leader, league
+trainer and the champion opens once you've beaten the one before; each group of route trainers
+opens with the gym leader before it. The line below the list shows the trainer's team and
+prize, and beaten trainers have a `*`. Pick a trainer, then your team: the battle is the
+trainer's own kind, singles or doubles. Their creatures stand on the far side of the ring as
+their pictures from the GBA game, at their own levels with their own moves, types and
+abilities; they hop when they act, shake when hit and sink away when they faint.
+
+Beating a gym leader earns their badge and the TM move their gym gives. **Teach a TM move** at
+the bottom of the list teaches a won move to any of your Chao in place of one of its moves; it
+stays in that move slot, also after new partners, until another TM move goes there. Friends'
+copies of that Chao, online or exported, battle with it too. Your progress and the taught
+moves are kept in the mod's `gba/trainers.txt`, never in your save.
+**Battle the GBA game's trainers** in the mod's settings (GBA link group) turns Trainers off.
+
+**Live battles:** friends who are online and at Chao Karate too are at the top of the "Battle
+against" list, marked "live" ("busy" while they're in a battle). Pick one to challenge them
+with your team and format; "Waiting for ... to answer" shows until they do (B takes the
+challenge back). On their side the challenge pops up on the karate menu, or in the battle menu
+if it's open: **Accept** and pick a team, or **Decline** (back to the karate menu when the
+challenge opened the battle menu). Each of you then battles from your own
+game, your own Chao on the left, and chooses for your own Chao; once you've chosen,
+"Waiting for ..." shows until your friend has too (B there gives up). Both games show the same
+turns and the same result. Giving up, leaving the karate area or going offline loses the
+battle, and a player who takes more than 2 minutes to choose once the other has chosen loses
+too. Both games need the same GBA ROM.
+
+**Live rule, GBA save partners:** the row under your friends in the "Battle against" list
+(A switches it) says whether your challenges allow what partners from a GBA save taught.
+**Not allowed** means both teams battle without it: moves a partner from a GBA save taught are
+left out, and a Chao whose partner came from a GBA save battles as Normal type with no ability
+(basic moves fill the empty slots). Moves from wild visitors, the gift and trainers' TMs always
+count. The challenge shows the rule to your friend, and each game applies it to its own team.
+
+A challenge that comes while you're elsewhere, in
+another battle or in live karate is turned down on its own. **Live battles with friends
+online** in the mod's settings (GBA link group) turns them off: friends' challenges are turned
+down and the list has no live entries.
+
+Battles never change your save: every Chao in them is a copy, win or lose.
 
 ## Problems
 

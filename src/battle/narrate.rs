@@ -14,7 +14,7 @@ use super::fighter::{Ailment, Stat};
 /// Frames a beat lasts: a message, a quick HP change, the longer moments.
 const MESSAGE: u16 = 90;
 const QUICK: u16 = 30;
-const ATTACK: u16 = 45;
+const ATTACK: u16 = 50;
 const FAINT: u16 = 80;
 const END: u16 = 150;
 
@@ -30,11 +30,13 @@ pub enum Cue {
     Hide {
         slot: Slot,
     },
-    /// Attacks (a short step toward `toward`), or for a status move, a show of strength.
+    /// Uses move `move_id`: attacks (a short step toward `toward`), or for a status move, a
+    /// show of strength.
     Attack {
         by: Slot,
         toward: Option<Slot>,
         status: bool,
+        move_id: u16,
     },
     /// Takes a hit: 0 light, 1 medium, 2 heavy.
     Hurt {
@@ -44,11 +46,53 @@ pub enum Cue {
     Faint {
         at: Slot,
     },
+    /// The fighter at `slot` has this status now (also as it comes out with one).
+    Ailment {
+        slot: Slot,
+        ailment: Option<Ailment>,
+    },
+    /// The fighter at `slot` became confused (`on`) or came out of it.
+    Confusion {
+        slot: Slot,
+        on: bool,
+    },
+    /// A moment's sign on the fighter at `slot`.
+    Sign {
+        slot: Slot,
+        sign: Sign,
+    },
     /// The end: the winners cheer, the others droop (`None` for a draw).
     Result {
         winner: Option<usize>,
     },
     Sound(Sound),
+}
+
+/// What a fighter shows for a moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sign {
+    /// A move's hit landed (`strong`: a critical or strong hit).
+    Struck {
+        strong: bool,
+    },
+    /// Acting while confused.
+    Confused,
+    Flinched,
+    /// Too paralyzed to move.
+    Paralyzed,
+    /// Asleep through its turn.
+    Snoring,
+    /// Frozen through its turn.
+    Frozen,
+    /// Hurt by its burn.
+    Burned,
+    /// Hurt by poison.
+    Poisoned,
+    /// Its shield stopped a move.
+    Guarded,
+    StatUp,
+    StatDown,
+    Healed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +268,15 @@ impl Narrator<'_> {
         self.push(Some(text), Vec::new(), Vec::new(), MESSAGE);
     }
 
+    fn say_with(&mut self, text: String, cues: Vec<Cue>) {
+        self.push(Some(text), cues, Vec::new(), MESSAGE);
+    }
+
+    /// The `Ailment` cue for `slot` with `ailment`.
+    fn ailment_cue(slot: Slot, ailment: Option<Ailment>) -> Vec<Cue> {
+        vec![Cue::Ailment { slot, ailment }]
+    }
+
     fn hp(&self, slot: Slot, hp: u16) -> Vec<Update> {
         self.planned
             .at(slot)
@@ -294,9 +347,16 @@ impl Narrator<'_> {
                 } else {
                     format!("The foe sends out {name}!")
                 };
+                let mut cues = vec![Cue::Show { slot: at, member }];
+                if let Some(a) = self.planned.ailment[at.side].get(member).copied().flatten() {
+                    cues.push(Cue::Ailment {
+                        slot: at,
+                        ailment: Some(a),
+                    });
+                }
                 self.push(
                     Some(text),
-                    vec![Cue::Show { slot: at, member }],
+                    cues,
                     vec![Update::Active {
                         slot: at,
                         member: Some(member),
@@ -334,6 +394,7 @@ impl Narrator<'_> {
                     by,
                     toward: self.aimed_at(by),
                     status: self.names.is_status_move(move_id),
+                    move_id,
                 };
                 self.push(Some(text), vec![cue], Vec::new(), ATTACK);
             }
@@ -347,7 +408,19 @@ impl Narrator<'_> {
             }
             Event::CantAct { by, why } => {
                 let who = self.who(by);
-                self.say(match why {
+                let sign = match why {
+                    Blocked::Asleep => Some(Sign::Snoring),
+                    Blocked::Frozen => Some(Sign::Frozen),
+                    Blocked::FullyParalyzed => Some(Sign::Paralyzed),
+                    Blocked::Flinched => Some(Sign::Flinched),
+                    Blocked::Confusion => Some(Sign::Confused),
+                    _ => None,
+                };
+                let cues = sign
+                    .map(|sign| Cue::Sign { slot: by, sign })
+                    .into_iter()
+                    .collect();
+                let text = match why {
                     Blocked::Asleep => format!("{who} is sound asleep."),
                     Blocked::Frozen => format!("{who} is frozen solid!"),
                     Blocked::FullyParalyzed => format!("{who} is paralyzed and can't move!"),
@@ -361,7 +434,8 @@ impl Narrator<'_> {
                     Blocked::Provoked => format!("{who} is too provoked for that!"),
                     Blocked::LostFocus => format!("{who} lost its focus!"),
                     Blocked::Storing => format!("{who} keeps building up power."),
-                });
+                };
+                self.say_with(text, cues);
             }
             Event::NoTarget { .. } => self.say("There was nobody to hit...".into()),
             Event::Missed { by, .. } => {
@@ -395,6 +469,11 @@ impl Narrator<'_> {
                 let frames = if text.is_some() { MESSAGE } else { QUICK };
                 let mut cues = Vec::new();
                 if damage > 0 {
+                    let strong = crit || effect == Effectiveness::Super;
+                    cues.push(Cue::Sign {
+                        slot: target,
+                        sign: Sign::Struck { strong },
+                    });
                     cues.push(Cue::Hurt {
                         target,
                         heavy: self.heaviness(target, damage),
@@ -440,17 +519,25 @@ impl Narrator<'_> {
                 };
                 let heavy = self.heaviness(target, damage);
                 let updates = self.hp(target, hp);
-                self.push(
-                    Some(text),
-                    vec![Cue::Hurt { target, heavy }],
-                    updates,
-                    MESSAGE,
-                );
+                let mut cues = vec![Cue::Hurt { target, heavy }];
+                let sign = match by {
+                    HurtBy::Poison => Some(Sign::Poisoned),
+                    HurtBy::Burn => Some(Sign::Burned),
+                    _ => None,
+                };
+                if let Some(sign) = sign {
+                    cues.push(Cue::Sign { slot: target, sign });
+                }
+                self.push(Some(text), cues, updates, MESSAGE);
             }
             Event::Healed { target, hp, .. } => {
                 let text = format!("{} regains health!", self.who(target));
                 let updates = self.hp(target, hp);
-                self.push(Some(text), Vec::new(), updates, MESSAGE);
+                let cues = vec![Cue::Sign {
+                    slot: target,
+                    sign: Sign::Healed,
+                }];
+                self.push(Some(text), cues, updates, MESSAGE);
             }
             Event::HpSet { target, hp } => {
                 let updates = self.hp(target, hp);
@@ -459,7 +546,8 @@ impl Narrator<'_> {
             Event::Ailment { target, ailment } => {
                 let text = format!("{} {}!", self.who(target), ailment_started(ailment));
                 let updates = self.ailment(target, Some(ailment));
-                self.push(Some(text), Vec::new(), updates, MESSAGE);
+                let cues = Self::ailment_cue(target, Some(ailment));
+                self.push(Some(text), cues, updates, MESSAGE);
             }
             Event::AlreadyAilment { target, .. } => {
                 let text = format!("{} already has a condition!", self.who(target));
@@ -468,17 +556,32 @@ impl Narrator<'_> {
             Event::WokeUp { target } | Event::NoiseWoke { target } => {
                 let text = format!("{} woke up!", self.who(target));
                 let updates = self.ailment(target, None);
-                self.push(Some(text), Vec::new(), updates, MESSAGE);
+                self.push(
+                    Some(text),
+                    Self::ailment_cue(target, None),
+                    updates,
+                    MESSAGE,
+                );
             }
             Event::Thawed { target } => {
                 let text = format!("{} thawed out!", self.who(target));
                 let updates = self.ailment(target, None);
-                self.push(Some(text), Vec::new(), updates, MESSAGE);
+                self.push(
+                    Some(text),
+                    Self::ailment_cue(target, None),
+                    updates,
+                    MESSAGE,
+                );
             }
             Event::Cured { target, .. } => {
                 let text = format!("{} is cured!", self.who(target));
                 let updates = self.ailment(target, None);
-                self.push(Some(text), Vec::new(), updates, MESSAGE);
+                self.push(
+                    Some(text),
+                    Self::ailment_cue(target, None),
+                    updates,
+                    MESSAGE,
+                );
             }
             Event::TeamCured { side } => {
                 let updates = (0..self.planned.ailment[side].len())
@@ -489,16 +592,28 @@ impl Narrator<'_> {
                     })
                     .collect();
                 let whose = if side == 0 { "Your" } else { "The foe's" };
+                let cues = (0..2)
+                    .map(|pos| Slot::new(side, pos))
+                    .filter(|&slot| self.planned.at(slot).is_some())
+                    .map(|slot| Cue::Ailment {
+                        slot,
+                        ailment: None,
+                    })
+                    .collect();
                 self.push(
                     Some(format!("{whose} team is cured!")),
-                    Vec::new(),
+                    cues,
                     updates,
                     MESSAGE,
                 );
             }
             Event::Confused { target } => {
                 let text = format!("{} is confused!", self.who(target));
-                self.say(text);
+                let cues = vec![Cue::Confusion {
+                    slot: target,
+                    on: true,
+                }];
+                self.say_with(text, cues);
             }
             Event::AlreadyConfused { target } => {
                 let text = format!("{} is confused already!", self.who(target));
@@ -506,11 +621,19 @@ impl Narrator<'_> {
             }
             Event::IsConfused { by } => {
                 let text = format!("{} is confused...", self.who(by));
-                self.say(text);
+                let cues = vec![Cue::Sign {
+                    slot: by,
+                    sign: Sign::Confused,
+                }];
+                self.say_with(text, cues);
             }
             Event::ConfusionEnded { target } => {
                 let text = format!("{} is no longer confused!", self.who(target));
-                self.say(text);
+                let cues = vec![Cue::Confusion {
+                    slot: target,
+                    on: false,
+                }];
+                self.say_with(text, cues);
             }
             Event::StatChanged { target, stat, by } => {
                 let how = match by {
@@ -520,7 +643,8 @@ impl Narrator<'_> {
                     _ => "rose a lot",
                 };
                 let text = format!("{}'s {} {how}!", self.who(target), stat_name(stat));
-                self.say(text);
+                let sign = if by > 0 { Sign::StatUp } else { Sign::StatDown };
+                self.say_with(text, vec![Cue::Sign { slot: target, sign }]);
             }
             Event::StatAtLimit { target, stat, up } => {
                 let way = if up { "higher" } else { "lower" };
@@ -586,7 +710,11 @@ impl Narrator<'_> {
             }
             Event::Shielded { target } => {
                 let text = format!("{} shielded itself!", self.who(target));
-                self.say(text);
+                let cues = vec![Cue::Sign {
+                    slot: target,
+                    sign: Sign::Guarded,
+                }];
+                self.say_with(text, cues);
             }
             Event::HungOn { target } => {
                 let text = format!("{} hung on!", self.who(target));
@@ -938,16 +1066,30 @@ mod tests {
             [Cue::Attack {
                 by: a,
                 toward: Some(b),
-                status: false
+                status: false,
+                move_id: 5,
             }]
         );
-        // 50 of 80 HP is a heavy hit.
+        // 50 of 80 HP is a heavy hit, and a strong one.
         assert_eq!(
-            beats[3].cues[0],
-            Cue::Hurt {
-                target: b,
-                heavy: 2
-            }
+            beats[3].cues[..2],
+            [
+                Cue::Sign {
+                    slot: b,
+                    sign: Sign::Struck { strong: true }
+                },
+                Cue::Hurt {
+                    target: b,
+                    heavy: 2
+                }
+            ]
+        );
+        assert_eq!(
+            beats[4].cues,
+            [Cue::Ailment {
+                slot: b,
+                ailment: Some(Ailment::Burn)
+            }]
         );
         assert!(matches!(beats[5].cues[0], Cue::Attack { status: true, .. }));
         assert_eq!(beats[7].cues, [Cue::Hide { slot: b }]);
@@ -1011,11 +1153,90 @@ mod tests {
         assert_eq!(beats[0].text, None);
         assert_eq!(beats[0].frames, QUICK);
         assert_eq!(
-            beats[0].cues[0],
-            Cue::Hurt {
+            beats[0].cues[..2],
+            [
+                Cue::Sign {
+                    slot: b,
+                    sign: Sign::Struck { strong: false }
+                },
+                Cue::Hurt {
+                    target: b,
+                    heavy: 0
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn status_shows_on_the_fighters() {
+        let (a, b) = (Slot::new(0, 0), Slot::new(1, 0));
+        let mut planned = view();
+        planned.active = [[Some(0), None], [Some(0), None]];
+        planned.ailment[0][1] = Some(Ailment::Sleep);
+        let events = [
+            Event::Confused { target: b },
+            Event::IsConfused { by: b },
+            Event::CantAct {
+                by: a,
+                why: Blocked::Flinched,
+            },
+            Event::StatChanged {
+                target: a,
+                stat: Stat::Attack,
+                by: -1,
+            },
+            Event::Hurt {
                 target: b,
-                heavy: 0
-            }
+                damage: 5,
+                hp: 75,
+                by: HurtBy::Burn,
+            },
+            Event::ConfusionEnded { target: b },
+            Event::Withdrawn { at: a, member: 0 },
+            Event::SwitchedIn { at: a, member: 1 },
+            Event::WokeUp { target: a },
+        ];
+        let cues: Vec<Cue> = beats(&events, &mut planned, &Plain)
+            .into_iter()
+            .flat_map(|b| b.cues)
+            .collect();
+        assert_eq!(
+            cues,
+            [
+                Cue::Confusion { slot: b, on: true },
+                Cue::Sign {
+                    slot: b,
+                    sign: Sign::Confused
+                },
+                Cue::Sign {
+                    slot: a,
+                    sign: Sign::Flinched
+                },
+                Cue::Sign {
+                    slot: a,
+                    sign: Sign::StatDown
+                },
+                Cue::Hurt {
+                    target: b,
+                    heavy: 0
+                },
+                Cue::Sign {
+                    slot: b,
+                    sign: Sign::Burned
+                },
+                Cue::Confusion { slot: b, on: false },
+                Cue::Hide { slot: a },
+                // The one coming in is still asleep.
+                Cue::Show { slot: a, member: 1 },
+                Cue::Ailment {
+                    slot: a,
+                    ailment: Some(Ailment::Sleep)
+                },
+                Cue::Ailment {
+                    slot: a,
+                    ailment: None
+                },
+            ]
         );
     }
 }

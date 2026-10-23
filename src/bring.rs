@@ -114,10 +114,14 @@ pub fn set_friend_gardens(mask: u8) {
     FRIEND_GARDENS.store(mask, Ordering::Relaxed);
 }
 
+/// Other players are in garden `area` now (from their states).
+pub fn friends_in(area: i32) -> bool {
+    (1..=3).contains(&area) && FRIEND_GARDENS.load(Ordering::Relaxed) & (1 << area) != 0
+}
+
 /// Whether garden `area` is shared now: someone else is in it, or the server runs it.
 fn shared(area: i32) -> bool {
-    ((1..=3).contains(&area) && FRIEND_GARDENS.load(Ordering::Relaxed) & (1 << area) != 0)
-        || crate::garden::server_runs()
+    friends_in(area) || crate::garden::server_runs()
 }
 
 /// Hooks the garden load's CreateChao calls. Call once at startup.

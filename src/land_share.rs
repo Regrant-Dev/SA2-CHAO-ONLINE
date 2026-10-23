@@ -128,7 +128,7 @@ fn export(name: &str) -> Option<u32> {
 /// ledges from the garden's loaded object layout (re/garden-collision.md §8.3); None until
 /// that layout is this garden's.
 #[cfg(target_arch = "x86")]
-fn read(index: usize) -> Option<Garden> {
+pub(crate) fn read(index: usize) -> Option<Garden> {
     use crate::chao_sim::land::{CLIMB_TYPE, LAND_EXPORT, SET_LISTS, read_blockers, read_ledges};
     let land = export(LAND_EXPORT[index])?;
     let mem = Images::of(&[data_dll()? as u32, 0x0040_0000])?;
@@ -177,7 +177,7 @@ fn read_motions() -> Option<crate::chao_sim::motion::MotionTable> {
 }
 
 #[cfg(not(target_arch = "x86"))]
-fn read(_index: usize) -> Option<Garden> {
+pub(crate) fn read(_index: usize) -> Option<Garden> {
     None
 }
 

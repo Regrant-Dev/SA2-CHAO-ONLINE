@@ -16,7 +16,7 @@ const KARATE_MAIN: usize = 0x01A5_D14C;
 /// The karate main object's MainSub.
 pub const MAIN_EXEC: usize = 0x0054_2DA0;
 /// `ChaoArea_Karate`.
-const AREA_KARATE: i32 = 10;
+pub const AREA_KARATE: i32 = 10;
 /// Game paused: the karate objects and Chao stop.
 const PAUSED: usize = 0x0174_AFF7;
 /// Menu buttons pressed this frame, player 1 (built from the pad and keyboard by 0x441AB0).
@@ -216,19 +216,40 @@ impl Karate {
     }
 }
 
-/// Where each of our Chao stands: (object, position, facing). Its MainSub keeps it there.
-static SPOTS: Mutex<Vec<(usize, [f32; 3], i32)>> = Mutex::new(Vec::new());
+/// Where one of our Chao stands and faces, and how high it's lifted off the floor (0 on it).
+/// Its MainSub keeps it there.
+#[derive(Clone, Copy)]
+struct Spot {
+    object: usize,
+    at: [f32; 3],
+    angle: i32,
+    lift: f32,
+}
 
-fn spots() -> std::sync::MutexGuard<'static, Vec<(usize, [f32; 3], i32)>> {
+static SPOTS: Mutex<Vec<Spot>> = Mutex::new(Vec::new());
+
+fn spots() -> std::sync::MutexGuard<'static, Vec<Spot>> {
     SPOTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Moves one of our Chao to `at`, facing `angle`.
+/// Moves one of our Chao to `at`, facing `angle`, standing on the floor.
 pub fn place(object: usize, at: [f32; 3], angle: i32) {
+    place_lifted(object, at, angle, 0.0);
+}
+
+/// Moves one of our Chao to `at`, facing `angle`, `lift` above `at`'s height (a hop or a
+/// glide; 0 leaves the height to the game).
+pub fn place_lifted(object: usize, at: [f32; 3], angle: i32, lift: f32) {
+    let spot = Spot {
+        object,
+        at,
+        angle,
+        lift,
+    };
     let mut s = spots();
-    match s.iter_mut().find(|(o, _, _)| *o == object) {
-        Some(spot) => *spot = (object, at, angle),
-        None => s.push((object, at, angle)),
+    match s.iter_mut().find(|s| s.object == object) {
+        Some(old) => *old = spot,
+        None => s.push(spot),
     }
 }
 
@@ -289,7 +310,7 @@ pub fn remove(object: usize) {
     if alive(object) {
         write(object + OBJ_MAIN, DELETE_OBJECT);
     }
-    spots().retain(|(o, _, _)| *o != object);
+    spots().retain(|s| s.object != object);
 }
 
 /// `id` is a real entry of the motion table at `controller` (0x793D30 doesn't check, and a bad
@@ -369,14 +390,9 @@ pub fn sound(id: u32) {
 /// MainSub of our Chao: the game's own update between two writes of its spot, so nothing moves
 /// it but us (the height stays the game's, so it stands on the floor).
 extern "C" fn chao_main(object: usize) {
-    let spot = std::panic::catch_unwind(|| {
-        spots()
-            .iter()
-            .find(|(o, _, _)| *o == object)
-            .map(|&(_, at, angle)| (at, angle))
-    })
-    .ok()
-    .flatten();
+    let spot = std::panic::catch_unwind(|| spots().iter().find(|s| s.object == object).copied())
+        .ok()
+        .flatten();
     let d: usize = read(object + OBJ_DATA1);
     if let Some(spot) = spot
         && d != 0
@@ -398,14 +414,16 @@ extern "C" fn chao_main(object: usize) {
     }
 }
 
-/// Writes x, z and facing; the height is the game's unless it fell off the ring.
-fn put(d: usize, (at, angle): ([f32; 3], i32)) {
+/// Writes x, z and facing; the height is the game's unless it's lifted or fell off the ring.
+fn put(d: usize, spot: Spot) {
     let mut p: Vector = read(d + D_POSITION);
-    p.x = at[0];
-    p.z = at[2];
-    if !p.y.is_finite() || p.y < FLOOR_MIN {
-        p.y = at[1];
+    p.x = spot.at[0];
+    p.z = spot.at[2];
+    if spot.lift > 0.0 {
+        p.y = spot.at[1] + spot.lift;
+    } else if !p.y.is_finite() || p.y < FLOOR_MIN {
+        p.y = spot.at[1];
     }
     write(d + D_POSITION, p);
-    write(d + D_ROTATION_Y, angle);
+    write(d + D_ROTATION_Y, spot.angle);
 }

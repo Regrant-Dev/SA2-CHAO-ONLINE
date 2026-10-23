@@ -219,6 +219,7 @@ fn export_all(mod_path: &str) {
     }
     // What they have from GBA link partners, for battles against copies of them.
     crate::gba_link::export_partners(&dir, &identities);
+    crate::battle::ladder::export_taught(&dir, &identities);
     log!("export: {count} Chao written to {}", dir.display());
 }
 

@@ -603,6 +603,7 @@ fn pump(online: &mut Online, now: Instant) {
             }
             Event::Disconnected { reason } => {
                 log!("online: disconnected: {reason}");
+                crate::battle::online::lost();
                 online.remote.clear();
                 crate::held::clear();
                 crate::garden::set_locked(Vec::new());
@@ -645,6 +646,7 @@ fn pump(online: &mut Online, now: Instant) {
                     .map(|r| r.name)
                     .unwrap_or_default();
                 log!("online: player {id} '{name}' left");
+                crate::battle::online::peer_left(id);
                 crate::garden::player_left(Some(id));
                 crate::carried::player_left(id);
                 hud::toast(format!("{name} left"));
@@ -855,6 +857,31 @@ fn pump(online: &mut Online, now: Instant) {
                 body: Body::Partners { list },
                 ..
             } => crate::gba_link::others_learned(&list),
+            // Live battles (battle/online.rs): the host's own messages; players' go to the host
+            // only.
+            Event::Game {
+                from,
+                body:
+                    body @ (Body::BattleOffer { .. }
+                    | Body::BattleStart { .. }
+                    | Body::BattleStep { .. }
+                    | Body::BattleEnd { .. }),
+            } => {
+                let remote = &online.remote;
+                crate::battle::online::received(from, body, |id| {
+                    remote
+                        .get(&id)
+                        .map_or_else(|| format!("player {id}"), |r| r.name.clone())
+                });
+            }
+            Event::Game {
+                body:
+                    Body::BattleChallenge { .. }
+                    | Body::BattleAnswer { .. }
+                    | Body::BattleChoice { .. }
+                    | Body::BattleLeave { .. },
+                ..
+            } => {}
             // The Chao locked against us (only the host says so).
             Event::Game {
                 from,
@@ -1339,6 +1366,8 @@ pub fn on_frame() {
     let Some(online) = guard.as_mut() else {
         room::update(None, Vec::new());
         crate::bring::set_friend_gardens(0);
+        // Nobody to send live battle messages to.
+        crate::battle::online::take_outgoing();
         return;
     };
     let now = Instant::now();
@@ -1536,7 +1565,8 @@ pub fn on_frame() {
     }
     // What our Chao have from GBA link partners, for friends' battles against copies of them.
     if online.session.my_id().is_some() && RESEND_PARTNERS.swap(false, Ordering::Relaxed) {
-        for list in crate::gba_link::shared_partners().chunks(MAX_PARTNERS) {
+        let shared = crate::battle::ladder::shared_partners(crate::gba_link::shared_partners());
+        for list in shared.chunks(MAX_PARTNERS) {
             let body = Body::Partners {
                 list: list.to_vec(),
             };
@@ -1588,6 +1618,12 @@ pub fn on_frame() {
         online
             .session
             .send(Body::KaratePick { opponent }, true, now);
+    }
+    // Live battles' messages to the host (battle/online.rs).
+    for body in crate::battle::online::take_outgoing() {
+        if online.session.my_id().is_some() {
+            online.session.send(body, true, now);
+        }
     }
 
     for (id, index) in crate::garden::take_left()
@@ -2009,6 +2045,7 @@ pub fn on_frame() {
                 | together::flags()
                 | crate::race::flags()
                 | crate::karate_live::flags()
+                | crate::battle::online::flags()
                 | if game::between_areas() {
                     game::POSE_LOADING
                 } else {

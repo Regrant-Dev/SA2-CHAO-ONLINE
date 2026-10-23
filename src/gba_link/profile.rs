@@ -25,11 +25,24 @@ pub struct Profile {
 }
 
 /// The profile of a Chao that has `learned` (`None` without a partner). Moves the ROM doesn't
-/// have are dropped and empty slots are filled with basic moves it doesn't know yet.
-pub fn profile(rom: &Rom, learned: Option<&Learned>) -> Profile {
+/// have are dropped and empty slots are filled with basic moves it doesn't know yet. Without
+/// `save_partners` (a live battle's rule), moves a partner from a GBA save taught are left out,
+/// and a partner from a GBA save gives no types or ability (Normal, none).
+pub fn profile(rom: &Rom, learned: Option<&Learned>, save_partners: bool) -> Profile {
     let mut moves = [0u16; 4];
     let mut n = 0;
-    let known = learned.map_or([0; 4], |l| l.moves);
+    let known = learned.map_or([0; 4], |l| {
+        let mut known = l.moves;
+        if !save_partners {
+            for (i, id) in known.iter_mut().enumerate() {
+                if l.save_moves & 1 << i != 0 {
+                    *id = 0;
+                }
+            }
+        }
+        known
+    });
+    let learned = learned.filter(|l| save_partners || !l.partner.from_save);
     for id in known.into_iter().chain(basic_moves(rom)) {
         if n < moves.len()
             && id != 0
@@ -148,7 +161,7 @@ mod tests {
     fn profiles_with_and_without_a_partner() {
         let Some(rom) = rom() else { return };
         let basic = basic_moves(&rom);
-        let none = profile(&rom, None);
+        let none = profile(&rom, None, true);
         assert_eq!(none.types, [NORMAL; 2]);
         assert_eq!(none.ability, 0);
         assert_eq!(none.moves, basic);
@@ -165,10 +178,13 @@ mod tests {
                 moves: taught,
                 level: 5,
                 ability: 0,
+                from_save: false,
             },
             moves: super::super::store::teach([0; 4], taught),
+            save_moves: 0,
         };
-        let p = profile(&rom, Some(&learned));
+        let p = profile(&rom, Some(&learned), true);
+        assert_eq!(profile(&rom, Some(&learned), false), p);
         assert_eq!(p.types, info.types);
         assert_ne!(p.ability, 0);
         assert_eq!(p.ability, info.abilities[0]);
@@ -189,9 +205,31 @@ mod tests {
                 ..learned.partner
             },
             moves: [MOVE_COUNT + 5, 0, 0, 0],
+            save_moves: 0,
         };
-        let p = profile(&rom, Some(&odd));
+        let p = profile(&rom, Some(&odd), true);
         assert_eq!(p.ability, 3);
         assert_eq!(p.moves, basic);
+
+        // From a GBA save: all of it with save partners allowed; without, its moves and its
+        // partner's types and ability go, and the moves a wild one taught stay.
+        let wild = basic[0];
+        let saved = Learned {
+            partner: Partner {
+                from_save: true,
+                ..learned.partner
+            },
+            moves: [taught[0], wild, 0, 0],
+            save_moves: 0b01,
+        };
+        let with = profile(&rom, Some(&saved), true);
+        assert_eq!(with.types, info.types);
+        assert_eq!(with.moves[..2], [taught[0], wild]);
+        let without = profile(&rom, Some(&saved), false);
+        assert_eq!(without.types, [NORMAL; 2]);
+        assert_eq!(without.ability, 0);
+        assert_eq!(without.partner, None);
+        assert_eq!(without.moves[0], wild);
+        assert!(!without.moves.contains(&taught[0]) || basic.contains(&taught[0]));
     }
 }

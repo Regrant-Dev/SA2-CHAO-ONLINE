@@ -12,6 +12,8 @@ Online multiplayer for **Sonic Adventure 2** (Steam PC), for up to 8 players. It
 - Your Chao can visit friends' gardens, run in their Chao Races and fight them in karate.
 - Inspect your Chao's hidden stats, temperament, emotions, alignment and bonds in F9.
 - Unlock jewel eggs in the Black Market by collecting 120-180 emblems.
+- GBA link: creatures from your own GBA game visit your gardens and teach your Chao moves,
+  types and abilities, for turn-based Chao battles against trainers and friends.
 - Text chat, and a "go to friend" option to jump to where someone is.
 
 Press **F9** in game for the menu. Multiplayer stays off until you turn it on. There's also an
@@ -29,6 +31,12 @@ For automatic updates before each Steam launch, set up the optional
 new mod releases without update prompts and keeps your settings and saves.
 
 Karate needs the game's Battle DLC.
+
+The GBA link and Chao battles need your own copy of **Emerald** for the Game Boy Advance: a
+ROM of the US release (game code BPEE) dumped from a cartridge you own. A save file from it is
+optional. The mod contains
+none of that game's data: names, moves, types and pictures are read from your ROM. Everything
+else works without it. See [how to play](docs/how-to-play.md) for setting it up.
 
 ## Developers
 

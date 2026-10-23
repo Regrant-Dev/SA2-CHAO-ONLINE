@@ -9,8 +9,9 @@
 pub const SIZE: f32 = 6.0;
 /// Global texture indices: `BASE + slot * 2 + frame` (the game's own are far from here).
 const GBIX_BASE: u32 = 0x7E5A_0000;
-/// Pictures kept at once (a garden holds 4 partners).
-const SLOTS: usize = 6;
+/// Pictures kept at once (a garden holds 4 partners, 6 wild visitors and the link machine's
+/// screen).
+const SLOTS: usize = 12;
 /// Frames shown this long each (milliseconds).
 const FRAME_TIME: u32 = 600;
 
@@ -138,10 +139,18 @@ pub fn frame_at(ms: u32, count: usize) -> usize {
 }
 
 #[cfg(target_arch = "x86")]
-pub use game::{draw, forget};
+pub use game::{Textures, draw_panel, draw_picture, forget};
+
+/// Draws the picture of `species` (in its usual colours) at the animal position `at`.
+pub fn draw(species: u16, at: [f32; 3], held: bool) {
+    draw_picture(species, false, at, held);
+}
 
 #[cfg(not(target_arch = "x86"))]
-pub fn draw(_species: u16, _at: [f32; 3], _held: bool) {}
+pub fn draw_picture(_species: u16, _shiny: bool, _at: [f32; 3], _held: bool) {}
+
+#[cfg(not(target_arch = "x86"))]
+pub fn draw_panel(_species: u16, _feet: [f32; 3], _yaw: i32, _height: f32) {}
 
 #[cfg(not(target_arch = "x86"))]
 pub fn forget() {}
@@ -174,19 +183,122 @@ mod game {
     const DROP_CARRIED: f32 = 1.2;
     const TEXNAME: usize = 12;
 
+    /// Game textures made from RGBA8 frames, as one texture list. They belong to the scene they
+    /// were made in.
+    pub struct Textures {
+        /// NJS_TEXNAME entries (name, attr, texaddr) for every frame.
+        names: Box<[u32]>,
+        /// The NJS_TEXLIST the parser fills (all frames).
+        all: Box<[u32; 2]>,
+        count: usize,
+        /// The scene they were made in and their records then.
+        scene: Scene,
+        signature: Vec<[usize; 4]>,
+    }
+
+    // SAFETY: the raw words are only used on the game thread.
+    unsafe impl Send for Textures {}
+
+    impl Textures {
+        /// Makes `frames` (RGBA8, `w` x `h`, multiples of 4) into textures with global indices
+        /// `gbix + i`; `alpha_test`: their alpha strips draw with alpha test and depth writes.
+        /// Game thread.
+        pub fn make(
+            frames: &[Vec<u8>],
+            w: usize,
+            h: usize,
+            gbix: u32,
+            alpha_test: bool,
+        ) -> Option<Self> {
+            let count = frames.len();
+            if count == 0 || !room(count + 4) {
+                return None;
+            }
+            let archive = gvm(frames, w, h, gbix);
+            let mut names = vec![0u32; count * 3].into_boxed_slice();
+            let all = Box::new([names.as_mut_ptr() as u32, count as u32]);
+            let result: i32;
+            // SAFETY: a checked archive we built (the parser byte-swaps its header in place
+            // and keeps no pointer into it), a list with an entry per texture, on the game
+            // thread.
+            unsafe {
+                std::arch::asm!(
+                    "push ebx",
+                    "mov ebx, {list}",
+                    "call {f}",
+                    "pop ebx",
+                    list = in(reg) all.as_ptr(),
+                    f = in(reg) PARSE_GVM,
+                    inlateout("eax") archive.as_ptr() => result,
+                    clobber_abi("C"),
+                );
+            }
+            let made = (0..count).all(|i| names[i * 3 + 2] != 0);
+            if result != 1 || !made {
+                return None;
+            }
+            if alpha_test {
+                for i in 0..count {
+                    let record = names[i * 3 + 2] as usize;
+                    // SAFETY: our texture's record and info, just made.
+                    unsafe {
+                        let info = ((record + 0xC) as *const usize).read();
+                        if info != 0 {
+                            ((info + INFO_FORMAT) as *mut u32).write(ALPHA_TEST_FORMAT);
+                        }
+                    }
+                }
+            }
+            let signature = signature(&names, count);
+            Some(Self {
+                names,
+                all,
+                count,
+                scene: scene(),
+                signature,
+            })
+        }
+
+        /// Still ours: made in this scene, and the game hasn't reused the records.
+        pub fn ours(&self) -> bool {
+            self.scene == scene()
+                && self.signature.iter().all(|s| s[0] != 0 && s[3] != 0)
+                && signature(&self.names, self.count) == self.signature
+        }
+
+        /// Releases them if they're still ours (else the game freed them with their scene).
+        pub fn release(&self) {
+            if self.ours() {
+                // SAFETY: our list; its records are still ours in this scene.
+                unsafe {
+                    std::mem::transmute::<usize, extern "C" fn(usize)>(RELEASE)(
+                        self.all.as_ptr() as usize
+                    )
+                };
+            }
+        }
+
+        /// The NJS_TEXLIST of every frame.
+        pub fn list(&self) -> usize {
+            self.all.as_ptr() as usize
+        }
+
+        /// The NJS_TEXNAME entry of frame `i`.
+        fn entry(&self, i: usize) -> u32 {
+            self.names.as_ptr() as u32 + (i.min(self.count - 1) * TEXNAME) as u32
+        }
+    }
+
     /// One picture's textures.
     struct Picture {
         species: u16,
+        shiny: bool,
         slot: usize,
-        frames: usize,
-        /// NJS_TEXNAME entries (name, attr, texaddr) for every frame.
-        names: Box<[u32]>,
-        /// The list the parser fills (all frames) and the one drawn (one frame).
-        all: Box<[u32; 2]>,
+        textures: Textures,
+        /// The list drawn (one frame).
         shown: Box<[u32; 2]>,
-        /// The scene it was made in and its records then.
-        scene: (i16, u32, i32),
-        signature: Vec<[usize; 4]>,
+        /// When it was last drawn: the one drawn longest ago makes room for a new one.
+        used: std::time::Instant,
     }
 
     /// The quad model: NJS_OBJECT, NJS_CNK_MODEL and the two chunk lists.
@@ -200,8 +312,8 @@ mod game {
     struct Pictures {
         list: Vec<Picture>,
         model: Option<Model>,
-        /// Species that failed (not tried again this scene).
-        failed: Vec<(u16, (i16, u32, i32))>,
+        /// Species (and shiny) that failed (not tried again this scene).
+        failed: Vec<((u16, bool), Scene)>,
     }
 
     // SAFETY: the raw words are only used on the game thread.
@@ -214,7 +326,10 @@ mod game {
     });
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-    fn scene() -> (i16, u32, i32) {
+    /// The level, its run and the Chao area: textures belong to one scene.
+    type Scene = (i16, u32, i32);
+
+    fn scene() -> Scene {
         (
             crate::game::current_level(),
             crate::game::stage_run(),
@@ -272,12 +387,6 @@ mod game {
             .collect()
     }
 
-    fn ours(p: &Picture) -> bool {
-        p.scene == scene()
-            && p.signature.iter().all(|s| s[0] != 0 && s[3] != 0)
-            && signature(&p.names, p.frames) == p.signature
-    }
-
     /// Free texture records and infos, at least.
     fn room(n: usize) -> bool {
         // SAFETY: the game's texture pools (base pointers and counts, statics).
@@ -297,109 +406,95 @@ mod game {
         }
     }
 
-    /// Makes the picture of `species` in `slot`.
-    fn make(species: u16, slot: usize) -> Option<Picture> {
+    /// Makes the picture of `species` (in its shiny colours when `shiny`) in `slot`.
+    fn make(species: u16, shiny: bool, slot: usize) -> Option<Picture> {
         let rom = super::super::loaded_rom()?;
-        let sprite = rom.front_sprite(species)?;
+        let sprite = if shiny {
+            rom.shiny_front_sprite(species)?
+        } else {
+            rom.front_sprite(species)?
+        };
         let frames = sprite.frames.len().min(2);
-        if frames == 0 || !room(frames + 4) {
-            return None;
-        }
         let gbix = GBIX_BASE + (slot * 2) as u32;
-        let archive = gvm(
+        let Some(textures) = Textures::make(
             &sprite.frames[..frames],
             sprite.width as usize,
             sprite.height as usize,
             gbix,
-        );
-        let mut names = vec![0u32; frames * 3].into_boxed_slice();
-        let all = Box::new([names.as_mut_ptr() as u32, frames as u32]);
-        let result: i32;
-        // SAFETY: a checked archive we built (the parser byte-swaps its header in place and
-        // keeps no pointer into it), a list with an entry per texture, on the game thread.
-        unsafe {
-            std::arch::asm!(
-                "push ebx",
-                "mov ebx, {list}",
-                "call {f}",
-                "pop ebx",
-                list = in(reg) all.as_ptr(),
-                f = in(reg) PARSE_GVM,
-                inlateout("eax") archive.as_ptr() => result,
-                clobber_abi("C"),
-            );
-        }
-        let made = (0..frames).all(|i| names[i * 3 + 2] != 0);
-        if result != 1 || !made {
+            true,
+        ) else {
             log!("gba link: textures for species {species} weren't made");
             return None;
-        }
-        for i in 0..frames {
-            let record = names[i * 3 + 2] as usize;
-            // SAFETY: our texture's record and info, just made.
-            unsafe {
-                let info = ((record + 0xC) as *const usize).read();
-                if info != 0 {
-                    ((info + INFO_FORMAT) as *mut u32).write(ALPHA_TEST_FORMAT);
-                }
-            }
-        }
-        let shown = Box::new([names.as_ptr() as u32, 1]);
-        let signature = signature(&names, frames);
+        };
+        let shown = Box::new([textures.entry(0), 1]);
         Some(Picture {
             species,
+            shiny,
             slot,
-            frames,
-            names,
-            all,
+            textures,
             shown,
-            scene: scene(),
-            signature,
+            used: std::time::Instant::now(),
         })
-    }
-
-    fn release(p: &Picture) {
-        if ours(p) {
-            // SAFETY: our list; its records are still ours in this scene.
-            unsafe {
-                std::mem::transmute::<usize, extern "C" fn(usize)>(RELEASE)(p.all.as_ptr() as usize)
-            };
-        }
     }
 
     /// The garden is going: our textures go (or went with it).
     pub fn forget() {
         let mut s = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
         for p in s.list.drain(..) {
-            release(&p);
+            p.textures.release();
         }
         s.failed.clear();
     }
 
-    /// Draws the picture of `species` at the animal position `at` (`held`: carried by the
-    /// player). Display pass, game thread.
-    pub fn draw(species: u16, at: [f32; 3], held: bool) {
+    /// Draws the picture of `species` (`shiny`: in its shiny colours) at the animal position
+    /// `at` (`held`: carried by the player), turned to the camera. Display pass, game thread.
+    pub fn draw_picture(species: u16, shiny: bool, at: [f32; 3], held: bool) {
+        // SAFETY: the display pass; the matrix stack's top is the view matrix.
+        let view = unsafe {
+            let top = (MATRIX_TOP as *const usize).read();
+            if top == 0 {
+                return;
+            }
+            (top as *const [f32; 12]).read()
+        };
+        let cam = camera(&view);
+        let feet = [at[0], at[1] - if held { DROP_CARRIED } else { DROP }, at[2]];
+        draw_at(species, shiny, feet, facing(feet, cam), 1.0);
+    }
+
+    /// Draws the picture of `species` standing at `feet`, `height` tall, its front turned to
+    /// `yaw` (BAMS) whatever the camera does (a screen). Display pass, game thread.
+    pub fn draw_panel(species: u16, feet: [f32; 3], yaw: i32, height: f32) {
+        draw_at(species, false, feet, yaw, height / SIZE);
+    }
+
+    fn draw_at(species: u16, shiny: bool, feet: [f32; 3], yaw: i32, scale: f32) {
         let mut s = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
         let now = scene();
+        let key = (species, shiny);
+        let this = |p: &Picture| (p.species, p.shiny) == key;
         // Gone with an old scene: dropped without releasing (the game freed them).
-        s.list.retain(ours);
+        s.list.retain(|p| p.textures.ours());
         s.failed.retain(|(_, sc)| *sc == now);
-        if s.failed.iter().any(|(sp, _)| *sp == species) {
+        if s.failed.iter().any(|(k, _)| *k == key) {
             return;
         }
-        if !s.list.iter().any(|p| p.species == species) {
+        if !s.list.iter().any(this) {
             if s.list.len() >= SLOTS {
-                let old = s.list.remove(0);
-                release(&old);
+                let oldest = (0..s.list.len())
+                    .min_by_key(|&i| s.list[i].used)
+                    .unwrap_or(0);
+                let old = s.list.remove(oldest);
+                old.textures.release();
             }
             let used: Vec<usize> = s.list.iter().map(|p| p.slot).collect();
             let Some(slot) = (0..SLOTS).find(|i| !used.contains(i)) else {
                 return;
             };
-            match make(species, slot) {
+            match make(species, shiny, slot) {
                 Some(p) => s.list.push(p),
                 None => {
-                    s.failed.push((species, now));
+                    s.failed.push((key, now));
                     return;
                 }
             }
@@ -414,22 +509,12 @@ mod game {
         let Some(object) = s.model.as_ref().map(|m| m.object.as_ptr() as usize) else {
             return;
         };
-        let Some(p) = s.list.iter_mut().find(|p| p.species == species) else {
+        let Some(p) = s.list.iter_mut().find(|p| this(p)) else {
             return;
         };
-        let frame = frame_at(ms, p.frames);
-        p.shown[0] = p.names.as_ptr() as u32 + (frame * TEXNAME) as u32;
-        // SAFETY: the display pass; the matrix stack's top is the view matrix.
-        let view = unsafe {
-            let top = (MATRIX_TOP as *const usize).read();
-            if top == 0 {
-                return;
-            }
-            (top as *const [f32; 12]).read()
-        };
-        let cam = camera(&view);
-        let feet = [at[0], at[1] - if held { DROP_CARRIED } else { DROP }, at[2]];
-        let yaw = facing(feet, cam);
+        let frame = frame_at(ms, p.textures.count);
+        p.shown[0] = p.textures.entry(frame);
+        p.used = std::time::Instant::now();
         // SAFETY: display pass on the game thread; our checked quad and texture list.
         unsafe {
             crate::puppet::draw_solid(
@@ -437,7 +522,7 @@ mod game {
                 p.shown.as_ptr() as usize,
                 feet,
                 [0, 0x8000i32.wrapping_sub(yaw), 0],
-                1.0,
+                scale,
                 crate::puppet::Tilt::default(),
                 None,
             );

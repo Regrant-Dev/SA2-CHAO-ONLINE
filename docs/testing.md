@@ -55,6 +55,8 @@ retrying: `while true; do target/.../fakepeer client 127.0.0.1:43902 fakepeer; s
 | `FAKEPEER_RACE_PICK=cat,course,level` | Pick this Chao Race every 30 s (reaches you in its party) |
 | `FAKEPEER_KARATE=1` | 5 s after you reach the karate area (in its party), start a live karate fight against you and replay the recorded fight, or a pretend one (once per run) |
 | `FAKEPEER_KARATE_FILE=<file>` | Where a live fight you lead against fakepeer is recorded (default `target/karate-fight.rec`) |
+| `FAKEPEER_BATTLE=accept` | Accept your live Chao battle challenges with its `FAKEPEER_CHAO` Chao (Normal, basic moves), choosing with the battle AI. `singles` or `doubles`: also challenge you 5 s after you reach the karate area (again a minute after each battle) |
+| `FAKEPEER_ROM=<file>` | The GBA ROM for live battles (the same as your game's; default `~/Games/gba/emerald.gba`) |
 
 Rebuild and restart it after any protocol change (`PROTOCOL_VERSION`, docs/protocol.md).
 In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start.
@@ -81,6 +83,11 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
   ("Opponent: fakepeer"), then runs, and fakepeer records it.
 - **Live karate, following:** `FAKEPEER_ROOM=1 FAKEPEER_KARATE=1`, join its party and wait
   at the first karate menu; the fight starts by itself and replays the recorded fight.
+- **Live Chao battle:** `FAKEPEER_CHAO=... FAKEPEER_BATTLE=accept`: in the battle menu, your
+  team, then "fakepeer (live)"; it accepts and the battle plays with "Waiting for fakepeer..."
+  between your choices; its log shows each step and the result. `FAKEPEER_BATTLE=doubles`: the
+  challenge pops up on the karate menu; accept it and you play side 1 (your Chao still on the
+  left).
 - **Chat:** T, type, Enter; fakepeer answers "heard: ...".
 - **Party battles:** main menu 2P button (PARTY BATTLES) > Kart Race (fakepeer's kart, no CPU karts) and
   Treasure Hunt.

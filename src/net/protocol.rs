@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -598,6 +598,131 @@ pub enum Body {
     Partners {
         list: Vec<SharedPartner>,
     },
+    /// To the host only (net/battles.rs): the sender challenges player `to` to a live battle
+    /// (`format` 0 singles, 1 doubles) with this team; `dex` fingerprints the ROM data their
+    /// battle runs on (`battle::online::dex_print`). Without `save_partners`, both teams leave
+    /// out what partners from a GBA save taught (each game applies it to its own team).
+    BattleChallenge {
+        to: u8,
+        format: u8,
+        save_partners: bool,
+        dex: u32,
+        team: Vec<BattleMember>,
+    },
+    /// From the host: player `from` challenges the receiver, with the challenge's rule.
+    BattleOffer {
+        from: u8,
+        format: u8,
+        save_partners: bool,
+    },
+    /// To the host only: the answer to `to`'s challenge (`ANSWER_*`), with the sender's team
+    /// when they accept.
+    BattleAnswer {
+        to: u8,
+        answer: u8,
+        dex: u32,
+        team: Vec<BattleMember>,
+    },
+    /// From the host, to both players: live battle `battle` starts. The receiver is `side`
+    /// (the challenger 0, the accepter 1) against `opponent` and their `team`; `seed` is the
+    /// battle's first roll.
+    BattleStart {
+        battle: u16,
+        format: u8,
+        side: u8,
+        opponent: u8,
+        seed: u64,
+        team: Vec<BattleMember>,
+    },
+    /// To the host only: the sender's choices for step `step` (each turn's choices or
+    /// replacements, none when they have nothing to choose), and `check`, their battle's
+    /// checksum before it.
+    BattleChoice {
+        battle: u16,
+        step: u16,
+        check: u32,
+        picks: Vec<BattlePick>,
+    },
+    /// From the host, to both players once both chose: step `step` with both sides' choices
+    /// (side, pick) and its rolls' seed.
+    BattleStep {
+        battle: u16,
+        step: u16,
+        seed: u64,
+        picks: Vec<(u8, BattlePick)>,
+    },
+    /// To the host only: the sender is done with `battle` (`LEAVE_*`); battle 0 takes back
+    /// their challenge, or their answer, before a battle starts.
+    BattleLeave {
+        battle: u16,
+        reason: u8,
+    },
+    /// From the host: `battle` (0: one that never started) is over for the receiver
+    /// (`END_*`), won by side `winner` (2: nobody).
+    BattleEnd {
+        battle: u16,
+        reason: u8,
+        winner: u8,
+    },
+}
+
+/// Most Chao on a live battle team.
+pub const MAX_BATTLE_TEAM: usize = 6;
+/// `BattleAnswer::answer`.
+pub const ANSWER_DECLINE: u8 = 0;
+pub const ANSWER_ACCEPT: u8 = 1;
+/// Their game can't take a challenge now (in another battle, or away from the battle menu).
+pub const ANSWER_BUSY: u8 = 2;
+/// `BattlePick::kind`: use move `value`, the out-of-PP move, switch to member `value`, send
+/// member `value` in for a fainted fighter.
+pub const PICK_MOVE: u8 = 0;
+pub const PICK_OUT_OF_PP: u8 = 1;
+pub const PICK_SWITCH: u8 = 2;
+pub const PICK_REPLACE: u8 = 3;
+/// No target, no pass.
+pub const PICK_NONE: u8 = 0xFF;
+/// `BattleLeave::reason`.
+pub const LEAVE_OVER: u8 = 0;
+pub const LEAVE_GAVE_UP: u8 = 1;
+pub const LEAVE_LEFT: u8 = 2;
+/// `BattleEnd::reason`.
+pub const END_BUSY: u8 = 0;
+pub const END_DECLINED: u8 = 1;
+pub const END_ROM_DIFFERS: u8 = 2;
+pub const END_FORFEIT: u8 = 3;
+pub const END_DISCONNECT: u8 = 4;
+pub const END_TIMEOUT: u8 = 5;
+pub const END_DESYNC: u8 = 6;
+pub const END_WITHDRAWN: u8 = 7;
+/// `BattleEnd::winner` for nobody.
+pub const NO_WINNER: u8 = 2;
+
+/// A Chao on a live battle team: a copy of its record and its battle profile (ROM ids).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BattleMember {
+    pub chao: Box<ChaoData>,
+    /// Its partner's species (0: none).
+    pub species: u16,
+    pub types: [u8; 2],
+    /// 0: none.
+    pub ability: u8,
+    /// 0: an empty slot.
+    pub moves: [u16; 4],
+}
+
+/// One fighter's choice in a live battle step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BattlePick {
+    /// Its place on the field (0, or 1 in doubles).
+    pub pos: u8,
+    /// `PICK_*`.
+    pub kind: u8,
+    /// The move index (0..4) or team member (0..6).
+    pub value: u8,
+    /// A move's target, side * 2 + pos, or `PICK_NONE`.
+    pub target: u8,
+    /// The team member a passing move hands on to, or `PICK_NONE`.
+    pub pass: u8,
 }
 
 /// What one Chao has from its GBA link partner (`Body::Partners`): ids from the ROM.
@@ -1080,6 +1205,105 @@ mod tag {
     pub const SAVE_CHAO: u8 = 62;
     pub const CHAO_LOCKED: u8 = 63;
     pub const PARTNERS: u8 = 64;
+    pub const BATTLE_CHALLENGE: u8 = 65;
+    pub const BATTLE_OFFER: u8 = 66;
+    pub const BATTLE_ANSWER: u8 = 67;
+    pub const BATTLE_START: u8 = 68;
+    pub const BATTLE_CHOICE: u8 = 69;
+    pub const BATTLE_STEP: u8 = 70;
+    pub const BATTLE_LEAVE: u8 = 71;
+    pub const BATTLE_END: u8 = 72;
+}
+
+fn write_battle_team(w: &mut Writer, team: &[BattleMember]) {
+    w.u8(team.len() as u8);
+    for m in team {
+        w.bytes(&m.chao.bytes)
+            .u16(m.species)
+            .u8(m.types[0])
+            .u8(m.types[1])
+            .u8(m.ability);
+        for id in m.moves {
+            w.u16(id);
+        }
+    }
+}
+
+/// A live battle team of `min..=MAX_BATTLE_TEAM` Chao, their ids in the ROM's ranges.
+fn read_battle_team(r: &mut Reader, min: usize) -> Result<Vec<BattleMember>> {
+    use crate::gba::rom::{ABILITY_COUNT, MOVE_COUNT, SPECIES_COUNT, TYPE_COUNT};
+    let count = usize::from(r.u8()?);
+    if !(min..=MAX_BATTLE_TEAM).contains(&count) {
+        return Err(WireError::BadValue("battle team"));
+    }
+    (0..count)
+        .map(|_| {
+            let chao = chao_data(r)?;
+            let species = r.u16()?;
+            let types = [r.u8()?, r.u8()?];
+            let ability = r.u8()?;
+            let moves = [r.u16()?, r.u16()?, r.u16()?, r.u16()?];
+            if species >= SPECIES_COUNT
+                || types.iter().any(|&t| t >= TYPE_COUNT)
+                || ability >= ABILITY_COUNT
+                || moves.iter().any(|&m| m >= MOVE_COUNT)
+            {
+                return Err(WireError::BadValue("battle team"));
+            }
+            Ok(BattleMember {
+                chao,
+                species,
+                types,
+                ability,
+                moves,
+            })
+        })
+        .collect()
+}
+
+/// A 0 or 1 byte.
+fn wire_flag(r: &mut Reader, what: &'static str) -> Result<bool> {
+    match r.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(WireError::BadValue(what)),
+    }
+}
+
+fn battle_format(r: &mut Reader) -> Result<u8> {
+    match r.u8()? {
+        f @ 0..=1 => Ok(f),
+        _ => Err(WireError::BadValue("battle format")),
+    }
+}
+
+fn write_battle_pick(w: &mut Writer, p: &BattlePick) {
+    w.u8(p.pos).u8(p.kind).u8(p.value).u8(p.target).u8(p.pass);
+}
+
+fn read_battle_pick(r: &mut Reader) -> Result<BattlePick> {
+    let p = BattlePick {
+        pos: r.u8()?,
+        kind: r.u8()?,
+        value: r.u8()?,
+        target: r.u8()?,
+        pass: r.u8()?,
+    };
+    let member = usize::from(p.value) < MAX_BATTLE_TEAM;
+    let ok = p.pos < 2
+        && match p.kind {
+            PICK_MOVE => p.value < 4,
+            PICK_OUT_OF_PP => p.value == 0,
+            PICK_SWITCH | PICK_REPLACE => member,
+            _ => false,
+        }
+        && (p.target == PICK_NONE || p.target < 4)
+        && (p.pass == PICK_NONE || usize::from(p.pass) < MAX_BATTLE_TEAM);
+    if ok {
+        Ok(p)
+    } else {
+        Err(WireError::BadValue("battle pick"))
+    }
 }
 
 /// `GardenChao` lists as `GardenChao` and `ServerChao` carry them.
@@ -1933,6 +2157,96 @@ impl Body {
                         w.u16(m);
                     }
                 }
+            }
+            Self::BattleChallenge {
+                to,
+                format,
+                save_partners,
+                dex,
+                team,
+            } => {
+                w.u8(tag::BATTLE_CHALLENGE)
+                    .u8(*to)
+                    .u8(*format)
+                    .u8(u8::from(*save_partners))
+                    .u32(*dex);
+                write_battle_team(w, team);
+            }
+            Self::BattleOffer {
+                from,
+                format,
+                save_partners,
+            } => {
+                w.u8(tag::BATTLE_OFFER)
+                    .u8(*from)
+                    .u8(*format)
+                    .u8(u8::from(*save_partners));
+            }
+            Self::BattleAnswer {
+                to,
+                answer,
+                dex,
+                team,
+            } => {
+                w.u8(tag::BATTLE_ANSWER).u8(*to).u8(*answer).u32(*dex);
+                write_battle_team(w, team);
+            }
+            Self::BattleStart {
+                battle,
+                format,
+                side,
+                opponent,
+                seed,
+                team,
+            } => {
+                w.u8(tag::BATTLE_START)
+                    .u16(*battle)
+                    .u8(*format)
+                    .u8(*side)
+                    .u8(*opponent)
+                    .bytes(&seed.to_le_bytes());
+                write_battle_team(w, team);
+            }
+            Self::BattleChoice {
+                battle,
+                step,
+                check,
+                picks,
+            } => {
+                w.u8(tag::BATTLE_CHOICE)
+                    .u16(*battle)
+                    .u16(*step)
+                    .u32(*check)
+                    .u8(picks.len() as u8);
+                for p in picks {
+                    write_battle_pick(w, p);
+                }
+            }
+            Self::BattleStep {
+                battle,
+                step,
+                seed,
+                picks,
+            } => {
+                w.u8(tag::BATTLE_STEP)
+                    .u16(*battle)
+                    .u16(*step)
+                    .bytes(&seed.to_le_bytes())
+                    .u8(picks.len() as u8);
+                for (side, p) in picks {
+                    w.u8(*side);
+                    write_battle_pick(w, p);
+                }
+            }
+            Self::BattleLeave { battle, reason } => {
+                w.u8(tag::BATTLE_LEAVE).u16(*battle).u8(*reason);
+            }
+            Self::BattleEnd {
+                battle,
+                reason,
+                winner,
+            } => {
+                w.u8(tag::BATTLE_END).u16(*battle).u8(*reason).u8(*winner);
             }
             Self::UpgradeGot {
                 level,
@@ -2871,6 +3185,117 @@ impl Body {
                     .collect::<Result<Vec<_>>>()?;
                 Self::Partners { list }
             }
+            tag::BATTLE_CHALLENGE => Self::BattleChallenge {
+                to: player_id(r)?,
+                format: battle_format(r)?,
+                save_partners: wire_flag(r, "battle rule")?,
+                dex: r.u32()?,
+                team: read_battle_team(r, 1)?,
+            },
+            tag::BATTLE_OFFER => Self::BattleOffer {
+                from: player_id(r)?,
+                format: battle_format(r)?,
+                save_partners: wire_flag(r, "battle rule")?,
+            },
+            tag::BATTLE_ANSWER => {
+                let to = player_id(r)?;
+                let answer = r.u8()?;
+                let dex = r.u32()?;
+                let team = read_battle_team(r, 0)?;
+                let ok = match answer {
+                    ANSWER_ACCEPT => !team.is_empty(),
+                    ANSWER_DECLINE | ANSWER_BUSY => team.is_empty(),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(WireError::BadValue("battle answer"));
+                }
+                Self::BattleAnswer {
+                    to,
+                    answer,
+                    dex,
+                    team,
+                }
+            }
+            tag::BATTLE_START => {
+                let battle = r.u16()?;
+                let format = battle_format(r)?;
+                let side = r.u8()?;
+                if side > 1 {
+                    return Err(WireError::BadValue("battle side"));
+                }
+                Self::BattleStart {
+                    battle,
+                    format,
+                    side,
+                    opponent: player_id(r)?,
+                    seed: u64::from_le_bytes(r.take(8)?.try_into().unwrap()),
+                    team: read_battle_team(r, 1)?,
+                }
+            }
+            tag::BATTLE_CHOICE => {
+                let battle = r.u16()?;
+                let step = r.u16()?;
+                let check = r.u32()?;
+                let count = usize::from(r.u8()?);
+                if count > 2 {
+                    return Err(WireError::BadValue("battle picks"));
+                }
+                let picks = (0..count)
+                    .map(|_| read_battle_pick(r))
+                    .collect::<Result<_>>()?;
+                Self::BattleChoice {
+                    battle,
+                    step,
+                    check,
+                    picks,
+                }
+            }
+            tag::BATTLE_STEP => {
+                let battle = r.u16()?;
+                let step = r.u16()?;
+                let seed = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
+                let count = usize::from(r.u8()?);
+                if count > 4 {
+                    return Err(WireError::BadValue("battle picks"));
+                }
+                let picks = (0..count)
+                    .map(|_| {
+                        let side = r.u8()?;
+                        if side > 1 {
+                            return Err(WireError::BadValue("battle side"));
+                        }
+                        Ok((side, read_battle_pick(r)?))
+                    })
+                    .collect::<Result<_>>()?;
+                Self::BattleStep {
+                    battle,
+                    step,
+                    seed,
+                    picks,
+                }
+            }
+            tag::BATTLE_LEAVE => {
+                let battle = r.u16()?;
+                let reason = r.u8()?;
+                if reason > LEAVE_LEFT {
+                    return Err(WireError::BadValue("battle leave"));
+                }
+                Self::BattleLeave { battle, reason }
+            }
+            tag::BATTLE_END => {
+                let battle = r.u16()?;
+                let reason = r.u8()?;
+                let winner = r.u8()?;
+                if reason > END_WITHDRAWN || winner > NO_WINNER {
+                    return Err(WireError::BadValue("battle end"));
+                }
+                Self::BattleEnd {
+                    battle,
+                    reason,
+                    winner,
+                }
+            }
             _ => return Err(WireError::BadTag("body", t)),
         })
     }
@@ -3533,7 +3958,235 @@ mod tests {
                     }],
                 },
             },
+            Message::Game {
+                from: 1,
+                body: Body::BattleChallenge {
+                    to: 2,
+                    format: 1,
+                    save_partners: false,
+                    dex: 0xDEAD_BEEF,
+                    team: vec![battle_member(); 2],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::BattleOffer {
+                    from: 1,
+                    format: 0,
+                    save_partners: true,
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::BattleAnswer {
+                    to: 1,
+                    answer: ANSWER_ACCEPT,
+                    dex: 7,
+                    team: vec![battle_member()],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::BattleAnswer {
+                    to: 1,
+                    answer: ANSWER_BUSY,
+                    dex: 0,
+                    team: Vec::new(),
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::BattleStart {
+                    battle: 3,
+                    format: 1,
+                    side: 1,
+                    opponent: 1,
+                    seed: 0x0123_4567_89AB_CDEF,
+                    team: vec![battle_member(); MAX_BATTLE_TEAM],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::BattleChoice {
+                    battle: 3,
+                    step: 9,
+                    check: 0x1234_5678,
+                    picks: vec![
+                        BattlePick {
+                            pos: 0,
+                            kind: PICK_MOVE,
+                            value: 3,
+                            target: 3,
+                            pass: 5,
+                        },
+                        BattlePick {
+                            pos: 1,
+                            kind: PICK_SWITCH,
+                            value: 4,
+                            target: PICK_NONE,
+                            pass: PICK_NONE,
+                        },
+                    ],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::BattleStep {
+                    battle: 3,
+                    step: 9,
+                    seed: u64::MAX,
+                    picks: vec![(
+                        1,
+                        BattlePick {
+                            pos: 0,
+                            kind: PICK_REPLACE,
+                            value: 2,
+                            target: PICK_NONE,
+                            pass: PICK_NONE,
+                        },
+                    )],
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::BattleLeave {
+                    battle: 3,
+                    reason: LEAVE_GAVE_UP,
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::BattleEnd {
+                    battle: 0,
+                    reason: END_WITHDRAWN,
+                    winner: NO_WINNER,
+                },
+            },
         ]
+    }
+
+    fn battle_member() -> BattleMember {
+        BattleMember {
+            chao: Box::new(valid_chao()),
+            species: 25,
+            types: [13, 13],
+            ability: 9,
+            moves: [84, 98, 0, 0],
+        }
+    }
+
+    #[test]
+    fn live_battle_messages_stay_in_range() {
+        let decodes =
+            |body: Body| Message::decode(&Message::Game { from: 1, body }.encode()).is_ok();
+        let challenge = |team: Vec<BattleMember>, format: u8| Body::BattleChallenge {
+            to: 2,
+            format,
+            save_partners: true,
+            dex: 0,
+            team,
+        };
+        // The rule is a flag.
+        let mut bytes = Message::Game {
+            from: 1,
+            body: Body::BattleOffer {
+                from: 2,
+                format: 0,
+                save_partners: false,
+            },
+        }
+        .encode();
+        let last = bytes.len() - 1;
+        bytes[last] = 2;
+        assert!(Message::decode(&bytes).is_err());
+        assert!(decodes(challenge(vec![battle_member(); 6], 0)));
+        assert!(!decodes(challenge(vec![battle_member(); 7], 0)));
+        assert!(!decodes(challenge(Vec::new(), 0)));
+        assert!(!decodes(challenge(vec![battle_member()], 2)));
+        let mut bad = battle_member();
+        bad.moves[3] = crate::gba::rom::MOVE_COUNT;
+        assert!(!decodes(challenge(vec![bad], 0)));
+        let mut bad = battle_member();
+        bad.types[1] = crate::gba::rom::TYPE_COUNT;
+        assert!(!decodes(challenge(vec![bad], 0)));
+        let mut bad = battle_member();
+        bad.ability = crate::gba::rom::ABILITY_COUNT;
+        assert!(!decodes(challenge(vec![bad], 0)));
+        // An accept comes with a team, the other answers without.
+        let answer = |answer: u8, team: Vec<BattleMember>| Body::BattleAnswer {
+            to: 2,
+            answer,
+            dex: 0,
+            team,
+        };
+        assert!(decodes(answer(ANSWER_DECLINE, Vec::new())));
+        assert!(!decodes(answer(ANSWER_ACCEPT, Vec::new())));
+        assert!(!decodes(answer(ANSWER_DECLINE, vec![battle_member()])));
+        assert!(!decodes(answer(3, Vec::new())));
+        // Picks: at most 2 a player, 4 a step, each in range.
+        let pick = |pos: u8, kind: u8, value: u8, target: u8, pass: u8| BattlePick {
+            pos,
+            kind,
+            value,
+            target,
+            pass,
+        };
+        let choice = |picks: Vec<BattlePick>| Body::BattleChoice {
+            battle: 1,
+            step: 1,
+            check: 0,
+            picks,
+        };
+        let ok = pick(1, PICK_MOVE, 3, 2, PICK_NONE);
+        assert!(decodes(choice(vec![ok; 2])));
+        assert!(!decodes(choice(vec![ok; 3])));
+        for bad in [
+            pick(2, PICK_MOVE, 0, PICK_NONE, PICK_NONE),
+            pick(0, PICK_MOVE, 4, PICK_NONE, PICK_NONE),
+            pick(0, PICK_OUT_OF_PP, 1, PICK_NONE, PICK_NONE),
+            pick(0, PICK_SWITCH, 6, PICK_NONE, PICK_NONE),
+            pick(0, 4, 0, PICK_NONE, PICK_NONE),
+            pick(0, PICK_MOVE, 0, 4, PICK_NONE),
+            pick(0, PICK_MOVE, 0, PICK_NONE, 6),
+        ] {
+            assert!(!decodes(choice(vec![bad])), "{bad:?}");
+        }
+        let step = |picks: Vec<(u8, BattlePick)>| Body::BattleStep {
+            battle: 1,
+            step: 1,
+            seed: 0,
+            picks,
+        };
+        assert!(decodes(step(vec![(0, ok), (0, ok), (1, ok), (1, ok)])));
+        assert!(!decodes(step(vec![(0, ok); 5])));
+        assert!(!decodes(step(vec![(2, ok)])));
+        assert!(!decodes(Body::BattleLeave {
+            battle: 1,
+            reason: LEAVE_LEFT + 1
+        }));
+        assert!(!decodes(Body::BattleEnd {
+            battle: 1,
+            reason: END_WITHDRAWN + 1,
+            winner: 0
+        }));
+        assert!(!decodes(Body::BattleEnd {
+            battle: 1,
+            reason: END_FORFEIT,
+            winner: NO_WINNER + 1
+        }));
+        // A whole team of six fits in one reliable message.
+        let start = Message::Game {
+            from: SERVER,
+            body: Body::BattleStart {
+                battle: 1,
+                format: 1,
+                side: 0,
+                opponent: 2,
+                seed: 1,
+                team: vec![battle_member(); MAX_BATTLE_TEAM],
+            },
+        };
+        assert!(start.encode().len() < 32 * 1100);
     }
 
     #[test]

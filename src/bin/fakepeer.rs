@@ -40,17 +40,26 @@
 //! fight against you as the leader and replays that recording (a real fight), or, without one,
 //! a pretend fight (the Chao circle, side 1 loses HP, side 0 wins by knockout after ~20 s).
 //!
+//! Live Chao battles: set FAKEPEER_BATTLE=accept and it accepts your challenges (battle menu >
+//! your team > its name, "live") with its FAKEPEER_CHAO Chao (Normal, basic moves), choosing
+//! with the battle AI; FAKEPEER_BATTLE=singles or doubles also challenges you once you have been
+//! in the karate area for 5 s (again a minute after each battle). It needs the same GBA ROM as
+//! your game: FAKEPEER_ROM, default ~/Games/gba/emerald.gba.
+//!
 //! Build/run (not built by default): cargo run --release --target x86_64-unknown-linux-gnu --features fakepeer --bin fakepeer -- host
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use sa2_chao_online::battle::online::{self as live, Duel, Incoming};
+use sa2_chao_online::battle::team::Dex;
 use sa2_chao_online::chao::file;
 use sa2_chao_online::game::KNOWN_GAME_BUILD;
 use sa2_chao_online::net::protocol::ChaoLock;
 use sa2_chao_online::net::protocol::{
-    Body, BroughtChao, GardenChao, GardenItem, ItemId, ItemPlace, KarateFighter, KarateState,
-    MAX_CARRIED_CHAO, MAX_CHAT, Message, PlayerState, RACE_PROGRESS_UNKNOWN,
+    ANSWER_ACCEPT, ANSWER_BUSY, Body, BroughtChao, GardenChao, GardenItem, ItemId, ItemPlace,
+    KarateFighter, KarateState, LEAVE_OVER, MAX_CARRIED_CHAO, MAX_CHAT, Message, PlayerState,
+    RACE_PROGRESS_UNKNOWN, SERVER,
 };
 use sa2_chao_online::net::roster::key_from_hex;
 use sa2_chao_online::net::session::{Client, Event, Host, Identity, Session};
@@ -180,6 +189,40 @@ fn main() {
     let mut recording_start = Instant::now();
     let mut last_cheer = Instant::now();
 
+    // Live battles: the mode, our ROM data and team, the battle on, and a player to challenge.
+    let battle_mode = std::env::var("FAKEPEER_BATTLE").unwrap_or_default();
+    let battle_setup: Option<(Dex, Vec<_>)> = (!battle_mode.is_empty())
+        .then(|| {
+            let path = std::env::var("FAKEPEER_ROM").unwrap_or_else(|_| {
+                format!(
+                    "{}/Games/gba/emerald.gba",
+                    std::env::var("HOME").unwrap_or_default()
+                )
+            });
+            let rom = sa2_chao_online::gba::rom::Rom::open(std::path::Path::new(&path))
+                .map_err(|e| eprintln!("battle: {path}: {e}"))
+                .ok()?;
+            let dex = Dex::from_rom(&rom)
+                .map_err(|e| eprintln!("battle: {e}"))
+                .ok()?;
+            let team = live::plain_team(&rom, &chao);
+            if team.is_empty() {
+                eprintln!("battle: no team (FAKEPEER_CHAO)");
+                return None;
+            }
+            println!("battle: {} with {} Chao", battle_mode, team.len());
+            Some((dex, team))
+        })
+        .flatten();
+    let challenge_format: Option<u8> = match battle_mode.as_str() {
+        "singles" => Some(0),
+        "doubles" => Some(1),
+        _ => None,
+    };
+    let mut duel: Option<Duel> = None;
+    let mut battle_seen: Option<(u8, Instant)> = None;
+    let mut last_challenge: Option<Instant> = None;
+
     let start = Instant::now();
     let mut last_state = start;
     // The most recent poses from a real player, oldest first, for a delayed follow.
@@ -205,6 +248,12 @@ fn main() {
                         karate_seen.get_or_insert((from, now));
                     } else if karate_fight.is_none() {
                         karate_seen = None;
+                    }
+                    // In the karate area and not busy (flag 32): one to challenge.
+                    if s.level == 90 && s.chao_area == 10 && s.flags & 32 == 0 {
+                        battle_seen.get_or_insert((from, now));
+                    } else {
+                        battle_seen = None;
                     }
                     heard.push_back(s);
                     if heard.len() > FOLLOW_DELAY
@@ -397,6 +446,77 @@ fn main() {
                     }
                     recording.clear();
                 }
+                Event::Game {
+                    from: SERVER,
+                    body:
+                        body @ (Body::BattleOffer { .. }
+                        | Body::BattleStart { .. }
+                        | Body::BattleStep { .. }
+                        | Body::BattleEnd { .. }),
+                } => match live::incoming(body, |id| format!("player {id}")) {
+                    Some(Incoming::Offer { from, format, .. }) => {
+                        let body = match &battle_setup {
+                            Some((dex, team)) if duel.is_none() => {
+                                println!("battle: accepting player {from}'s {format:?} challenge");
+                                Body::BattleAnswer {
+                                    to: from,
+                                    answer: ANSWER_ACCEPT,
+                                    dex: live::dex_print(dex),
+                                    team: team.clone(),
+                                }
+                            }
+                            _ => Body::BattleAnswer {
+                                to: from,
+                                answer: ANSWER_BUSY,
+                                dex: 0,
+                                team: Vec::new(),
+                            },
+                        };
+                        session.send(body, true, now);
+                    }
+                    Some(Incoming::Start(start)) => {
+                        if let Some((dex, team)) = &battle_setup {
+                            println!(
+                                "battle: {} starts against player {} as side {}",
+                                start.battle, start.opponent, start.side
+                            );
+                            duel = Duel::new(dex, &start, team);
+                        }
+                    }
+                    Some(Incoming::Step {
+                        battle,
+                        step,
+                        seed,
+                        picks,
+                    }) => {
+                        if let Some(d) = duel.as_mut().filter(|d| d.id == battle) {
+                            let events = d.step(step, seed, &picks);
+                            println!("battle: step {step}, {} events", events.len());
+                            if let Some(outcome) = d.over() {
+                                println!("battle: over after {} turns: {outcome:?}", d.turn());
+                                let body = Body::BattleLeave {
+                                    battle,
+                                    reason: LEAVE_OVER,
+                                };
+                                session.send(body, true, now);
+                                duel = None;
+                                last_challenge = Some(now);
+                            }
+                        }
+                    }
+                    Some(Incoming::End {
+                        battle,
+                        reason,
+                        winner,
+                    }) => {
+                        println!("battle: {battle} ended (reason {reason}, winner {winner})");
+                        if duel.as_ref().is_some_and(|d| d.id == battle) || battle == 0 {
+                            duel = None;
+                            last_challenge = Some(now);
+                        }
+                    }
+                    _ => {}
+                },
                 Event::Connected { .. } | Event::Joined { .. } => {
                     println!("{event:?}");
                     send_chao = true;
@@ -440,6 +560,27 @@ fn main() {
                 true,
                 now,
             );
+        }
+        // Live battle: our choice for each step, and a challenge now and then.
+        if let Some(body) = duel.as_mut().and_then(Duel::choice) {
+            session.send(body, true, now);
+        }
+        if let (Some(format), Some((dex, team)), Some((player, since))) =
+            (challenge_format, &battle_setup, battle_seen)
+            && duel.is_none()
+            && now.duration_since(since) > Duration::from_secs(5)
+            && last_challenge.is_none_or(|at| now.duration_since(at) > Duration::from_secs(60))
+        {
+            println!("battle: challenging player {player}");
+            let body = Body::BattleChallenge {
+                to: player,
+                format,
+                save_partners: true,
+                dex: live::dex_print(dex),
+                team: team.clone(),
+            };
+            session.send(body, true, now);
+            last_challenge = Some(now);
         }
         if session.my_id().is_some() && now.duration_since(last_pick) >= Duration::from_secs(30) {
             last_pick = now;

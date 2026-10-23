@@ -55,11 +55,26 @@
       </Property>
     </Group>
     <Group name="GBALink" display="GBA link">
-      <Property name="GbaRom" display="GBA ROM (your own, game code BPEE)" type="string" defaultvalue="" alwaysinclude="true">
-        <HelpText>Path to your own GBA ROM (game code BPEE). Empty: the first .gba file in the mod's gba folder. Names, types and pictures are read from it.</HelpText>
+      <Property name="GbaRom" display="GBA ROM (your own Emerald, US, game code BPEE)" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Path to your own ROM of Emerald for the Game Boy Advance (US release, game code BPEE), dumped from your cartridge. Empty: the first .gba file in the mod's gba folder. Names, types and pictures are read from it.</HelpText>
       </Property>
       <Property name="GbaSave" display="GBA save (.sav)" type="string" defaultvalue="" alwaysinclude="true">
-        <HelpText>Path to the 128 KB save of that game. Empty: the first .sav file in the mod's gba folder. It is only read, never changed. In game: F9 > GBA link.</HelpText>
+        <HelpText>Path to the 128 KB save of that game. Empty: the first .sav file in the mod's gba folder. It is only read, never changed. In game: the link machine in each garden (F9 > GBA link with the machine off).</HelpText>
+      </Property>
+      <Property name="WildVisitors" display="Wild visitors in the gardens" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Each garden has an area of the GBA game each day, and that area's wild creatures come by now and then for your Chao to absorb. Needs the ROM.</HelpText>
+      </Property>
+      <Property name="BattleEffects" display="Battle effects" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>In Chao battles, the Chao move by kind of move and show their status, with the GBA game's move effects, sparkles, a flash on strong hits and sounds. Off: karate punches and hits only.</HelpText>
+      </Property>
+      <Property name="LinkMachine" display="Link machine in the gardens" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Each garden has a link machine near its transporter: walk up and press the action button to pick a creature from your GBA save (or a kept one) and it comes out of the machine. Off: the machine is gone and F9 > GBA link lists them instead.</HelpText>
+      </Property>
+      <Property name="BattleTrainers" display="Battle the GBA game's trainers" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Trainers in the Chao battle menu: the GBA game's route trainers, gym leaders, league and champion with their teams from your ROM, each opening once the one before is beaten. Gym leaders give badges and TM moves to teach your Chao. Progress is kept in the mod's gba/trainers.txt.</HelpText>
+      </Property>
+      <Property name="BattleOnline" display="Live battles with friends online" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>In the Chao battle menu, challenge a friend who is online at Chao Karate to a live battle: each of you picks a team and chooses your own moves. Off: friends' challenges are turned down and none can be sent.</HelpText>
       </Property>
     </Group>
   </Groups>

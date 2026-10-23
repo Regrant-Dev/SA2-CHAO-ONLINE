@@ -314,7 +314,8 @@ impl Rom {
         trainers_ok && classes_ok && wild_ok && groups_ok && sections_ok
     }
 
-    fn map_header(&self, group: u8, num: u8) -> Option<usize> {
+    /// The file offset of a map's header (`num` unchecked against the group's count).
+    pub(super) fn map_header(&self, group: u8, num: u8) -> Option<usize> {
         let maps = self.ptr_at(MAP_GROUPS + usize::from(group) * 4)?;
         self.ptr_at(maps + usize::from(num) * 4)
     }

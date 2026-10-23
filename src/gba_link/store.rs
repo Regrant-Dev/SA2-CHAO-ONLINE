@@ -1,15 +1,18 @@
 //! What GBA link keeps in `<mod>/gba/partners.txt`, one record a line:
 //!
 //! - `partner <chao identity> <species> <type> <type> <move> <move> <move> <move> <level>
-//!   <ability> <known move> <known move> <known move> <known move>`: the partner a Chao absorbed
-//!   last and the four moves the Chao knows from its partners, by its `ChaoData::identity` (the
-//!   SA2 save is never changed for this). Lines without the last five fields load with no
-//!   ability recorded and the partner's moves as the known ones.
+//!   <ability> <known move> <known move> <known move> <known move> <from a save> <save moves>`:
+//!   the partner a Chao absorbed last and the four moves the Chao knows from its partners, by its
+//!   `ChaoData::identity` (the SA2 save is never changed for this). `<from a save>` is 1 when that
+//!   partner came from a GBA save, and `<save moves>` has bit `i` set when known move `i` was
+//!   taught by one. Lines without the last two fields load with neither; lines without the last
+//!   seven also load with no ability recorded and the partner's moves as the known ones.
 //! - `import <key> <garden> <day>`: a creature brought into a garden, by `save::Mon::key`, and
 //!   the day (Unix days); each comes to each garden once a day.
-//! - `brought <garden> <key> <species> <type> <type> <move>... <level> <ability>`: brought and not
-//!   absorbed yet; it's there each time the garden loads. `waiting` lines (the same with a base
-//!   speed in place of the ability) load with no ability recorded.
+//! - `brought <garden> <key> <species> <type> <type> <move>... <level> <ability> <from a save>`:
+//!   brought and not absorbed yet; it's there each time the garden loads. Lines without the last
+//!   field load as not from a save. `waiting` lines (without it, with a base speed in place of
+//!   the ability) load with no ability recorded.
 //!
 //! - `kept <key> <species> <level> <move> <move> <move> <move>`: a creature the mod keeps (the
 //!   first-partner gift), offered like the GBA save's.
@@ -32,6 +35,8 @@ pub struct Partner {
     pub level: u8,
     /// Its ability id; 0 when not recorded.
     pub ability: u8,
+    /// It came from a GBA save (not a wild visitor, the gift or the mod's own list).
+    pub from_save: bool,
 }
 
 /// What a Chao has from absorbing: its last partner and the four moves it knows (0 for an empty
@@ -40,6 +45,26 @@ pub struct Partner {
 pub struct Learned {
     pub partner: Partner,
     pub moves: [u16; 4],
+    /// Bit `i`: `moves[i]` was taught by a partner from a GBA save.
+    pub save_moves: u8,
+}
+
+impl Learned {
+    /// The save marks (as `save_moves`) of `moves`: those it has with a mark here.
+    pub fn marks_for(&self, moves: [u16; 4]) -> u8 {
+        let mut marks = 0;
+        for (i, id) in moves.into_iter().enumerate() {
+            let marked = self
+                .moves
+                .iter()
+                .position(|&m| m == id && id != 0)
+                .is_some_and(|at| self.save_moves & 1 << at != 0);
+            if marked {
+                marks |= 1 << i;
+            }
+        }
+        marks
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,15 +111,35 @@ impl Refused {
 /// The moves a Chao knows after a partner with `taught` moves: those first, then the ones it
 /// knew that still fit, four at most, no repeats and no empty slots between.
 pub fn teach(known: [u16; 4], taught: [u16; 4]) -> [u16; 4] {
+    teach_marked(known, 0, taught, false).0
+}
+
+/// `teach`, with the moves' save marks (bit `i` for move `i`, as `Learned::save_moves`): known
+/// moves keep theirs, taught ones are marked when `from_save`. A move it knew that is taught
+/// again takes the teacher's mark.
+pub fn teach_marked(
+    known: [u16; 4],
+    known_marks: u8,
+    taught: [u16; 4],
+    from_save: bool,
+) -> ([u16; 4], u8) {
     let mut out = [0u16; 4];
+    let mut marks = 0u8;
     let mut n = 0;
-    for id in taught.into_iter().chain(known) {
+    let known = known
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, known_marks & 1 << i != 0));
+    for (id, marked) in taught.into_iter().map(|id| (id, from_save)).chain(known) {
         if n < out.len() && id != 0 && !out[..n].contains(&id) {
             out[n] = id;
+            if marked {
+                marks |= 1 << n;
+            }
             n += 1;
         }
     }
-    out
+    (out, marks)
 }
 
 impl Store {
@@ -105,21 +150,44 @@ impl Store {
             let kind = w.next();
             let rest: Vec<&str> = w.collect();
             match kind {
-                Some("partner") if rest.len() == 9 || rest.len() == 14 => {
+                Some("partner") if matches!(rest.len(), 9 | 14 | 16) => {
                     let ability = rest.get(9).map_or(Some(0), |v| v.parse().ok());
-                    if let (Ok(id), Some(partner), Some(ability)) = (
+                    let from_save = rest.get(14).map_or(Some(false), |v| flag(v));
+                    let save_moves = rest
+                        .get(15)
+                        .map_or(Some(0), |v| v.parse::<u8>().ok().filter(|m| *m < 16));
+                    if let (
+                        Ok(id),
+                        Some(partner),
+                        Some(ability),
+                        Some(from_save),
+                        Some(save_moves),
+                    ) = (
                         u64::from_str_radix(rest[0], 16),
                         partner(&rest[1..9]),
                         ability,
+                        from_save,
+                        save_moves,
                     ) {
-                        let partner = Partner { ability, ..partner };
-                        let moves = if rest.len() == 14 {
+                        let partner = Partner {
+                            ability,
+                            from_save,
+                            ..partner
+                        };
+                        let moves = if rest.len() >= 14 {
                             moves(&rest[10..14])
                         } else {
                             Some(teach([0; 4], partner.moves))
                         };
                         if let Some(moves) = moves {
-                            s.partners.insert(id, Learned { partner, moves });
+                            s.partners.insert(
+                                id,
+                                Learned {
+                                    partner,
+                                    moves,
+                                    save_moves,
+                                },
+                            );
                         }
                     }
                 }
@@ -132,22 +200,30 @@ impl Store {
                         s.imports.push((key, garden, day));
                     }
                 }
-                Some(k @ ("brought" | "waiting")) if rest.len() == 11 => {
+                Some(k @ ("brought" | "waiting"))
+                    if rest.len() == 11 || (k == "brought" && rest.len() == 12) =>
+                {
                     let ability = if k == "brought" {
                         rest[10].parse().ok()
                     } else {
                         rest[10].parse::<u8>().ok().map(|_| 0)
                     };
-                    if let (Ok(garden), Ok(key), Some(partner), Some(ability)) = (
+                    let from_save = rest.get(11).map_or(Some(false), |v| flag(v));
+                    if let (Ok(garden), Ok(key), Some(partner), Some(ability), Some(from_save)) = (
                         rest[0].parse(),
                         u64::from_str_radix(rest[1], 16),
                         partner(&rest[2..10]),
                         ability,
+                        from_save,
                     ) {
                         s.waiting.push(Waiting {
                             garden,
                             key,
-                            partner: Partner { ability, ..partner },
+                            partner: Partner {
+                                ability,
+                                from_save,
+                                ..partner
+                            },
                         });
                     }
                 }
@@ -197,13 +273,15 @@ impl Store {
         for (id, l) in &self.partners {
             let m = l.moves;
             out += &format!(
-                "partner {id:016x} {} {} {} {} {} {}\n",
+                "partner {id:016x} {} {} {} {} {} {} {} {}\n",
                 fields(&l.partner),
                 l.partner.ability,
                 m[0],
                 m[1],
                 m[2],
-                m[3]
+                m[3],
+                u8::from(l.partner.from_save),
+                l.save_moves
             );
         }
         for (key, garden, day) in &self.imports {
@@ -211,11 +289,12 @@ impl Store {
         }
         for w in &self.waiting {
             out += &format!(
-                "brought {} {:016x} {} {}\n",
+                "brought {} {:016x} {} {} {}\n",
                 w.garden,
                 w.key,
                 fields(&w.partner),
-                w.partner.ability
+                w.partner.ability,
+                u8::from(w.partner.from_save)
             );
         }
         for (key, species, level, m) in &self.kept {
@@ -281,13 +360,24 @@ impl Store {
             .iter()
             .position(|w| w.garden == garden && w.key == key)?;
         let partner = self.waiting.remove(at).partner;
-        let known = self.partners.get(&identity).map_or([0; 4], |l| l.moves);
+        Some(self.learn(identity, partner))
+    }
+
+    /// A Chao (`identity`) absorbed `partner`, which never waited here (a wild visitor): as
+    /// `absorbed`. Returns what the Chao has now.
+    pub fn learn(&mut self, identity: u64, partner: Partner) -> Learned {
+        let (known, marks) = self
+            .partners
+            .get(&identity)
+            .map_or(([0; 4], 0), |l| (l.moves, l.save_moves));
+        let (moves, save_moves) = teach_marked(known, marks, partner.moves, partner.from_save);
         let learned = Learned {
             partner,
-            moves: teach(known, partner.moves),
+            moves,
+            save_moves,
         };
         self.partners.insert(identity, learned);
-        Some(learned)
+        learned
     }
 
     pub fn waiting_in(&self, garden: u8) -> impl Iterator<Item = &Waiting> {
@@ -304,7 +394,17 @@ fn partner(f: &[&str]) -> Option<Partner> {
         moves: moves(f.get(3..7)?)?,
         level: b(7)?,
         ability: 0,
+        from_save: false,
     })
+}
+
+/// `0` or `1`.
+fn flag(v: &str) -> Option<bool> {
+    match v {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
 }
 
 fn moves(f: &[&str]) -> Option<[u16; 4]> {
@@ -323,6 +423,7 @@ mod tests {
             moves: [1, 2, 0, 300],
             level: 42,
             ability: 9,
+            from_save: false,
         }
     }
 
@@ -334,9 +435,31 @@ mod tests {
             Learned {
                 partner: p(5),
                 moves: [300, 1, 2, 44],
+                save_moves: 0,
+            },
+        );
+        s.partners.insert(
+            0x77,
+            Learned {
+                partner: Partner {
+                    from_save: true,
+                    ..p(6)
+                },
+                moves: [1, 2, 3, 4],
+                save_moves: 0b0101,
             },
         );
         s.import(0xAB, 2, 20_000, p(9)).unwrap();
+        s.import(
+            0xEF,
+            2,
+            20_000,
+            Partner {
+                from_save: true,
+                ..p(10)
+            },
+        )
+        .unwrap();
         s.import(
             0xCD,
             3,
@@ -383,8 +506,17 @@ mod tests {
         );
         // Written back in the current form.
         let text = s.to_text();
-        assert!(text.contains("partner 00000000000000aa 25 13 13 84 0 45 0 12 0 84 45 0 0\n"));
-        assert!(text.contains("brought 2 00000000000000cd 400 3 7 1 2 0 300 42 0\n"));
+        assert!(text.contains("partner 00000000000000aa 25 13 13 84 0 45 0 12 0 84 45 0 0 0 0\n"));
+        assert!(text.contains("brought 2 00000000000000cd 400 3 7 1 2 0 300 42 0 0\n"));
+        // The form before save marks.
+        let older = Store::parse(
+            "partner 00000000000000aa 25 13 13 84 0 45 0 12 7 84 45 0 0\n\
+             brought 2 00000000000000cd 400 3 7 1 2 0 300 42 9\n",
+        );
+        assert!(!older.partners[&0xAA].partner.from_save);
+        assert_eq!(older.partners[&0xAA].save_moves, 0);
+        assert_eq!(older.partners[&0xAA].partner.ability, 7);
+        assert!(!older.waiting[0].partner.from_save);
         assert_eq!(Store::parse(&text), s);
     }
 
@@ -396,6 +528,42 @@ mod tests {
         // A move it knew already moves up instead of taking two slots.
         assert_eq!(teach([1, 2, 3, 4], [3, 0, 0, 0]), [3, 1, 2, 4]);
         assert_eq!(teach([1, 2, 0, 0], [0; 4]), [1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn save_marks_follow_the_moves() {
+        // Taught by a save partner: marked; known ones keep their marks as they move down.
+        assert_eq!(
+            teach_marked([0; 4], 0, [5, 6, 0, 0], true),
+            ([5, 6, 0, 0], 0b0011)
+        );
+        assert_eq!(
+            teach_marked([5, 6, 0, 0], 0b0011, [7, 0, 0, 0], false),
+            ([7, 5, 6, 0], 0b0110)
+        );
+        // Taught again by a wild one: the mark goes.
+        assert_eq!(
+            teach_marked([7, 5, 6, 0], 0b0110, [5, 0, 0, 0], false),
+            ([5, 7, 6, 0], 0b0100)
+        );
+        // Pushed out: its mark goes with it.
+        assert_eq!(
+            teach_marked([1, 2, 3, 4], 0b1000, [8, 9, 0, 0], false),
+            ([8, 9, 1, 2], 0)
+        );
+        let mut s = Store::default();
+        let saved = Partner {
+            from_save: true,
+            moves: [5, 6, 0, 0],
+            ..p(1)
+        };
+        assert_eq!(s.learn(77, saved).save_moves, 0b0011);
+        let wild = Partner {
+            moves: [7, 0, 0, 0],
+            ..p(2)
+        };
+        let l = s.learn(77, wild);
+        assert_eq!((l.moves, l.save_moves), ([7, 5, 6, 0], 0b0110));
     }
 
     #[test]
@@ -431,5 +599,23 @@ mod tests {
         assert_eq!(learned.partner.species, 2);
         assert_eq!(learned.moves, [50, 1, 2, 300]);
         assert_eq!(s.absorbed(1, 999, 77), None);
+    }
+
+    #[test]
+    fn a_visitor_teaches_without_waiting() {
+        let mut s = Store::default();
+        s.import(1, 1, 20_100, p(1)).unwrap();
+        let learned = s.learn(77, p(2));
+        assert_eq!(learned.partner, p(2));
+        assert_eq!(learned.moves, [1, 2, 300, 0]);
+        let wild = Partner {
+            moves: [7, 0, 0, 0],
+            ..p(3)
+        };
+        assert_eq!(s.learn(77, wild).moves, [7, 1, 2, 300]);
+        // The waiting partner and the day's imports are untouched.
+        assert_eq!(s.waiting.len(), 1);
+        assert_eq!(s.imports.len(), 1);
+        assert_eq!(s.partners[&77].partner, wild);
     }
 }

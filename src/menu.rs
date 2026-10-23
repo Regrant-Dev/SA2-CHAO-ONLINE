@@ -155,6 +155,16 @@ pub struct Settings {
     pub player_key: String,
     /// GBA link's ROM and save (empty: found in `<mod>/gba/`).
     pub gba: crate::gba_link::Paths,
+    /// Wild visitors come to the gardens (`gba_link::set_wild_visitors`).
+    pub wild_visitors: bool,
+    /// Battles show moves with effects and status on the Chao (`battle::visuals`).
+    pub battle_effects: bool,
+    /// Each garden has its link machine (`gba_link::set_link_machine`).
+    pub link_machine: bool,
+    /// "Trainers" in the battle menu (`battle::trainers`).
+    pub battle_trainers: bool,
+    /// Live battles against friends online (`battle::online`).
+    pub battle_online: bool,
 }
 
 impl Settings {
@@ -177,6 +187,11 @@ impl Settings {
             stage_sync: true,
             player_key: String::new(),
             gba: crate::gba_link::Paths::default(),
+            wild_visitors: true,
+            battle_effects: true,
+            link_machine: true,
+            battle_trainers: true,
+            battle_online: true,
         };
         for line in text.lines() {
             let line = line.split([';', '#']).next().unwrap_or("").trim();
@@ -213,6 +228,36 @@ impl Settings {
                 "playerkey" => s.player_key = v,
                 "gbarom" => s.gba.rom = v,
                 "gbasave" => s.gba.save = v,
+                "wildvisitors" => {
+                    s.wild_visitors = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
+                "linkmachine" => {
+                    s.link_machine = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
+                "battleeffects" => {
+                    s.battle_effects = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
+                "battletrainers" => {
+                    s.battle_trainers = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
+                "battleonline" => {
+                    s.battle_online = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
                 "gamevolume" => s.game_volume = v.parse::<u32>().map_or(100, |p| p.min(100)),
                 "skinvoicevolume" => {
                     s.voice_volume = v.parse::<u32>().map_or(100, |p| p.min(voice::MAX_VOLUME))
@@ -245,7 +290,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\nWildVisitors={}\nBattleEffects={}\nLinkMachine={}\nBattleTrainers={}\nBattleOnline={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -270,6 +315,11 @@ impl Settings {
                 .unwrap_or_else(|| self.player_key.clone()),
             self.gba.rom,
             self.gba.save,
+            if self.wild_visitors { "On" } else { "Off" },
+            if self.battle_effects { "On" } else { "Off" },
+            if self.link_machine { "On" } else { "Off" },
+            if self.battle_trainers { "On" } else { "Off" },
+            if self.battle_online { "On" } else { "Off" },
         )
     }
 }
@@ -282,6 +332,11 @@ pub fn load(mod_path: &str) -> Settings {
         .map(|t| Settings::parse(&t))
         .unwrap_or_else(|| Settings::parse(""));
     crate::gba_link::set_paths(settings.gba.clone());
+    crate::gba_link::set_wild_visitors(settings.wild_visitors);
+    crate::battle::visuals::set_enabled(settings.battle_effects);
+    crate::gba_link::set_link_machine(settings.link_machine);
+    crate::battle::trainers::set_enabled(settings.battle_trainers);
+    crate::battle::online::set_enabled(settings.battle_online);
     settings
 }
 
@@ -349,6 +404,11 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
             rom: String::new(),
             save: String::new(),
         },
+        wild_visitors: true,
+        battle_effects: true,
+        link_machine: true,
+        battle_trainers: true,
+        battle_online: true,
     },
     message: String::new(),
     keys: Vec::new(),
@@ -612,7 +672,11 @@ pub fn on_frame() {
     }
     if m.pressed(VK_RETURN) {
         if row == Row::GbaLink {
-            m.gba = Some(crate::gba_link::Page::open());
+            if crate::gba_link::link_machine() {
+                hud::toast("Use the link machine in a garden: walk up, press the action button");
+            } else {
+                m.gba = Some(crate::gba_link::Page::open());
+            }
             return;
         }
         if row == Row::ChaoDetails {
@@ -1067,6 +1131,9 @@ fn draw(m: &Menu, rows: &[Row]) {
             ),
             Row::ChaoDetails => "[ Chao details: stats, personality, bonds & more ]".into(),
             Row::SaveChao => "[ Save Chao garden now ] (autosaves every 5 min)".into(),
+            Row::GbaLink if crate::gba_link::link_machine() => {
+                "GBA link: use the link machine in a garden".into()
+            }
             Row::GbaLink => "[ GBA link: bring a partner from your GBA save ]".into(),
             Row::Lock => format!("Others can change my Chao: < {} >", m.settings.lock.label()),
             Row::KarateOpponent => {
@@ -1168,6 +1235,11 @@ mod tests {
                 rom: "C:\\games\\my rom.gba".into(),
                 save: "saves/mine.sav".into(),
             },
+            wild_visitors: false,
+            battle_effects: false,
+            link_machine: false,
+            battle_trainers: false,
+            battle_online: false,
         };
         assert_eq!(Settings::parse(&s.to_ini()), s);
         // The networking side reads the same file.

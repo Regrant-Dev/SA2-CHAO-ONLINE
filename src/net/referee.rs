@@ -21,6 +21,8 @@
 //!   `ServerItems`) to everyone every couple of seconds; a server item is claimed like anyone's.
 //!   The dedicated server keeps the trees and items in a file (`saved` / `load`).
 //!
+//! - **Live Chao battles** (battles.rs): challenges, teams and each step's choices and seed.
+//!
 //! The dedicated server and a hosting player run the same referee (`session::Host`).
 
 use std::collections::HashMap;
@@ -106,6 +108,8 @@ pub struct Referee {
     sent_items: Option<Instant>,
     /// The server running gardens' Chao itself (chao_host.rs); none in some tests.
     chao: Option<Box<super::chao_host::ChaoHost>>,
+    /// Live Chao battles (battles.rs).
+    battles: super::battles::Battles,
 }
 
 /// Most hunt pieces remembered (a few per hunt); past it the oldest hunts are forgotten.
@@ -125,6 +129,9 @@ impl Referee {
     pub fn observe(&mut self, from: u8, body: &Body, out: &mut Vec<Out>) -> bool {
         if let Some(chao) = self.chao.as_mut() {
             chao.observe(from, body, Instant::now());
+        }
+        if self.battles.observe(from, body, Instant::now(), out) {
+            return false;
         }
         match body {
             // The server's own garden Chao: only it sends those; the ground and what players
@@ -518,6 +525,7 @@ impl Referee {
 
     /// Player `id` joined with key `key` (their Chao are known by it) and name `name`.
     pub fn joined(&mut self, id: u8, key: PlayerKey, name: &str) {
+        self.battles.joined(id);
         if let Some(chao) = self.chao.as_mut() {
             chao.joined(id, key, name);
         }
@@ -537,6 +545,7 @@ impl Referee {
     /// Player `id` left the lobby: their items went with them, but the server keeps those that
     /// were in no one's save.
     pub fn left(&mut self, id: u8) {
+        self.battles.left(id);
         if let Some(chao) = self.chao.as_mut() {
             chao.left(id);
         }
@@ -588,6 +597,7 @@ impl Referee {
 
     /// Call often (the host's poll): the gardens, the server's items and its Chao to send now.
     pub fn tick(&mut self, now: Instant, out: &mut Vec<Out>) {
+        self.battles.tick(now, out);
         if let Some(chao) = self.chao.as_mut() {
             let items = self
                 .items

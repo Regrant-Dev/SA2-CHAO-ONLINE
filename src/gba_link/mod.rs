@@ -3,9 +3,10 @@
 //! (names, types, pictures) is read from the player's own ROM (`crate::gba`); the GBA save is
 //! only read.
 //!
-//! - F9 "GBA link" lists the save's party and boxes and the ones the mod keeps (without a save,
-//!   a one-time gift of one of the ROM's first partners); Enter brings one into the garden we're
-//!   in (`store`: each once a day per garden, 4 waiting per garden at most).
+//! - The link machine in each garden (`machine`; F9 "GBA link" when it's switched off) lists the
+//!   save's party and boxes and the ones the mod keeps (without a save, a one-time gift of one
+//!   of the ROM's first partners); the one picked comes into the garden we're in (`store`: each
+//!   once a day per garden, 4 waiting per garden at most).
 //! - In the garden each waiting partner is an animal object drawn as its picture (`scene`).
 //! - A Chao that absorbs one keeps it as its partner, which teaches it the partner's moves (it
 //!   keeps four), type ids and ability, in `<mod>/gba/partners.txt` by the Chao's identity; its
@@ -13,14 +14,20 @@
 //!   status balloon shows the partner's types (balloon.rs).
 //! - Other players' Chao: what theirs have from partners comes online (`Body::Partners`), and
 //!   exporting Chao files writes `partners.txt` next to them, which is read from `chao/import`.
+//! - Wild visitors: each garden has an area of the ROM's wild tables each day (`rotation`), whose
+//!   creatures come by now and then and are absorbed like partners (`wild`).
 
 // Off the game (Linux builds) only the tests use the garden side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
-mod billboard;
+pub(crate) mod billboard;
+mod machine;
+mod machine_model;
 pub mod profile;
+pub mod rotation;
 mod scene;
 pub mod store;
+mod wild;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -116,7 +123,8 @@ pub fn set_paths(paths: Paths) {
 pub fn rom() -> Result<Arc<Rom>, String> {
     let paths = with(|l| l.paths.clone());
     let path = resolve(&paths.rom, "gba").ok_or_else(|| {
-        "No GBA ROM: put your own .gba in the mod's gba folder or set GbaRom".to_string()
+        "No GBA ROM: put your own Emerald .gba (US) in the mod's gba folder or set GbaRom"
+            .to_string()
     })?;
     if let Some(rom) = with(|l| {
         l.rom
@@ -170,7 +178,7 @@ fn write_store() {
     }
 }
 
-/// Where a creature on the F9 list comes from.
+/// Where a creature on the GBA link list comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Party(u8),
@@ -214,7 +222,7 @@ impl Candidate {
     }
 }
 
-/// A creature's line in the F9 list: where it is, its name (the ROM's species name), level
+/// A creature's line in the GBA link list: where it is, its name (the ROM's species name), level
 /// and type names.
 pub fn label(rom: &Rom, c: &Candidate) -> String {
     let place = match c.source {
@@ -302,6 +310,7 @@ fn import_checked(mon: &Candidate) -> Result<String, String> {
         moves: mon.moves,
         level: mon.level.clamp(1, 100),
         ability: ability_of(&species, mon.ability_slot),
+        from_save: matches!(mon.source, Source::Party(_) | Source::Box { .. }),
     };
     with_store(|s| s.import(mon.key, garden, today(), partner))
         .map_err(|r| r.message().to_string())?;
@@ -338,8 +347,9 @@ pub fn partner_types(identity: u64) -> Option<Vec<String>> {
 /// The battle profile of the Chao with `identity`: its partner's types and ability and the
 /// moves it was taught, or Normal type with basic moves without a partner. Ours come from
 /// `partners.txt`, other players' from what they sent, then from `chao/import/partners.txt`.
-/// Loads the ROM if needed.
-pub fn battle_profile(identity: u64) -> Result<Profile, String> {
+/// Without `save_partners`, what partners from a GBA save gave is left out (`profile`). Loads
+/// the ROM if needed.
+pub fn battle_profile(identity: u64, save_partners: bool) -> Result<Profile, String> {
     let rom = rom()?;
     let learned = with_store(|s| s.partners.get(&identity).copied())
         .or_else(|| {
@@ -354,7 +364,7 @@ pub fn battle_profile(identity: u64) -> Result<Profile, String> {
             let text = std::fs::read_to_string(path).ok()?;
             Store::parse(&text).partners.get(&identity).copied()
         });
-    Ok(profile::profile(&rom, learned.as_ref()))
+    Ok(profile::profile(&rom, learned.as_ref(), save_partners))
 }
 
 /// What friends' Chao files carry from partners, under the mod folder.
@@ -389,8 +399,10 @@ pub fn others_learned(list: &[SharedPartner]) {
                     moves: p.moves,
                     level: 0,
                     ability: p.ability,
+                    from_save: false,
                 },
                 moves: p.moves,
+                save_moves: 0,
             },
         );
     }
@@ -444,9 +456,11 @@ fn absorbed(garden: u8, key: u64, identity: u64) {
     );
 }
 
-/// Each frame: the garden's waiting partners (scene.rs).
+/// Each frame: the garden's waiting partners (scene.rs) and wild visitors (wild.rs).
 pub fn on_frame() {
     scene::on_frame();
+    wild::on_frame();
+    machine::on_frame();
 }
 
 pub fn install() {
@@ -462,10 +476,57 @@ pub fn install() {
 /// A garden object that is one of our partners (items.rs leaves them out: they're never shared
 /// or saved).
 pub fn is_partner(object: usize) -> bool {
-    scene::is_partner_object(object)
+    scene::is_partner_object(object) || wild::is_visitor(object)
 }
 
-/// What Enter does on a row of the F9 page.
+/// Settings from config.ini (`WildVisitors`): wild visitors come to the gardens.
+pub fn set_wild_visitors(on: bool) {
+    wild::set_enabled(on);
+}
+
+/// A Chao (`identity`) absorbed a wild visitor: it keeps it as its partner, as with `absorbed`.
+fn learned_wild(identity: u64, partner: Partner) {
+    let learned = with_store(|s| s.learn(identity, partner));
+    write_store();
+    crate::online::resend_partners();
+    log!(
+        "gba link: a Chao absorbed a wild species {} (types {:?}, ability {}, moves {:?})",
+        learned.partner.species,
+        learned.partner.types,
+        learned.partner.ability,
+        learned.moves
+    );
+}
+
+/// Brings `c` into the garden we're in as `import` does, coming out at `at` with a hop along
+/// `angle` (BAMS) instead of walking in ahead of the player (the link machine). The message to
+/// show, or why it can't come.
+pub fn bring_out(c: &Candidate, at: [f32; 3], angle: i32) -> Result<String, String> {
+    if crate::game::in_garden() {
+        let garden = crate::game::current_chao_area() as u8;
+        with_store(|s| s.can_import(c.key, garden, today()))
+            .map_err(|r| r.message().to_string())?;
+        if !wild::room_for_partner(garden) {
+            return Err("The garden is full of animals right now".into());
+        }
+    }
+    let name = import_checked(c)?;
+    scene::arrive_at(c.key, at, angle);
+    Ok(format!("{name} came out of the link machine"))
+}
+
+/// Settings from config.ini (`LinkMachine`): each garden has its link machine, which replaces
+/// the F9 GBA link page.
+pub fn set_link_machine(on: bool) {
+    machine::set_enabled(on);
+}
+
+/// The gardens have their link machine (the F9 GBA link page only points to it).
+pub fn link_machine() -> bool {
+    machine::enabled()
+}
+
+/// What picking a row of the GBA link list (the link machine's or the F9 page) does.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// Nothing (a message).
@@ -476,7 +537,7 @@ pub enum Action {
     Gift(u16),
 }
 
-/// The F9 page: the save's creatures and the mod's kept ones, one row each; without a save,
+/// The GBA link list: the save's creatures and the mod's kept ones, one row each; without a save,
 /// the first-partner gift until it's taken.
 pub struct Page {
     pub rows: Vec<(String, Action)>,
@@ -562,11 +623,24 @@ impl Page {
 
 /// Takes the gift `species` (one of the ROM's first partners, once only). The message to show.
 pub fn take_gift(species: u16) -> String {
-    let Ok(rom) = rom() else {
-        return "No GBA ROM".into();
-    };
+    match take_gift_candidate(species) {
+        Ok(c) => {
+            let name = loaded_rom()
+                .and_then(|r| r.species_name(c.species))
+                .map(|n| ascii(&n))
+                .unwrap_or_default();
+            format!("{name} is yours: F9 > GBA link brings it to a garden")
+        }
+        Err(e) => e,
+    }
+}
+
+/// Takes the gift `species` (once only): it's kept by the mod from now on. The kept one, to
+/// bring into a garden.
+pub fn take_gift_candidate(species: u16) -> Result<Candidate, String> {
+    let rom = rom().map_err(|_| "No GBA ROM".to_string())?;
     if !rom.starters().is_some_and(|s| s.contains(&species)) {
-        return "Not a gift partner".into();
+        return Err("Not a gift partner".into());
     }
     let moves = rom.moves_at_level(species, GIFT_LEVEL);
     let key = SystemTime::now()
@@ -575,12 +649,18 @@ pub fn take_gift(species: u16) -> String {
         ^ (u64::from(species) << 48)
         | 1 << 63;
     if !with_store(|s| s.take_gift(key, species, GIFT_LEVEL, moves)) {
-        return "The gift was taken already".into();
+        return Err("The gift was taken already".into());
     }
     write_store();
-    let name = ascii(&rom.species_name(species).unwrap_or_default());
     log!("gba link: took gift species {species}");
-    format!("{name} is yours: F9 > GBA link brings it to a garden")
+    Ok(Candidate {
+        source: Source::Kept,
+        key,
+        species,
+        level: GIFT_LEVEL,
+        moves,
+        ability_slot: 0,
+    })
 }
 
 #[cfg(test)]

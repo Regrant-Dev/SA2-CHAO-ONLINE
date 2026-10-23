@@ -9,7 +9,13 @@
 //! battle stops with the game while it's paused. Leaving the area deletes every object there;
 //! `on_frame` notices and forgets ours.
 //!
+//! A trainer's creatures stand in the ring as their ROM pictures (figures.rs) where a Chao would.
 //! The battle uses copies of the Chao records: no battle ever changes the save.
+//!
+//! Live battles (online.rs): the friends in the karate area are offered in the opponent list,
+//! a friend's challenge opens the picker on its own at the mode select (or interrupts it), and
+//! the session's messages go to the host. Anywhere else, or in another battle, a challenge is
+//! turned down at once.
 
 // The hook only exists in the 32-bit game build.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
@@ -19,47 +25,36 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chao::{self, ChaoData};
+use crate::gba::rom::Rom;
 use crate::gba_link::Profile;
 use crate::hud;
 use crate::log;
 
 use super::arena::{self, Karate};
+use super::effects_gfx::{self, Book};
 use super::engine::Format;
 use super::event::Slot;
 use super::narrate::{Cue, Sound};
-use super::session::{self, Command, Entry, Lineup, Screen, Session, buttons};
+use super::online::{self, Incoming};
+use super::session::{self, Command, Entry, Friend, Lineup, Screen, Session, buttons};
 use super::team::Dex;
+use super::trainers::{self, Roster};
+use super::visuals::{self, Director, Order};
+use super::{figures, ladder};
 
 /// The arena gets this many frames (15 seconds of running game) to come up after the menu
 /// closes.
 const LEAVE_LIMIT: u32 = 15 * 60;
-/// An attack's step toward its target: how far and how many frames out and back.
-const STEP_DISTANCE: f32 = 3.0;
-const STEP_FRAMES: u16 = 30;
-/// Frames after an attack or a hit before the fighting stance comes back.
-const STANCE_AFTER: u16 = 50;
-/// Frames after a Chao appears before its stance starts.
-const FIRST_STANCE: u16 = 3;
-
-/// Chao motions (karate's motion table, re/chao-battle-arena.md 4).
-mod motion {
-    pub const STANCE: u16 = 0x255;
-    pub const WIND_UP: u16 = 0x242;
-    pub const ATTACKS: [u16; 4] = [0x243, 0x244, 0x246, 0x247];
-    pub const HIT: [u16; 3] = [0x249, 0x24A, 0x24B];
-    pub const DOWN: u16 = 0x24C;
-    pub const WON: [u16; 2] = [0x24D, 0x24E];
-    pub const LOST: [u16; 2] = [0x24F, 0x250];
-    pub const DRAW: u16 = 0x1E0;
-}
 
 mod sound {
     pub const CURSOR: u32 = 0x8000;
     pub const CONFIRM: u32 = 0x100E;
     pub const HITS: [u32; 2] = [0, 2];
-    pub const ATTACK_VOICES: [u32; 3] = [0x6070, 0x6071, 0x606F];
     pub const LOSER: u32 = 0x6067;
 }
+
+/// The friends list and the connection are looked at again every this many frames.
+const NETWORK_EVERY: u32 = 20;
 
 /// Our button below the mode select's two, in the game's 640x480 space.
 const BUTTON: (f32, f32, f32, f32) = (320.0, 432.0, 200.0, 34.0);
@@ -78,12 +73,7 @@ enum Arena {
 #[derive(Clone, Copy)]
 struct Shown {
     object: usize,
-    home: [f32; 3],
     angle: i32,
-    /// An attack's step toward this point: frames played.
-    step: Option<([f32; 3], u16)>,
-    /// Frames until the stance comes back (0 = leave its motion alone).
-    stance_in: u16,
 }
 
 struct Game {
@@ -98,11 +88,23 @@ struct Game {
     format: Format,
     shown: [[Option<Shown>; 2]; 2],
     dex: Option<Arc<Dex>>,
-    /// Varies the voices and motions.
+    /// The ROM's effect sprites (read with the dex while `BattleEffects` is on) and the ROM
+    /// their pictures come from.
+    book: Option<Arc<Book>>,
+    rom: Option<Arc<Rom>>,
+    /// The GBA game's trainers (read with the dex while `BattleTrainers` is on).
+    roster: Option<Arc<Roster>>,
+    /// The trainers were read (or couldn't be): not again.
+    roster_read: bool,
+    /// What the Chao and effects do (while a battle is in the arena).
+    director: Option<Director>,
+    /// Varies the sounds.
     turn: u32,
     /// The HP bars as drawn (a fraction per team member, NaN before the first draw): they run
     /// down or up to the real HP over a moment.
     bars: Bars,
+    /// Frames the session ran (for `NETWORK_EVERY`).
+    frames: u32,
 }
 
 type Bars = [[f32; session::TEAM_SIZE]; 2];
@@ -116,8 +118,14 @@ static GAME: Mutex<Game> = Mutex::new(Game {
     format: Format::Singles,
     shown: [[None; 2]; 2],
     dex: None,
+    book: None,
+    rom: None,
+    roster: None,
+    roster_read: false,
+    director: None,
     turn: 0,
     bars: [[f32::NAN; session::TEAM_SIZE]; 2],
+    frames: 0,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, Game> {
@@ -128,11 +136,13 @@ fn lock() -> std::sync::MutexGuard<'static, Game> {
 /// battle when the area goes.
 pub fn on_frame() {
     let mut g = lock();
+    online::set_busy(g.session.as_ref().is_some_and(Session::busy));
     let Some(k) = arena::karate() else {
         if g.main != 0 {
             forget(&mut g);
             g.main = 0;
         }
+        refuse_all();
         return;
     };
     if k.main != g.main {
@@ -144,10 +154,11 @@ pub fn on_frame() {
     if live {
         // Live karate wraps the main object itself; our button and picker let go.
         if (g.session.is_some() || g.on_button) && g.arena == Arena::Menu {
-            g.session = None;
+            close_session(&mut g);
             g.on_button = false;
             k.hold_mode_select(false);
         }
+        refuse_all();
         if g.session.is_none() && k.main_sub() == ours {
             k.set_main_sub(arena::MAIN_EXEC);
             g.main = 0;
@@ -160,17 +171,100 @@ pub fn on_frame() {
     }
 }
 
+/// Drops the session; a live battle or challenge in it is left (the host is told).
+fn close_session(g: &mut Game) {
+    if let Some(mut s) = g.session.take() {
+        s.abandon();
+        online::send(s.take_outgoing());
+    }
+}
+
+/// Turns down what the host sends while no battle menu can show it.
+fn refuse_all() {
+    for event in online::take_incoming() {
+        match event {
+            Incoming::Offer { from, .. } => online::send(vec![session::busy_answer(from)]),
+            Incoming::Start(start) => online::send(vec![session::left(start.battle)]),
+            _ => {}
+        }
+    }
+}
+
+/// What the host sent for the battle menu. A challenge with no picker open opens it, when the
+/// mode select is waiting for input.
+fn network(g: &mut Game, k: Karate) {
+    for event in online::take_incoming() {
+        if g.session.is_none() {
+            match &event {
+                Incoming::Offer { from, .. } => {
+                    let free = online::enabled()
+                        && (k.mode_select_input() || (g.on_button && k.mode_select_held()));
+                    if free {
+                        let was_on = g.on_button;
+                        g.on_button = true;
+                        k.hold_mode_select(true);
+                        open(g);
+                        match g.session.as_mut() {
+                            // Turned down, it goes back to the mode select.
+                            Some(s) if !was_on => s.set_opened_by_offer(),
+                            Some(_) => {}
+                            None if !was_on => {
+                                // The picker couldn't open (no ROM): the mode select as it was.
+                                g.on_button = false;
+                                k.hold_mode_select(false);
+                            }
+                            None => {}
+                        }
+                    }
+                    if g.session.is_none() {
+                        online::send(vec![session::busy_answer(*from)]);
+                        continue;
+                    }
+                }
+                Incoming::Start(start) => {
+                    online::send(vec![session::left(start.battle)]);
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+        if let Some(s) = g.session.as_mut() {
+            s.network(event);
+        }
+    }
+}
+
+/// Friends online in the karate area, for live battles.
+fn friends() -> Vec<Friend> {
+    crate::online::others()
+        .into_iter()
+        .filter_map(|(id, name, state)| {
+            let s = state?;
+            let here = s.level == crate::game::LEVEL_CHAO_WORLD
+                && i32::from(s.chao_area) == arena::AREA_KARATE;
+            here.then_some(Friend {
+                id,
+                name,
+                busy: s.flags & crate::game::POSE_KARATE_BUSY != 0,
+            })
+        })
+        .collect()
+}
+
 /// Drops the battle without touching game memory (the area and its objects are gone).
 fn forget(g: &mut Game) {
     if g.session.is_some() {
         log!("battle: left the karate area");
     }
-    g.session = None;
+    close_session(g);
     g.on_button = false;
     g.release_next = false;
     g.arena = Arena::Menu;
     g.shown = [[None; 2]; 2];
+    g.director = None;
     arena::forget_all();
+    effects_gfx::end(true);
+    figures::clear(true);
 }
 
 /// MainSub of the karate main object while we're in the area.
@@ -207,14 +301,15 @@ fn before(object: usize) {
     if g.session.is_some() && g.arena == Arena::Menu && !k.mode_select_held() {
         // The picker lost the mode select (live karate started from it): let it go.
         log!("battle: the karate menu moved on; picker closed");
-        g.session = None;
+        close_session(&mut g);
         g.on_button = false;
     }
+    network(&mut g, k);
     if g.session.as_ref().is_some_and(Session::done) {
         // Done without closing: it failed part-way (a panic caught in `main_exec`).
         log!("battle: the battle stopped; back to the menu");
         if g.arena == Arena::Menu {
-            g.session = None;
+            close_session(&mut g);
             g.on_button = false;
             k.hold_mode_select(false);
         } else {
@@ -267,7 +362,14 @@ fn after(object: usize) {
         }
     }
     if g.arena == Arena::Ready {
-        let (position, look) = camera(g.format);
+        let (mut position, mut look) = camera(g.format);
+        if let Some(d) = &g.director {
+            let shake = d.shake();
+            for i in 0..3 {
+                position[i] += shake[i];
+                look[i] += shake[i];
+            }
+        }
         k.set_camera(position, look);
     }
 }
@@ -293,11 +395,24 @@ fn home(format: Format, slot: Slot) -> ([f32; 3], i32) {
     ([x, arena::FLOOR, z], angle)
 }
 
+/// Where every slot stands in `format`.
+fn homes(format: Format) -> [[[f32; 3]; 2]; 2] {
+    [0, 1].map(|side| [0, 1].map(|pos| home(format, Slot::new(side, pos)).0))
+}
+
 /// Opens the picker: the ROM's data, our Chao and the opponents to choose from.
 fn open(g: &mut Game) {
+    let rom = match crate::gba_link::rom() {
+        Ok(rom) => rom,
+        Err(e) => {
+            log!("battle: {e}");
+            hud::toast(format!("Battle: {e}"));
+            return;
+        }
+    };
     let dex = match g.dex.clone() {
         Some(dex) => dex,
-        None => match crate::gba_link::rom().and_then(|rom| Dex::from_rom(&rom)) {
+        None => match Dex::from_rom(&rom) {
             Ok(dex) => {
                 let dex = Arc::new(dex);
                 g.dex = Some(dex.clone());
@@ -310,6 +425,17 @@ fn open(g: &mut Game) {
             }
         },
     };
+    if visuals::enabled() && g.book.is_none() {
+        g.book = Some(Arc::new(Book::from_rom(&rom)));
+    }
+    if trainers::enabled() && !g.roster_read {
+        g.roster_read = true;
+        match Roster::from_rom(&rom, &dex) {
+            Some(roster) => g.roster = Some(Arc::new(roster)),
+            None => log!("battle: the ROM's trainers couldn't be read"),
+        }
+    }
+    g.rom = Some(rom);
     arena::sound(sound::CONFIRM);
     let own = own_chao();
     let lineups = lineups();
@@ -321,13 +447,22 @@ fn open(g: &mut Game) {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64);
-    g.session = Some(Session::open(dex, own, lineups, Box::new(profile_of), seed));
+    let mut session = Session::open(dex, own, lineups, Box::new(profile_of), seed);
+    if trainers::enabled() {
+        session = match g.roster.clone() {
+            Some(roster) => session.with_trainers(roster, ladder::load()),
+            None => session.with_progress(ladder::load()),
+        };
+    }
+    session.set_friends(friends());
+    g.session = Some(session);
     g.bars = [[f32::NAN; session::TEAM_SIZE]; 2];
 }
 
-/// A Chao's types, ability and moves (Normal with no moves if the ROM can't be read).
-fn profile_of(chao: &ChaoData) -> Profile {
-    crate::gba_link::battle_profile(chao.identity()).unwrap_or_else(|e| {
+/// A Chao's types, ability and moves (Normal with no moves if the ROM can't be read); without
+/// `save_partners`, leaving out what partners from a GBA save gave.
+fn profile_of(chao: &ChaoData, save_partners: bool) -> Profile {
+    crate::gba_link::battle_profile(chao.identity(), save_partners).unwrap_or_else(|e| {
         log!("battle: no profile ({e})");
         Profile {
             types: [0, 0],
@@ -430,10 +565,19 @@ fn imported_chao() -> Vec<Entry> {
 
 fn run_session(g: &mut Game, k: Karate, pressed: u32) {
     let ready = g.arena == Arena::Ready;
+    g.frames = g.frames.wrapping_add(1);
+    let look = g.frames.is_multiple_of(NETWORK_EVERY);
     let Some(session) = g.session.as_mut() else {
         return;
     };
+    if look {
+        session.set_friends(friends());
+        if session.waits_on_host() && crate::online::my_id().is_none() {
+            session.network(Incoming::Lost);
+        }
+    }
     let commands = session.update(pressed, ready);
+    online::send(session.take_outgoing());
     let screen = session.screen();
     for c in commands {
         match c {
@@ -441,6 +585,13 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
             Command::OpenArena(format) => {
                 log!("battle: starting ({format:?})");
                 g.format = format;
+                let effects = visuals::enabled() && g.book.is_some();
+                g.director = Some(Director::new(
+                    effects,
+                    homes(format),
+                    g.dex.clone(),
+                    g.book.clone().filter(|_| effects),
+                ));
                 g.on_button = false;
                 g.arena = Arena::Leaving(0);
                 k.leave_menu();
@@ -451,8 +602,25 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
             }
             Command::Closed => {
                 // Back to our button in the held mode select.
-                g.session = None;
+                close_session(g);
                 return;
+            }
+            Command::Released => {
+                // Back to the mode select as the challenge found it.
+                if let Some(note) = g.session.as_mut().and_then(Session::take_farewell) {
+                    hud::toast(note);
+                }
+                close_session(g);
+                g.on_button = false;
+                g.release_next = true;
+                return;
+            }
+            Command::Progress => {
+                if let Some(s) = &g.session {
+                    ladder::save(s.progress());
+                    // Friends' copies of our Chao take the TM moves too.
+                    crate::online::resend_partners();
+                }
             }
         }
     }
@@ -479,16 +647,13 @@ fn end_battle(g: &mut Game, k: Karate) {
         k.back_to_menu();
     }
     g.arena = Arena::Menu;
-    g.session = None;
+    close_session(g);
     g.on_button = false;
+    g.director = None;
+    effects_gfx::end(false);
+    figures::clear(false);
+    crate::gba_link::billboard::forget();
     log!("battle: back to the menu");
-}
-
-fn shown_mut(g: &mut Game, slot: Slot) -> Option<&mut Shown> {
-    g.shown
-        .get_mut(slot.side)
-        .and_then(|s| s.get_mut(slot.pos))
-        .and_then(Option::as_mut)
 }
 
 fn object_at(g: &Game, slot: Slot) -> Option<usize> {
@@ -517,6 +682,16 @@ fn cue_frame(g: &mut Game, cue: Cue) {
     match cue {
         Cue::Show { slot, member } => {
             hide(g, slot);
+            let species = g
+                .session
+                .as_ref()
+                .and_then(|s| s.species(slot.side, member));
+            figures::show(slot, species, home(g.format, slot).0);
+            if species.is_some() {
+                let orders = g.director.as_mut().map(|d| d.cue(&cue)).unwrap_or_default();
+                carry_out(g, &orders);
+                return;
+            }
             let record = g
                 .session
                 .as_ref()
@@ -525,99 +700,86 @@ fn cue_frame(g: &mut Game, cue: Cue) {
             let Some(record) = record else { return };
             let (at, angle) = home(g.format, slot);
             match arena::spawn(&record, at, angle) {
-                Some(object) => {
-                    // The stance once its first update has set its motions up.
-                    g.shown[slot.side][slot.pos] = Some(Shown {
-                        object,
-                        home: at,
-                        angle,
-                        step: None,
-                        stance_in: FIRST_STANCE,
-                    });
-                }
-                None => log!("battle: couldn't make the Chao for {slot:?}"),
-            }
-        }
-        Cue::Hide { slot } => hide(g, slot),
-        Cue::Attack { by, toward, status } => {
-            let target = toward.map(|t| home(g.format, t).0);
-            let Some(s) = shown_mut(g, by) else { return };
-            if status {
-                arena::motion(s.object, motion::WIND_UP, 20);
-            } else {
-                arena::motion(s.object, motion::ATTACKS[pick % motion::ATTACKS.len()], 15);
-                arena::sound(sound::ATTACK_VOICES[pick % sound::ATTACK_VOICES.len()]);
-                s.step = target.map(|t| (t, 0));
-            }
-            s.stance_in = STANCE_AFTER;
-        }
-        Cue::Hurt { target, heavy } => {
-            let Some(s) = shown_mut(g, target) else {
-                return;
-            };
-            let id = motion::HIT[usize::from(heavy).min(motion::HIT.len() - 1)];
-            arena::motion(s.object, id, 1);
-            s.stance_in = STANCE_AFTER;
-        }
-        Cue::Faint { at } => {
-            if let Some(s) = shown_mut(g, at) {
-                arena::motion(s.object, motion::DOWN, 1);
-                s.stance_in = 0;
-            }
-        }
-        Cue::Result { winner } => {
-            for side in 0..2 {
-                for pos in 0..2 {
-                    let Some(object) = object_at(g, Slot::new(side, pos)) else {
-                        continue;
-                    };
-                    let id = match winner {
-                        None => motion::DRAW,
-                        Some(w) if w == side => motion::WON[pick % 2],
-                        Some(_) => motion::LOST[pick % 2],
-                    };
-                    arena::motion(object, id, 20);
-                    if let Some(s) = shown_mut(g, Slot::new(side, pos)) {
-                        s.stance_in = 0;
-                        s.step = None;
+                Some(object) => g.shown[slot.side][slot.pos] = Some(Shown { object, angle }),
+                None => {
+                    log!("battle: couldn't make the Chao for {slot:?}");
+                    if let Some(d) = g.director.as_mut() {
+                        d.cue(&Cue::Hide { slot });
                     }
+                    return;
                 }
             }
-            if winner != Some(0) {
-                arena::sound(sound::LOSER);
-            }
         }
-        Cue::Sound(s) => arena::sound(match s {
-            Sound::Cursor | Sound::Back => sound::CURSOR,
-            Sound::Confirm => sound::CONFIRM,
-            Sound::Hit => sound::HITS[pick % 2],
-            Sound::Faint => sound::LOSER,
-        }),
+        Cue::Hide { slot } => {
+            hide(g, slot);
+            figures::show(slot, None, [0.0; 3]);
+        }
+        Cue::Sound(s) => {
+            arena::sound(match s {
+                Sound::Cursor | Sound::Back => sound::CURSOR,
+                Sound::Confirm => sound::CONFIRM,
+                Sound::Hit => sound::HITS[pick % 2],
+                Sound::Faint => sound::LOSER,
+            });
+            return;
+        }
+        Cue::Result { winner } if winner != Some(0) => arena::sound(sound::LOSER),
+        _ => {}
+    }
+    let orders = g.director.as_mut().map(|d| d.cue(&cue)).unwrap_or_default();
+    carry_out(g, &orders);
+}
+
+/// Does what the director asks.
+fn carry_out(g: &Game, orders: &[Order]) {
+    for order in orders {
+        match *order {
+            Order::Motion { slot, id, blend } => {
+                if let Some(object) = object_at(g, slot) {
+                    arena::motion(object, id, blend);
+                } else {
+                    figures::play(slot, id);
+                }
+            }
+            Order::Sound(id) => arena::sound(id),
+            Order::Ball {
+                slot,
+                state,
+                frames,
+            } => {
+                if let Some(object) = object_at(g, slot) {
+                    effects_gfx::emote(object, state, frames);
+                }
+            }
+            Order::Particles { kind, at, count } => effects_gfx::particles(kind, at, count, g.turn),
+        }
     }
 }
 
-/// Steps toward targets and back, and the stance after a motion.
+/// One frame of the Chao and the effects: where each stands, what starts, what's drawn.
 fn animate(g: &mut Game) {
-    for row in &mut g.shown {
-        for s in row.iter_mut().flatten() {
-            let mut at = s.home;
-            if let Some((target, frame)) = s.step {
-                let t = f32::from(frame) / f32::from(STEP_FRAMES);
-                let (dx, dz) = (target[0] - s.home[0], target[2] - s.home[2]);
-                let length = (dx * dx + dz * dz).sqrt().max(1.0);
-                let reach = (t * std::f32::consts::PI).sin() * STEP_DISTANCE;
-                at[0] += dx / length * reach;
-                at[2] += dz / length * reach;
-                s.step = (frame < STEP_FRAMES).then_some((target, frame + 1));
-            }
-            arena::place(s.object, at, s.angle);
-            if s.stance_in > 0 {
-                s.stance_in -= 1;
-                if s.stance_in == 0 {
-                    arena::motion(s.object, motion::STANCE, 25);
-                }
-            }
+    let Some(d) = g.director.as_mut() else {
+        return;
+    };
+    let out = d.frame();
+    let scene = d.effects().then(|| d.scene());
+    for &(slot, at, lift) in &out.places {
+        let shown = g
+            .shown
+            .get(slot.side)
+            .and_then(|s| s.get(slot.pos))
+            .copied()
+            .flatten();
+        match shown {
+            Some(s) => arena::place_lifted(s.object, at, s.angle, lift),
+            None => figures::place(slot, [at[0], at[1] + lift, at[2]]),
         }
+    }
+    carry_out(g, &out.orders);
+    if let Some(scene) = scene
+        && g.arena == Arena::Ready
+    {
+        effects_gfx::show(scene, g.rom.clone());
     }
 }
 
