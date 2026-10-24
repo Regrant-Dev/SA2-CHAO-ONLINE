@@ -345,13 +345,28 @@ impl Swim {
     }
 
     /// One frame on: toward its cell, and from there to a neighbouring one (not straight back
-    /// when it can help it). Returns the heading (BAMS, the game's sin/cos convention).
-    pub fn step(&mut self, spots: &Spots, rng: &mut Rng) -> i32 {
+    /// when it can help it; toward `called`, the whistling player, when it's called, staying
+    /// put at the pond cell nearest them). Returns the heading (BAMS, the game's sin/cos
+    /// convention).
+    pub fn step(&mut self, spots: &Spots, rng: &mut Rng, called: Option<(f32, f32)>) -> i32 {
         let goal = middle(self.to);
         let (dx, dz) = (goal.0 - self.at.0, goal.1 - self.at.1);
         let d = (dx * dx + dz * dz).sqrt();
         if d <= SWIM_SPEED {
             self.at = goal;
+            if let Some(player) = called {
+                let here = dist2(goal, player);
+                let nearer = spots
+                    .neighbours(self.to)
+                    .into_iter()
+                    .filter(|&c| dist2(middle(c), player) < here)
+                    .min_by(|&a, &b| dist2(middle(a), player).total_cmp(&dist2(middle(b), player)));
+                if let Some(n) = nearer {
+                    self.from = Some(self.to);
+                    self.to = n;
+                }
+                return heading(player.0 - self.at.0, player.1 - self.at.1);
+            }
             let mut next = spots.neighbours(self.to);
             if next.len() > 1 {
                 next.retain(|c| Some(*c) != self.from);
@@ -376,6 +391,29 @@ fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
 /// The BAMS angle that walks along (dx, dz) as the game does (sin, cos).
 fn heading(dx: f32, dz: f32) -> i32 {
     (dx.atan2(dz) * 65536.0 / std::f32::consts::TAU) as i32
+}
+
+/// A whistle calls visitors for this long (it starts again while the player whistles), from
+/// this far away; they come to within `CALL_NEAR` of the player.
+pub const CALL_SECS: u64 = 6;
+pub const CALL_REACH: f32 = 100.0;
+pub const CALL_NEAR: f32 = 4.0;
+/// How fast a called visitor walks (units a frame).
+const WALK_SPEED: f32 = 0.3;
+
+/// One frame of a called visitor at `at` walking to `player`: where it is next and its heading,
+/// or `None` once it's near enough.
+pub fn walk_toward(at: (f32, f32), player: (f32, f32)) -> Option<((f32, f32), i32)> {
+    let (dx, dz) = (player.0 - at.0, player.1 - at.1);
+    let d = (dx * dx + dz * dz).sqrt();
+    if d <= CALL_NEAR {
+        return None;
+    }
+    let step = WALK_SPEED.min(d - CALL_NEAR);
+    Some((
+        (at.0 + dx / d * step, at.1 + dz / d * step),
+        heading(dx, dz),
+    ))
 }
 
 /// Whether a roaming visitor at `at` in a garden (index 0..3) swims: in a pond cell, below the
@@ -496,6 +534,8 @@ mod game {
         alone_since: Option<Instant>,
         carrying: Option<Carried>,
         pending: Option<Carried>,
+        /// The player whistled: visitors come to where they are until then.
+        called: Option<(Instant, (f32, f32))>,
         rng: Rng,
     }
 
@@ -528,6 +568,7 @@ mod game {
                 alone_since: None,
                 carrying: None,
                 pending: None,
+                called: None,
                 rng: Rng::new(seed),
             }
         });
@@ -710,8 +751,28 @@ mod game {
         if w.pending.is_some() && crate::garden::player_held() == 0 {
             hand_over(w, garden, now);
         }
+        hear_whistle(w, now);
         go_away(w, now);
         come(w, garden, now);
+    }
+
+    /// Player 1's entity (PLAYERS[0]): its action byte (+0) is 42 while whistling, and its
+    /// position at +0x14 (whistle.rs).
+    const PLAYERS: usize = 0x01DE_A6C0;
+    const ACTION_WHISTLE: u8 = 42;
+
+    /// While the player whistles, visitors are called to them (for `CALL_SECS` after).
+    fn hear_whistle(w: &mut Wild, now: Instant) {
+        // SAFETY: the game's player table (a static) and player 1's entity, on the game thread.
+        let whistling = unsafe {
+            let p = (PLAYERS as *const usize).read();
+            p != 0 && (p as *const u8).read() == ACTION_WHISTLE
+        };
+        if whistling && let Some((at, _)) = sa2::player_position() {
+            w.called = Some((now + Duration::from_secs(CALL_SECS), (at.x, at.z)));
+        } else if w.called.is_some_and(|(until, _)| now >= until) {
+            w.called = None;
+        }
     }
 
     /// Walked into garden `garden`: its visitors start anew.
@@ -1011,7 +1072,8 @@ mod game {
         }
     }
 
-    /// A roaming visitor in the pond swims; a held one stops.
+    /// A roaming visitor in the pond swims; a held one stops. Called by a whistle, one on land
+    /// walks to the player and one in the pond swims to its edge nearest them.
     ///
     /// # Safety
     /// Game thread; `object` is our live visitor with Data1 `d`.
@@ -1021,6 +1083,7 @@ mod game {
             spots,
             rng,
             garden,
+            called,
             ..
         } = w;
         let (Some(v), Some(spots)) = (live.iter_mut().find(|v| v.object == object), spots) else {
@@ -1033,13 +1096,24 @@ mod game {
         // SAFETY: as the caller's.
         unsafe {
             let at = ((d + D_POSITION) as *const [f32; 3]).read_unaligned();
+            let called = called
+                .map(|(_, p)| p)
+                .filter(|p| dist2((at[0], at[2]), *p) < CALL_REACH * CALL_REACH);
             if v.swim.is_none() && in_pond(spots, at) {
                 v.swim = Swim::start(spots, (at[0], at[2]));
             }
             let Some(s) = v.swim.as_mut() else {
+                if let Some(((x, z), angle)) = called.and_then(|p| walk_toward((at[0], at[2]), p)) {
+                    ((d + D_POSITION) as *mut [f32; 3]).write_unaligned([x, at[1], z]);
+                    ((d + D_ANGLE) as *mut i32).write_unaligned(angle);
+                    let d2 = ((object + OBJ_DATA2) as *const usize).read();
+                    if d2 != 0 {
+                        (d2 as *mut [f32; 3]).write_unaligned([0.0; 3]);
+                    }
+                }
                 return;
             };
-            let angle = s.step(spots, rng);
+            let angle = s.step(spots, rng, called);
             let surface = spots
                 .water_at(s.to)
                 .unwrap_or(WATER_Y[usize::from(garden.saturating_sub(1)).min(2)]);
@@ -1271,7 +1345,7 @@ mod tests {
         let mut rng = Rng::new(3);
         let (lo, hi) = (middle((4, 4)), middle((6, 6)));
         for _ in 0..5_000 {
-            swim.step(&spots, &mut rng);
+            swim.step(&spots, &mut rng, None);
             assert!((lo.0 - 0.01..=hi.0 + 0.01).contains(&swim.at.0));
             assert!((lo.1 - 0.01..=hi.1 + 0.01).contains(&swim.at.1));
         }
@@ -1280,6 +1354,31 @@ mod tests {
         assert_eq!(heading(1.0, 0.0), 0x4000);
         let y = swim_y(-2.0, 0.0);
         assert!((y + 3.5).abs() < 1e-4);
+        // Called from beyond the pond's (6, 6) corner: it swims there and stays.
+        let player = (middle((6, 6)).0 + 20.0, middle((6, 6)).1 + 20.0);
+        for _ in 0..2_000 {
+            swim.step(&spots, &mut rng, Some(player));
+        }
+        assert_eq!(swim.to, (6, 6));
+        let corner = middle((6, 6));
+        assert!(dist2(swim.at, corner) < 0.01);
+    }
+
+    #[test]
+    fn a_whistle_walks_a_visitor_to_the_player() {
+        let mut at = (0.0, 0.0);
+        let player = (30.0, 40.0);
+        let mut steps = 0;
+        while let Some((next, angle)) = walk_toward(at, player) {
+            // Heading toward the player, a step at a time, never past the stopping distance.
+            assert_eq!(angle, heading(player.0 - at.0, player.1 - at.1));
+            assert!(dist2(next, at).sqrt() <= WALK_SPEED + 1e-4);
+            at = next;
+            steps += 1;
+            assert!(steps < 1_000);
+        }
+        assert!((dist2(at, player).sqrt() - CALL_NEAR).abs() < 1e-3);
+        assert_eq!(walk_toward((29.0, 40.0), player), None);
     }
 
     #[test]

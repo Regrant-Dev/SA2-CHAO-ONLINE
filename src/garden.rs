@@ -2980,10 +2980,13 @@ unsafe extern "C" fn sound_at_thunk() {
     )
 }
 
+/// As `sound_at_thunk`, for the held sound call.
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
 unsafe extern "C" fn sound_held_thunk() {
     std::arch::naked_asm!(
+        "cmp byte ptr [{quiet}], 0",
+        "jne 2f",
         "push eax",
         "push ecx",
         "push edx",
@@ -3000,6 +3003,9 @@ unsafe extern "C" fn sound_held_thunk() {
         "pop eax",
         "push {sound}",
         "ret",
+        "2:",
+        "ret",
+        quiet = sym SOUNDS_QUIET,
         call = const SOUND_HELD,
         heard = sym heard,
         sound = const SOUND_HELD_FN,

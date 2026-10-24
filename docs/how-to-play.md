@@ -321,6 +321,8 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
   time and never more than 5 (fewer when the garden is full of other animals).
   Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
   shiny, in the GBA game's shiny colours.
+- Whistle and nearby ones come to you: land creatures walk over and stop a few steps away,
+  and water creatures swim to the edge of the pond nearest you.
 - Your Chao pick them up and absorb them like partners: a wild one teaches a Chao its four
   moves, its types and its ability. Its moves are picked at random from the ones its kind
   learns by its level, so two of a kind can teach different moves. Absorbing gives no battle
