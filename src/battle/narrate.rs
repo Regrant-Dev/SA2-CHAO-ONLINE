@@ -14,7 +14,7 @@ use super::fighter::{Ailment, Stat};
 /// Frames a beat lasts: a message, a quick HP change, the longer moments.
 const MESSAGE: u16 = 90;
 const QUICK: u16 = 30;
-const ATTACK: u16 = 50;
+pub const ATTACK: u16 = 50;
 const FAINT: u16 = 80;
 const END: u16 = 150;
 
@@ -31,12 +31,13 @@ pub enum Cue {
         slot: Slot,
     },
     /// Uses move `move_id`: attacks (a short step toward `toward`), or for a status move, a
-    /// show of strength.
+    /// show of strength. `charging`: the first turn of a two-turn move, which only gets ready.
     Attack {
         by: Slot,
         toward: Option<Slot>,
         status: bool,
         move_id: u16,
+        charging: bool,
     },
     /// Takes a hit: 0 light, 1 medium, 2 heavy.
     Hurt {
@@ -328,6 +329,16 @@ impl Narrator<'_> {
         target.filter(|&t| t != by).or_else(|| self.facing(by))
     }
 
+    /// The move `by` uses now only gets ready this turn (a two-turn move's first turn).
+    fn readying(&self, by: Slot) -> bool {
+        self.ahead
+            .iter()
+            .take_while(|e| !matches!(e, Event::UsedMove { .. }))
+            .any(|e| {
+                matches!(*e, Event::Started { target, condition: Condition::Readying(_) } if target == by)
+            })
+    }
+
     /// The foe standing in front of `by`, or the other one when that one is down.
     fn facing(&self, by: Slot) -> Option<Slot> {
         let ahead = Slot::new(1 - by.side, by.pos);
@@ -395,6 +406,7 @@ impl Narrator<'_> {
                     toward: self.aimed_at(by),
                     status: self.names.is_status_move(move_id),
                     move_id,
+                    charging: self.readying(by),
                 };
                 self.push(Some(text), vec![cue], Vec::new(), ATTACK);
             }
@@ -1068,6 +1080,7 @@ mod tests {
                 toward: Some(b),
                 status: false,
                 move_id: 5,
+                charging: false,
             }]
         );
         // 50 of 80 HP is a heavy hit, and a strong one.
@@ -1238,5 +1251,45 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_two_turn_moves_first_use_is_marked_as_getting_ready() {
+        let (a, b) = (Slot::new(0, 0), Slot::new(1, 0));
+        let mut planned = View {
+            active: [[Some(0), None], [Some(0), None]],
+            hp: [vec![100], vec![80]],
+            max_hp: [vec![100], vec![80]],
+            ailment: [vec![None], vec![None]],
+        };
+        let charging = |events: &[Event], planned: &mut View| -> Vec<bool> {
+            beats(events, planned, &Plain)
+                .into_iter()
+                .flat_map(|b| b.cues)
+                .filter_map(|c| match c {
+                    Cue::Attack { charging, .. } => Some(charging),
+                    _ => None,
+                })
+                .collect()
+        };
+        let ready = [
+            Event::UsedMove { by: a, move_id: 7 },
+            Event::Started {
+                target: a,
+                condition: Condition::Readying(7),
+            },
+            Event::UsedMove { by: b, move_id: 5 },
+        ];
+        assert_eq!(charging(&ready, &mut planned), [true, false]);
+        // Someone else getting ready later doesn't count.
+        let other = [
+            Event::UsedMove { by: a, move_id: 5 },
+            Event::UsedMove { by: b, move_id: 7 },
+            Event::Started {
+                target: b,
+                condition: Condition::Readying(7),
+            },
+        ];
+        assert_eq!(charging(&other, &mut planned), [false, true]);
     }
 }

@@ -104,8 +104,8 @@ mode 1 only.
 
 - A partner is an animal of id 3 (silent) created without a save record, after checking the
   category-2 count. Its display is replaced by one drawing the partner's picture, and its main
-  is wrapped: after the animal's own main, while it roams and the player holds nothing, collision
-  entry 2 is enabled (0x486CD0) so Chao notice it in the open.
+  is wrapped (the animal's own main, silenced). Collision entry 2 stays as the game sets it, so
+  Chao only notice it while the player carries it.
 - `0x56708E` jumps to the mod: for a partner it applies the partner's effect, has the animal's
   own main delete it (mode 3) and goes on at 0x5674CC, so the motions, sparkles, sounds and
   balloon stay and the animal effects are skipped; any other animal or drive goes on at 0x567094

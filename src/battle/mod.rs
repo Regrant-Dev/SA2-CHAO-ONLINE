@@ -27,7 +27,7 @@
 //!   the progress and TM moves won; `figures` shows their creatures in the arena.
 //! - `visuals`: how the arena shows each cue (motions by kind of move, status signs, effect
 //!   sprites, flash and shake), with `effects_gfx` reading the ROM's effect sprites and drawing
-//!   them.
+//!   them and `movement` moving each move's sprites the way its script does.
 //! - `arena`: the karate arena's menu, Chao, camera and motions.
 //! - `game`: ties the session to the arena and the HUD each frame.
 
@@ -47,6 +47,7 @@ pub mod game;
 pub mod ladder;
 pub mod levels;
 mod mirror;
+pub mod movement;
 pub mod narrate;
 pub mod online;
 pub mod rng;

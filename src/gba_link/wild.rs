@@ -2,7 +2,7 @@
 //! (`rotation`) come by now and then, picked from the area's wild tables with their chances and
 //! level ranges: land ones walk on the grass, water ones swim in the pond, and now and then one
 //! is shiny (the ROM's shiny colours). Each is an animal object made like a partner's
-//! (`scene::create`), so Chao notice it, pick it up and absorb it, which teaches them its moves,
+//! (`scene::create`): a Chao the player hands it to absorbs it, which teaches them its moves,
 //! types and ability as a partner does (`Store::learn`). Each visitor knows four moves picked at
 //! random from the ones its kind learns by its level (`random_moves`), so two of a kind can teach
 //! different ones. Up to 5 are in a garden at once. Visitors are never saved: they go when the
@@ -477,8 +477,8 @@ mod game {
 
     use super::super::rotation::{self, Area};
     use super::super::scene::{
-        D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1,
-        enable_touch, hooked, quietly, room, to_come,
+        D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1, hooked,
+        quietly, room, to_come,
     };
     use super::super::store::Partner;
     use super::*;
@@ -700,11 +700,21 @@ mod game {
         }
         if !sa2::in_garden() {
             // The lobby and Chao World's other areas: a carried visitor waits for the next
-            // garden.
+            // garden, and a note says so (the hands look empty here).
             delete_all(w);
             w.garden = 0;
             if let Some(c) = w.carrying.take() {
                 w.pending = Some(c);
+            }
+            if let Some(c) = w.pending
+                && !sa2::between_areas()
+                && sa2::game_state() != GAME_STATE_PAUSED
+            {
+                let name = super::super::loaded_rom()
+                    .and_then(|rom| rom.species_name(c.visitor.species))
+                    .map(|n| super::super::ascii(&n))
+                    .unwrap_or_else(|| "a visitor".into());
+                crate::hud::banner(&format!("Carrying {name} to your next garden"));
             }
             return;
         }
@@ -755,6 +765,9 @@ mod game {
         go_away(w, now);
         come(w, garden, now);
     }
+
+    /// The pause screen's GameState.
+    const GAME_STATE_PAUSED: i16 = 17;
 
     /// Player 1's entity (PLAYERS[0]): its action byte (+0) is 42 while whistling, and its
     /// position at +0x14 (whistle.rs).
@@ -909,6 +922,11 @@ mod game {
             "gba link: a visitor (species {}) came along in the player's hands",
             c.visitor.species
         );
+        let name = super::super::loaded_rom()
+            .and_then(|rom| rom.species_name(c.visitor.species))
+            .map(|n| super::super::ascii(&n))
+            .unwrap_or_else(|| "Your visitor".into());
+        crate::hud::toast(format!("{name} came along"));
     }
 
     /// Visitors that stayed long enough go once the player is away from them.
@@ -1066,9 +1084,6 @@ mod game {
             }
             let roaming = ((d + D_MODE) as *const u8).read() == MODE_ROAM;
             with(|w| swim(w, object, d, roaming));
-            if roaming && crate::garden::player_held() == 0 {
-                enable_touch(object);
-            }
         }
     }
 

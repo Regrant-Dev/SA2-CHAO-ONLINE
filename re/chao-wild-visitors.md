@@ -65,8 +65,8 @@ applies its effect and goes on at 0x5674CC (motions, sparkles, sounds and the st
 stay; the animal effects are skipped). Any other animal object the mod makes goes through the
 same site. A Chao only notices an animal on its own while collision entry 2 is enabled
 (0x486CD0, EAX = object, ECX = 2); the game enables it only while the player carries it
-(mode 1), and the partners' main wrapper also enables it while roaming with the player's hands
-empty.
+(mode 1), and the mod leaves that as it is for partners and visitors, so a Chao only takes one
+it is handed.
 
 ---
 

@@ -656,7 +656,30 @@ pub fn on_frame() {
     card::on_frame();
 }
 
+/// The note left in a new `gba` folder, saying what goes in it.
+const FOLDER_NOTE: &str = "PUT YOUR ROM HERE.txt";
+const FOLDER_NOTE_TEXT: &str = "Put your own ROM of Emerald for the Game Boy Advance here \
+(the US release, game code BPEE, 16 MB), dumped from a cartridge you own. Its file name must \
+end in .gba (check that Windows isn't hiding a second extension). A save file from it (.sav) \
+is optional. Then start the game again.\r\n";
+
+/// Makes the mod's `gba` folder with its note when there's none, so players see where the
+/// ROM goes.
+fn make_folder() {
+    let dir = folder();
+    if dir.exists() {
+        return;
+    }
+    let made = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join(FOLDER_NOTE), FOLDER_NOTE_TEXT));
+    match made {
+        Ok(()) => log!("gba link: made {} for the ROM", dir.display()),
+        Err(e) => log!("gba link: can't make {}: {e}", dir.display()),
+    }
+}
+
 pub fn install() {
+    make_folder();
     scene::install();
     // The ROM in the background, so the status balloon has the type names from the start.
     std::thread::spawn(|| {

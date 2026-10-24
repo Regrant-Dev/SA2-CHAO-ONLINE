@@ -69,6 +69,107 @@ Lengths are one pass (one cycle for loops).
   (Data2 +0..+8) every frame; the height is the game's physics (ground mode). A hop motion
   alone stays on the floor.
 
+### The table offline, and more motions for moves
+
+- The table is the export `al_motion_table` of `resource/gd_PC/DLL/Win32/Data_DLL_orig.dll`
+  (the 31 MB file; `Data_DLL.dll` beside it is the mod loader's proxy): RVA 0x32B7C8, image
+  base 0x10000000, 622 entries of 0x1C bytes (ids 0..0x26D; 0x26E has a null motion).
+- Every entry passes `motion_ok`: motions lie in 0x10259430..0x1032B7B8, modes are 0..7.
+- The clips are `NJS_MOTION` type 3 (position + angle), 40 nodes; node 1 is the body. Position
+  keys are `{u32 frame, f32 x, y, z}`, angle keys `{u16 frame, s16 x, y, z}`. Standing body y is
+  1.0, sitting 0.55; a negative x angle leans forward. The "moment" below is read from the body
+  keys (its lunge, jump or lean); arms and hands weren't measured.
+- Ids to keep off the arena Chao: 0x156..0x15A and 0x25D..0x261 (the body leaves its spot),
+  0x264..0x267 (the moment is after frame 100), 0x101..0x10E (held in someone's hands), 0x3A and
+  0x3C (lying poses). Prop motions (0x143..0x153, 0x15C..0x170, 0xE5..0xED) play without their
+  prop, as a mime.
+- Loops play on until the next motion (the stance 50 frames on); chains (modes 4..6) go on by
+  themselves with no AI.
+
+| id | end | frames | moment | look | played by |
+|---|---|---|---|---|---|
+| 0x1BD | hold | 39 | f16, leans −25° | head-butt | dark tease `0x5A1780` |
+| 0x1D4 → 0x1D5 | next, ping-pong | 25 + 5 | f19, z +0.5 | pounce hop | joy `0x5A0BA0` |
+| 0x238 → 0x239 | next, lying | 32 + 167 | f17..23 | dive, face-plant | fright `0x5647B0` |
+| 0x1B9 | hold | 67 | f26..46 | hop and swing | dark tease `0x5A1600` |
+| 0x1C1, 0x1C0 | hold | 53, 81 | | lean in and back, stand tall | (body keys only) |
+| 0x135 | loop | 48 | two hops to y 1.7 | bunny hops | animal play 3 |
+| 0x1BB | hold | 67 | y 3.7 at f26, 3.5 at f46 | double high jump | dark tease `0x5A1700` |
+| 0x259, 0x207 | hold | 44, 32 | y 2.1 at f18, 1.8 at f13 | hops | (body keys only) |
+| 0x146 → 0x147 | next | 67 + 73 | | blowing bubbles | toy skill 9 |
+| 0xEB → 0xEC → 0xED | next | 44 + 39 + 39 | | pouring from a can | watering `0x5680F0` |
+| 0x83 → 0x82 | next, loop | 84 + 65 | | take-off, then flap | (body keys only) |
+| 0x87 → 0x88 | next, ping-pong | 20 | y 2.2 | airborne | (body keys only) |
+| 0x14C → 0x14D | next, ping-pong | 25 + 16 | y 2.8, then 2.2..3.65 | rise and hover | toy skill 7 |
+| 0x11D → 0x11E → 0x11F | next | 25 + 33 + 13 | f20, y 1.9 | rears up; the game lights a flame at the hand from f20 | dragon play `0x5A27B0` |
+| 0x11C | hold | 67 | leans −30° | lean forward | animal play 8 (sound 0x6087) |
+| 0x163, 0x165, 0x16B | loop, loop, ping-pong | 57, 20, 20 | | playing a tune | performances A4, A1, A2 |
+| 0x14F | loop | 80 | | seated drum | toy skill 1 |
+| 0x11A → 0x11B | next, loop | 29 + 29 | | sway and flex | animal play 8 |
+| 0x1BF | hold | 71 | f28..57, z +0.9 | leans in, glaring | dislike `0x5A1800` (voice 0x6069) |
+| 0x1C3 | hold | 72 | | wiggle tease | dark tease `0x5A1680` |
+| 0x136 → 0x137 | next, loop | 12 + 100 | | seated rocking | karate taunt |
+| 0x248 | loop | 33 | ±0.2 sideways | sway (reads as a dodge) | karate set, unplayed |
+| 0x1F1 → 0x1F2 | next, loop | 33 + 33 | | cower | fear `0x59F350` (whimper 0x602D) |
+| 0xB7 → 0xB8 | next, loop | 20 + 20 | | munching (seated) | eat (sound 0x603D) |
+| 0xCB → 0xCC | next | 51 + 105 | 360° spin at f29..54, y 1.8 | soaking it up | absorb (sparkle ring `0x6EFF10`) |
+| 0xFA | loop | 150 | | pleased | petted |
+| 0x13F | hold | 50 | | lean (after 0x13E, 90) | warthog play 5 |
+| 0x0D | hold | 50 | | noticing | watering `0x5680F0` (emotion ball 1) |
+| 0x133 | loop | 60 | flip at f19..46, z +1.0 | rolling forward flips | animal play 13 |
+| 0x81, 0x77 | loop | 33, 24 | | charging run, fast run | warthog chain, whistle and ball |
+| 0x140 → 0x81 | hold | 30 | z +0.5 | head-down charge | warthog `0x13E → 0x13F → 0x140 → 0x81` |
+| 0xCA | hold | 9 | | reach and grab | grab |
+| 0xBC → 0xBD → 0xBE | hold, next | 40 + 47 + 87 | | reaching for an item | pick-up `0x5613C0` |
+| 0xCE | hold | 95 | y 2.4 at f9, z +0.9 at f69 | big hop | newborn `0x5685B0` |
+| 0x171 → 0x172 | hold, next | 17 + 17 | z +0.38 | quick step | dance B0 |
+| 0x184, 0x183, 0x17E, 0x15D | loop, loop, hold, loop | 89, 112, 40, 31 | 0x17E: a 360° spin with a hop | dances | dances B3, B2, B1, A5 |
+| 0x138 → 0x139, 0x16F → 0x170 | next, ping-pong | 13 + 33, 33 + 44 | | dances | dances B4, A7 |
+| 0x27 → 0x28 | next, ping-pong | 50 + 20 | | yawn | sleepy (sound 0x6005) |
+| 0x18C | hold, then 0 | 79 | | swoon | (sound 0x6091) |
+| 0x203 → 0x204 | next, loop | 6 + 24 | | mischief | (sounds 0x6065, 0x6066, 0x6068; eyes 10) |
+| 0xE5 → 0xE6 → 0xE7 | next | 47 + 13 + 60 | | digging | seeds `0x567B10` |
+| 0x92 → 0x93 | next, hold | 47 + 40 | rolls 200° | dive roll | swim trick `0x5620D0` |
+| 0x8C | hold | 47 | from y 1.8 | coming down | hop clip |
+
+### How a move picks its motion
+
+- Its kind comes from its ROM record, the first that fits: the sound list; for status moves
+  rest, heal, protect, weather, a status for the foe, raising, lowering, else charge; for
+  damaging moves the one-hit, two-turn, multi-hit, recoil and draining effects, then going
+  first (priority above 0 or the first-turn flinch), then contact, water, flying, spread
+  (physical, on both foes or everyone), physical, special (`visuals::classify`).
+- Each kind has a set of motions, each with its moment (frame). A move that is the `k`th of
+  its kind (by id, `places`) picks `(k + k / n) mod n` of its kind's `n` (`vary`), so
+  neighbours in a kind never share one and the set is used evenly.
+- Its sprites leave at the moment. A step toward the target reaches furthest then, and the
+  stance waits until the step is back; a quick move's dash lasts at least its moment + 4
+  frames. A spread move's dust and shake come at its moment (single jumps only: 0x1BB is
+  still in the air until about f66).
+- A damaging move's sprites land 34..46 frames into the 50-frame attack beat (`LAND_FROM`,
+  `LAND_BY`): they leave at the moment, moved just enough to land in that window. The hit
+  that follows plays the hurt motion; its plain-hit burst is left out when the move's own
+  sprites landed on that Chao in the last 20 frames, and the target only shudders as they
+  land for a status move.
+- Sprites that stay on the user (orbits, auras, rises, gathers, bursts on the user) move with
+  it through its step and lift; shots leave from where it is at that frame.
+- Status moves giving a status pick by the status: sleep 0x27, confusion 0x17E, infatuation
+  0x18C (with the heart ball, state 4), poison 0x203, paralysis 0x1BF, burn 0x11D; fire and
+  dragon special moves rear up (0x11D) with flame particles at the moment.
+- Two-turn moves: the narrator marks the turn that only gets ready (`Cue::Attack { charging }`,
+  a `Readying` start after the use). That turn plays 0x14C with a lift (into the air), 0xE5
+  (underground), 0x92 (underwater) or a focus pose, and shows no ROM sprites. While it is
+  away the stance doesn't come back, and in the air it hovers 2 units up until its next
+  attack, a hurt, a sign or a faint. The next turn strikes (0x8C from the air, coming down by
+  the moment; 0x1BB from the ground, with the dust at its take-off, f13) with them.
+- Multi-hit moves: each later hit on the target keeps the user's loop going and, for a contact
+  move, steps in again. Only a move's hits count (a hurt with the hit's burst just before it),
+  not poison, weather and other damage.
+- A new attack drops the last move's sprites that haven't started yet, with the shake, flash
+  and landing that were to come with them; what's already in flight still lands.
+- With `BattleEffects` off none of this runs: a damaging move plays one of 0x243, 0x244, 0x246,
+  0x247 with the step, a status move 0x242.
+
 ---
 
 ## 2. Emotion balls
@@ -175,6 +276,15 @@ The 0x40xx ids mean different sounds in the karate area and in a garden: that ba
 - **0x559720** (u32 colour 0xAABBGGRR, f32 x0, y0, x1, y1, z), cdecl: an untextured rectangle
   in the 640×480 virtual screen, drawn in a display pass; alpha 0xFF takes the opaque path,
   anything less is blended (`chao-details.md` "Draw calls").
+- The effect sprites are camera-facing quads in a display object of object list 1 with texture
+  format 0xE (alpha test, depth writes); the arena Chao (list 4) and the trainers' figures draw
+  after them, so a quad through the middle of a Chao is hidden by the Chao's front half. Drawn
+  1.8 units toward the camera from where they are, they show in front of the body.
+- The object display loop `0x470010` runs every list's +0x14, then the +0x20 displays, then
+  list 0's and list 1's +0x1C, then lists 2..5's +0x1C. A list-1 object's +0x1C therefore
+  draws after the arena Chao. Blended sprites (OAM object mode 1) draw there, their opaque
+  pixels at alpha 0x92 (4 of RGB5A3's 7 steps), keeping the parser's texture format (blended,
+  no depth writes), so the Chao shows through them as on the GBA.
 
 ---
 
@@ -212,7 +322,7 @@ One opcode byte, then its operands (LE; pointers are ROM addresses, 0x08000000 +
 |---|---|---|---|
 | 0x00 | load sheet | 3 | u16 tag (loads the sheet and the palette of that tag) |
 | 0x01 | unload sheet | 3 | u16 tag |
-| 0x02 | create sprite | 7 + 2n | u32 SpriteTemplate*, u8 (0x80 = placed at the target, low 7 bits subpriority), u8 n, n × s16 |
+| 0x02 | create sprite | 7 + 2n | u32 SpriteTemplate*, u8 (0x80 = layered by the target's draw order rather than the attacker's, low 7 bits subpriority), u8 n, n × s16 |
 | 0x03 | create task | 7 + 2n | u32 function, u8 priority, u8 n, n × s16 |
 | 0x04 | delay | 2 | u8 |
 | 0x05, 0x06, 0x07 | wait / nop | 1 | |
@@ -249,11 +359,51 @@ Walking a script means following `call`, `goto` and both targets of 0x11, 0x12, 
 with a visited set, stopping at `end` and `return`. With those rules every move script
 1..354 parses to the end without an unknown opcode.
 
+- The 0x80 placement bit doesn't say where a sprite shows: every sprite is created at the
+  target's position and its template's callback (with the command's arguments) moves it from
+  there, e.g. to the attacker and across. 456 of 862 attacker-to-target shots have the bit set.
+- In play order (`battle_anim.rs` `move_play`): every `call` inlined each time it's made
+  (8 deep at most), `goto` followed, 0x11 takes its second pointer (the attack turn; the first
+  is the charge turn), 0x24 (contest) never taken, 0x12 and 0x21 not taken unless the main path
+  shows no sprite of its own (then taken: one move picks its whole animation by an argument).
+  Delays (0x04) add their frames; 0x05 (wait for sprites and tasks) is counted as 8 frames.
+  Scripts then run a median of 40 frames, 90% under 120, the longest 224.
+- Some moves draw their sprites from tasks (0x03), not from 0x02; only the sheet they load
+  (0x00) shows which.
+
+### Sprite callbacks and tasks by movement
+
+How the arena moves a move's sprites (`anim_kinds.rs`) comes from the template callback (the
+u32 at template +0x14, compared whole) and, for some, an argument naming a battler (0 or 2 the
+attacker's side, 1 or 3 the target's). The groups, by what the callback does to its sprite:
+bursts and auras on a battler, straight shots, shots swaying up and down, lines sweeping
+across, lobs, spirals onto a battler, corkscrews along the way, orbits round the attacker,
+rain from above, rises from the ground, drains from the target to the attacker, and gathers
+into the attacker. The address lists are in `anim_kinds.rs` (`callback`, `task`).
+
+- Sprites with no sheet do other things: the attacker lunging (6 callbacks), tinting
+  (0x081157FD colour in argument 4; 0x081158A5 in argument 3) and shaking (0x081160A5:
+  argument 3 of 0 or 1 shakes the screen, 2 or 3 a battler).
+- Tasks: shaking a battler (argument 0 the battler: 1 or 3 the target's side, 4 and up a fixed
+  position), the screen shake 0x081162A5, 0x081152DD (argument 0 of 4 or more: the screen, else
+  one battler), tints (colour in argument 4 for 0x08116621 and 0x08116665, argument 5 for
+  0x08115A05, 0x08115B0D and 0x08115C81), and about 25 that draw sprites of their own.
+- The straight and lob callbacks 0x080A7821, 0x080A78AD and 0x08110851 take the flight's frames
+  in argument 4; the two lobs take the arc's height in argument 5.
+- Sorting every move by its biggest group (shots first, then movements on the target, on the
+  attacker, bursts, auras; 8 or more shots at most 4 frames apart are a beam): about 80
+  bursts, 50 auras, 34 rises, 31 beams, 31 plain hits only, 30 volleys, 26 rains, 14 single
+  shots, 14 spirals, 11 lobs, 10 volleys of lobs, 10 orbits, 7 drains, 4 gathers and 3
+  corkscrews; 27 show nothing of their own. 18 shake the screen (with 4 or more target shakes,
+  or 3 shakes at fixed positions, counted as one).
+
 ### Sprite templates
 
 - `SpriteTemplate` (0x18 bytes): u16 sheet tag, u16 palette tag, u32 OamData*, u32 anims
   (table of AnimCmd lists), u32 images, u32 affine anims, u32 callback.
-- OamData (8 bytes): shape = byte 1 bits 6..7, size = byte 3 bits 6..7, 8bpp = byte 1 bit 5.
+- OamData (8 bytes): shape = byte 1 bits 6..7, size = byte 3 bits 6..7, 8bpp = byte 1 bit 5,
+  object mode = byte 1 bits 2..3 (1: blended with what's behind it). 48 of the 274 main
+  sprites with a template are blended, among them the 64×64 shields and auras.
 
 | shape \ size | 0 | 1 | 2 | 3 |
 |---|---|---|---|---|
@@ -269,9 +419,17 @@ with a visited set, stopping at `end` and `return`. With those rules every move 
 - Templates whose sheet tag is below 10000 are palette-blend and shake helpers with no sheet.
 - Across the 354 move scripts: 2115 sprite creations with a sheet, all 4bpp, palette tag
   always equal to the sheet tag; 9 sizes (32×32, 16×16, 8×8, 8×16, 32×16, 64×64, 16×32,
-  32×64, 64×32). 1191 of them are placed at the attacker.
+  32×64, 64×32). 1191 of them are layered by the attacker (bit 0x80 clear).
+- A sheet only tasks draw from has templates of its own elsewhere in the ROM: records whose
+  sheet and palette tags are both its tag, with no images (+0xC 0), OAM data and animations
+  in the ROM, a Thumb callback (odd ROM address) and affine animations 0 or in the ROM. A
+  4-aligned scan finds them; the size met most often (the smaller of equals) is how the
+  sheet is cut (1D mapping: a 16×32 frame is 8 tiles, 2 per row). E.g. 10115 is 16×32,
+  10211 and 10001 8×8, 10253 16×32, 10010 64×64. With none, the first 8×8 tile shows.
 - Tag 10135 (the plain hit) appears in 106 move scripts; 25 scripts use only it and 47 create
   no sprite with a sheet (tasks and palette effects only).
+- Sizes across the move templates: 42 are 8×8 and 109 are 16×16; in 130 of the 455 the first
+  frame is less than 10% opaque.
 - A move's type is byte 2 of its record (`rom.rs` `MOVES`), so the commonest sheet among the
   moves of each type can be counted from the ROM; every type id 0..17 has one.
 

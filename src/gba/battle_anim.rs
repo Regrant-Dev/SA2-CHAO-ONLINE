@@ -2,9 +2,10 @@
 //! or a status condition's animation script makes, and those sprites' frames as pictures.
 //!
 //! Only the script and sprite formats are known here; which sheet belongs to what comes from
-//! walking the ROM's own scripts.
+//! walking the ROM's own scripts. `move_play` gives a move's script in play order, with each
+//! sprite's callback and arguments and the frame it comes at, for `anim_kinds` to sort.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::lz77;
 use super::rom::{MOVE_COUNT, Rom};
@@ -32,6 +33,14 @@ pub const TAG_BASE: u16 = 10_000;
 const TEMPLATE_SIZE: usize = 0x18;
 const TEMPLATE_OAM: usize = 4;
 const TEMPLATE_ANIMS: usize = 8;
+const TEMPLATE_IMAGES: usize = 0xC;
+const TEMPLATE_AFFINE: usize = 0x10;
+/// OAM byte 1: the object mode (bits 2..3; 1 is blended with what's behind it) and 8bpp.
+const OAM_MODE: u8 = 0x0C;
+const OAM_BLENDED: u8 = 0x04;
+const OAM_8BPP: u8 = 0x20;
+/// The ROM's addresses start here.
+const ROM_ADDRESS: u32 = 0x0800_0000;
 /// One 8x8 4bpp tile.
 const TILE_BYTES: usize = 32;
 /// Frames read from one animation.
@@ -41,14 +50,24 @@ const ROM_LEN: usize = 16 << 20;
 /// Script bytes walked at most per script (all its branches together).
 const MAX_STEPS: usize = 20_000;
 
-/// The "create sprite" command's placement bit: the sprite starts at the target.
-const AT_TARGET: u8 = 0x80;
+/// The "create sprite" command's placement bit: the sprite is layered by the target's draw
+/// order rather than the attacker's (where it starts and goes is its callback's business).
+const BY_TARGET: u8 = 0x80;
+/// A template's callback (a ROM code address).
+const TEMPLATE_CALLBACK: usize = 0x14;
+/// Calls followed inside each other at most, and gotos followed in one script.
+const MAX_DEPTH: usize = 8;
+const MAX_JUMPS: usize = 64;
+/// Frames counted for a "wait for the sprites and tasks to finish".
+pub const WAIT_FRAMES: u16 = 8;
 
 /// Script opcodes with something to follow.
 mod op {
     pub const LOAD_SHEET: u8 = 0x00;
     pub const CREATE_SPRITE: u8 = 0x02;
     pub const CREATE_TASK: u8 = 0x03;
+    pub const DELAY: u8 = 0x04;
+    pub const WAIT: u8 = 0x05;
     pub const END: u8 = 0x08;
     pub const CALL: u8 = 0x0E;
     pub const RETURN: u8 = 0x0F;
@@ -80,8 +99,141 @@ fn fixed_len(code: u8) -> Option<usize> {
 pub struct Created {
     /// The template's file offset.
     pub template: usize,
-    /// Starts at the target rather than the attacker.
-    pub at_target: bool,
+    /// Layered by the target's draw order (not where it shows: see `BY_TARGET`).
+    pub by_target: bool,
+}
+
+/// A command a script runs, as `move_play` meets it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Loads the sheet with this tag.
+    Load(u16),
+    /// Makes a sprite from the template at file offset `template`; `callback` is the template's
+    /// callback (the whole ROM address), `args` the command's arguments.
+    Sprite {
+        template: usize,
+        callback: u32,
+        by_target: bool,
+        args: Vec<i16>,
+    },
+    /// Starts the task at ROM address `function` with `args`.
+    Task { function: u32, args: Vec<i16> },
+}
+
+/// A step and the frame it comes at (delays added up; a wait counts `WAIT_FRAMES`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Timed {
+    pub frame: u16,
+    pub step: Step,
+}
+
+/// A script in play order: every call each time it's made, the attack turn of a two-turn
+/// move, and (with `branches`) the conditional jumps taken.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Play {
+    pub steps: Vec<Timed>,
+    /// It picks its commands by the turn (a charge turn, then the attack).
+    pub two_turn: bool,
+}
+
+/// Walks a script in play order (`Rom::move_play`).
+struct Player<'a> {
+    rom: &'a Rom,
+    out: Play,
+    clock: u16,
+    budget: usize,
+    branches: bool,
+}
+
+impl Player<'_> {
+    /// Runs the script at `at` until it ends or returns; `None` on a bad command.
+    fn run(&mut self, mut at: usize, depth: usize) -> Option<()> {
+        let rom = self.rom;
+        let mut jumps = 0;
+        loop {
+            // Out of steps: what was met so far stands.
+            let Some(left) = self.budget.checked_sub(1) else {
+                return Some(());
+            };
+            self.budget = left;
+            let code = *rom.bytes_at(at, 1)?.first()?;
+            let byte = |o: usize| rom.bytes_at(at + o, 1).and_then(|b| b.first().copied());
+            let args = |o: usize, n: usize| -> Option<Vec<i16>> {
+                (0..n)
+                    .map(|i| rom.u16_at(at + o + 2 * i).map(|v| v as i16))
+                    .collect()
+            };
+            let frame = self.clock;
+            match code {
+                op::LOAD_SHEET => {
+                    let tag = rom.u16_at(at + 1)?;
+                    self.out.steps.push(Timed {
+                        frame,
+                        step: Step::Load(tag),
+                    });
+                    at += 3;
+                }
+                op::CREATE_SPRITE => {
+                    let template = rom.ptr_at(at + 1)?;
+                    let n = usize::from(byte(6)?);
+                    self.out.steps.push(Timed {
+                        frame,
+                        step: Step::Sprite {
+                            template,
+                            callback: rom.u32_at(template + TEMPLATE_CALLBACK).unwrap_or(0),
+                            by_target: byte(5)? & BY_TARGET != 0,
+                            args: args(7, n)?,
+                        },
+                    });
+                    at += 7 + 2 * n;
+                }
+                op::CREATE_TASK => {
+                    let n = usize::from(byte(6)?);
+                    self.out.steps.push(Timed {
+                        frame,
+                        step: Step::Task {
+                            function: rom.u32_at(at + 1)?,
+                            args: args(7, n)?,
+                        },
+                    });
+                    at += 7 + 2 * n;
+                }
+                op::SOUND_TASK => at += 6 + 2 * usize::from(byte(5)?),
+                op::DELAY => {
+                    self.clock = self.clock.saturating_add(u16::from(byte(1)?));
+                    at += 2;
+                }
+                op::WAIT => {
+                    self.clock = self.clock.saturating_add(WAIT_FRAMES);
+                    at += 1;
+                }
+                op::END | op::RETURN => return Some(()),
+                op::CALL => {
+                    if depth < MAX_DEPTH {
+                        self.run(rom.ptr_at(at + 1)?, depth + 1)?;
+                    }
+                    at += 5;
+                }
+                op::PICK_BY_TURN => {
+                    self.out.two_turn = true;
+                    at = rom.ptr_at(at + 5)?;
+                }
+                op::JUMP_IF_TURN if self.branches => at = rom.ptr_at(at + 2)?,
+                op::JUMP_IF_TURN => at += 6,
+                op::JUMP_IF_ARGUMENT if self.branches => at = rom.ptr_at(at + 4)?,
+                op::JUMP_IF_ARGUMENT => at += 8,
+                op::JUMP_IF_CONTEST => at += 5,
+                op::GOTO => {
+                    jumps += 1;
+                    if jumps > MAX_JUMPS {
+                        return Some(());
+                    }
+                    at = rom.ptr_at(at + 1)?;
+                }
+                other => at += fixed_len(other)?,
+            }
+        }
+    }
 }
 
 /// What a script shows: the sprites it creates and the sheets it loads (some are drawn by
@@ -110,6 +262,26 @@ pub struct Template {
     pub width: u8,
     pub height: u8,
     pub frames: Vec<Frame>,
+    /// The GBA draws it see-through, blended with what's behind it.
+    pub blended: bool,
+}
+
+impl Template {
+    /// The sheet's first 8x8 tile alone (for a sheet with no template of its own).
+    pub fn first_tile(tag: u16) -> Template {
+        Template {
+            tag,
+            width: 8,
+            height: 8,
+            frames: vec![Frame {
+                tile: 0,
+                duration: 0,
+                h_flip: false,
+                v_flip: false,
+            }],
+            blended: false,
+        }
+    }
 }
 
 /// A sheet's tiles and its 16 colours (RGBA8, colour 0 clear).
@@ -122,25 +294,6 @@ impl Sheet {
     /// Its 8x8 tiles.
     pub fn tiles(&self) -> usize {
         self.tiles.len() / TILE_BYTES
-    }
-
-    /// The biggest square frame (up to 64x64) its tiles fill from tile 0, as a template (for a
-    /// sheet only tasks draw).
-    pub fn square(&self, tag: u16) -> Option<Template> {
-        let side = [64u8, 32, 16, 8]
-            .into_iter()
-            .find(|&s| usize::from(s / 8).pow(2) <= self.tiles())?;
-        Some(Template {
-            tag,
-            width: side,
-            height: side,
-            frames: vec![Frame {
-                tile: 0,
-                duration: 0,
-                h_flip: false,
-                v_flip: false,
-            }],
-        })
     }
 
     /// One `width` x `height` frame starting at `tile` (tiles row-major, low nibble the left
@@ -206,6 +359,31 @@ impl Rom {
         self.walk(self.ptr_at(MOVE_SCRIPTS + usize::from(id) * 4)?)
     }
 
+    /// Move `id`'s script in play order (the attack turn of a two-turn move; with `branches`,
+    /// taking the jumps on the turn and on an argument). `None` when it can't be walked.
+    pub fn move_play(&self, id: u16, branches: bool) -> Option<Play> {
+        if id == 0 || id >= MOVE_COUNT {
+            return None;
+        }
+        let mut player = Player {
+            rom: self,
+            out: Play::default(),
+            clock: 0,
+            budget: MAX_STEPS,
+            branches,
+        };
+        player.run(self.ptr_at(MOVE_SCRIPTS + usize::from(id) * 4)?, 0)?;
+        Some(player.out)
+    }
+
+    /// The sheet tag of the template at `offset`, when it has a sheet.
+    pub fn template_tag(&self, offset: usize) -> Option<u16> {
+        let tag = self.u16_at(offset)?;
+        (TAG_BASE..TAG_BASE + SHEET_COUNT)
+            .contains(&tag)
+            .then_some(tag)
+    }
+
     /// What status condition script `index` shows.
     pub fn status_anim(&self, index: u8) -> Option<Script> {
         if index >= STATUS_COUNT {
@@ -248,7 +426,7 @@ impl Rom {
                         let args = usize::from(*self.bytes_at(at + 6, 1)?.first()?);
                         out.created.push(Created {
                             template,
-                            at_target: placement & AT_TARGET != 0,
+                            by_target: placement & BY_TARGET != 0,
                         });
                         at += 7 + 2 * args;
                     }
@@ -299,7 +477,7 @@ impl Rom {
             return None;
         }
         let oam = self.bytes_at(self.ptr_at(offset + TEMPLATE_OAM)?, 8)?;
-        if oam[1] & 0x20 != 0 {
+        if oam[1] & OAM_8BPP != 0 {
             // 8bpp: not used by the battle animations.
             return None;
         }
@@ -339,7 +517,43 @@ impl Rom {
             width,
             height,
             frames,
+            blended: oam[1] & OAM_MODE == OAM_BLENDED,
         })
+    }
+
+    /// The sprite templates anywhere in the ROM for each of `tags` (a sheet that only tasks
+    /// draw from has its sprites made from templates no script names): records whose sheet
+    /// and palette tags are both the tag, with no images of their own, OAM data, animations,
+    /// a callback in the ROM and no affine animations or ROM ones.
+    pub fn sheet_templates(&self, tags: &HashSet<u16>) -> HashMap<u16, Vec<Template>> {
+        let mut out: HashMap<u16, Vec<Template>> = HashMap::new();
+        if tags.is_empty() {
+            return out;
+        }
+        let in_rom = |a: u32| (ROM_ADDRESS..ROM_ADDRESS + ROM_LEN as u32).contains(&a);
+        for offset in (0..ROM_LEN - TEMPLATE_SIZE).step_by(4) {
+            let Some(tag) = self.u16_at(offset) else {
+                break;
+            };
+            if !(TAG_BASE..TAG_BASE + SHEET_COUNT).contains(&tag)
+                || self.u16_at(offset + 2) != Some(tag)
+                || !tags.contains(&tag)
+            {
+                continue;
+            }
+            let word = |o: usize| self.u32_at(offset + o).unwrap_or(0);
+            let affine = word(TEMPLATE_AFFINE);
+            let fits = word(TEMPLATE_IMAGES) == 0
+                && in_rom(word(TEMPLATE_OAM))
+                && in_rom(word(TEMPLATE_ANIMS))
+                && (affine == 0 || in_rom(affine))
+                && word(TEMPLATE_CALLBACK) & 1 == 1
+                && in_rom(word(TEMPLATE_CALLBACK));
+            if let Some(t) = fits.then(|| self.anim_template(offset)).flatten() {
+                out.entry(tag).or_default().push(t);
+            }
+        }
+        out
     }
 
     /// The sheet with `tag`: its tiles (the LZ77 data's own length) and the first 16 colours of

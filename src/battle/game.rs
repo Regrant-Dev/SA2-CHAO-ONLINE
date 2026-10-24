@@ -264,9 +264,9 @@ fn forget(g: &mut Game) {
     g.release_next = false;
     g.arena = Arena::Menu;
     g.shown = [[None; 2]; 2];
-    g.director = None;
+    let effects = g.director.take().is_some_and(|d| d.effects());
     arena::forget_all();
-    effects_gfx::end(true);
+    effects_gfx::end(true, effects);
     figures::clear(true);
 }
 
@@ -429,7 +429,9 @@ fn open(g: &mut Game) {
         },
     };
     if visuals::enabled() && g.book.is_none() {
-        g.book = Some(Arc::new(Book::from_rom(&rom)));
+        let book = Book::from_rom(&rom);
+        log!("battle: effect sprites read: {}", book.summary());
+        g.book = Some(Arc::new(book));
     }
     if trainers::enabled() && !g.roster_read {
         g.roster_read = true;
@@ -671,8 +673,8 @@ fn end_battle(g: &mut Game, k: Karate) {
     g.arena = Arena::Menu;
     close_session(g);
     g.on_button = false;
-    g.director = None;
-    effects_gfx::end(false);
+    let effects = g.director.take().is_some_and(|d| d.effects());
+    effects_gfx::end(false, effects);
     figures::clear(false);
     crate::gba_link::billboard::forget();
     log!("battle: back to the menu");
@@ -746,6 +748,11 @@ fn cue_frame(g: &mut Game, cue: Cue) {
             return;
         }
         Cue::Result { winner } if winner != Some(0) => arena::sound(sound::LOSER),
+        Cue::Attack { move_id, .. } => {
+            if let Some(line) = g.director.as_mut().and_then(|d| d.told(move_id)) {
+                log!("battle: {line}");
+            }
+        }
         _ => {}
     }
     let orders = g.director.as_mut().map(|d| d.cue(&cue)).unwrap_or_default();

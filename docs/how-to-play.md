@@ -267,7 +267,8 @@ Advance: a ROM of the US release (game code BPEE, the first version) dumped from
 own. Its 128 KB save file is optional. Nothing from the game comes with the mod: names, types
 and pictures are read from your ROM, and the save is only read, never changed.
 
-- Put the ROM (`.gba`) and the save (`.sav`) in `mods/sa2-chao-online/gba/`, or set their paths
+- Put the ROM (`.gba`) and the save (`.sav`) in `mods/sa2-chao-online/gba/` (the mod makes this
+  folder the first time it runs, with a note inside), or set their paths
   in the Mod Manager (GBA link group; `GbaRom` and `GbaSave` in `config.ini`).
 - Each garden of your own (not a shared online one) has a **link machine** beside its
   transporter, a short walk to one side of its doorway: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
@@ -280,8 +281,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
   the machine's hatch as a partner, drawn as its picture, and walks into the garden. B, Esc or
   Backspace closes the list. While it is open your character stands still and the game doesn't
   take the presses. When the garden is full of animals, a wild visitor leaves to make room.
-- A Chao that comes close to a partner picks it up and absorbs it; you can also carry it to a
-  Chao, as with animals.
+- Carry a partner to the Chao you want it to teach: a Chao only takes one it's handed, as with
+  animals, so Chao walking past leave it alone.
 - Without a save, the list offers a one-time gift instead: one of the game's three first
   partners at level 5, picked once and kept by the mod (in `gba/partners.txt`). The link machine
   brings it out right away; after that it is on the list like the save's.
@@ -323,14 +324,16 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
   shiny, in the GBA game's shiny colours.
 - Whistle and nearby ones come to you: land creatures walk over and stop a few steps away,
   and water creatures swim to the edge of the pond nearest you.
-- Your Chao pick them up and absorb them like partners: a wild one teaches a Chao its four
+- Carry one to a Chao and it absorbs it like a partner (Chao walking past leave visitors alone,
+  so you choose who learns what): a wild one teaches a Chao its four
   moves, its types and its ability. Its moves are picked at random from the ones its kind
   learns by its level, so two of a kind can teach different moves. Absorbing gives no battle
-  XP. You can carry one to a Chao too.
+  XP.
 - Stand next to one, or pick it up, and a card at the top right shows it: name, level, types,
   ability, its stats at that level and the four moves a Chao that absorbs it learns. Partners
   brought from the link machine get the same card.
-- Carry one through the transporter and it comes along: it is in your hands when you reach
+- Carry one through the transporter and it comes along (in the lobby a note at the top says
+  you're carrying it; your hands look empty there): it is in your hands when you reach
   the next garden, ready to give to a Chao there.
 - Wild visitors are never saved; one that has been about for a few minutes leaves once you are
   away from it, and new ones keep coming. They don't come to shared online gardens, and the ones
@@ -392,17 +395,32 @@ loses; the result screen shows who's still standing and the XP your Chao earned 
 scrolls a long one), and A goes back to the karate menu. A battle that reaches 200 turns is a
 draw.
 
-**In the ring:** each Chao moves by the kind of move it uses: karate punches and kicks for
-moves that touch the foe, a throw or a hop and stomp for other physical moves, a swim stroke
-for water moves, flapping up for flying moves, a focus pose for other special moves, singing
-for sound moves, cheering for raising its own stats, taunts for lowering the foe's, a guard
-for shielding, lying down for resting and eating for healing. The move's own effect from the
-GBA game (read from your ROM) flies from the user to its target or bursts on it, with
-sparkles, splashes, flames or snow where they fit. A critical or strong hit flashes the
-screen white and shakes the view. Status shows on the Chao: an asleep Chao sleeps between
-turns, a confused one stumbles under a swirl, a flinching one shows "!", a paralyzed one
-shivers, a frozen one sits in ice, and a fainting one falls over and cries. **Battle effects**
-in the mod's settings (GBA link group) turns all this off, leaving the karate punches and hits.
+**In the ring:** each Chao moves by the kind of move it uses, and each move has its own motion
+within its kind, so two moves of a kind rarely look alike: lunges, swings, kicks, head-butts,
+pounces and diving slams for moves that touch the foe; a throw or a swing for other physical
+moves; a jump and a stomp for moves that hit everyone; a swim, a roll or a splash for water
+moves; taking off for flying moves; a focus pose for other special moves, or rearing up with a
+flame for fire and dragon ones; singing or a tune for sound moves; a flurry that steps in for
+every hit of a multi-hit move; a head-down charge for moves with recoil; reaching out to soak
+it up for draining moves; a quick dash for moves that go first; its biggest jump or kick for
+one-hit knock-outs; a dance for weather; a yawn, a spin, a swoon, a glare or a tease for moves
+that give the foe a status; cheering for raising its own stats, taunts for lowering the foe's,
+a guard, a dodge or a cower for shielding, lying down for resting and eating or soaking up for
+healing. A two-turn move gets ready its own way on its first turn (rising up, digging, diving
+or focusing) and strikes on the second; a Chao that rises up hovers in the air until then. The move's own effect from the GBA game (read from
+your ROM) moves the way it does there: a shot, a lob, a volley or a beam from the user to its
+target, a spiral, a rain from above, a rise from the ground, a ring around the user, a drain
+back to the user, or a burst on the target, with sparkles, splashes, flames or snow where they
+fit. Effects on the user move with it as it steps in or jumps. A damaging move's effect lands
+just before the target takes the hit; a status move's makes the target shudder. Effects the
+GBA game draws see-through let the Chao show through them. A move that tints the GBA screen
+flashes the arena in its colour. In doubles, a move that hits both foes lands on each, and one
+that hits everyone else lands on the user's partner too. A critical or strong hit,
+and a move that shakes the GBA screen, flashes the screen white and shakes the view. Status
+shows on the Chao: an asleep Chao sleeps between turns, a confused one stumbles under a swirl,
+a flinching one shows "!", a paralyzed one shivers, a frozen one sits in ice, and a fainting
+one falls over and cries. **Battle effects** in the mod's settings (GBA link group) turns all
+this off, leaving the karate punches and hits.
 
 **Rules:** the GBA game's battle rules: its type chart, accuracy and evasion, critical hits,
 the same-type bonus, priority, PP, status conditions, stat stages, weather, move effects and

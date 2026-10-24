@@ -1,7 +1,8 @@
 //! Partners in the garden (re/chao-animals.md): each waiting partner is a garden animal object
 //! (`0x548D30`, id 3, no save record) with our display, which draws its picture as a
-//! camera-facing quad, and our main around the animal's, which lets Chao notice it while it
-//! roams. A Chao that takes one absorbs it as usual (motions, sparkles, the status balloon),
+//! camera-facing quad, and our main around the animal's (silenced). As with the game's own
+//! animals, Chao only notice one while the player carries it: a Chao that's handed one absorbs
+//! it as usual (motions, sparkles, the status balloon),
 //! but at `0x56708E` a partner skips the animal effects for ours (`super::absorbed`); so does a
 //! wild visitor (`super::wild`), which makes its objects with the same helpers.
 
@@ -9,8 +10,8 @@
 pub(super) use game::creatures;
 #[cfg(target_arch = "x86")]
 pub(super) use game::{
-    D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1,
-    enable_touch, hooked, quietly, room, to_come,
+    D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1, hooked,
+    quietly, room, to_come,
 };
 #[cfg(target_arch = "x86")]
 pub use game::{install, is_partner_object, on_frame};
@@ -93,10 +94,6 @@ mod game {
     /// animals and Chaos Drives.
     const ANIMAL_COUNT: usize = 0x01DC_0F88;
     const ANIMAL_LIMIT: usize = 0x008A_B840;
-    /// Enable collision entry ECX of object EAX.
-    const ENABLE_COLLISION: usize = 0x0048_6CD0;
-    /// The Chao-touch collision entry (id 0x87) Chao notice animals by.
-    const TOUCH_ENTRY: u32 = 2;
     /// AddHappiness (ESI = Chao, EDI = delta, push f32 alignment; caller pops 4).
     const ADD_HAPPINESS: usize = 0x0053_6320;
 
@@ -210,22 +207,6 @@ mod game {
         unsafe {
             (ANIMAL_COUNT as *const u32).read().saturating_add(reserve)
                 < (ANIMAL_LIMIT as *const u32).read()
-        }
-    }
-
-    /// Lets Chao notice `object` (its collision entry 2) this frame.
-    ///
-    /// # Safety
-    /// Game thread; `object` is a live animal.
-    pub unsafe fn enable_touch(object: usize) {
-        unsafe {
-            std::arch::asm!(
-                "call {f}",
-                f = in(reg) ENABLE_COLLISION,
-                inout("eax") object => _,
-                inout("ecx") TOUCH_ENTRY => _,
-                clobber_abi("C"),
-            );
         }
     }
 
@@ -392,8 +373,8 @@ mod game {
         })
     }
 
-    /// The animal's own main, then: while it roams and the player holds nothing, Chao can
-    /// notice it (the game only lets them while the player carries an animal).
+    /// The animal's own main (silenced). Chao only notice it while the player carries it, as
+    /// the game has it for its own animals: a Chao takes it when it's handed to them.
     extern "C" fn partner_main(object: usize) {
         let main = lock()
             .spawned
@@ -408,18 +389,6 @@ mod game {
         };
         // SAFETY: the animal's own main with its object, on the game thread.
         quietly(|| unsafe { std::mem::transmute::<usize, extern "C" fn(usize)>(main)(object) });
-        // SAFETY: as above; the main may have deleted it (MainSub changed, mode 3).
-        unsafe {
-            if ((object + OBJ_MAIN) as *const usize).read()
-                != partner_main as extern "C" fn(usize) as usize
-            {
-                return;
-            }
-            let d = data1(object);
-            if d != 0 && (d as *const u8).read() == MODE_ROAM && crate::garden::player_held() == 0 {
-                enable_touch(object);
-            }
-        }
     }
 
     /// Draws the partner's picture where the animal is.

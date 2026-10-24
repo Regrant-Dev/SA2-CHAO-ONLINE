@@ -2902,19 +2902,58 @@ unsafe extern "C" fn hat_clear_eax_thunk() {
     )
 }
 
-/// The AI tick with `THINKING` set to its Chao (EAX).
+/// The AI tick with `THINKING` set to its Chao (EAX), after `sane_place` checks it.
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
 unsafe extern "C" fn ai_tick_thunk() {
     std::arch::naked_asm!(
+        "push ecx",
+        "push edx",
+        "push eax",
+        "push eax",
+        "call {sane}",
+        "add esp, 4",
+        "pop eax",
+        "pop edx",
+        "pop ecx",
         "mov dword ptr [{thinking}], eax",
         "mov edx, {tick}",
         "call edx",
         "mov dword ptr [{thinking}], 0",
         "ret",
+        sane = sym sane_place,
         thinking = sym THINKING,
         tick = const AI_TICK,
     )
+}
+
+/// Before a Chao thinks: a place that isn't a real number (NaN or infinite) would make its
+/// behaviours read the garden grid far out of range (the flee target 0x59F490 looks up the
+/// cell under it) and crash the game, so it's put back on its feet next to the player.
+#[cfg(target_arch = "x86")]
+extern "C" fn sane_place(chao: usize) {
+    let _ = std::panic::catch_unwind(|| {
+        // SAFETY: the Chao the AI tick is about to run (its object and Data1), game thread.
+        unsafe {
+            let d = data1(chao);
+            if d == 0 {
+                return;
+            }
+            let p = (d + D_POSITION) as *mut [f32; 3];
+            let at = p.read_unaligned();
+            if at.iter().all(|v| v.is_finite()) {
+                return;
+            }
+            let safe = crate::game::player_position()
+                .map_or([0.0, 0.0, 0.0], |(v, _)| [v.x + 3.0, v.y + 1.0, v.z]);
+            p.write_unaligned(safe);
+            let d2 = ((chao + OBJ_DATA2) as *const usize).read();
+            if d2 != 0 {
+                (d2 as *mut [f32; 3]).write_unaligned([0.0; 3]);
+            }
+            log!("garden: a Chao's place wasn't a number ({at:?}); put it next to the player");
+        }
+    });
 }
 
 /// A sound played while a Chao thinks (game thread, from the thunks): noted for `sounds_frame`.
@@ -3589,11 +3628,16 @@ pub fn in_hands(holder: Vector, angle: i32, offset: [f32; 3]) -> Vector {
     }
 }
 
-/// Writes the place, and the held bit (draw offset; can't be picked up while held).
+/// Writes the place, and the held bit (draw offset; can't be picked up while held). A place
+/// that isn't a real number (from a broken report) is never written: the game's grid lookups
+/// would read far outside the garden with it.
 ///
 /// # Safety
 /// `d` is the Chao's Data1.
 unsafe fn put(d: usize, (at, rotation_y, held): (Vector, i32, bool)) {
+    if ![at.x, at.y, at.z].iter().all(|v| v.is_finite()) {
+        return;
+    }
     unsafe {
         ((d + D_POSITION) as *mut Vector).write_unaligned(at);
         ((d + D_ROTATION_Y) as *mut i32).write(rotation_y);
