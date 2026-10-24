@@ -4,8 +4,10 @@
 //! GBA save's creatures, the ones the mod keeps and, without a save, the one-time gift (the
 //! rows of `Page`). The machine's screen shows the picture of the one highlighted, and the one
 //! picked hops out of the machine's hatch into the garden (`super::bring_out`). Its first row,
-//! "Moves", lists the player's Chao by name and then one's moves, to choose the four it battles
-//! with (`Page::chao_list`, `Page::chao_moves`). A shared garden has it while it shows its
+//! "Moves, type & ability", lists the player's Chao by name, then what one battles with: its
+//! moves (four), types (one or two) and ability (or none), each a page to choose from
+//! (`Page::chao_list`, `Page::chao_choices`). Every page takes the keyboard search and jumps of
+//! `crate::search`. A shared garden has it while it shows its
 //! shared visitors (`super::shared`): each player uses it for themselves, and the one picked
 //! comes out as a shared visitor once the server takes it.
 //!
@@ -24,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::machine_model::Machine;
 use super::{Action, Page};
 use crate::chao_sim::land::{Tri, probe};
+use crate::search::{self, Edit, Search, Typed};
 
 /// config.ini `LinkMachine`.
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -277,6 +280,9 @@ pub enum Key {
     Down,
     PageUp,
     PageDown,
+    /// Left and Right: `search::JUMP` rows up or down.
+    JumpUp,
+    JumpDown,
     Pick,
     Back,
 }
@@ -286,15 +292,19 @@ pub enum Key {
 pub enum Outcome {
     Stay,
     Moved,
+    /// The search changed (the cursor may have moved with it).
+    Searched,
     Close,
     Chose(Action),
 }
 
-/// The pick list: `Page`'s rows, the cursor only on rows with something to pick.
+/// The pick list: `Page`'s rows that match the search, the cursor only on rows with something
+/// to pick.
 pub struct List {
     pub page: Page,
     /// The last refusal, shown under the rows.
     pub message: Option<String>,
+    pub search: Search,
 }
 
 fn pickable(a: &Action) -> bool {
@@ -308,58 +318,73 @@ impl List {
         Self {
             page,
             message: None,
+            search: Search::default(),
         }
     }
 
-    /// The next pickable row from the cursor, `step` rows at a time (wrapping).
-    fn next(&self, forward: bool) -> usize {
-        let n = self.page.rows.len();
-        if n == 0 {
-            return 0;
-        }
-        let mut r = self.page.row;
-        for _ in 0..n {
-            r = if forward {
-                (r + 1) % n
-            } else {
-                (r + n - 1) % n
-            };
-            if pickable(&self.page.rows[r].1) {
-                return r;
+    /// The rows that show (the search's).
+    pub fn shown(&self) -> Vec<usize> {
+        self.search
+            .shown((0..self.page.rows.len()).map(|i| self.page.name(i)))
+    }
+
+    /// The rows that show and can be picked.
+    fn candidates(&self) -> Vec<usize> {
+        self.shown()
+            .into_iter()
+            .filter(|&i| pickable(&self.page.rows[i].1))
+            .collect()
+    }
+
+    /// The cursor's row shows and can be picked.
+    fn on_candidate(&self) -> bool {
+        self.candidates().contains(&self.page.row)
+    }
+
+    /// `by` shown rows up or down from the cursor (stopping at the ends), then the pickable row
+    /// nearest there, on the earlier side first.
+    fn toward(&self, by: usize, forward: bool) -> usize {
+        let shown = self.shown();
+        let Some(last) = shown.len().checked_sub(1) else {
+            return self.page.row;
+        };
+        let at = shown
+            .iter()
+            .position(|&i| i == self.page.row)
+            .unwrap_or_else(|| shown.partition_point(|&i| i < self.page.row).min(last));
+        let target = if forward {
+            (at + by).min(last)
+        } else {
+            at.saturating_sub(by)
+        };
+        let mut best = self.page.row;
+        let mut gap = usize::MAX;
+        for (place, &i) in shown.iter().enumerate() {
+            if pickable(&self.page.rows[i].1) && place.abs_diff(target) < gap {
+                gap = place.abs_diff(target);
+                best = i;
             }
         }
-        self.page.row
+        best
     }
 
     /// Handles one press; `visible` rows fit on screen.
     pub fn press(&mut self, key: Key, visible: usize) -> Outcome {
-        let n = self.page.rows.len();
         let before = self.page.row;
         match key {
-            Key::Up => self.page.row = self.next(false),
-            Key::Down => self.page.row = self.next(true),
-            Key::PageUp | Key::PageDown if n > 0 => {
-                let target = if key == Key::PageUp {
-                    self.page.row.saturating_sub(visible.max(1))
-                } else {
-                    (self.page.row + visible.max(1)).min(n - 1)
-                };
-                // The pickable row nearest the target, on its side first.
-                let mut best = self.page.row;
-                let mut gap = usize::MAX;
-                for (i, (_, a)) in self.page.rows.iter().enumerate() {
-                    if pickable(a) && i.abs_diff(target) < gap {
-                        gap = i.abs_diff(target);
-                        best = i;
-                    }
-                }
-                self.page.row = best;
+            Key::Up | Key::Down => {
+                self.page.row = search::step(self.page.row, &self.candidates(), key == Key::Down);
             }
-            Key::PageUp | Key::PageDown => {}
+            Key::PageUp | Key::PageDown => {
+                self.page.row = self.toward(visible.max(1), key == Key::PageDown);
+            }
+            Key::JumpUp | Key::JumpDown => {
+                self.page.row = self.toward(search::JUMP, key == Key::JumpDown);
+            }
             Key::Back => return Outcome::Close,
             Key::Pick => {
                 return match self.page.rows.get(self.page.row) {
-                    Some((_, a)) if pickable(a) => Outcome::Chose(a.clone()),
+                    Some((_, a)) if pickable(a) && self.on_candidate() => Outcome::Chose(a.clone()),
                     _ => Outcome::Stay,
                 };
             }
@@ -373,19 +398,42 @@ impl List {
         }
     }
 
-    /// Scrolls so the cursor's row shows among `visible` rows.
+    /// This frame's typing (`search::Search::edit`; a fresh Backspace with nothing to delete,
+    /// like Esc with nothing to clear, closes the page). The cursor stays on a row that shows.
+    pub fn typed(&mut self, typed: &Typed, visible: usize) -> Outcome {
+        match self.search.edit(typed, true) {
+            Edit::None => Outcome::Stay,
+            Edit::Back => Outcome::Close,
+            Edit::Changed => {
+                self.page.row = search::settle(self.page.row, &self.candidates());
+                self.page.scroll = 0;
+                self.message = None;
+                self.scroll_to(visible);
+                Outcome::Searched
+            }
+        }
+    }
+
+    /// Scrolls so the cursor's row shows among `visible` rows (`scroll` counts the rows that
+    /// show).
     pub fn scroll_to(&mut self, visible: usize) {
         let visible = visible.max(1);
+        let shown = self.shown();
+        let at = shown.iter().position(|&i| i == self.page.row).unwrap_or(0);
         let p = &mut self.page;
-        if p.row < p.scroll {
-            p.scroll = p.row;
-        } else if p.row >= p.scroll + visible {
-            p.scroll = p.row + 1 - visible;
+        p.scroll = p.scroll.min(shown.len().saturating_sub(1));
+        if at < p.scroll {
+            p.scroll = at;
+        } else if at >= p.scroll + visible {
+            p.scroll = at + 1 - visible;
         }
     }
 
     /// The species of the highlighted row, for the machine's screen.
     pub fn species(&self) -> Option<u16> {
+        if !self.on_candidate() {
+            return None;
+        }
         match self.page.rows.get(self.page.row)?.1 {
             Action::Bring(ref c) => Some(c.species),
             Action::Gift(s) => Some(s),
@@ -407,7 +455,7 @@ mod game {
 
     use super::super::billboard::{self, Textures};
     use super::super::machine_model::Machine;
-    use super::super::{Action, Page};
+    use super::super::{Action, Page, nav_hints};
     use super::{
         Key, List, Outcome, REACH_UP, box_mesh, enabled, machine_box, model, picture, spot, world,
     };
@@ -415,6 +463,7 @@ mod game {
     use crate::hud;
     use crate::input::Hotkey;
     use crate::log;
+    use crate::search::{self, Keyboard, Owner, Typed};
 
     const OBJ_MAIN: usize = 0x10;
     const OBJ_DISPLAY: usize = 0x14;
@@ -439,11 +488,13 @@ mod game {
     const ACTION_PRESSED: usize = 0x01DE_FB00;
     const PAD_PRESSED: usize = 0x01DE_FC10;
     const ACTION_BUTTONS: u32 = 0x402;
-    /// Menu buttons (`MenuButtons_Pressed`): B back, A pick, up, down.
+    /// Menu buttons (`MenuButtons_Pressed`): B back, A pick, up, down, left, right.
     const BACK: u32 = 0x02;
     const PICK: u32 = 0x04;
     const UP: u32 = 0x10;
     const DOWN: u32 = 0x20;
+    const LEFT: u32 = 0x40;
+    const RIGHT: u32 = 0x80;
     /// The pause screen's GameState.
     const PAUSED: i16 = 17;
     /// Registry categories the player can pick up: Chao, eggs, animals and drives, fruit,
@@ -461,16 +512,11 @@ mod game {
         pub const CONFIRM: u32 = 0x100E;
     }
 
-    const VK_BACK: i32 = 0x08;
-    const VK_RETURN: i32 = 0x0D;
-    const VK_ESCAPE: i32 = 0x1B;
-    const VK_PRIOR: i32 = 0x21;
-    const VK_NEXT: i32 = 0x22;
+    const VK_LEFT: i32 = 0x25;
     const VK_UP: i32 = 0x26;
+    const VK_RIGHT: i32 = 0x27;
     const VK_DOWN: i32 = 0x28;
-    const KEYS: [i32; 7] = [
-        VK_BACK, VK_RETURN, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_UP, VK_DOWN,
-    ];
+    const KEYS: [i32; 4] = [VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN];
 
     const COLOR_TITLE: i32 = 0xFFFF_E080u32 as i32;
     const COLOR_TEXT: i32 = 0xFFE0_E0E0u32 as i32;
@@ -515,7 +561,8 @@ mod game {
         /// Textures that failed in this scene (not tried again).
         textures_failed: Option<Scene>,
         list: Option<List>,
-        /// The rows picked to open the pages over the first one ("Moves", then a Chao).
+        /// The rows picked to open the pages over the first one ("Moves, type & ability", a
+        /// Chao, then one of its lists).
         trail: Vec<Action>,
         /// Frames since the list opened or the game was last paused (the opening and resuming
         /// presses aren't picks).
@@ -525,6 +572,8 @@ mod game {
         /// The picture on the screen while the list is closed.
         shown: Option<u16>,
         keys: Vec<Hotkey>,
+        /// Typing, Enter, Esc and PgUp/PgDn (read every frame).
+        keyboard: Option<Keyboard>,
     }
 
     // SAFETY: the raw addresses are only used on the game thread.
@@ -542,6 +591,7 @@ mod game {
         paused: false,
         shown: None,
         keys: Vec::new(),
+        keyboard: None,
     });
 
     type Scene = (i16, u32, i32);
@@ -984,38 +1034,48 @@ mod game {
             .is_some_and(Hotkey::repeating)
     }
 
-    /// This frame's presses on the list, from the menu buttons and the keyboard.
-    fn keys(s: &mut State) -> Vec<Key> {
-        let buttons = sa2::menu_buttons_pressed();
+    /// This frame's presses on the list, from the menu buttons and the keyboard, and its
+    /// typing. While a typing key is down the menu buttons don't count (the game's letter keys
+    /// press them too).
+    fn keys(s: &mut State) -> (Vec<Key>, Typed) {
+        let typed = s.keyboard.get_or_insert_with(Keyboard::default).read();
+        let buttons = if typed.held {
+            0
+        } else {
+            sa2::menu_buttons_pressed()
+        };
         fn held(s: &mut State, key: i32) -> bool {
             pressed(s, key) || repeating(s, key)
         }
         let mut out = Vec::new();
-        if buttons & UP != 0 || held(s, VK_UP) {
+        // Each key's state is read every frame, so a press isn't seen late.
+        let arrows = KEYS.map(|k| held(s, k));
+        let [left, up, right, down] = arrows;
+        if buttons & UP != 0 || up {
             out.push(Key::Up);
         }
-        if buttons & DOWN != 0 || held(s, VK_DOWN) {
+        if buttons & DOWN != 0 || down {
             out.push(Key::Down);
         }
-        if held(s, VK_PRIOR) {
+        if buttons & LEFT != 0 || left {
+            out.push(Key::JumpUp);
+        }
+        if buttons & RIGHT != 0 || right {
+            out.push(Key::JumpDown);
+        }
+        if typed.page_up {
             out.push(Key::PageUp);
         }
-        if held(s, VK_NEXT) {
+        if typed.page_down {
             out.push(Key::PageDown);
         }
-        // Each key's state is read every frame, so a press isn't seen late.
-        let (enter, escape, back) = (
-            pressed(s, VK_RETURN),
-            pressed(s, VK_ESCAPE),
-            pressed(s, VK_BACK),
-        );
-        if buttons & PICK != 0 || enter {
+        if buttons & PICK != 0 || typed.enter {
             out.push(Key::Pick);
         }
-        if buttons & BACK != 0 || escape || back {
+        if buttons & BACK != 0 {
             out.push(Key::Back);
         }
-        out
+        (out, typed)
     }
 
     fn close(s: &mut State) {
@@ -1026,6 +1086,7 @@ mod game {
         }
         OPEN.store(false, Ordering::Relaxed);
         REQUESTED.store(false, Ordering::Relaxed);
+        search::take_keyboard(Owner::LinkMachine, false);
     }
 
     /// Rows that fit on screen.
@@ -1097,22 +1158,24 @@ mod game {
     /// The page that `opened` (the last of the trail) opens; the first page without one.
     fn page(opened: Option<&Action>) -> Page {
         match opened {
-            Some(Action::Moves) => Page::chao_list(),
+            Some(Action::ChaoList) => Page::chao_list(),
+            Some(&Action::Chao(identity)) => Page::chao_choices(identity),
             Some(&Action::ChaoMoves(identity)) => Page::chao_moves(identity),
+            Some(&Action::ChaoTypes(identity)) => Page::chao_types(identity),
+            Some(&Action::ChaoAbilities(identity)) => Page::chao_abilities(identity),
             _ => {
                 let mut page = Page::open();
-                page.rows.insert(
-                    0,
-                    (
-                        "Moves: choose the four moves each Chao battles with".into(),
-                        Action::Moves,
-                    ),
+                page.push_front(
+                    "Moves, type & ability: choose what each Chao battles with".into(),
+                    Action::ChaoList,
                 );
-                page.hints = vec![
+                page.hints = [
                     "A / Enter: it comes out of the machine as a partner".into(),
                     "for your Chao (each once a day per garden, 4 at a time).".into(),
-                    "Up/Down (PgUp/PgDn) pick. B / Esc / Backspace close.".into(),
-                ];
+                ]
+                .into_iter()
+                .chain(nav_hints("close"))
+                .collect();
                 page
             }
         }
@@ -1140,10 +1203,12 @@ mod game {
         s.age = 0;
         OPEN.store(true, Ordering::Relaxed);
         sa2::set_controls(false);
+        search::take_keyboard(Owner::LinkMachine, true);
         // The keys already down don't count.
         for key in KEYS {
             let _ = pressed(s, key);
         }
+        let _ = s.keyboard.get_or_insert_with(Keyboard::default).read();
         play(sound::CONFIRM);
     }
 
@@ -1154,7 +1219,8 @@ mod game {
         }
         // Keep the controls off (something else ending mustn't turn them on mid-pick).
         sa2::set_controls(false);
-        let keys = keys(s);
+        search::take_keyboard(Owner::LinkMachine, true);
+        let (keys, typed) = keys(s);
         if sa2::game_state() == PAUSED {
             // Hidden under the pause menu; the press that leaves it isn't a pick.
             s.paused = true;
@@ -1166,35 +1232,20 @@ mod game {
         s.age += 1;
         let visible = visible();
         if s.age > 2 {
+            let typing = s
+                .list
+                .as_mut()
+                .map_or(Outcome::Stay, |l| l.typed(&typed, visible));
+            if !outcome(s, garden, typing) {
+                return;
+            }
             for key in keys {
                 let Some(list) = s.list.as_mut() else {
                     return;
                 };
-                match list.press(key, visible) {
-                    Outcome::Stay => {}
-                    Outcome::Moved => play(sound::CURSOR),
-                    Outcome::Close => {
-                        if !up(s) {
-                            return;
-                        }
-                    }
-                    Outcome::Chose(Action::Back) => {
-                        if !up(s) {
-                            return;
-                        }
-                    }
-                    Outcome::Chose(action @ (Action::Moves | Action::ChaoMoves(_))) => {
-                        s.list = Some(List::new(page(Some(&action))));
-                        s.trail.push(action);
-                        play(sound::CONFIRM);
-                    }
-                    Outcome::Chose(Action::Toggle { identity, id }) => toggle(s, identity, id),
-                    Outcome::Chose(action) => {
-                        if chose(s, garden, action) {
-                            close(s);
-                            return;
-                        }
-                    }
+                let done = list.press(key, visible);
+                if !outcome(s, garden, done) {
+                    return;
                 }
             }
         }
@@ -1204,22 +1255,57 @@ mod game {
         }
     }
 
-    /// Switches a Chao's move on or off for battles (kept at once); the page stays as it was
-    /// with the change, or says why it can't.
-    fn toggle(s: &mut State, identity: u64, id: u16) {
-        let result = super::super::toggle_move(identity, id);
+    /// What a press did on the list. Whether the list is still open.
+    fn outcome(s: &mut State, garden: u8, done: Outcome) -> bool {
+        use super::super::{choose_ability, toggle_move, toggle_type};
+        match done {
+            Outcome::Stay | Outcome::Searched => {}
+            Outcome::Moved => play(sound::CURSOR),
+            Outcome::Close | Outcome::Chose(Action::Back) => return up(s),
+            Outcome::Chose(action) if action.opens_page() => {
+                s.list = Some(List::new(page(Some(&action))));
+                s.trail.push(action);
+                play(sound::CONFIRM);
+            }
+            Outcome::Chose(Action::Toggle { identity, id }) => {
+                changed(s, toggle_move(identity, id).map_err(|e| e.message()));
+            }
+            Outcome::Chose(Action::ToggleType { identity, id }) => {
+                changed(s, toggle_type(identity, id).map_err(|e| e.message()));
+            }
+            Outcome::Chose(Action::Ability { identity, id }) => {
+                let result = choose_ability(identity, id).map(|()| true);
+                changed(s, result.map_err(|e| e.message()));
+            }
+            Outcome::Chose(action) => {
+                if chose(s, garden, action) {
+                    close(s);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// After a Chao's move, type or ability was switched (kept at once): the page shows the
+    /// change with its cursor, scroll and search as they were, or says why it can't (`result`:
+    /// whether it's on now, or why not).
+    fn changed(s: &mut State, result: Result<bool, &'static str>) {
+        let fresh = page(s.trail.last());
         let Some(list) = s.list.as_mut() else {
             return;
         };
         match result {
             Ok(on) => {
                 let (row, scroll) = (list.page.row, list.page.scroll);
-                *list = List::new(page(s.trail.last()));
+                let search = std::mem::take(&mut list.search);
+                *list = List::new(fresh);
+                list.search = search;
                 list.page.row = row.min(list.page.rows.len().saturating_sub(1));
                 list.page.scroll = scroll;
                 play(if on { sound::CONFIRM } else { sound::CURSOR });
             }
-            Err(why) => list.message = Some(why.message().to_string()),
+            Err(why) => list.message = Some(why.to_string()),
         }
     }
 
@@ -1264,24 +1350,34 @@ mod game {
     fn draw(list: &List, visible: usize) {
         let size = hud::menu_font();
         let page = &list.page;
+        let shown = list.shown();
         let mut lines: Vec<(String, i32)> = vec![(format!("== {} ==", page.title), COLOR_TITLE)];
-        for (i, (text, _)) in page.rows.iter().enumerate().skip(page.scroll).take(visible) {
+        if !list.search.is_empty() {
+            lines.push((format!("Search: {}_", list.search.text()), COLOR_TITLE));
+        }
+        for &i in shown.iter().skip(page.scroll).take(visible) {
             let selected = i == page.row;
             lines.push((
-                format!("{} {text}", if selected { ">" } else { " " }),
+                format!("{} {}", if selected { ">" } else { " " }, page.rows[i].0),
                 if selected { COLOR_SELECTED } else { COLOR_TEXT },
             ));
         }
-        if page.rows.len() > visible {
+        if shown.is_empty() {
+            lines.push(("  No matches".into(), COLOR_HINT));
+        }
+        if shown.len() > visible {
             lines.push((
                 format!(
                     "Showing {}-{} of {}",
                     page.scroll + 1,
-                    (page.scroll + visible).min(page.rows.len()),
-                    page.rows.len()
+                    (page.scroll + visible).min(shown.len()),
+                    shown.len()
                 ),
                 COLOR_HINT,
             ));
+        }
+        if let Some(note) = page.note(page.row).filter(|_| shown.contains(&page.row)) {
+            lines.push((note.to_string(), COLOR_TEXT));
         }
         if let Some(m) = &list.message {
             lines.push((m.clone(), COLOR_MESSAGE));
@@ -1321,6 +1417,8 @@ mod tests {
         List::new(Page {
             title: String::new(),
             hints: Vec::new(),
+            names: (0..rows.len()).map(|i| Some(format!("Row {i}"))).collect(),
+            notes: Vec::new(),
             rows: rows
                 .into_iter()
                 .enumerate()
@@ -1329,6 +1427,95 @@ mod tests {
             row: 3,
             scroll: 2,
         })
+    }
+
+    fn typed(text: &str) -> Typed {
+        Typed {
+            text: text.into(),
+            ..Typed::default()
+        }
+    }
+
+    #[test]
+    fn left_and_right_jump_ten_rows() {
+        let mut rows: Vec<Action> = (0..25).map(|i| bring(i + 1)).collect();
+        rows[10] = Action::None;
+        let mut l = list(rows);
+        assert_eq!(l.press(Key::JumpDown, 5), Outcome::Moved);
+        // Row 10 can't be picked: the nearest one, the earlier first.
+        assert_eq!(l.page.row, 9);
+        l.press(Key::JumpDown, 5);
+        assert_eq!(l.page.row, 19);
+        assert_eq!(l.page.scroll, 15);
+        l.press(Key::JumpDown, 5);
+        assert_eq!(l.page.row, 24);
+        assert_eq!(l.press(Key::JumpDown, 5), Outcome::Stay);
+        l.press(Key::JumpUp, 5);
+        assert_eq!(l.page.row, 14);
+        l.press(Key::JumpUp, 5);
+        l.press(Key::JumpUp, 5);
+        assert_eq!(l.page.row, 0);
+        // PgUp/PgDn still move a page.
+        l.press(Key::PageDown, 5);
+        assert_eq!(l.page.row, 5);
+    }
+
+    #[test]
+    fn typing_searches_the_rows_by_name() {
+        let mut rows: Vec<Action> = (0..30).map(|i| bring(i + 1)).collect();
+        rows[0] = Action::ChaoList;
+        let mut l = list(rows);
+        l.page.names[0] = None;
+        l.press(Key::Down, 5);
+        assert_eq!(l.page.row, 1);
+        // "Row 2", "Row 12" and "Row 20".."Row 29" match "2"; the row without a name stays.
+        assert_eq!(l.typed(&typed("2"), 5), Outcome::Searched);
+        assert_eq!(
+            l.shown(),
+            [0, 2, 12, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+        );
+        // The cursor went to a row that shows (the nearest, the earlier first).
+        assert_eq!(l.page.row, 0);
+        l.press(Key::Down, 5);
+        assert_eq!((l.page.row, l.species()), (2, Some(3)));
+        l.press(Key::JumpDown, 5);
+        assert_eq!(l.page.row, 28);
+        assert_eq!(l.page.scroll, 7);
+        l.press(Key::Down, 5);
+        assert_eq!((l.page.row, l.page.scroll), (29, 8));
+        l.press(Key::Down, 5);
+        assert_eq!(l.page.row, 0);
+        l.typed(&typed("1"), 5);
+        assert_eq!(l.search.text(), "21");
+        assert_eq!(l.shown(), [0, 21]);
+        // Nothing matches: no row to pick, until Backspace.
+        l.typed(&typed("x"), 5);
+        assert_eq!(l.shown(), [0]);
+        l.page.names[0] = Some("Moves".into());
+        assert!(l.shown().is_empty());
+        assert_eq!(l.press(Key::Pick, 5), Outcome::Stay);
+        assert_eq!(l.press(Key::Down, 5), Outcome::Stay);
+        assert_eq!(l.species(), None);
+        let erase = Typed {
+            erase: true,
+            erase_fresh: true,
+            ..Typed::default()
+        };
+        assert_eq!(l.typed(&erase, 5), Outcome::Searched);
+        assert_eq!(l.shown(), [21]);
+        assert_eq!(l.page.row, 21);
+        assert_eq!(l.press(Key::Pick, 5), Outcome::Chose(bring(22)));
+        // Esc clears the search, then closes; a fresh Backspace with none closes too.
+        let escape = Typed {
+            escape: true,
+            ..Typed::default()
+        };
+        assert_eq!(l.typed(&escape, 5), Outcome::Searched);
+        assert_eq!(l.shown().len(), 30);
+        assert_eq!(l.page.row, 21);
+        assert_eq!(l.typed(&escape, 5), Outcome::Close);
+        assert_eq!(l.typed(&erase, 5), Outcome::Close);
+        assert_eq!(l.typed(&Typed::default(), 5), Outcome::Stay);
     }
 
     #[test]

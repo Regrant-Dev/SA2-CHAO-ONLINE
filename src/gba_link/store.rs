@@ -13,6 +13,13 @@
 //!   gift and TM moves), oldest first, each with 1 when only partners from a GBA save taught it,
 //!   and the four it battles with (0: an empty slot). A Chao with a `partner` line and no
 //!   `moves` line knows the partner line's active moves.
+//! - `types <chao identity> <active type> <active type> [<type> <only from saves>]...`: every
+//!   type the Chao got from partners, oldest first, each with 1 when only partners from a GBA
+//!   save gave it, and the one or two it battles as (the same twice for one, 255 twice for
+//!   none).
+//! - `abilities <chao identity> <active ability> [<ability> <only from saves>]...`: the same for
+//!   abilities, with the one it battles with (0: none). A Chao with a `partner` line and no
+//!   `types` or `abilities` line has its partner line's types and ability, active.
 //! - `level <chao identity> <level> <xp>`: its battle level (1..=100) and the XP it has toward
 //!   the next (`battle::levels`). A Chao without one is at level 5 with none.
 //! - `import <key> <garden> <day>`: a creature brought into a garden, by `save::Mon::key`, and
@@ -238,6 +245,215 @@ impl Moves {
     }
 }
 
+/// An active type slot with no type in it (`Traits::active_types`).
+pub const NO_TYPE: u8 = 0xFF;
+
+/// Every type and ability a Chao got from partners, and the ones it battles with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Traits {
+    /// Each type it got, oldest first, and whether only partners from a GBA save gave it.
+    pub types: Vec<(u8, bool)>,
+    /// Each ability it got (never 0), oldest first, the same way.
+    pub abilities: Vec<(u8, bool)>,
+    /// The types it battles as: the same twice for one, `NO_TYPE` twice for none.
+    pub active_types: [u8; 2],
+    /// The ability it battles with (0: none).
+    pub ability: u8,
+}
+
+impl Default for Traits {
+    fn default() -> Self {
+        Traits {
+            types: Vec::new(),
+            abilities: Vec::new(),
+            active_types: [NO_TYPE; 2],
+            ability: 0,
+        }
+    }
+}
+
+/// Why a type or ability can't be chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraitRefused {
+    /// The Chao never got it.
+    Unknown,
+    /// It's the only type it battles as.
+    LastType,
+    /// It battles as two types already.
+    TwoTypes,
+}
+
+impl TraitRefused {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unknown => "It never got that from a partner",
+            Self::LastType => "A Chao needs at least one type",
+            Self::TwoTypes => "2 types already: turn one off first",
+        }
+    }
+}
+
+/// Adds `id` to `list` (`from_save`: given by a partner from a GBA save); one it had keeps its
+/// mark only when given by one again. Whether it's new.
+fn add_marked<T: PartialEq + Copy>(list: &mut Vec<(T, bool)>, id: T, from_save: bool) -> bool {
+    match list.iter_mut().find(|(k, _)| *k == id) {
+        Some((_, marked)) => {
+            *marked &= from_save;
+            false
+        }
+        None => {
+            list.push((id, from_save));
+            true
+        }
+    }
+}
+
+impl Traits {
+    /// What a Chao known only by its partner record has: the partner's types and ability (its
+    /// mark), active. None for no partner (species 0).
+    pub fn from_partner(p: &Partner) -> Traits {
+        let mut t = Traits::default();
+        t.learn(p);
+        t
+    }
+
+    /// The types `types` (the same twice for one) and `ability` (0: none), active, as another
+    /// player's game sends them; never only from a save.
+    pub fn chosen(types: [u8; 2], ability: u8) -> Traits {
+        Traits::from_partner(&Partner {
+            species: 1,
+            types,
+            moves: [0; 4],
+            level: 0,
+            ability,
+            from_save: false,
+        })
+    }
+
+    /// Partner `p` gives its types and ability: new ones join the lists. The ones it battles
+    /// with only change when it had none yet (then they're the partner's).
+    pub fn learn(&mut self, p: &Partner) {
+        if p.species == 0 {
+            return;
+        }
+        let had_types = !self.types.is_empty();
+        for t in p.types {
+            if t != NO_TYPE {
+                add_marked(&mut self.types, t, p.from_save);
+            }
+        }
+        if !had_types && p.types[0] != NO_TYPE {
+            self.active_types = if p.types[1] == NO_TYPE {
+                [p.types[0]; 2]
+            } else {
+                p.types
+            };
+        }
+        if p.ability != 0 {
+            let had = !self.abilities.is_empty();
+            add_marked(&mut self.abilities, p.ability, p.from_save);
+            if !had {
+                self.ability = p.ability;
+            }
+        }
+    }
+
+    pub fn knows_type(&self, t: u8) -> bool {
+        t != NO_TYPE && self.types.iter().any(|&(k, _)| k == t)
+    }
+
+    pub fn knows_ability(&self, a: u8) -> bool {
+        a != 0 && self.abilities.iter().any(|&(k, _)| k == a)
+    }
+
+    /// Whether only partners from a GBA save gave type `t`.
+    pub fn type_only_from_saves(&self, t: u8) -> bool {
+        self.types.iter().any(|&(k, marked)| k == t && marked)
+    }
+
+    /// Whether only partners from a GBA save gave ability `a`.
+    pub fn ability_only_from_saves(&self, a: u8) -> bool {
+        self.abilities.iter().any(|&(k, marked)| k == a && marked)
+    }
+
+    pub fn is_type_active(&self, t: u8) -> bool {
+        t != NO_TYPE && self.active_types.contains(&t)
+    }
+
+    /// The types it battles as, one or two (none when it has none).
+    pub fn active_type_list(&self) -> Vec<u8> {
+        let [a, b] = self.active_types;
+        match (a != NO_TYPE, b != NO_TYPE && b != a) {
+            (true, true) => vec![a, b],
+            (true, false) => vec![a],
+            (false, true) => vec![b],
+            (false, false) => Vec::new(),
+        }
+    }
+
+    /// Switches type `t` on (as a second type) or off (one stays on). Whether it's on now.
+    pub fn toggle_type(&mut self, t: u8) -> Result<bool, TraitRefused> {
+        if !self.knows_type(t) {
+            return Err(TraitRefused::Unknown);
+        }
+        let active = self.active_type_list();
+        if active.contains(&t) {
+            return match active.iter().find(|&&a| a != t) {
+                Some(&other) => {
+                    self.active_types = [other; 2];
+                    Ok(false)
+                }
+                None => Err(TraitRefused::LastType),
+            };
+        }
+        self.active_types = match active[..] {
+            [] => [t; 2],
+            [a] => [a, t],
+            _ => return Err(TraitRefused::TwoTypes),
+        };
+        Ok(true)
+    }
+
+    /// Battles with ability `a` from now on (0: none).
+    pub fn choose_ability(&mut self, a: u8) -> Result<(), TraitRefused> {
+        if a != 0 && !self.knows_ability(a) {
+            return Err(TraitRefused::Unknown);
+        }
+        self.ability = a;
+        Ok(())
+    }
+
+    /// Without repeated or empty entries, and active ones it doesn't have.
+    fn tidy(mut self) -> Traits {
+        let mut seen = Vec::new();
+        self.types.retain(|&(t, _)| {
+            let keep = t != NO_TYPE && !seen.contains(&t);
+            seen.push(t);
+            keep
+        });
+        let mut seen = Vec::new();
+        self.abilities.retain(|&(a, _)| {
+            let keep = a != 0 && !seen.contains(&a);
+            seen.push(a);
+            keep
+        });
+        let known: Vec<u8> = self
+            .active_type_list()
+            .into_iter()
+            .filter(|&t| self.knows_type(t))
+            .collect();
+        self.active_types = match known[..] {
+            [] => [NO_TYPE; 2],
+            [a] => [a; 2],
+            [a, b, ..] => [a, b],
+        };
+        if !self.knows_ability(self.ability) {
+            self.ability = 0;
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Waiting {
     pub garden: u8,
@@ -251,6 +467,9 @@ pub struct Store {
     pub partners: BTreeMap<u64, Learned>,
     /// Chao identity -> every move it learned (`moves_of` for the ones with a partner only).
     pub moves: BTreeMap<u64, Moves>,
+    /// Chao identity -> every type and ability it got (`traits_of` for the ones with a partner
+    /// only).
+    pub traits: BTreeMap<u64, Traits>,
     /// Chao identity -> its battle level (`level` for the ones without).
     pub levels: BTreeMap<u64, Level>,
     /// (key, garden, day).
@@ -260,6 +479,16 @@ pub struct Store {
     pub kept: Vec<(u64, u16, u8, [u16; 4])>,
     /// The species taken as the gift, once it's been taken.
     pub gift: Option<u16>,
+}
+
+/// What a file has of one Chao: its last partner, every move, type and ability it got (and the
+/// ones it battles with) and its battle level.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    pub partner: Option<Partner>,
+    pub moves: Moves,
+    pub traits: Traits,
+    pub level: Level,
 }
 
 /// Why an import isn't allowed.
@@ -307,6 +536,8 @@ impl Store {
     /// yet.
     pub fn parse_with_taught(text: &str, taught: &BTreeMap<u64, [u16; 4]>) -> Self {
         let mut s = Self::default();
+        // Chao identity -> (a `types` line was read, an `abilities` line was).
+        let mut parts: BTreeMap<u64, (bool, bool)> = BTreeMap::new();
         for line in text.lines() {
             let mut w = line.split_whitespace();
             let kind = w.next();
@@ -410,6 +641,39 @@ impl Store {
                         s.moves.insert(id, Moves { known, active }.tidy());
                     }
                 }
+                Some("types") if rest.len() >= 3 && (rest.len() - 3).is_multiple_of(2) => {
+                    let known: Option<Vec<(u8, bool)>> = rest[3..]
+                        .chunks(2)
+                        .map(|p| Some((p[0].parse().ok()?, flag(p[1])?)))
+                        .collect();
+                    if let (Ok(id), Ok(a), Ok(b), Some(known)) = (
+                        u64::from_str_radix(rest[0], 16),
+                        rest[1].parse::<u8>(),
+                        rest[2].parse::<u8>(),
+                        known,
+                    ) {
+                        let t = s.traits.entry(id).or_default();
+                        t.types = known;
+                        t.active_types = [a, b];
+                        parts.entry(id).or_default().0 = true;
+                    }
+                }
+                Some("abilities") if rest.len() >= 2 && rest.len().is_multiple_of(2) => {
+                    let known: Option<Vec<(u8, bool)>> = rest[2..]
+                        .chunks(2)
+                        .map(|p| Some((p[0].parse().ok()?, flag(p[1])?)))
+                        .collect();
+                    if let (Ok(id), Ok(active), Some(known)) = (
+                        u64::from_str_radix(rest[0], 16),
+                        rest[1].parse::<u8>(),
+                        known,
+                    ) {
+                        let t = s.traits.entry(id).or_default();
+                        t.abilities = known;
+                        t.ability = active;
+                        parts.entry(id).or_default().1 = true;
+                    }
+                }
                 Some("level") if rest.len() == 3 => {
                     if let (Ok(id), Ok(level), Ok(xp)) = (
                         u64::from_str_radix(rest[0], 16),
@@ -421,6 +685,25 @@ impl Store {
                 }
                 Some("gift") if rest.len() == 1 => s.gift = rest[0].parse().ok(),
                 _ => {}
+            }
+        }
+        // A Chao with only one of the two lines has the other from its partner line.
+        for (identity, (types, abilities)) in parts {
+            let seed = s
+                .partners
+                .get(&identity)
+                .map(|l| Traits::from_partner(&l.partner))
+                .unwrap_or_default();
+            if let Some(t) = s.traits.get_mut(&identity) {
+                if !types {
+                    t.types = seed.types;
+                    t.active_types = seed.active_types;
+                }
+                if !abilities {
+                    t.abilities = seed.abilities;
+                    t.ability = seed.ability;
+                }
+                *t = std::mem::take(t).tidy();
             }
         }
         for (&identity, tms) in taught {
@@ -490,6 +773,18 @@ impl Store {
             out += &format!("moves {id:016x} {} {} {} {}", a[0], a[1], a[2], a[3]);
             for &(move_id, marked) in &m.known {
                 out += &format!(" {move_id} {}", u8::from(marked));
+            }
+            out += "\n";
+        }
+        for (id, t) in &self.traits {
+            let [a, b] = t.active_types;
+            out += &format!("types {id:016x} {a} {b}");
+            for &(ty, marked) in &t.types {
+                out += &format!(" {ty} {}", u8::from(marked));
+            }
+            out += &format!("\nabilities {id:016x} {}", t.ability);
+            for &(ability, marked) in &t.abilities {
+                out += &format!(" {ability} {}", u8::from(marked));
             }
             out += "\n";
         }
@@ -586,9 +881,13 @@ impl Store {
     }
 
     /// A Chao (`identity`) absorbed `partner`, which never waited here (a wild visitor): as
-    /// `absorbed`. Its moves join the ones the Chao knows (`Moves::learn`). Returns what the
-    /// Chao has now and the moves new to it.
+    /// `absorbed`. Its moves join the ones the Chao knows (`Moves::learn`), and its types and
+    /// ability the ones it got (`Traits::learn`). Returns what the Chao has now and the moves
+    /// new to it.
     pub fn learn(&mut self, identity: u64, partner: Partner) -> (Learned, Vec<u16>) {
+        let mut t = self.traits_of(identity);
+        t.learn(&partner);
+        self.traits.insert(identity, t);
         let mut m = self.moves_of(identity);
         let new = m.learn(partner.moves, partner.from_save);
         let learned = Learned {
@@ -622,27 +921,52 @@ impl Store {
         self.moves.insert(identity, moves);
     }
 
+    /// Every type and ability the Chao with `identity` got, and the ones it battles with (from
+    /// its partner record when it has no lists yet; none for one without a partner).
+    pub fn traits_of(&self, identity: u64) -> Traits {
+        self.traits
+            .get(&identity)
+            .cloned()
+            .or_else(|| {
+                self.partners
+                    .get(&identity)
+                    .map(|l| Traits::from_partner(&l.partner))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Keeps `traits` as the Chao's (active ones it doesn't have left out).
+    pub fn set_traits(&mut self, identity: u64, traits: Traits) {
+        self.traits.insert(identity, traits.tidy());
+    }
+
     /// The Chao's battle level (a new Chao's when it has none).
     pub fn level(&self, identity: u64) -> Level {
         self.levels.get(&identity).copied().unwrap_or_default()
     }
 
-    /// What this file has of the Chao with `identity`: its partner, moves and level (`None` when
-    /// it has nothing of it).
-    pub fn record(&self, identity: u64) -> Option<(Option<Partner>, Moves, Level)> {
+    /// What this file has of the Chao with `identity` (`None` when it has nothing of it).
+    pub fn record(&self, identity: u64) -> Option<Record> {
         let partner = self.partners.get(&identity).map(|l| l.partner);
         let known = partner.is_some()
             || self.moves.contains_key(&identity)
+            || self.traits.contains_key(&identity)
             || self.levels.contains_key(&identity);
-        known.then(|| (partner, self.moves_of(identity), self.level(identity)))
+        known.then(|| Record {
+            partner,
+            moves: self.moves_of(identity),
+            traits: self.traits_of(identity),
+            level: self.level(identity),
+        })
     }
 
-    /// The Chao it has anything of (a partner, moves or a level).
+    /// The Chao it has anything of (a partner, moves, types and abilities or a level).
     pub fn identities(&self) -> Vec<u64> {
         let mut ids: Vec<u64> = self
             .partners
             .keys()
             .chain(self.moves.keys())
+            .chain(self.traits.keys())
             .chain(self.levels.keys())
             .copied()
             .collect();
@@ -962,6 +1286,127 @@ mod tests {
         s.set_moves(5, m);
         assert_eq!(s.partners[&5].moves, [0, 2, 3, 0]);
         assert_eq!(s.partners[&5].save_moves, 0b0010);
+    }
+
+    #[test]
+    fn a_chao_keeps_every_type_and_ability_and_its_choice() {
+        let mut s = Store::default();
+        let saved = Partner {
+            types: [3, 3],
+            ability: 9,
+            from_save: true,
+            ..p(1)
+        };
+        s.learn(77, saved);
+        let t = s.traits_of(77);
+        assert_eq!(t.types, [(3, true)]);
+        assert_eq!(t.abilities, [(9, true)]);
+        // The first partner's are the active ones.
+        assert_eq!((t.active_types, t.ability), ([3, 3], 9));
+        // A later one adds to the lists without changing the choice; a type it had loses its
+        // save mark when a wild one gives it again.
+        let wild = Partner {
+            types: [3, 7],
+            ability: 12,
+            ..p(2)
+        };
+        s.learn(77, wild);
+        let mut t = s.traits_of(77);
+        assert_eq!(t.types, [(3, false), (7, false)]);
+        assert_eq!(t.abilities, [(9, true), (12, false)]);
+        assert_eq!((t.active_types, t.ability), ([3, 3], 9));
+        assert_eq!(s.partners[&77].partner.types, [3, 7]);
+        // Choosing: a second type, then a third is refused; the last can't go off.
+        assert_eq!(t.toggle_type(7), Ok(true));
+        assert_eq!(t.active_types, [3, 7]);
+        assert_eq!(t.active_type_list(), [3, 7]);
+        assert_eq!(t.toggle_type(5), Err(TraitRefused::Unknown));
+        assert_eq!(t.toggle_type(3), Ok(false));
+        assert_eq!(t.active_types, [7, 7]);
+        assert_eq!(t.toggle_type(7), Err(TraitRefused::LastType));
+        assert_eq!(t.choose_ability(12), Ok(()));
+        assert_eq!(t.choose_ability(13), Err(TraitRefused::Unknown));
+        assert_eq!(t.choose_ability(0), Ok(()));
+        assert_eq!(t.ability, 0);
+        s.set_traits(77, t.clone());
+        // No ability chosen stays none when another partner comes.
+        s.learn(
+            77,
+            Partner {
+                types: [1, 1],
+                ability: 20,
+                ..p(3)
+            },
+        );
+        let after = s.traits_of(77);
+        assert_eq!((after.active_types, after.ability), ([7, 7], 0));
+        assert!(after.knows_type(1) && after.knows_ability(20));
+        let mut three = Traits::default();
+        for (types, ability) in [([1, 1], 4), ([2, 2], 5), ([3, 3], 6)] {
+            three.learn(&Partner {
+                types,
+                ability,
+                ..p(4)
+            });
+        }
+        assert_eq!(three.toggle_type(2), Ok(true));
+        assert_eq!(three.toggle_type(3), Err(TraitRefused::TwoTypes));
+        // Kept and read back, with what doesn't fit left out.
+        s.set_traits(
+            88,
+            Traits {
+                types: vec![(4, false), (4, true), (6, true)],
+                abilities: vec![(0, false), (30, true)],
+                active_types: [6, 99],
+                ability: 31,
+            },
+        );
+        assert_eq!(s.traits[&88].types, [(4, false), (6, true)]);
+        assert_eq!(s.traits[&88].active_types, [6, 6]);
+        assert_eq!(s.traits[&88].ability, 0);
+        let text = s.to_text();
+        assert!(text.contains("types 0000000000000058 6 6 4 0 6 1\n"));
+        assert!(text.contains("abilities 0000000000000058 0 30 1\n"));
+        assert!(text.contains("types 000000000000004d 7 7 3 0 7 0 1 0\n"));
+        assert_eq!(Store::parse(&text), s);
+        assert!(s.record(88).is_some());
+        assert!(s.identities().contains(&88));
+    }
+
+    #[test]
+    fn older_files_have_the_partners_types_and_ability_active() {
+        let s = Store::parse(
+            "partner 00000000000000aa 25 13 10 84 0 45 0 12 9 84 45 0 0 1 0\n\
+             partner 00000000000000bb 25 13 13 84 0 45 0 12\n",
+        );
+        let t = s.traits_of(0xAA);
+        assert_eq!(t.types, [(13, true), (10, true)]);
+        assert_eq!(t.abilities, [(9, true)]);
+        assert_eq!((t.active_types, t.ability), ([13, 10], 9));
+        // No ability recorded: none here (the battle profile looks it up in the ROM).
+        let t = s.traits_of(0xBB);
+        assert_eq!(
+            (t.types.len(), t.active_types, t.abilities.len()),
+            (1, [13, 13], 0)
+        );
+        assert_eq!(s.traits_of(0xCC), Traits::default());
+        // Nothing is written for them until they change.
+        assert!(!s.to_text().contains("types"));
+        // A file with only one of the two lines takes the other from the partner line.
+        let s = Store::parse(
+            "partner 00000000000000aa 25 13 10 84 0 45 0 12 9 84 45 0 0 0 0\n\
+             types 00000000000000aa 10 10 13 0 10 0 2 0\n\
+             abilities 00000000000000dd 0\n\
+             types 1 2\nabilities 1 x 3 1\n",
+        );
+        let t = s.traits_of(0xAA);
+        assert_eq!(t.types.len(), 3);
+        assert_eq!(
+            (t.active_types, t.abilities.clone(), t.ability),
+            ([10, 10], vec![(9, false)], 9)
+        );
+        assert_eq!(s.traits_of(0xDD), Traits::default());
+        assert_eq!(s.traits.len(), 2);
     }
 
     #[test]

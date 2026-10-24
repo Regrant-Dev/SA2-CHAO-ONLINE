@@ -31,9 +31,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chao::{self, ChaoData};
 use crate::gba::rom::Rom;
 use crate::gba_link::Profile;
-use crate::gba_link::store::Moves;
+use crate::gba_link::store::{Moves, Traits};
 use crate::hud;
 use crate::log;
+use crate::search::{self, Keyboard, Owner};
 
 use super::arena::{self, Karate};
 use super::effects_gfx::{self, Book};
@@ -113,6 +114,8 @@ struct Game {
     bars: Bars,
     /// Frames the session ran (for `NETWORK_EVERY`).
     frames: u32,
+    /// The menus' keyboard: typing, Enter, Esc and PgUp/PgDn (read every frame).
+    keyboard: Option<Keyboard>,
 }
 
 type Bars = [[f32; session::TEAM_SIZE]; 2];
@@ -134,6 +137,7 @@ static GAME: Mutex<Game> = Mutex::new(Game {
     turn: 0,
     bars: [[f32::NAN; session::TEAM_SIZE]; 2],
     frames: 0,
+    keyboard: None,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, Game> {
@@ -146,6 +150,9 @@ pub fn on_frame() {
     wild::on_frame();
     let mut g = lock();
     online::set_busy(g.session.as_ref().is_some_and(Session::busy));
+    if g.session.is_none() {
+        search::take_keyboard(Owner::Battle, false);
+    }
     let Some(k) = arena::karate() else {
         if g.main != 0 {
             forget(&mut g);
@@ -295,12 +302,25 @@ extern "C" fn main_exec(object: usize) {
 }
 
 /// Our buttons this frame: none while the game window isn't focused, chat is being typed or
-/// the F9 menu is open.
-fn pressed() -> u32 {
+/// the F9 menu is open. A menu list showing also takes the keyboard (`Session::keyboard`): its
+/// typing searches it, and the menu buttons don't count while a typing key is down (the game's
+/// letter keys press them too).
+fn pressed(g: &mut Game) -> u32 {
+    let typed = g.keyboard.get_or_insert_with(Keyboard::default).read();
+    let typing = g.session.as_ref().is_some_and(Session::typing) && g.arena == Arena::Menu;
+    search::take_keyboard(Owner::Battle, typing);
     if !crate::input::game_focused() || crate::chat::typing() || crate::menu::is_open() {
         return 0;
     }
-    arena::buttons()
+    let buttons = if typing && typed.held {
+        0
+    } else {
+        arena::buttons()
+    };
+    match g.session.as_mut().filter(|_| g.arena == Arena::Menu) {
+        Some(s) => buttons | s.keyboard(&typed),
+        None => buttons,
+    }
 }
 
 fn before(object: usize) {
@@ -308,7 +328,7 @@ fn before(object: usize) {
         return;
     };
     let mut g = lock();
-    let pressed = pressed();
+    let pressed = pressed(&mut g);
     if std::mem::take(&mut g.release_next) {
         k.hold_mode_select(false);
     }
@@ -556,22 +576,32 @@ fn open_with(g: &mut Game, wild: Option<WildFoe>) {
     g.bars = [[f32::NAN; session::TEAM_SIZE]; 2];
 }
 
-/// A Chao's types, ability, moves (of `moves` when given) and battle level (Normal with no
-/// moves at a new Chao's level if the ROM can't be read); without `save_partners`, leaving out
-/// what partners from a GBA save gave.
-fn profile_of(chao: &ChaoData, moves: Option<&Moves>, save_partners: bool) -> Profile {
-    crate::gba_link::battle_profile(chao.identity(), moves, save_partners).unwrap_or_else(|e| {
-        log!("battle: no profile ({e})");
-        Profile {
-            types: [0, 0],
-            ability: 0,
-            moves: [0; 4],
-            partner: None,
-            level: crate::gba_link::battle_level(chao.identity(), moves.is_some())
+/// A Chao's types, ability, moves (of `moves` and `traits` when given) and battle level (Normal
+/// with no moves at a new Chao's level if the ROM can't be read); without `save_partners`,
+/// leaving out what partners from a GBA save gave.
+fn profile_of(
+    chao: &ChaoData,
+    moves: Option<&Moves>,
+    traits: Option<&Traits>,
+    save_partners: bool,
+) -> Profile {
+    crate::gba_link::battle_profile(chao.identity(), moves, traits, save_partners).unwrap_or_else(
+        |e| {
+            log!("battle: no profile ({e})");
+            Profile {
+                types: [0, 0],
+                ability: 0,
+                moves: [0; 4],
+                partner: None,
+                level: crate::gba_link::battle_level(
+                    chao.identity(),
+                    moves.is_some() || traits.is_some(),
+                )
                 .0
                 .level,
-        }
-    })
+            }
+        },
+    )
 }
 
 /// A hatched Chao that's fine to show (an egg or a damaged record isn't).
@@ -585,16 +615,18 @@ fn entry(chao: ChaoData) -> Entry {
         name: crate::karate::chao_name(&chao),
         chao,
         moves: None,
+        traits: None,
     }
 }
 
-/// Copies of the Chao in our save, with every move each one learned.
+/// Copies of the Chao in our save, with every move, type and ability each one got.
 fn own_chao() -> Vec<Entry> {
     (0..crate::game::GARDEN_SLOTS)
         .filter_map(crate::game::read_chao_slot)
         .filter(usable)
         .map(|chao| Entry {
             moves: Some(crate::gba_link::moves_of(chao.identity())),
+            traits: Some(crate::gba_link::traits_of(chao.identity())),
             ..entry(chao)
         })
         .collect()
@@ -743,6 +775,11 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
             Command::Moves(identity) => {
                 if let Some(moves) = g.session.as_ref().and_then(|s| s.own_moves(identity)) {
                     crate::gba_link::set_moves(identity, moves.clone());
+                }
+            }
+            Command::Traits(identity) => {
+                if let Some(traits) = g.session.as_ref().and_then(|s| s.own_traits(identity)) {
+                    crate::gba_link::set_traits(identity, traits.clone());
                 }
             }
         }
@@ -1109,6 +1146,9 @@ fn draw_menu(screen: &Screen) {
     if !screen.title.is_empty() {
         lines.push((screen.title.clone(), GOLD));
     }
+    if let Some(text) = screen.search.as_deref().filter(|t| !t.is_empty()) {
+        lines.push((format!("Search: {text}_"), GOLD));
+    }
     let first = match screen.cursor {
         Some(cursor) => first_visible(screen.items.len(), cursor),
         None => screen
@@ -1154,6 +1194,12 @@ fn draw_menu(screen: &Screen) {
     }
     if !screen.hint.is_empty() {
         lines.push((screen.hint.to_string(), DIM));
+    }
+    if screen.search.is_some() {
+        lines.push((
+            "Left/Right: jump 10  Type: search  Enter: A  Esc: B".into(),
+            DIM,
+        ));
     }
     if lines.is_empty() {
         return;

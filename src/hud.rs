@@ -285,6 +285,32 @@ pub fn center2(first: &str, second: &str) {
     }
 }
 
+/// Two small lines centred near the top (a garden's wild area as it loads): out of the way of
+/// the game, the second a little smaller.
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+pub fn top_title(first: &str, second: &str) {
+    let hud = HUD.lock().unwrap_or_else(|e| e.into_inner());
+    let (w, h) = screen_size();
+    let top = h * 0.06;
+    let mut y = top;
+    let mut lines = Vec::new();
+    for (line, small) in [(first, 60.0), (second, 80.0)] {
+        let fit = w * 0.6 / line.chars().count().max(1) as f32;
+        let size = (h / small).min(fit).round().max(8.0);
+        let width = size * line.chars().count() as f32;
+        lines.push(((w - width) / 2.0, y, size, line, width));
+        y += size * 1.4;
+    }
+    let left = lines.iter().map(|l| l.0).fold(f32::MAX, f32::min);
+    let right = lines.iter().map(|l| l.0 + l.4).fold(f32::MIN, f32::max);
+    let (last_y, last_size) = lines.last().map_or((top, 0.0), |l| (l.1, l.2));
+    let size = lines.last().map_or(8.0, |l| l.2);
+    backdrop(left, top, right, last_y + last_size, size);
+    for (x, y, size, line, _) in lines {
+        draw(&hud, x, y, size, TOAST_COLOR, line);
+    }
+}
+
 /// A line at the top right (race position).
 pub fn corner(line: &str) {
     let (w, h) = screen_size();

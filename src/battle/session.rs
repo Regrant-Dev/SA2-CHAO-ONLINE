@@ -6,20 +6,23 @@
 //!
 //! No game access here: `update` takes the buttons pressed this frame and returns `Command`s for
 //! the arena (game.rs), and `screen` says what the HUD shows. A live battle's messages come in
-//! through `network` and go out through `take_outgoing`.
+//! through `network` and go out through `take_outgoing`. The menus' lists take the keyboard
+//! (`keyboard`): typing searches the long ones by name, and Left/Right or PgUp/PgDn jump
+//! (`crate::search`).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use crate::chao::ChaoData;
 use crate::gba_link::Profile;
-use crate::gba_link::store::{MoveRefused, Moves};
+use crate::gba_link::store::{MoveRefused, Moves, TraitRefused, Traits};
 use crate::log;
 use crate::net::protocol::{
     ANSWER_ACCEPT, ANSWER_BUSY, ANSWER_DECLINE, BattleMember, BattlePick, Body, END_BUSY,
     END_DECLINED, END_DESYNC, END_DISCONNECT, END_FORFEIT, END_ROM_DIFFERS, END_TIMEOUT,
     END_WITHDRAWN, LEAVE_GAVE_UP, LEAVE_LEFT, LEAVE_OVER,
 };
+use crate::search::{self, Edit, Search, Typed};
 
 use super::ai;
 use super::data::{MoveData, Target, types};
@@ -44,6 +47,13 @@ pub mod buttons {
     pub const A: u32 = 0x04;
     pub const UP: u32 = 0x10;
     pub const DOWN: u32 = 0x20;
+    pub const LEFT: u32 = 0x40;
+    pub const RIGHT: u32 = 0x80;
+    /// Not the game's: the keyboard's PgUp and PgDn (`Session::keyboard`).
+    pub const PAGE_UP: u32 = 1 << 30;
+    pub const PAGE_DOWN: u32 = 1 << 31;
+    /// What moves a list's cursor.
+    pub const MOVES: u32 = UP | DOWN | LEFT | RIGHT | PAGE_UP | PAGE_DOWN;
 }
 
 /// Most Chao on a team.
@@ -64,12 +74,14 @@ const END_LOST: u8 = 0xFF;
 const WAIT_LIMIT: u32 = 150 * 60;
 
 /// A Chao to battle with: a copy of its record (the save is never touched), its name and, for
-/// the player's own, every move it learned (`None` for other players' Chao: their game's).
+/// the player's own, every move, type and ability it got (`None` for other players' Chao: their
+/// game's).
 #[derive(Clone)]
 pub struct Entry {
     pub name: String,
     pub chao: ChaoData,
     pub moves: Option<Moves>,
+    pub traits: Option<Traits>,
 }
 
 /// A ready-made opponent team: a friend's Chao, the imported ones.
@@ -173,6 +185,9 @@ pub enum Command {
     /// The moves of the player's Chao with this identity changed (`Session::own_moves`): a TM
     /// move taught or the four it battles with chosen.
     Moves(u64),
+    /// The types or ability the player's Chao with this identity battles with were chosen
+    /// (`Session::own_traits`).
+    Traits(u64),
 }
 
 /// One fighter's box on the HUD.
@@ -223,14 +238,19 @@ pub struct Screen {
     pub bars: Vec<(usize, u16)>,
     /// A list without a cursor: the first of its items shown (`VISIBLE_ITEMS` at once).
     pub scroll: usize,
+    /// A list typing searches: what's typed (empty for nothing yet). Its items are the ones
+    /// that match.
+    pub search: Option<String>,
 }
 
 /// Menu items shown at once (longer lists scroll).
 pub const VISIBLE_ITEMS: usize = 7;
 
-/// A Chao's profile: of the moves given (the player's own Chao's), else of the moves it's known
-/// by; the flag is a live battle's rule (`Body::BattleChallenge::save_partners`).
-pub type ProfileOf = Box<dyn Fn(&ChaoData, Option<&Moves>, bool) -> Profile + Send>;
+/// A Chao's profile: of the moves, types and ability given (the player's own Chao's), else of
+/// the ones it's known by; the flag is a live battle's rule
+/// (`Body::BattleChallenge::save_partners`).
+pub type ProfileOf =
+    Box<dyn Fn(&ChaoData, Option<&Moves>, Option<&Traits>, bool) -> Profile + Send>;
 
 pub struct Session {
     dex: Arc<Dex>,
@@ -272,6 +292,8 @@ pub struct Session {
     farewell: Option<String>,
     /// A battle with a wild visitor (`with_wild`): the menu is only its team screen and fight.
     wild: Option<Wild>,
+    /// What's typed to search the list showing (cleared when another list shows).
+    search: Search,
 }
 
 /// The wild visitor a session battles, and how it ended for it (once decided).
@@ -334,12 +356,32 @@ enum State {
     Done,
 }
 
-/// Choosing the four moves one of the player's Chao battles with, from every move it learned:
-/// which Chao (`chao` none), then its moves.
+/// Choosing what one of the player's Chao battles with: which Chao (`chao` none), then its
+/// moves, types or ability (`section` none), then that list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Choosing {
     chao: Option<usize>,
+    section: Option<Section>,
     cursor: usize,
+}
+
+/// A list of "Choose moves, type & ability".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    /// Four of every move it learned.
+    Moves,
+    /// One or two of the types its partners gave it.
+    Types,
+    /// One of the abilities its partners gave it, or none.
+    Ability,
+}
+
+impl Section {
+    const ALL: [Section; 3] = [Section::Moves, Section::Types, Section::Ability];
+
+    fn row(self) -> usize {
+        self as usize
+    }
 }
 
 /// Moves `cursor` up or down a list of `len` (wrapping); whether it moved.
@@ -458,7 +500,7 @@ impl Session {
     ) -> Session {
         let own_profiles = own
             .iter()
-            .map(|e| profile_of(&e.chao, e.moves.as_ref(), true))
+            .map(|e| profile_of(&e.chao, e.moves.as_ref(), e.traits.as_ref(), true))
             .collect();
         Session {
             dex_print: online::dex_print(&dex),
@@ -484,6 +526,7 @@ impl Session {
             levels: BTreeMap::new(),
             farewell: None,
             wild: None,
+            search: Search::default(),
         }
     }
 
@@ -927,6 +970,16 @@ impl Session {
             .as_ref()
     }
 
+    /// Every type and ability the player's Chao with `identity` got, to keep after
+    /// `Command::Traits`.
+    pub fn own_traits(&self, identity: u64) -> Option<&Traits> {
+        self.own
+            .iter()
+            .find(|e| e.chao.identity() == identity)?
+            .traits
+            .as_ref()
+    }
+
     /// Every move the player's Chao `own[chao]` learned, oldest first, and whether only
     /// partners from a GBA save taught it.
     fn known_moves(&self, chao: usize) -> Vec<(u16, bool)> {
@@ -936,9 +989,28 @@ impl Session {
             .map_or_else(Vec::new, |m| m.known.clone())
     }
 
-    /// A frame of "Choose moves" on the team screen: which Chao, then its moves, where A
-    /// switches one on or off. `None` once it's back to the team.
-    fn choose_moves(
+    /// Every type and ability the player's Chao `own[chao]` got (none for one without).
+    fn traits(&self, chao: usize) -> Traits {
+        self.own
+            .get(chao)
+            .and_then(|e| e.traits.clone())
+            .unwrap_or_default()
+    }
+
+    /// The rows of a "Choose moves, type & ability" list after its items, "Done" last: the
+    /// moves, types or abilities (with "None" first).
+    fn section_len(&self, chao: usize, section: Section) -> usize {
+        match section {
+            Section::Moves => self.known_moves(chao).len() + 1,
+            Section::Types => self.traits(chao).types.len() + 1,
+            Section::Ability => self.traits(chao).abilities.len() + 2,
+        }
+    }
+
+    /// A frame of "Choose moves, type & ability" on the team screen: which Chao, then its
+    /// moves, types or ability, then that list, where A switches a move or type on or off or
+    /// picks the ability. `None` once it's back to the team.
+    fn choose(
         &mut self,
         mut c: Choosing,
         pressed: u32,
@@ -956,42 +1028,111 @@ impl Session {
                 out.push(sound(Sound::Confirm));
                 return Some(Choosing {
                     chao: Some(c.cursor),
+                    section: None,
                     cursor: 0,
                 });
             }
             return Some(c);
         };
-        let known = self.known_moves(chao);
-        // Its moves, then "Done".
-        if step(&mut c.cursor, known.len() + 1, pressed) {
+        let Some(section) = c.section else {
+            // Moves, type, ability, then "Done".
+            if step(&mut c.cursor, Section::ALL.len() + 1, pressed) {
+                out.push(sound(Sound::Cursor));
+            }
+            let back = Choosing {
+                chao: None,
+                section: None,
+                cursor: chao,
+            };
+            if pressed & buttons::B != 0 {
+                out.push(sound(Sound::Back));
+                return Some(back);
+            }
+            if pressed & buttons::A != 0 {
+                out.push(sound(Sound::Confirm));
+                return Some(match Section::ALL.get(c.cursor) {
+                    Some(&section) => Choosing {
+                        section: Some(section),
+                        cursor: 0,
+                        ..c
+                    },
+                    None => back,
+                });
+            }
+            return Some(c);
+        };
+        if step(&mut c.cursor, self.section_len(chao, section), pressed) {
             out.push(sound(Sound::Cursor));
         }
         let back = Choosing {
-            chao: None,
-            cursor: chao,
+            chao: Some(chao),
+            section: None,
+            cursor: section.row(),
         };
         if pressed & buttons::B != 0 {
             out.push(sound(Sound::Back));
             return Some(back);
         }
-        if pressed & buttons::A != 0 {
-            let Some(&(id, _)) = known.get(c.cursor) else {
+        if pressed & buttons::A == 0 {
+            return Some(c);
+        }
+        let traits = self.traits(chao);
+        let done = match section {
+            Section::Moves => self.known_moves(chao).get(c.cursor).map(|&(id, _)| {
+                self.toggle_move(chao, id)
+                    .map_err(|why| format!("{}.", why.message()))
+            }),
+            Section::Types => traits.types.get(c.cursor).map(|&(t, _)| {
+                self.toggle_type(chao, t)
+                    .map_err(|why| format!("{}.", why.message()))
+            }),
+            Section::Ability => match c.cursor {
+                0 => Some(0),
+                i => traits.abilities.get(i - 1).map(|&(a, _)| a),
+            }
+            .map(|a| {
+                self.choose_ability(chao, a)
+                    .map(|()| true)
+                    .map_err(|why| format!("{}.", why.message()))
+            }),
+        };
+        match done {
+            // "Done".
+            None => {
                 out.push(sound(Sound::Confirm));
                 return Some(back);
-            };
-            match self.toggle_move(chao, id) {
-                Ok(on) => out.push(sound(if on { Sound::Confirm } else { Sound::Back })),
-                Err(why) => self.notice = Some(format!("{}.", why.message())),
             }
+            Some(Ok(on)) => out.push(sound(if on { Sound::Confirm } else { Sound::Back })),
+            Some(Err(why)) => self.notice = Some(why),
         }
         Some(c)
     }
 
-    /// The screen of "Choose moves" (`choose_moves`).
+    /// "Lv 12. Fire/Flying, Blaze. Battles with: ..." for the player's Chao `own[chao]`.
+    fn battles_with(&self, chao: usize) -> Option<String> {
+        let p = self.own_profiles.get(chao)?;
+        let names: Vec<String> = p
+            .moves
+            .iter()
+            .filter(|&&id| self.dex.move_data(id).is_some())
+            .map(|&id| self.dex.move_name(id))
+            .collect();
+        let ability = match p.ability {
+            0 => "no ability".to_string(),
+            a => self.dex.ability_name(a),
+        };
+        Some(format!(
+            "{}, {ability}. Battles with: {}.",
+            type_names(&self.dex, p.types),
+            names.join(", ")
+        ))
+    }
+
+    /// The screen of "Choose moves, type & ability" (`choose`).
     fn choosing_screen(&self, c: &Choosing) -> Screen {
         let Some(chao) = c.chao else {
             return Screen {
-                title: "Choose moves for which Chao?".into(),
+                title: "Moves, type & ability: which Chao?".into(),
                 items: self
                     .own
                     .iter()
@@ -1002,70 +1143,169 @@ impl Session {
                     })
                     .collect(),
                 cursor: Some(c.cursor),
-                detail: self.own_profiles.get(c.cursor).map(|p| {
-                    let names: Vec<String> = p
-                        .moves
-                        .iter()
-                        .filter(|&&id| self.dex.move_data(id).is_some())
-                        .map(|&id| self.dex.move_name(id))
-                        .collect();
-                    format!("Battles with: {}.", names.join(", "))
-                }),
+                detail: self.battles_with(c.cursor),
                 hint: "A: choose  B: back",
                 ..Screen::default()
             };
         };
-        let known = self.known_moves(chao);
-        let moves = self.own.get(chao).and_then(|e| e.moves.as_ref());
-        let mut items: Vec<String> = known
-            .iter()
-            .map(|&(id, marked)| {
-                let on = if moves.is_some_and(|m| m.is_active(id)) {
-                    "[x]"
+        let name = self.own.get(chao).map_or("", |e| e.name.as_str());
+        let traits = self.traits(chao);
+        let save_note = " Only partners from a GBA save gave it: live battles without GBA save \
+                         partners leave it out.";
+        let Some(section) = c.section else {
+            let m = self
+                .own
+                .get(chao)
+                .and_then(|e| e.moves.clone())
+                .unwrap_or_default();
+            let on = m.active.iter().filter(|&&id| id != 0).count();
+            let types: Vec<String> = traits
+                .active_type_list()
+                .into_iter()
+                .map(|t| self.dex.type_name(t))
+                .collect();
+            let items = vec![
+                format!("Moves: {on} of {} on", m.known.len()),
+                if types.is_empty() {
+                    "Type: Normal (none from partners yet)".into()
                 } else {
-                    "[ ]"
-                };
-                let about = match self.dex.move_data(id) {
-                    Some(d) if d.power > 1 => {
-                        format!("{} {}", self.dex.type_name(d.type_id), d.power)
-                    }
-                    Some(d) => self.dex.type_name(d.type_id),
-                    None => String::new(),
-                };
-                let save = if marked { "  (GBA save)" } else { "" };
-                format!("{on} {}  {about}{save}", self.dex.move_name(id))
-            })
-            .collect();
-        items.push("Done".into());
-        let detail = match known.get(c.cursor) {
-            Some(&(id, marked)) => {
-                let mut d = self
-                    .dex
-                    .move_data(id)
-                    .map(|m| move_detail(&self.dex, &m))
-                    .unwrap_or_default();
-                if marked {
-                    d.push_str(
-                        " Only partners from a GBA save taught it: live battles without GBA \
-                         save partners leave it out.",
-                    );
+                    format!("Type: {}", types.join("/"))
+                },
+                match traits.ability {
+                    0 => "Ability: none".into(),
+                    a => format!("Ability: {}", self.dex.ability_name(a)),
+                },
+                "Done".into(),
+            ];
+            let detail = match Section::ALL.get(c.cursor) {
+                Some(Section::Moves) => {
+                    "Up to four moves from every move it has learned; empty slots take basic moves."
                 }
-                d
-            }
-            None if known.is_empty() => {
-                "It hasn't learned any moves yet, so it battles with basic moves.".into()
-            }
-            None => "Up to four moves on; empty slots take basic moves.".into(),
+                Some(Section::Types) => "One or two of the types its partners gave it.",
+                Some(Section::Ability) => "One of the abilities its partners gave it, or none.",
+                None => "Back to your Chao.",
+            };
+            return Screen {
+                title: format!("{name}: moves, type & ability"),
+                items,
+                cursor: Some(c.cursor),
+                detail: Some(format!(
+                    "{detail} {}",
+                    self.battles_with(chao).unwrap_or_default()
+                )),
+                hint: "A: choose  B: back",
+                ..Screen::default()
+            };
         };
+        let mut items: Vec<String>;
+        let detail;
+        let title;
+        let hint;
+        match section {
+            Section::Moves => {
+                let known = self.known_moves(chao);
+                let moves = self.own.get(chao).and_then(|e| e.moves.as_ref());
+                items = known
+                    .iter()
+                    .map(|&(id, marked)| {
+                        let on = if moves.is_some_and(|m| m.is_active(id)) {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        };
+                        let about = match self.dex.move_data(id) {
+                            Some(d) if d.power > 1 => {
+                                format!("{} {}", self.dex.type_name(d.type_id), d.power)
+                            }
+                            Some(d) => self.dex.type_name(d.type_id),
+                            None => String::new(),
+                        };
+                        let save = if marked { "  (GBA save)" } else { "" };
+                        format!("{on} {}  {about}{save}", self.dex.move_name(id))
+                    })
+                    .collect();
+                detail = match known.get(c.cursor) {
+                    Some(&(id, marked)) => {
+                        let mut d = self
+                            .dex
+                            .move_data(id)
+                            .map(|m| move_detail(&self.dex, &m))
+                            .unwrap_or_default();
+                        if marked {
+                            d.push_str(
+                                " Only partners from a GBA save taught it: live battles without \
+                                 GBA save partners leave it out.",
+                            );
+                        }
+                        d
+                    }
+                    None if known.is_empty() => {
+                        "It hasn't learned any moves yet, so it battles with basic moves.".into()
+                    }
+                    None => "Up to four moves on; empty slots take basic moves.".into(),
+                };
+                title = format!("{name}'s moves (4 at most)");
+                hint = "A: use or drop  B: back";
+            }
+            Section::Types => {
+                items = traits
+                    .types
+                    .iter()
+                    .map(|&(t, marked)| {
+                        let on = if traits.is_type_active(t) {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        };
+                        let save = if marked { "  (GBA save)" } else { "" };
+                        format!("{on} {}{save}", self.dex.type_name(t))
+                    })
+                    .collect();
+                detail = match traits.types.get(c.cursor) {
+                    Some(&(_, true)) => format!("One or two types on.{save_note}"),
+                    Some(_) => "One or two types on.".into(),
+                    None if traits.types.is_empty() => {
+                        "Its partners haven't given it a type yet, so it battles as Normal.".into()
+                    }
+                    None => "One or two types on.".into(),
+                };
+                title = format!("{name}'s type (2 at most)");
+                hint = "A: use or drop  B: back";
+            }
+            Section::Ability => {
+                let mark = |on: bool| if on { "(o)" } else { "( )" };
+                items = vec![format!("{} None", mark(traits.ability == 0))];
+                items.extend(traits.abilities.iter().map(|&(a, marked)| {
+                    let save = if marked { "  (GBA save)" } else { "" };
+                    format!(
+                        "{} {}{save}",
+                        mark(traits.ability == a),
+                        self.dex.ability_name(a)
+                    )
+                }));
+                detail = match c.cursor.checked_sub(1).map(|i| traits.abilities.get(i)) {
+                    None => "It battles without an ability.".into(),
+                    Some(Some(&(a, marked))) => {
+                        let about = self.dex.ability_description(a).trim().to_string();
+                        if marked {
+                            format!("{about}{save_note}")
+                        } else {
+                            about
+                        }
+                    }
+                    Some(None) => "The ability it battles with, or none.".into(),
+                };
+                title = format!("{name}'s ability");
+                hint = "A: choose  B: back";
+            }
+        }
+        items.push("Done".into());
         Screen {
-            title: format!(
-                "{}'s moves (4 at most)",
-                self.own.get(chao).map_or("", |e| e.name.as_str())
-            ),
+            title,
             items,
             cursor: Some(c.cursor),
             detail: Some(detail),
-            hint: "A: use or drop  B: back",
+            hint,
             ..Screen::default()
         }
     }
@@ -1078,6 +1318,45 @@ impl Session {
         let identity = self.moves_changed(chao);
         self.queued.push(Command::Moves(identity));
         Ok(on)
+    }
+
+    /// Switches type `t` of the player's Chao `own[chao]` on or off for battles
+    /// (`Traits::toggle_type`); whether it's on now. The change goes out as `Command::Traits`.
+    pub fn toggle_type(&mut self, chao: usize, t: u8) -> Result<bool, TraitRefused> {
+        let e = self.own.get_mut(chao).ok_or(TraitRefused::Unknown)?;
+        let on = e
+            .traits
+            .as_mut()
+            .ok_or(TraitRefused::Unknown)?
+            .toggle_type(t)?;
+        self.traits_changed(chao);
+        Ok(on)
+    }
+
+    /// The player's Chao `own[chao]` battles with ability `a` (0: none) from now on
+    /// (`Traits::choose_ability`). The change goes out as `Command::Traits`.
+    pub fn choose_ability(&mut self, chao: usize, a: u8) -> Result<(), TraitRefused> {
+        let e = self.own.get_mut(chao).ok_or(TraitRefused::Unknown)?;
+        e.traits
+            .as_mut()
+            .ok_or(TraitRefused::Unknown)?
+            .choose_ability(a)?;
+        self.traits_changed(chao);
+        Ok(())
+    }
+
+    /// After `own[chao]`'s types or ability changed: copies of that Chao take them too, and
+    /// the change goes out.
+    fn traits_changed(&mut self, chao: usize) {
+        let identity = self.own[chao].chao.identity();
+        let traits = self.own[chao].traits.clone();
+        for e in &mut self.own {
+            if e.chao.identity() == identity {
+                e.traits.clone_from(&traits);
+            }
+        }
+        self.refresh_profiles();
+        self.queued.push(Command::Traits(identity));
     }
 
     /// After `own[chao]`'s moves changed: copies of that Chao (the same identity) take them
@@ -1101,7 +1380,7 @@ impl Session {
 
     /// `profile`, under a live battle's rule. The player's own Chao are at the levels here.
     fn profile_ruled(&self, e: &Entry, save_partners: bool) -> Profile {
-        let mut p = (self.profile_of)(&e.chao, e.moves.as_ref(), save_partners);
+        let mut p = (self.profile_of)(&e.chao, e.moves.as_ref(), e.traits.as_ref(), save_partners);
         p.level = self.level_of(e.chao.identity()).level;
         p
     }
@@ -1399,13 +1678,236 @@ impl Session {
         }
     }
 
+    /// The menu list showing, by its rows' search names (`None`: the row always shows, as
+    /// "Done" does), one per item of its screen; `None` when no list with a cursor shows.
+    fn list_names(&self) -> Option<Vec<Option<String>>> {
+        let named = |names: Vec<String>, after: usize| -> Vec<Option<String>> {
+            names
+                .into_iter()
+                .map(Some)
+                .chain(std::iter::repeat_n(None, after))
+                .collect()
+        };
+        let own_names = || self.own.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        Some(match &self.state {
+            State::Format { .. } => vec![None; self.formats()],
+            State::Trainers(picker) => picker.names(&trainers::Ctx {
+                roster: self.trainers.as_deref()?,
+                progress: &self.progress,
+                dex: &self.dex,
+                own: &self.own,
+                profiles: &self.own_profiles,
+            }),
+            State::Team { moves: None, .. } => named(own_names(), 2),
+            State::Team { moves: Some(c), .. } => match (c.chao, c.section) {
+                (None, _) => named(own_names(), 0),
+                (Some(_), None) => vec![None; Section::ALL.len() + 1],
+                (Some(chao), Some(Section::Moves)) => named(
+                    self.known_moves(chao)
+                        .iter()
+                        .map(|&(id, _)| self.dex.move_name(id))
+                        .collect(),
+                    1,
+                ),
+                (Some(chao), Some(Section::Types)) => named(
+                    self.traits(chao)
+                        .types
+                        .iter()
+                        .map(|&(t, _)| self.dex.type_name(t))
+                        .collect(),
+                    1,
+                ),
+                (Some(chao), Some(Section::Ability)) => std::iter::once(None)
+                    .chain(named(
+                        self.traits(chao)
+                            .abilities
+                            .iter()
+                            .map(|&(a, _)| self.dex.ability_name(a))
+                            .collect(),
+                        1,
+                    ))
+                    .collect(),
+            },
+            State::Opponent { picked, .. } => self
+                .opponents(picked)
+                .into_iter()
+                .map(|(label, against)| match against {
+                    Against::Live(i) => self.friends.get(i).map(|f| f.name.clone()),
+                    Against::Lineup(_) => Some(label),
+                    _ => None,
+                })
+                .collect(),
+            // A press on its way as the challenge came doesn't move it either.
+            State::Offer { age, .. } if *age >= OFFER_GRACE => vec![None; 2],
+            _ => return None,
+        })
+    }
+
+    /// The cursor of the list showing (`list_names`).
+    fn cursor_mut(&mut self) -> Option<&mut usize> {
+        match &mut self.state {
+            State::Format { cursor }
+            | State::Opponent { cursor, .. }
+            | State::Offer { cursor, .. }
+            | State::Team {
+                moves: None,
+                cursor,
+                ..
+            } => Some(cursor),
+            State::Team { moves: Some(c), .. } => Some(&mut c.cursor),
+            State::Trainers(picker) => Some(picker.cursor_mut()),
+            _ => None,
+        }
+    }
+
+    /// Which list shows: another one clears the search.
+    fn list_key(&self) -> Option<(u8, usize, usize)> {
+        Some(match &self.state {
+            State::Format { .. } => (0, 0, 0),
+            State::Trainers(picker) => {
+                let (view, of) = picker.view_key();
+                (1, view, of)
+            }
+            State::Team { moves: None, .. } => (2, 0, 0),
+            State::Team { moves: Some(c), .. } => match (c.chao, c.section) {
+                (None, _) => (3, 0, 0),
+                (Some(chao), None) => (4, chao, 0),
+                (Some(chao), Some(section)) => (5, chao, section.row()),
+            },
+            State::Opponent { .. } => (6, 0, 0),
+            State::Offer { .. } => (7, 0, 0),
+            _ => return None,
+        })
+    }
+
+    /// The list showing takes typing to search it: it has rows with names.
+    pub fn typing(&self) -> bool {
+        self.list_names()
+            .is_some_and(|names| names.iter().any(Option::is_some))
+    }
+
+    /// The rows of the list showing that match the search (`None` without a list).
+    fn shown_rows(&self) -> Option<Vec<usize>> {
+        let names = self.list_names()?;
+        Some(self.search.shown(names.iter().map(Option::as_deref)))
+    }
+
+    /// This frame's keyboard on the menus: typing searches a list that has names (Backspace
+    /// deletes a letter, Esc clears the search, or goes back when there's none), Enter is A and
+    /// PgUp/PgDn jump. The buttons it presses, for `update`.
+    pub fn keyboard(&mut self, typed: &Typed) -> u32 {
+        if self.list_names().is_none() {
+            return 0;
+        }
+        let mut extra = 0;
+        if typed.enter {
+            extra |= buttons::A;
+        }
+        if typed.page_up {
+            extra |= buttons::PAGE_UP;
+        }
+        if typed.page_down {
+            extra |= buttons::PAGE_DOWN;
+        }
+        if !self.typing() {
+            if typed.escape {
+                extra |= buttons::B;
+            }
+            return extra;
+        }
+        match self.search.edit(typed, false) {
+            Edit::None => {}
+            Edit::Back => extra |= buttons::B,
+            Edit::Changed => {
+                self.notice = None;
+                let shown = self.shown_rows().unwrap_or_default();
+                if let Some(cursor) = self.cursor_mut() {
+                    *cursor = search::settle(*cursor, &shown);
+                }
+            }
+        }
+        extra
+    }
+
+    /// Moves the cursor of the list showing among the rows that match the search: Up/Down a
+    /// row (wrapping), Left/Right and PgUp/PgDn `search::JUMP` rows. The buttons left for the
+    /// list itself (A does nothing when no row matches).
+    fn navigate(&mut self, pressed: u32, out: &mut Vec<Command>) -> u32 {
+        let Some(shown) = self.shown_rows() else {
+            return pressed;
+        };
+        let Some(cursor) = self.cursor_mut() else {
+            return pressed;
+        };
+        let old = *cursor;
+        let mut c = search::settle(old, &shown);
+        if pressed & buttons::UP != 0 {
+            c = search::step(c, &shown, false);
+        } else if pressed & buttons::DOWN != 0 {
+            c = search::step(c, &shown, true);
+        } else if pressed & (buttons::LEFT | buttons::PAGE_UP) != 0 {
+            c = search::jump(c, &shown, false, search::JUMP);
+        } else if pressed & (buttons::RIGHT | buttons::PAGE_DOWN) != 0 {
+            c = search::jump(c, &shown, true, search::JUMP);
+        }
+        *cursor = c;
+        if c != old && pressed & buttons::MOVES != 0 {
+            out.push(sound(Sound::Cursor));
+            if let State::Trainers(picker) = &mut self.state {
+                picker.clear_notice();
+            }
+        }
+        let rest = pressed & !buttons::MOVES;
+        if shown.is_empty() {
+            rest & !buttons::A
+        } else {
+            rest
+        }
+    }
+
+    /// `s` (the screen of the list showing) with only the rows that match the search, and the
+    /// search's line.
+    fn searched(&self, mut s: Screen) -> Screen {
+        if !self.typing() {
+            return s;
+        }
+        s.search = Some(self.search.text().to_string());
+        let Some(shown) = self.shown_rows().filter(|_| !self.search.is_empty()) else {
+            return s;
+        };
+        if shown.is_empty() {
+            s.items = vec!["No matches".into()];
+            s.disabled = vec![0];
+            s.cursor = None;
+            s.detail = None;
+            s.bars.clear();
+            s.scroll = 0;
+            return s;
+        }
+        let place = |i: usize| shown.iter().position(|&r| r == i);
+        s.items = shown
+            .iter()
+            .filter_map(|&i| s.items.get(i).cloned())
+            .collect();
+        s.disabled = s.disabled.iter().filter_map(|&i| place(i)).collect();
+        s.bars = s
+            .bars
+            .iter()
+            .filter_map(|&(i, xp)| Some((place(i)?, xp)))
+            .collect();
+        s.cursor = s.cursor.and_then(place);
+        s
+    }
+
     /// Runs one frame with the buttons pressed in it; `arena_ready` once the arena is set up
     /// after `OpenArena`.
     pub fn update(&mut self, pressed: u32, arena_ready: bool) -> Vec<Command> {
         let mut out = std::mem::take(&mut self.queued);
-        if pressed & (buttons::A | buttons::B | buttons::UP | buttons::DOWN) != 0 {
+        if pressed & (buttons::A | buttons::B | buttons::MOVES) != 0 {
             self.notice = None;
         }
+        let list = self.list_key();
+        let pressed = self.navigate(pressed, &mut out);
         let state = std::mem::replace(&mut self.state, State::Done);
         self.state = match state {
             State::Format { mut cursor } => {
@@ -1508,7 +2010,7 @@ impl Session {
                 picked,
                 foe,
                 live,
-                moves: self.choose_moves(choosing, pressed, &mut out),
+                moves: self.choose(choosing, pressed, &mut out),
             },
             State::Team {
                 format,
@@ -1561,6 +2063,7 @@ impl Session {
                         live,
                         moves: Some(Choosing {
                             chao: None,
+                            section: None,
                             cursor: 0,
                         }),
                     }
@@ -1765,12 +2268,15 @@ impl Session {
             }
             State::Done => State::Done,
         };
+        if self.list_key() != list {
+            self.search.clear();
+        }
         self.note_live();
         out
     }
 
     pub fn screen(&self) -> Screen {
-        let mut s = match &self.state {
+        let s = match &self.state {
             State::Format { cursor } => {
                 let mut items = vec!["Singles (1 on 1)".into(), "Doubles (2 on 2)".into()];
                 if self.trainers.is_some() {
@@ -1825,7 +2331,7 @@ impl Session {
                     items.push(format!("{mark} {:<7}  Lv {}", e.name, level.level));
                     bars.push((i, (level.fraction() * 1000.0) as u16));
                 }
-                items.push("Choose moves".into());
+                items.push("Choose moves, type & ability".into());
                 items.push(format!("Done ({} picked)", picked.len()));
                 let against = foe.and_then(|id| self.trainers.as_ref()?.foes.get(&id));
                 let wild = self.wild.as_ref().map(|w| w.creature.fighter.name.as_str());
@@ -1842,8 +2348,9 @@ impl Session {
                         self.level_of(e.chao.identity()),
                     )),
                     _ if *cursor == self.own.len() => Some(
-                        "Choose the four moves each of your Chao battles with, from every move \
-                         it has learned."
+                        "Choose what each of your Chao battles with: four of every move it has \
+                         learned, one or two of the types and one of the abilities its partners \
+                         gave it."
                             .into(),
                     ),
                     _ => Some(match (wild, against, live) {
@@ -1962,6 +2469,7 @@ impl Session {
             State::Fight(f) => f.screen(),
             State::Done => Screen::default(),
         };
+        let mut s = self.searched(s);
         if let Some(n) = &self.notice {
             s.message = Some(n.clone());
         }
@@ -3231,6 +3739,7 @@ mod tests {
             name: name.into(),
             chao: chao(points),
             moves: None,
+            traits: None,
         }
     }
 
@@ -3261,6 +3770,7 @@ mod tests {
         let own = (0..own)
             .map(|i| Entry {
                 moves: Some(known.clone()),
+                traits: Some(Traits::default()),
                 ..entry(&format!("Own{i}"), 200 + i as i16 * 100)
             })
             .collect();
@@ -3269,12 +3779,17 @@ mod tests {
             Arc::new(dex),
             own,
             lineups,
-            Box::new(move |_, chosen, _| Profile {
-                types: [0, 0],
-                ability: 0,
-                moves: chosen.map_or(moves, |m| m.active),
-                partner: None,
-                level: team::FAIR_LEVEL,
+            Box::new(move |_, chosen, traits, save_partners| {
+                let (types, ability) = traits.map_or(([0, 0], 0), |t| {
+                    crate::gba_link::profile::traits_ruled(t, save_partners)
+                });
+                Profile {
+                    types,
+                    ability,
+                    moves: chosen.map_or(moves, |m| m.active),
+                    partner: None,
+                    level: team::FAIR_LEVEL,
+                }
             }),
             7,
         )
@@ -3378,7 +3893,7 @@ mod tests {
         // With each one's battle level and XP bar.
         assert_eq!(s.screen().items[0], "1 Own0     Lv 5");
         assert_eq!(s.screen().items[2], "2 Own2     Lv 5");
-        assert_eq!(s.screen().items[3], "Choose moves");
+        assert_eq!(s.screen().items[3], "Choose moves, type & ability");
         assert_eq!(s.screen().bars, [(0, 0), (1, 0), (2, 0)]);
         s.update(buttons::DOWN, false);
         s.update(buttons::DOWN, false);
@@ -3421,18 +3936,30 @@ mod tests {
         s.update(buttons::A, false); // singles
         s.update(buttons::UP, false);
         s.update(buttons::UP, false);
-        assert_eq!(s.screen().items[2], "Choose moves");
+        assert_eq!(s.screen().items[2], "Choose moves, type & ability");
         assert!(
             s.screen()
                 .detail
                 .unwrap()
-                .starts_with("Choose the four moves")
+                .starts_with("Choose what each of your Chao battles with")
         );
         s.update(buttons::A, false);
         let screen = s.screen();
-        assert_eq!(screen.title, "Choose moves for which Chao?");
+        assert_eq!(screen.title, "Moves, type & ability: which Chao?");
         assert_eq!(screen.items[0], "Own0     3 of 4 moves");
         s.update(buttons::A, false); // Own0
+        let screen = s.screen();
+        assert_eq!(screen.title, "Own0: moves, type & ability");
+        assert_eq!(
+            screen.items,
+            [
+                "Moves: 3 of 4 on",
+                "Type: Normal (none from partners yet)",
+                "Ability: none",
+                "Done"
+            ]
+        );
+        s.update(buttons::A, false); // Moves
         let screen = s.screen();
         assert_eq!(screen.title, "Own0's moves (4 at most)");
         assert_eq!(screen.items.len(), 5);
@@ -3467,7 +3994,10 @@ mod tests {
             s.screen().message.as_deref(),
             Some("4 moves already: turn one off first.")
         );
-        // B: back to the Chao, then to the team on "Choose moves"; Own1 kept its moves.
+        // B: back to its lists, the Chao, then the team on its row; Own1 kept its moves.
+        s.update(buttons::B, false);
+        assert_eq!(s.screen().cursor, Some(0));
+        assert_eq!(s.screen().items[0], "Moves: 4 of 5 on");
         s.update(buttons::B, false);
         assert_eq!(s.screen().cursor, Some(0));
         s.update(buttons::B, false);
@@ -3477,6 +4007,262 @@ mod tests {
             s.own_moves(s.own[1].chao.identity()).unwrap().active,
             [1, 2, 3, 0]
         );
+    }
+
+    /// Partners from a save gave type 3 and ability 30, wild ones types 5 and 7 and ability 40.
+    fn traits() -> Traits {
+        let mut t = Traits::default();
+        let partner = |types, ability, from_save| crate::gba_link::store::Partner {
+            species: 1,
+            types,
+            moves: [0; 4],
+            level: 5,
+            ability,
+            from_save,
+        };
+        t.learn(&partner([3, 3], 30, true));
+        t.learn(&partner([5, 7], 40, false));
+        t
+    }
+
+    #[test]
+    fn choosing_the_type_and_ability_a_chao_battles_with() {
+        let mut s = session(2, Vec::new());
+        s.own[0].traits = Some(traits());
+        // A copy of Own0 shares what it chooses.
+        s.own[1].chao = s.own[0].chao.clone();
+        s.own[1].traits = Some(traits());
+        s.refresh_profiles();
+        let id = s.own[0].chao.identity();
+        s.update(buttons::A, false); // singles
+        s.update(buttons::UP, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false); // Choose moves, type & ability
+        s.update(buttons::A, false); // Own0
+        assert_eq!(s.screen().items[1], "Type: Type 3");
+        assert_eq!(s.screen().items[2], "Ability: Ability 30");
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false); // Type
+        let screen = s.screen();
+        assert_eq!(screen.title, "Own0's type (2 at most)");
+        assert_eq!(
+            screen.items,
+            ["[x] Type 3  (GBA save)", "[ ] Type 5", "[ ] Type 7", "Done"]
+        );
+        assert!(
+            screen
+                .detail
+                .unwrap()
+                .contains("Only partners from a GBA save")
+        );
+        // A second type, then a third is refused; the last can't go off.
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(s.update(0, false), [Command::Traits(id)]);
+        assert_eq!(s.own_traits(id).unwrap().active_types, [3, 5]);
+        assert_eq!(s.own_profiles[0].types, [3, 5]);
+        assert_eq!(s.own_profiles[1].types, [3, 5]);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(
+            s.screen().message.as_deref(),
+            Some("2 types already: turn one off first.")
+        );
+        s.update(buttons::UP, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false); // Type 3 off
+        assert_eq!(s.own_traits(id).unwrap().active_types, [5, 5]);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(
+            s.screen().message.as_deref(),
+            Some("A Chao needs at least one type.")
+        );
+        // Done: back to its lists on "Type".
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().cursor, Some(1));
+        assert_eq!(s.screen().items[1], "Type: Type 5");
+        // The ability: none, or one of its own.
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        let screen = s.screen();
+        assert_eq!(screen.title, "Own0's ability");
+        assert_eq!(
+            screen.items,
+            [
+                "( ) None",
+                "(o) Ability 30  (GBA save)",
+                "( ) Ability 40",
+                "Done"
+            ]
+        );
+        assert_eq!(
+            screen.detail.as_deref(),
+            Some("It battles without an ability.")
+        );
+        s.update(buttons::A, false);
+        assert_eq!(s.own_traits(id).unwrap().ability, 0);
+        assert_eq!(s.own_profiles[0].ability, 0);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(s.own_traits(id).unwrap().ability, 40);
+        assert_eq!(s.own_profiles[1].ability, 40);
+        assert!(s.screen().items[2].starts_with("(o)"));
+        let out = s.update(buttons::B, false);
+        assert!(out.contains(&Command::Traits(id)));
+        assert_eq!(s.screen().items[2], "Ability: Ability 40");
+        // A live battle without save partners leaves out what only saves gave.
+        let ruled = s.profile_ruled(&s.own[0].clone(), false);
+        assert_eq!((ruled.types, ruled.ability), ([5, 5], 40));
+        // A Chao without any types or abilities: nothing to pick but "None" and "Done".
+        assert_eq!(s.toggle_type(5, 1), Err(TraitRefused::Unknown));
+        assert_eq!(s.choose_ability(0, 99), Err(TraitRefused::Unknown));
+    }
+
+    /// Types `text` on the keyboard.
+    fn type_text(s: &mut Session, text: &str) -> u32 {
+        s.keyboard(&Typed {
+            text: text.into(),
+            ..Typed::default()
+        })
+    }
+
+    #[test]
+    fn typing_searches_the_team_picker_and_left_right_jump() {
+        let mut s = session(25, Vec::new());
+        s.update(buttons::A, false); // singles
+        assert!(s.typing());
+        assert_eq!(s.screen().search.as_deref(), Some(""));
+        // Right jumps ten, Left back; PgDn (from the keyboard) too, stopping at the end.
+        s.update(buttons::RIGHT, false);
+        assert_eq!(s.screen().cursor, Some(10));
+        let pgdn = s.keyboard(&Typed {
+            page_down: true,
+            ..Typed::default()
+        });
+        assert_eq!(pgdn, buttons::PAGE_DOWN);
+        s.update(pgdn, false);
+        assert_eq!(s.screen().cursor, Some(20));
+        s.update(buttons::RIGHT, false);
+        assert_eq!(s.screen().cursor, Some(26));
+        assert!(s.screen().items[26].starts_with("Done"));
+        s.update(buttons::LEFT, false);
+        assert_eq!(s.screen().cursor, Some(16));
+        // "own1" matches Own1 and Own10..Own19; the rows without names stay.
+        assert_eq!(type_text(&mut s, "OWN1"), 0);
+        let screen = s.screen();
+        assert_eq!(screen.search.as_deref(), Some("OWN1"));
+        assert_eq!(screen.items.len(), 13);
+        assert!(screen.items[0].contains("Own1 "));
+        assert!(screen.items[1].contains("Own10"));
+        assert_eq!(screen.items[11], "Choose moves, type & ability");
+        // The cursor stayed on Own16, which matches.
+        assert!(screen.items[screen.cursor.unwrap()].contains("Own16"));
+        assert_eq!(screen.bars.len(), 11);
+        s.update(buttons::A, false);
+        assert!(s.screen().items[7].starts_with("1 Own16"));
+        // Down from the last match goes on to the rows that always show, and wraps.
+        s.update(buttons::RIGHT, false);
+        assert_eq!(s.screen().cursor, Some(12));
+        s.update(buttons::DOWN, false);
+        assert_eq!(s.screen().cursor, Some(0));
+        // Backspace deletes a letter; Esc clears the search, and then goes back.
+        let erase = Typed {
+            erase: true,
+            erase_fresh: true,
+            ..Typed::default()
+        };
+        assert_eq!(s.keyboard(&erase), 0);
+        assert_eq!(s.screen().search.as_deref(), Some("OWN"));
+        assert_eq!(s.screen().items.len(), 27);
+        type_text(&mut s, "z");
+        let screen = s.screen();
+        assert_eq!(screen.items.len(), 2);
+        let escape = Typed {
+            escape: true,
+            ..Typed::default()
+        };
+        assert_eq!(s.keyboard(&escape), 0);
+        assert_eq!(s.screen().items.len(), 27);
+        // Backspace on an empty search does nothing here; Esc goes back, Enter is A.
+        assert_eq!(s.keyboard(&erase), 0);
+        assert_eq!(s.keyboard(&escape), buttons::B);
+        let enter = Typed {
+            enter: true,
+            ..Typed::default()
+        };
+        assert_eq!(s.keyboard(&enter), buttons::A);
+        // Nothing matches: A picks nothing.
+        type_text(&mut s, "qq");
+        let screen = s.screen();
+        assert_eq!((screen.items.len(), screen.cursor), (2, Some(0)));
+        // Another list clears the search.
+        s.update(buttons::B, false);
+        assert_eq!(s.screen().title, "Chao battle");
+        assert!(!s.typing());
+        assert_eq!(s.screen().search, None);
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().search.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_search_with_no_match_shows_none_and_picks_nothing() {
+        let mut s = session(3, Vec::new());
+        s.update(buttons::A, false); // singles
+        s.update(buttons::UP, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false); // Choose moves, type & ability
+        assert_eq!(s.screen().title, "Moves, type & ability: which Chao?");
+        type_text(&mut s, "own2");
+        let screen = s.screen();
+        assert_eq!(screen.items.len(), 1);
+        assert_eq!(screen.cursor, Some(0));
+        type_text(&mut s, "x");
+        let screen = s.screen();
+        assert_eq!(screen.items, ["No matches"]);
+        assert_eq!((screen.cursor, screen.detail), (None, None));
+        let out = s.update(buttons::A, false);
+        assert!(out.is_empty());
+        assert_eq!(s.screen().items, ["No matches"]);
+        // Backspace: Own2 again, and A picks it.
+        s.keyboard(&Typed {
+            erase: true,
+            ..Typed::default()
+        });
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().title, "Own2: moves, type & ability");
+        // Its move list searches by move name.
+        s.update(buttons::A, false);
+        type_text(&mut s, "move 3");
+        assert_eq!(s.screen().items.len(), 2);
+        assert!(s.screen().items[0].contains("Move 3"));
+        // Its lists without names (moves, type, ability, done) don't take typing.
+        s.update(buttons::B, false);
+        assert!(!s.typing());
+        assert_eq!(s.screen().search, None);
+    }
+
+    #[test]
+    fn the_opponent_list_searches_by_team_name() {
+        let lineup = |label: &str| Lineup {
+            label: label.into(),
+            members: vec![entry("F0", 500)],
+        };
+        let mut s = session(1, vec![lineup("Amy's Chao"), lineup("Bob's Chao")]);
+        s.update(buttons::A, false);
+        s.update(buttons::A, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().title, "Battle against");
+        assert_eq!(s.screen().items.len(), 3);
+        type_text(&mut s, "bob");
+        let screen = s.screen();
+        assert_eq!(screen.items, ["Bob's Chao (1)", "Copies of your team (1)"]);
+        assert_eq!(screen.cursor, Some(0));
+        assert_eq!(screen.detail.as_deref(), Some("F0"));
     }
 
     #[test]
@@ -3721,6 +4507,40 @@ mod tests {
             towns: vec![String::new()],
             tms: vec![Some(2)],
         }
+    }
+
+    #[test]
+    fn the_trainer_lists_search_by_name_and_jump() {
+        let mut s = session(1, Vec::new()).with_trainers(Arc::new(roster()), Progress::default());
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        assert!(s.screen().title.starts_with("Trainers"));
+        assert_eq!(s.screen().items.len(), 5);
+        // Right stops at the last row.
+        s.update(buttons::RIGHT, false);
+        assert_eq!(s.screen().cursor, Some(4));
+        type_text(&mut s, "t200");
+        let screen = s.screen();
+        assert_eq!(screen.items, ["League 1: T200", "Teach a TM move (0 won)"]);
+        assert_eq!(screen.disabled, [0, 1]);
+        s.update(buttons::UP, false);
+        assert_eq!(s.screen().cursor, Some(0));
+        // Locked: it says why, as without a search.
+        s.update(buttons::A, false);
+        assert!(s.screen().message.unwrap().starts_with("Beat "));
+        // Into the route trainers: another list, so the search starts again.
+        s.keyboard(&Typed {
+            escape: true,
+            ..Typed::default()
+        });
+        type_text(&mut s, "route");
+        assert_eq!(s.screen().items.len(), 2);
+        assert_eq!(s.screen().cursor, Some(0));
+        s.update(buttons::A, false);
+        let screen = s.screen();
+        assert_eq!(screen.search.as_deref(), Some(""));
+        assert_eq!(screen.items.len(), 1);
+        assert!(screen.items[0].contains("T10"));
     }
 
     #[test]
@@ -4527,7 +5347,7 @@ mod tests {
         let mut l = Lobby::new(1);
         // Type 1 marks a profile made without save partners.
         for s in &mut l.s {
-            s.profile_of = Box::new(|_, _, save_partners| Profile {
+            s.profile_of = Box::new(|_, _, _, save_partners| Profile {
                 types: [u8::from(!save_partners); 2],
                 ability: 0,
                 moves: [1, 0, 0, 0],

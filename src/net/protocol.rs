@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 26;
+pub const PROTOCOL_VERSION: u16 = 27;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -812,7 +812,7 @@ pub const WILD_SEE: u8 = 1;
 pub const WILD_PICK: u8 = 2;
 pub const WILD_MACHINE: u8 = 4;
 /// Most visitors in one `WildList`: the game's 10 animal entries less 2 left for its own.
-pub const MAX_WILD_LIST: usize = 12;
+pub const MAX_WILD_LIST: usize = 30;
 /// Most visitors in one `WildPick`.
 pub const MAX_WILD_PICK: usize = 5;
 /// A held visitor's offset in its holder's frame is at most this along each axis.

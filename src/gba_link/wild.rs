@@ -581,7 +581,7 @@ mod game {
         }
         if let Some((name, until)) = &w.title {
             if now < *until {
-                crate::hud::center2(name, "Wild visitors come from here this visit");
+                crate::hud::top_title(name, "Wild visitors come from here this visit");
             } else {
                 w.title = None;
             }

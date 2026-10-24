@@ -312,6 +312,7 @@ pub fn plain_team(rom: &crate::gba::rom::Rom, chao: &[ChaoData]) -> Vec<BattleMe
     let profile = crate::gba_link::profile::profile(
         rom,
         None,
+        &crate::gba_link::store::Traits::default(),
         &crate::gba_link::store::Moves::default(),
         true,
         team::FAIR_LEVEL,

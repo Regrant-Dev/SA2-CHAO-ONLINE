@@ -51,14 +51,29 @@ One player hosts and everyone else joins their address. Only the host needs to b
 
 A server keeps the lobby up so nobody has to host. Everyone joins it with its address.
 
-- **Docker:** `docker run -d --restart unless-stopped -p 43902:43902/udp ghcr.io/regrant-dev/sa2-chao-online-server:latest`
-- **Windows:** run `sa2co-server.exe` from the release.
+- **Docker:**
+  ```
+  docker run -d --restart unless-stopped -p 43902:43902/udp \
+    -v /path/to/data:/data -v /path/to/skins:/skins:ro \
+    ghcr.io/regrant-dev/sa2-chao-online-server:latest
+  ```
+  The container runs as user 65534, so the data folder must be writable by it:
+  `chown 65534:65534 /path/to/data`. The skins folder is optional (see below).
+- **Unraid:** add the container from the image above with the UDP port 43902 and two paths:
+  container `/data` (read/write) on a host folder such as
+  `/mnt/user/appdata/sa2-chao-online-server/data`, and optionally `/skins` (read only). Then
+  `chown 65534:65534` the data folder and restart the container.
+- **Windows:** run `sa2co-server.exe` from the release. To keep the gardens across restarts,
+  set the environment variable `SA2CO_DATA` to a folder first (e.g. `set SA2CO_DATA=data`).
 
 Update the server whenever you update the mod.
 
-**Keep the shared gardens:** the server keeps the gardens' trees and items and the Chao players
-left there (`chao/`, one file per player) in the folder `SA2CO_DATA` names, across restarts.
-Docker: mount a folder the container can write at `/data` (`-v /path/to/data:/data`).
+**Keep the shared gardens:** the server keeps the gardens' trees and items (`gardens.txt`) and
+the Chao players left there (`chao/`, one file per player) in its data folder across restarts:
+`/data` in Docker, the folder `SA2CO_DATA` names otherwise (none when it's not set). Each file
+is rewritten whole when it changes, and a forgotten player's file is removed, so the folder
+doesn't grow. Without a writable data folder the server still runs but forgets the gardens when
+it restarts, and its log says "can't write /data/gardens.txt".
 
 **Skins for everyone:** put skin folders (as in `mods/sa2-chao-online/skins/`) in a folder on the
 server and mount it at `/skins` (Docker: add `-v /path/to/skins:/skins:ro`). Everyone who joins
@@ -276,12 +291,20 @@ and pictures are read from your ROM, and the save is only read, never changed.
   Garden, dark and spiky in the Dark Garden. Stand next to it (any side), with empty hands and
   nothing to pick up closer to you, and press the action button to open its list of
   the save's party and boxes and the ones the mod keeps, with each one's level and types. The
-  list's first row, **Moves**, is for choosing your Chao's moves (below).
-- Move through the list with Up/Down on the controller or keyboard (PgUp/PgDn jump), and the
-  machine's screen shows the picture of the one highlighted. A or Enter picks it: it pops out of
-  the machine's hatch as a partner, drawn as its picture, and walks into the garden. B, Esc or
-  Backspace closes the list. While it is open your character stands still and the game doesn't
-  take the presses. When the garden is full of animals, a wild visitor leaves to make room.
+  list's first row, **Moves, type & ability**, is for choosing what your Chao battle with
+  (below).
+- Move through the list with Up/Down on the controller or keyboard, and the machine's screen
+  shows the picture of the one highlighted. A or Enter picks it: it pops out of the machine's
+  hatch as a partner, drawn as its picture, and walks into the garden. B, Esc or Backspace
+  closes the list. While it is open your character stands still and the game doesn't take the
+  presses. When the garden is full of animals, a wild visitor leaves to make room.
+- **Long lists:** in every list of the link machine, Left/Right (D-pad or arrow keys) jump 10
+  rows and PgUp/PgDn a page. Typing on the keyboard searches the list by name (the creature's,
+  the Chao's, the move's, type's or ability's), whatever the case and anywhere in the name: a
+  "Search:" line above the list shows what you typed and only the rows that match stay, with
+  rows like **Done** always there. Backspace deletes a letter and Esc clears the search; with
+  no search, they go back as before. While the list is open, letters only type into the search
+  (the chat's T and the status balloon's C wait), so on the keyboard pick with Enter.
 - Carry a partner to the Chao you want it to teach: a Chao only takes one it's handed, as with
   animals, so Chao walking past leave it alone.
 - Without a save, the list offers a one-time gift instead: one of the game's three first
@@ -297,18 +320,31 @@ and pictures are read from your ROM, and the save is only read, never changed.
 - A Chao remembers every move it has learned (from partners, wild visitors, the gift and TM
   moves) and battles with four of them. New moves fill its four when it has fewer; otherwise
   its four stay as they are. Either way "<Chao> learned <move>!" shows for each move new to it.
-  A later partner replaces the types and ability. A Chao without a partner is Normal type with
-  a few basic moves.
-- **Choosing moves:** pick **Moves** at the link machine, then one of your Chao by name. Its list
-  shows every move it has learned with the move's type and power; `[x]` marks the four (at most)
-  it battles with, and `(GBA save)` marks moves only a partner from a GBA save taught it. A or
-  Enter switches the move under the cursor on or off: a fifth one can't go on until one is off,
-  and the last one can't go off. Changes are kept at once; **Done** or B goes back. The battle
-  team screen has the same choice (Chao battles, below). A slot left empty battles with a basic
-  move.
-- The status balloon's last row shows the partner's types over the Chao's battle level, with
+  It also remembers every type and every ability its partners gave it (wild visitors and the
+  gift too), and battles as one or two of those types with one of those abilities, or none.
+  Its first partner's types and ability are the ones it starts with; later partners add theirs
+  to the lists without changing what it battles with. A Chao without a partner is Normal type
+  with a few basic moves and no ability.
+- **Choosing moves, type and ability:** pick **Moves, type & ability** at the link machine,
+  then one of your Chao by name. Its page has a row each for its moves, its type and its
+  ability (showing what it battles with now), and **Done**:
+  - **Moves** shows every move it has learned with the move's type and power; `[x]` marks the
+    four (at most) it battles with. A or Enter switches the move under the cursor on or off: a
+    fifth one can't go on until one is off, and the last one can't go off. A slot left empty
+    battles with a basic move.
+  - **Type** shows every type its partners gave it, by the ROM's names; `[x]` marks the one or
+    two it battles as. A or Enter switches one on or off: a third can't go on until one is off,
+    and the last one can't go off.
+  - **Ability** shows **None** and every ability its partners gave it; `(o)` marks the one it
+    battles with, and the line under the list is the ROM's description of the one highlighted.
+    A or Enter picks it.
+
+  `(GBA save)` marks moves, types and abilities only a partner from a GBA save gave it.
+  Changes are kept at once; **Done** or B goes back. The battle team screen has the same
+  choices (Chao battles, below).
+- The status balloon's last row shows the types the Chao battles as over its battle level, with
   a bar of its XP toward the next level for your own Chao (a friend's shows the level their
-  game sent) (Chao battles, below). Partners, moves and battle levels
+  game sent) (Chao battles, below). Partners, moves, types, abilities and battle levels
   are kept in `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an
   animal gives.
 
@@ -317,11 +353,12 @@ you walk into it (each of its areas comes once before any comes again). The
 Neutral Garden gets grassy routes and woods, the Hero Garden sea, sky and shore areas, and the
 Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, not a save.
 
-- The area's name shows for a few seconds when you walk into the garden.
+- The area's name shows for a few seconds at the top of the screen when you walk into the garden.
 - Wild creatures of that area come by now and then, picked with the same chances and levels as
   in the GBA game: four when you arrive, then one every 20 to 50 seconds, up to 6 or 7 at a
-  time and never more than 7. They don't crowd out the garden's own animals: the mod lets a
-  garden hold 20 animals instead of the game's 10.
+  time. In a shared online garden 3 more can be about for each other player there, up to 20.
+  They don't crowd out the garden's own animals: the mod lets a garden hold 32 animals instead
+  of the game's 10.
   Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
   shiny, in the GBA game's shiny colours.
 - Whistle and nearby ones come to you: land creatures walk over and stop a few steps away,
@@ -332,13 +369,14 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
   learns by its level, so two of a kind can teach different moves. Absorbing gives no battle
   XP.
 - Stand next to one, or pick it up, and a card at the top right shows it: name, level, types,
-  ability, its stats at that level and the four moves a Chao that absorbs it learns. Partners
-  brought from the link machine get the same card.
+  ability and the four moves a Chao that absorbs it learns (a Chao gets those, not its stats).
+  Partners brought from the link machine get the same card.
 - **Battle one:** with a wild visitor's card showing and your hands empty, press **Y** (needs
   the Battle DLC). You go straight to the karate arena, pick your team against it (singles),
   and when the battle ends you're back in the garden where you stood. It fights at its level
-  with the four moves, types, ability and stats its card shows. Win and your Chao that were sent
-  out get battle XP and it stays in the garden; lose or give up and it runs away. B on the team
+  with the four moves, types and ability its card shows, and its own stats for that level. Win
+  and your Chao that were sent out get battle XP and it stays in the garden; lose or give up
+  and it runs away. B on the team
   screen goes back without a battle and leaves it as it was. In a shared garden others see it
   busy while you battle it (nobody can pick it up), and one that runs away leaves the garden for
   everyone. A visitor never needs to be battled before a Chao absorbs it.
@@ -400,9 +438,9 @@ last button to reach **BATTLE** and press A. Then pick:
 2. **Your team:** up to 6 of the Chao in your save, each with its battle level and a bar of
    its XP toward the next. A picks or drops the Chao under the cursor; they go out in the order
    you picked them. The line below the list shows the Chao's battle level and XP, types,
-   ability, moves and battle stats. **Choose moves** picks a Chao, then switches its moves on
-   or off as at the link machine (Chao > GBA link). Choose **Done** at the bottom of the list
-   (Up from the top gets there).
+   ability, moves and battle stats. **Choose moves, type & ability** picks a Chao, then
+   chooses its moves, type and ability as at the link machine (Chao > GBA link). Choose
+   **Done** at the bottom of the list (Up from the top gets there).
 3. **Who to battle:** a friend online at Chao Karate for a live battle (below), a team of each
    online friend's Chao (their My Chao and the Chao they bring), the `.sa2chao` files in
    `chao/import` (six to a team), or copies of your other Chao (copies of your own team when
@@ -410,6 +448,15 @@ last button to reach **BATTLE** and press A. Then pick:
 
 **Controls:** the game's menu buttons, on a controller or the keyboard: Up/Down moves the
 cursor, A chooses, B goes back. Start pauses the game as usual, and the battle waits.
+
+**Long lists:** in the menus' lists (the team, the Chao and their moves, types and abilities,
+the opponents, the trainers and the TM moves), Left/Right jump 10 rows, as do PgUp/PgDn on the
+keyboard. In the lists with names (Chao, moves, types, abilities, creatures, trainers and
+teams), typing on the keyboard searches the list by name, whatever the case and anywhere in the
+name: a "Search:" line above the list shows what you typed and only the rows that match stay,
+with rows like **Done** always there. Backspace deletes a letter and Esc clears the search,
+or goes back when there's none. While such a list shows, letters only type into the search, so
+on the keyboard Enter chooses and Esc goes back; a controller works as before.
 
 **A turn:** choose for each of your Chao in the ring:
 
@@ -509,10 +556,11 @@ status balloon. Under the Level 50 rule the box shows Lv 50 without the XP bar, 
 answer such a challenge the team screen shows the stats at level 50.
 
 **Moves, types and ability** come from the Chao's partners: absorbing one teaches its moves,
-types and ability, and a Chao battles with 4 of the moves it has learned, chosen at the link
-machine or with **Choose moves** on the team screen (Chao > GBA link). A Chao without a partner
-is Normal type with a few basic moves and no ability. A friend's Chao battles with its
-partner's types and ability, its four moves and its battle level from their game, sent while
+types and ability, and a Chao battles with 4 of the moves it has learned, one or two of the
+types and one of the abilities (or none) its partners gave it, chosen at the link machine or
+with **Choose moves, type & ability** on the team screen (Chao > GBA link). A Chao without a
+partner is Normal type with a few basic moves and no ability. A friend's Chao battles with the
+types, ability and four moves they chose and its battle level from their game, sent while
 you're online together; your own Chao only ever use what your game keeps for them. Exporting
 Chao files also writes `partners.txt` next to them: put it in `chao/import` with their
 `.sa2chao` files (add its lines to the one there when you have Chao from more than one friend).
@@ -549,10 +597,11 @@ too. Both games need the same GBA ROM.
 
 **Live rule, GBA save partners:** the row under your friends in the "Battle against" list
 (A switches it) says whether your challenges allow what partners from a GBA save taught.
-**Not allowed** means both teams battle without it: moves a partner from a GBA save taught are
-left out, and a Chao whose partner came from a GBA save battles as Normal type with no ability
-(its other moves, then basic moves, fill the empty slots). Moves from wild visitors, the gift
-and trainers' TMs always count. The challenge shows the rule to your friend, and each game
+**Not allowed** means both teams battle without it: moves, types and abilities only partners
+from a GBA save gave are left out. The Chao's other moves, then basic moves, fill the empty
+move slots; its other types take a type's place (Normal when it has none), and its other
+abilities the ability's (none when it has none). What wild visitors, the gift and trainers'
+TMs gave always counts. The challenge shows the rule to your friend, and each game
 applies it to its own team.
 
 **Live rule, levels:** the next row says whether your challenges are **Level 50** (every Chao

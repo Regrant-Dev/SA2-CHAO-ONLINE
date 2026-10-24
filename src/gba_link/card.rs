@@ -1,5 +1,6 @@
 //! The info card of a creature in the garden (a wild visitor or a partner brought in): its name,
-//! level, types, ability, stats and the moves a Chao that absorbs it learns, all from the ROM.
+//! level, types, ability and the moves a Chao that absorbs it learns, all from the ROM (its stats
+//! only matter in a battle against it, which shows them there).
 //! It shows for the one the player holds, else the nearest within `RANGE`. A wild visitor's
 //! card also has the button that battles it (`wild_battle`).
 
@@ -14,8 +15,6 @@ use crate::net::protocol::WildPlace;
 
 /// A creature's card shows when the player is this close to it (across).
 pub const RANGE: f32 = 7.0;
-/// Stats are shown with this IV in every stat and a neutral nature (no EVs).
-const SHOWN_IV: u8 = 15;
 
 /// The card's lines.
 pub fn lines(rom: &Rom, partner: &Partner, shiny: bool) -> Vec<String> {
@@ -45,14 +44,6 @@ pub fn lines(rom: &Rom, partner: &Partner, shiny: bool) -> Vec<String> {
         })
         .map_or_else(|| "none".into(), |a| ascii(&a));
     out.push(format!("Ability: {ability}"));
-    if let Some(species) = rom.species(partner.species) {
-        let s = crate::battle::trainers::stats(species.base, SHOWN_IV, partner.level, 0);
-        out.push(format!("HP {}  Atk {}  Def {}", s.hp, s.attack, s.defense));
-        out.push(format!(
-            "SpA {}  SpD {}  Spe {}",
-            s.sp_attack, s.sp_defense, s.speed
-        ));
-    }
     out.push("Teaches:".into());
     let mut any = false;
     for id in partner.moves.into_iter().filter(|&id| id != 0) {
@@ -257,10 +248,9 @@ mod tests {
         assert!(text[0].ends_with("Lv12  (shiny)"));
         assert!(text[1].starts_with("Type: "));
         assert!(text[2].starts_with("Ability: ") && !text[2].ends_with("none"));
-        assert!(text[3].starts_with("HP ") && text[4].starts_with("SpA "));
-        assert_eq!(text[5], "Teaches:");
+        assert_eq!(text[3], "Teaches:");
         let taught = partner.moves.iter().filter(|&&m| m != 0).count();
-        assert_eq!(text.len(), 6 + taught);
+        assert_eq!(text.len(), 4 + taught);
         assert!(text.iter().all(|l| l.is_ascii()));
     }
 }

@@ -210,6 +210,7 @@ fn can_peek(menu_open: bool) -> bool {
         && unsafe { (game::CONTROLLER_ENABLED as *const u8).read_volatile() } != 0
         && !menu_open
         && !crate::chat::typing()
+        && !crate::search::keyboard_taken()
         && game::local_player().is_some_and(|p| !p.holding)
 }
 

@@ -107,7 +107,9 @@ pub fn on_frame(connected: bool, menu_open: bool) {
     if !c.open {
         // Keep the key states current so T doesn't count as pressed later.
         let t = c.pressed(VK_T);
-        if t && connected && !menu_open && input::game_focused() {
+        // A list's keyboard search takes the letters (`crate::search`).
+        if t && connected && !menu_open && !crate::search::keyboard_taken() && input::game_focused()
+        {
             c.open = true;
             c.text.clear();
             // Swallow keys already down (the T itself).

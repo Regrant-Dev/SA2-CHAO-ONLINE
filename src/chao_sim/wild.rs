@@ -9,14 +9,25 @@ use super::land::{GRID_COLS, GRID_ROWS, Garden, Tri, V3, cell_of, probe};
 /// Most visitors in a garden at once; each visit to a garden allows `MIN_CAP..=MAX_VISITORS`.
 pub const MAX_VISITORS: usize = 7;
 pub const MIN_CAP: usize = 6;
+/// In a shared garden the cap grows by this for each player there after the first, up to
+/// `MAX_SHARED_VISITORS` (`scaled_cap`).
+pub const PER_EXTRA_PLAYER: usize = 3;
+pub const MAX_SHARED_VISITORS: usize = 20;
 /// The game's category-2 entries (animals and drives, `0x8AB840`: 10 in the game, raised to
 /// this by the mod at start, `registry::raise_animal_limit`; the registry has room for 64), and
 /// how many of them are left for the game's own.
-pub const ANIMAL_LIMIT: u32 = 20;
+pub const ANIMAL_LIMIT: u32 = 32;
 pub const RESERVE: u32 = 2;
 /// Visitors that come at once when the garden loads; the others come one by one.
 pub const ON_ENTRY: usize = 4;
 const _: () = assert!(ON_ENTRY <= MIN_CAP && MIN_CAP <= MAX_VISITORS);
+const _: () = assert!(MAX_SHARED_VISITORS + RESERVE as usize <= ANIMAL_LIMIT as usize);
+
+/// A garden's cap with `players` in it: its own (`base`, `MIN_CAP..=MAX_VISITORS`), and
+/// `PER_EXTRA_PLAYER` more for each player after the first, at most `MAX_SHARED_VISITORS`.
+pub fn scaled_cap(base: usize, players: usize) -> usize {
+    (base + PER_EXTRA_PLAYER * players.saturating_sub(1)).min(MAX_SHARED_VISITORS)
+}
 /// Seconds between visitors, and how long one stays before it goes once out of the way.
 pub const NEXT_SECS: (u64, u64) = (20, 50);
 pub const STAY_SECS: (u64, u64) = (300, 480);
@@ -391,6 +402,16 @@ pub fn land_spot_away(spots: &Spots, from: &[(f32, f32)], rng: &mut Rng) -> Opti
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_gardens_get_more_visitors_with_more_players() {
+        assert_eq!(scaled_cap(7, 1), 7);
+        assert_eq!(scaled_cap(6, 0), 6);
+        assert_eq!(scaled_cap(7, 2), 10);
+        assert_eq!(scaled_cap(7, 4), 16);
+        assert_eq!(scaled_cap(7, 5), 19);
+        assert_eq!(scaled_cap(6, 8), MAX_SHARED_VISITORS);
+    }
+
     use super::*;
     use crate::chao_sim::land::{GRID_CELLS, LAND_EXPORT, PeFile};
 

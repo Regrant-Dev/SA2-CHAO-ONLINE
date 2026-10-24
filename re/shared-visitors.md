@@ -94,11 +94,13 @@ visitors and no machine.
 | `place` | `Roam(Roam)`, `Swim(Swim)`, `Held { by, offset, heard, let_go }` or `Battle { by, since }` |
 
 ### Room
-- Wild visitors: at most `cap` (≤ `MAX_VISITORS` = 7) at once.
+- Wild visitors: at most `scaled_cap(cap, players in the garden)`: the run's `cap`
+  (`MIN_CAP..=MAX_VISITORS`, 6..=7) plus 3 for each player after the first, at most
+  `MAX_SHARED_VISITORS` (20).
 - All visitors: wild + partner + the category-2 items the referee knows in that garden
-  (`ChaoHost.items`, animals and drives) + `RESERVE` (2) ≤ 20, the category-2 limit
-  (`0x8AB840`, which the mod raises from the game's 10). A list has at most 12
-  (`MAX_WILD_LIST`).
+  (`ChaoHost.items`, animals and drives) + `RESERVE` (2) ≤ 32, the category-2 limit
+  (`0x8AB840`, which the mod raises from the game's 10). A list has at most 30
+  (`MAX_WILD_LIST`). The first ask turned down for room is logged.
 - A partner that comes with no room left sends the roaming wild visitor farthest from every
   player away first (as `send_one_away` does alone). With none to send away it is refused.
 
@@ -146,9 +148,9 @@ visitors and no machine.
 
 ---
 
-## 3. Messages (protocol 26)
+## 3. Messages (protocol 27)
 
-`PROTOCOL_VERSION` 26. Players with 25 are turned away by their Hello. All new bodies are game
+`PROTOCOL_VERSION` 27. Players with an older one are turned away by their Hello. All new bodies are game
 bodies, tags 73..=86. The referee consumes every to-the-host body (never passed on) and drops
 the from-the-host ones when a player sends them; a game takes the from-the-host ones only from
 `SERVER` (0xFF), as `ItemSteer`.

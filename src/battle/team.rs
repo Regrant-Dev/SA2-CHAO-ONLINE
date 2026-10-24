@@ -175,12 +175,13 @@ pub fn type_chart(chart: &rom::TypeChart) -> TypeChart {
 }
 
 /// What a battle needs from the ROM, read once: every move with its name and description, the
-/// ability and type names, the type chart and the sound moves. Names are plain ASCII (the HUD's font has nothing else).
+/// ability names and descriptions, the type names, the type chart and the sound moves. Names are plain ASCII (the HUD's font has nothing else).
 pub struct Dex {
     moves: Vec<Option<MoveData>>,
     move_names: Vec<String>,
     move_descriptions: Vec<String>,
     ability_names: Vec<String>,
+    ability_descriptions: Vec<String>,
     type_names: Vec<String>,
     chart: TypeChart,
     out_of_pp: MoveData,
@@ -206,6 +207,13 @@ impl Dex {
         let ability_names = (0..rom::ABILITY_COUNT)
             .map(|id| rom.ability_name(id).map(|n| ascii(&n)).unwrap_or_default())
             .collect();
+        let ability_descriptions = (0..rom::ABILITY_COUNT)
+            .map(|id| {
+                rom.ability_description(id)
+                    .map(|d| ascii(&d.replace('\n', " ")))
+                    .unwrap_or_default()
+            })
+            .collect();
         let type_names = (0..rom::TYPE_COUNT)
             .map(|id| rom.type_name(id).map(|n| ascii(&n)).unwrap_or_default())
             .collect();
@@ -219,6 +227,7 @@ impl Dex {
             move_names,
             move_descriptions,
             ability_names,
+            ability_descriptions,
             type_names,
             chart: type_chart(rom.type_chart()),
             out_of_pp,
@@ -245,6 +254,7 @@ impl Dex {
             moves: table,
             move_descriptions: Vec::new(),
             ability_names: Vec::new(),
+            ability_descriptions: Vec::new(),
             type_names: Vec::new(),
             chart,
             out_of_pp,
@@ -282,6 +292,13 @@ impl Dex {
 
     pub fn ability_name(&self, id: u8) -> String {
         named(&self.ability_names, usize::from(id), "Ability")
+    }
+
+    /// The ROM's description of ability `id` on one line (empty when it has none).
+    pub fn ability_description(&self, id: u8) -> &str {
+        self.ability_descriptions
+            .get(usize::from(id))
+            .map_or("", String::as_str)
     }
 
     pub fn type_name(&self, id: u8) -> String {

@@ -10,13 +10,14 @@
 //! - In the garden each waiting partner is an animal object drawn as its picture (`scene`).
 //! - A Chao that absorbs one keeps it as its partner, which gives it the partner's type ids and
 //!   ability and teaches it the partner's moves, in `<mod>/gba/partners.txt` by the Chao's
-//!   identity; its stats and save don't change. A Chao remembers every move it learned and
-//!   battles with four of them, chosen at the link machine or the battle team screen. Its battle
-//!   level and XP are kept there too. `battle_profile` gives what a battle uses (`profile`). The
-//!   status balloon shows the partner's types and the battle level (balloon.rs).
-//! - Other players' Chao: what theirs have from partners, the four moves they battle with and
-//!   their battle levels come online (`Body::Partners`), and exporting Chao files writes
-//!   `partners.txt` next to them, which is read from `chao/import`.
+//!   identity; its stats and save don't change. A Chao remembers every move, type and ability
+//!   it got and battles with four of the moves, one or two of the types and one of the
+//!   abilities (or none), chosen at the link machine or the battle team screen. Its battle level
+//!   and XP are kept there too. `battle_profile` gives what a battle uses (`profile`). The status
+//!   balloon shows the types it battles as and the battle level (balloon.rs).
+//! - Other players' Chao: the types, ability and four moves theirs battle with and their battle
+//!   levels come online (`Body::Partners`), and exporting Chao files writes `partners.txt` next
+//!   to them, which is read from `chao/import`.
 //! - Wild visitors: each garden has an area of the ROM's wild tables each day (`rotation`), whose
 //!   creatures come by now and then and are absorbed like partners (`wild`).
 //! - In a garden the server runs, its visitors and the partners players bring are the server's,
@@ -50,7 +51,7 @@ use crate::battle::levels::Level;
 use crate::log;
 use crate::net::protocol::SharedPartner;
 pub use profile::Profile;
-use store::{Learned, Moves, Partner, Store};
+use store::{Learned, Moves, Partner, Store, Traits};
 
 /// The folder in the mod where the ROM and save are looked for when no path is set, and where
 /// `partners.txt` lives.
@@ -84,8 +85,9 @@ static LINK: Mutex<Link> = Mutex::new(Link {
     store_unreadable: false,
 });
 
-/// What other players' Chao have from their partners (`Body::Partners`), by Chao identity.
-static OTHERS: Mutex<BTreeMap<u64, Learned>> = Mutex::new(BTreeMap::new());
+/// What other players' Chao have from their partners (`Body::Partners`), with the types and
+/// ability they battle with, by Chao identity.
+static OTHERS: Mutex<BTreeMap<u64, (Learned, Traits)>> = Mutex::new(BTreeMap::new());
 /// Other players' Chao's battle levels (`Body::Partners`), by Chao identity.
 static OTHER_LEVELS: Mutex<BTreeMap<u64, Level>> = Mutex::new(BTreeMap::new());
 
@@ -386,25 +388,29 @@ pub fn has_partner(identity: u64) -> bool {
     })
 }
 
-/// The partner types of the Chao with `identity`, by the ROM's type names, for the status
-/// balloon (`None` when it has none or the ROM isn't loaded).
+/// The types the Chao with `identity` battles as, by the ROM's type names, for the status
+/// balloon (`None` when it has no partner or the ROM isn't loaded).
 pub fn partner_types(identity: u64) -> Option<Vec<String>> {
-    let learned =
-        with_store(|s| s.partners.get(&identity).copied()).filter(|l| l.partner.species != 0)?;
+    if !has_partner(identity) {
+        return None;
+    }
     let rom = loaded_rom()?;
-    let names: Vec<String> = type_names(&rom, learned.partner.types)
-        .iter()
-        .map(|t| ascii(t))
+    let names: Vec<String> = traits_of(identity)
+        .active_type_list()
+        .into_iter()
+        .filter_map(|t| rom.type_name(t))
+        .map(|t| ascii(&t))
         .collect();
     (!names.is_empty()).then_some(names)
 }
 
-/// What is known of a Chao: its partner, moves and battle level, and whether that level is
-/// from our own file (its XP is known).
+/// What is known of a Chao: its partner, moves, types and abilities and battle level, and
+/// whether that level is from our own file (its XP is known).
 #[derive(Default)]
 struct Known {
     partner: Option<Partner>,
     moves: Moves,
+    traits: Traits,
     level: Level,
     ours: bool,
 }
@@ -414,10 +420,15 @@ struct Known {
 /// Chao from `partners.txt` (a copy we have too), then from what they sent, then from
 /// `chao/import/partners.txt`.
 fn record(identity: u64, own: bool) -> Known {
-    let known = |(partner, moves, level): (Option<Partner>, Moves, Level), ours| Known {
-        partner,
-        moves,
-        level,
+    // Abilities older files didn't record come from the ROM.
+    let known = |r: store::Record, ours| Known {
+        traits: match loaded_rom() {
+            Some(rom) => profile::recorded(&rom, r.partner.as_ref(), r.traits),
+            None => r.traits,
+        },
+        partner: r.partner,
+        moves: r.moves,
+        level: r.level,
         ours,
     };
     if let Some(r) = with_store(|s| s.record(identity)) {
@@ -429,12 +440,15 @@ fn record(identity: u64, own: bool) -> Known {
             ..Known::default()
         };
     }
-    let other = lock(&OTHERS).get(&identity).copied();
+    let other = lock(&OTHERS).get(&identity).cloned();
     let level = lock(&OTHER_LEVELS).get(&identity).copied();
     if other.is_some() || level.is_some() {
         return Known {
-            partner: other.map(|l| l.partner),
-            moves: other.map_or_else(Moves::default, |l| Moves::from_learned(&l)),
+            partner: other.as_ref().map(|(l, _)| l.partner),
+            moves: other
+                .as_ref()
+                .map_or_else(Moves::default, |(l, _)| Moves::from_learned(l)),
+            traits: other.map(|(_, t)| t).unwrap_or_default(),
             level: level.unwrap_or_default(),
             ours: false,
         };
@@ -450,23 +464,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The battle profile of the Chao with `identity`: its partner's types and ability, the four
-/// moves it battles with and its battle level, or Normal type with basic moves without a
-/// partner (`record` says where it comes from). `chosen` is given for a Chao in our save: the
-/// moves it battles with, and only our own file counts for it. Without `save_partners`, what
+/// The battle profile of the Chao with `identity`: the types, ability and four moves it
+/// battles with and its battle level, or Normal type with basic moves without a partner
+/// (`record` says where it comes from). `moves` and `traits` are given for a Chao in our save
+/// (what it battles with), and only our own file counts for it. Without `save_partners`, what
 /// partners from a GBA save gave is left out (`profile`). Loads the ROM if needed.
 pub fn battle_profile(
     identity: u64,
-    chosen: Option<&Moves>,
+    moves: Option<&Moves>,
+    traits: Option<&Traits>,
     save_partners: bool,
 ) -> Result<Profile, String> {
     let rom = rom()?;
-    let k = record(identity, chosen.is_some());
-    let moves = chosen.unwrap_or(&k.moves);
+    let k = record(identity, moves.is_some() || traits.is_some());
     Ok(profile::profile(
         &rom,
         k.partner.as_ref(),
-        moves,
+        traits.unwrap_or(&k.traits),
+        moves.unwrap_or(&k.moves),
         save_partners,
         k.level.level,
     ))
@@ -505,28 +520,63 @@ pub fn set_moves(identity: u64, moves: Moves) {
     crate::online::resend_partners();
 }
 
+/// Every type and ability our Chao with `identity` got, and the ones it battles with (an ability
+/// older files didn't record from the ROM, once it's loaded).
+pub fn traits_of(identity: u64) -> Traits {
+    let (partner, traits) = with_store(|s| {
+        (
+            s.partners.get(&identity).map(|l| l.partner),
+            s.traits_of(identity),
+        )
+    });
+    match loaded_rom() {
+        Some(rom) => profile::recorded(&rom, partner.as_ref(), traits),
+        None => traits,
+    }
+}
+
+/// Keeps `traits` as our Chao's with `identity` (its types or ability chosen) and tells the
+/// others.
+pub fn set_traits(identity: u64, traits: Traits) {
+    with_store(|s| s.set_traits(identity, traits));
+    write_store();
+    crate::online::resend_partners();
+}
+
 /// What friends' Chao files carry from partners, under the mod folder.
 const IMPORTED_PARTNERS: &str = "chao/import/partners.txt";
 
-/// What our Chao have from partners, the four moves they battle with and their battle levels,
-/// to send to the others.
+/// What our Chao have from partners, the types, ability and four moves they battle with and
+/// their battle levels, to send to the others.
 pub fn shared_partners() -> Vec<SharedPartner> {
-    with_store(|s| shared_of(s))
+    let rom = loaded_rom();
+    with_store(|s| shared_of(s, rom.as_deref()))
 }
 
-/// Each Chao `store` has anything of: its partner (species 0, Normal and no ability without
-/// one), its active moves and its battle level.
-fn shared_of(store: &Store) -> Vec<SharedPartner> {
+/// Each Chao `store` has anything of: its partner's species (0 without one), the types it
+/// battles as (Normal without), its active ability (0: none; one older files didn't record from
+/// `rom`) and moves, and its battle level.
+fn shared_of(store: &Store, rom: Option<&Rom>) -> Vec<SharedPartner> {
     store
         .identities()
         .into_iter()
         .map(|identity| {
             let partner = store.partners.get(&identity).map(|l| l.partner);
+            let traits = store.traits_of(identity);
+            let traits = match rom {
+                Some(rom) => profile::recorded(rom, partner.as_ref(), traits),
+                None => traits,
+            };
+            let types = match traits.active_type_list()[..] {
+                [] => [profile::NORMAL; 2],
+                [a] => [a; 2],
+                [a, b, ..] => [a, b],
+            };
             SharedPartner {
                 identity,
                 species: partner.map_or(0, |p| p.species),
-                types: partner.map_or([profile::NORMAL; 2], |p| p.types),
-                ability: partner.map_or(0, |p| p.ability),
+                types,
+                ability: traits.ability,
                 moves: store.moves_of(identity).active,
                 level: store.level(identity).level,
             }
@@ -543,31 +593,47 @@ pub fn others_learned(list: &[SharedPartner]) {
         if p.species == 0 && p.moves.iter().all(|&m| m == 0) {
             continue;
         }
+        // The types and ability are the ones it battles with (0: no ability).
+        let traits = if p.species == 0 {
+            Traits::default()
+        } else {
+            Traits::chosen(p.types, p.ability)
+        };
         others.insert(
             p.identity,
-            Learned {
-                partner: Partner {
-                    species: p.species,
-                    types: p.types,
+            (
+                Learned {
+                    partner: Partner {
+                        species: p.species,
+                        types: p.types,
+                        moves: p.moves,
+                        level: 0,
+                        ability: p.ability,
+                        from_save: false,
+                    },
                     moves: p.moves,
-                    level: 0,
-                    ability: p.ability,
-                    from_save: false,
+                    save_moves: 0,
                 },
-                moves: p.moves,
-                save_moves: 0,
-            },
+                traits,
+            ),
         );
     }
 }
 
 /// The `partners.txt` that goes with exported Chao files: for each of `identities` our store
-/// has anything of, its partner (species 0 without one) with the four moves it battles with,
-/// and its battle level; not its whole move list. `None` when there's nothing to write.
+/// has anything of, its partner (species 0 without one), its types and abilities, the four moves
+/// it battles with (not its whole move list) and its battle level. `None` when there's nothing
+/// to write.
 fn export_of(store: &Store, identities: &[u64]) -> Option<Store> {
     let mut out = Store::default();
     for &identity in identities {
-        let Some((partner, moves, _)) = store.record(identity) else {
+        let Some(store::Record {
+            partner,
+            moves,
+            traits,
+            ..
+        }) = store.record(identity)
+        else {
             continue;
         };
         if let Some(&l) = store.levels.get(&identity) {
@@ -592,6 +658,9 @@ fn export_of(store: &Store, identities: &[u64]) -> Option<Store> {
                 save_moves: moves.active_marks(),
             },
         );
+        if partner.species != 0 {
+            out.traits.insert(identity, traits);
+        }
     }
     (!out.partners.is_empty() || !out.levels.is_empty()).then_some(out)
 }
@@ -671,19 +740,53 @@ const FOLDER_NOTE_TEXT: &str = "Put your own ROM of Emerald for the Game Boy Adv
 end in .gba (check that Windows isn't hiding a second extension). A save file from it (.sav) \
 is optional. Then start the game again.\r\n";
 
-/// Makes the mod's `gba` folder with its note when there's none, so players see where the
-/// ROM goes.
+/// Makes the mod's `gba` folder when there's none, and while it has no `.gba` file leaves the
+/// note saying what goes in it and logs what it does hold (a ROM still zipped or named
+/// `.gba.gba` shows up there).
 fn make_folder() {
     let dir = folder();
-    if dir.exists() {
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log!("gba link: can't make {}: {e}", dir.display());
         return;
     }
-    let made = std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(dir.join(FOLDER_NOTE), FOLDER_NOTE_TEXT));
-    match made {
-        Ok(()) => log!("gba link: made {} for the ROM", dir.display()),
-        Err(e) => log!("gba link: can't make {}: {e}", dir.display()),
+    if with(|l| !l.paths.rom.trim().is_empty()) {
+        // The ROM is set elsewhere (`GbaRom`).
+        return;
     }
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != FOLDER_NOTE)
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.iter().any(|n| has_extension(n, "gba")) {
+        return;
+    }
+    let note = dir.join(FOLDER_NOTE);
+    if !note.exists()
+        && let Err(e) = std::fs::write(&note, FOLDER_NOTE_TEXT)
+    {
+        log!("gba link: can't write {}: {e}", note.display());
+    }
+    log!(
+        "gba link: no ROM (.gba) in {}{}",
+        dir.display(),
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!("; it holds: {}", names.join(", "))
+        }
+    );
+}
+
+/// `name` ends in `.extension` (any case).
+fn has_extension(name: &str, extension: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(extension))
 }
 
 pub fn install() {
@@ -822,22 +925,53 @@ pub enum Action {
     Bring(Candidate),
     /// Take this first-partner species as the gift.
     Gift(u16),
-    /// The link machine's list of our Chao, to choose the moves one battles with
-    /// (`Page::chao_list`).
-    Moves,
+    /// The link machine's list of our Chao, to choose the moves, types and ability one battles
+    /// with (`Page::chao_list`).
+    ChaoList,
+    /// What our Chao with this identity battles with: its moves, types and ability, each to
+    /// choose (`Page::chao_choices`).
+    Chao(u64),
     /// The moves our Chao with this identity learned (`Page::chao_moves`).
     ChaoMoves(u64),
+    /// The types our Chao with this identity got (`Page::chao_types`).
+    ChaoTypes(u64),
+    /// The abilities our Chao with this identity got (`Page::chao_abilities`).
+    ChaoAbilities(u64),
     /// Switch move `id` of our Chao `identity` on or off for battles (`toggle_move`).
     Toggle { identity: u64, id: u16 },
+    /// Switch type `id` of our Chao `identity` on or off for battles (`toggle_type`).
+    ToggleType { identity: u64, id: u8 },
+    /// Our Chao `identity` battles with ability `id` (0: none) (`choose_ability`).
+    Ability { identity: u64, id: u8 },
     /// Back to the list before.
     Back,
 }
 
+impl Action {
+    /// It opens another page of the link machine's list.
+    pub fn opens_page(&self) -> bool {
+        matches!(
+            self,
+            Self::ChaoList
+                | Self::Chao(_)
+                | Self::ChaoMoves(_)
+                | Self::ChaoTypes(_)
+                | Self::ChaoAbilities(_)
+        )
+    }
+}
+
 /// The GBA link list: the save's creatures and the mod's kept ones, one row each; without a save,
-/// the first-partner gift until it's taken. The link machine's move lists are pages too.
+/// the first-partner gift until it's taken. The link machine's Chao, move, type and ability
+/// lists are pages too.
 pub struct Page {
     pub title: String,
     pub rows: Vec<(String, Action)>,
+    /// Each row's name for the keyboard search (`crate::search`); rows without one (past the
+    /// end too) always show.
+    pub names: Vec<Option<String>>,
+    /// A line about each row, shown under the list while it's highlighted (none past the end).
+    pub notes: Vec<Option<String>>,
     pub row: usize,
     pub scroll: usize,
     /// What the keys do here (the link machine's own when empty).
@@ -847,16 +981,66 @@ pub struct Page {
 /// The gift's level.
 const GIFT_LEVEL: u8 = 5;
 
+/// The last hint lines of the link machine's pages, with what B does (`back`: "back" or
+/// "close").
+pub fn nav_hints(back: &str) -> [String; 2] {
+    [
+        "Up/Down pick, Left/Right jump 10, PgUp/PgDn a page.".into(),
+        format!("Type to search. B / Esc / Backspace {back}."),
+    ]
+}
+
 impl Page {
+    fn new(title: String, rows: Vec<(String, Action)>, hints: Vec<String>) -> Self {
+        Self {
+            title,
+            rows,
+            names: Vec::new(),
+            notes: Vec::new(),
+            row: 0,
+            scroll: 0,
+            hints,
+        }
+    }
+
+    /// Row `i`'s search name.
+    pub fn name(&self, i: usize) -> Option<&str> {
+        self.names.get(i)?.as_deref()
+    }
+
+    /// Row `i`'s note.
+    pub fn note(&self, i: usize) -> Option<&str> {
+        self.notes.get(i)?.as_deref()
+    }
+
+    /// Adds a row with its search name.
+    fn push(&mut self, text: String, action: Action, name: Option<String>) {
+        self.names.resize(self.rows.len(), None);
+        self.rows.push((text, action));
+        self.names.push(name);
+    }
+
+    /// Puts a row without a search name or note first.
+    pub fn push_front(&mut self, text: String, action: Action) {
+        self.rows.insert(0, (text, action));
+        if !self.names.is_empty() {
+            self.names.insert(0, None);
+        }
+        if !self.notes.is_empty() {
+            self.notes.insert(0, None);
+        }
+    }
+
     /// Reads the ROM and save now.
     pub fn open() -> Self {
-        let mut rows = Vec::new();
+        let mut page = Self::new("Link machine".into(), Vec::new(), Vec::new());
         match rom() {
             Err(e) => {
                 log!("gba link: {e}");
-                rows.push((e, Action::None));
+                page.push(e, Action::None, None);
             }
             Ok(rom) => {
+                let name = |species: u16| rom.species_name(species).map(|n| ascii(&n));
                 let save = read_save();
                 if let Ok(save) = &save {
                     for c in save
@@ -865,13 +1049,15 @@ impl Page {
                         .chain(&save.boxes)
                         .filter_map(|m| Candidate::from_mon(&rom, m))
                     {
-                        rows.push((label(&rom, &c), Action::Bring(c)));
+                        let n = name(c.species);
+                        page.push(label(&rom, &c), Action::Bring(c), n);
                     }
                     if save.skipped > 0 {
-                        rows.push((
+                        page.push(
                             format!("({} damaged entries skipped)", save.skipped),
                             Action::None,
-                        ));
+                            None,
+                        );
                     }
                 }
                 let (kept, gift) = with_store(|s| (s.kept.clone(), s.gift));
@@ -884,15 +1070,19 @@ impl Page {
                         moves,
                         ability_slot: 0,
                     };
-                    rows.push((label(&rom, &c), Action::Bring(c)));
+                    page.push(label(&rom, &c), Action::Bring(c), name(species));
                 }
                 if let Err(e) = &save {
                     log!("gba link: {e}");
-                    rows.push((e.clone(), Action::None));
+                    page.push(e.clone(), Action::None, None);
                     if gift.is_none()
                         && let Some(starters) = rom.starters()
                     {
-                        rows.push(("Or take one gift partner (only once):".into(), Action::None));
+                        page.push(
+                            "Or take one gift partner (only once):".into(),
+                            Action::None,
+                            None,
+                        );
                         for species in starters {
                             let c = Candidate {
                                 source: Source::Kept,
@@ -903,72 +1093,152 @@ impl Page {
                                 ability_slot: 0,
                             };
                             let text = label(&rom, &c).replacen("Kept", "Gift", 1);
-                            rows.push((text, Action::Gift(species)));
+                            page.push(text, Action::Gift(species), name(species));
                         }
                     }
                 }
-                if rows.is_empty() {
-                    rows.push(("The save has no one to bring".into(), Action::None));
+                if page.rows.is_empty() {
+                    page.push("The save has no one to bring".into(), Action::None, None);
                 }
             }
         }
-        Self {
-            title: "Link machine".into(),
-            rows,
-            row: 0,
-            scroll: 0,
-            hints: Vec::new(),
-        }
+        page
     }
 
-    /// Our Chao (hatched, in any garden), to choose the moves one battles with.
+    /// Our Chao (hatched, in any garden), to choose what one battles with.
     pub fn chao_list() -> Self {
-        let mut rows: Vec<(String, Action)> = own_chao()
+        let mut page = Self::new(
+            "Moves, type & ability: which Chao?".into(),
+            Vec::new(),
+            [
+                "A / Enter: what it battles with. Each Chao remembers".into(),
+                "every move, type and ability its partners gave it.".into(),
+            ]
             .into_iter()
-            .map(|(identity, name)| {
-                let m = moves_of(identity);
-                (chao_row(&name, &m), Action::ChaoMoves(identity))
-            })
-            .collect();
-        if rows.is_empty() {
-            rows.push(("You have no Chao to choose moves for".into(), Action::None));
+            .chain(nav_hints("back"))
+            .collect(),
+        );
+        for (identity, name) in own_chao() {
+            let row = chao_row(&name, &moves_of(identity));
+            page.push(row, Action::Chao(identity), Some(name));
         }
-        Self {
-            title: "Moves: which Chao?".into(),
+        if page.rows.is_empty() {
+            page.push("You have no Chao to choose for".into(), Action::None, None);
+        }
+        page
+    }
+
+    /// What our Chao `identity` battles with: its moves, types and ability, each a page.
+    pub fn chao_choices(identity: u64) -> Self {
+        let rom = loaded_rom();
+        let rows = choice_rows(
+            identity,
+            &moves_of(identity),
+            &traits_of(identity),
+            |t| type_name(rom.as_deref(), t),
+            |a| ability_name(rom.as_deref(), a),
+        );
+        Self::new(
+            format!("{}: moves, type & ability", chao_name(identity)),
             rows,
-            row: 0,
-            scroll: 0,
-            hints: vec![
-                "A / Enter: its moves. Each Chao remembers every move".into(),
-                "it learned and battles with up to four of them.".into(),
-                "Up/Down (PgUp/PgDn) pick. B / Esc / Backspace back.".into(),
-            ],
-        }
+            [
+                "A / Enter: choose. Changes are kept at once.".into(),
+                "Up/Down pick. B / Esc / Backspace back.".into(),
+            ]
+            .into(),
+        )
     }
 
     /// Every move our Chao `identity` learned, each switched on or off for battles.
     pub fn chao_moves(identity: u64) -> Self {
-        let name = own_chao()
-            .into_iter()
-            .find(|(id, _)| *id == identity)
-            .map_or_else(|| "Chao".to_string(), |(_, name)| name);
         let rom = loaded_rom();
         let describe = |id: u16| match &rom {
             Some(rom) => move_label(rom, id),
             None => format!("Move #{id}"),
         };
-        Self {
-            title: format!("{name}'s moves (4 at most)"),
-            rows: move_rows(identity, &moves_of(identity), describe),
-            row: 0,
-            scroll: 0,
-            hints: vec![
+        let moves = moves_of(identity);
+        let mut page = Self::new(
+            format!("{}'s moves (4 at most)", chao_name(identity)),
+            move_rows(identity, &moves, describe),
+            [
                 "A / Enter: use or drop a move (kept at once). [x]: it".into(),
                 "battles with it. GBA save: only a save's partner taught it,".into(),
                 "so live battles without GBA save partners leave it out.".into(),
-                "Up/Down (PgUp/PgDn) pick. B / Esc / Backspace back.".into(),
-            ],
-        }
+            ]
+            .into_iter()
+            .chain(nav_hints("back"))
+            .collect(),
+        );
+        page.names = moves
+            .known
+            .iter()
+            .map(|&(id, _)| {
+                rom.as_ref()
+                    .and_then(|r| r.move_name(id))
+                    .map(|n| ascii(&n))
+            })
+            .collect();
+        page
+    }
+
+    /// Every type our Chao `identity` got, each switched on or off for battles (two at most).
+    pub fn chao_types(identity: u64) -> Self {
+        let rom = loaded_rom();
+        let traits = traits_of(identity);
+        let mut page = Self::new(
+            format!("{}'s type (2 at most)", chao_name(identity)),
+            type_rows(identity, &traits, |t| type_name(rom.as_deref(), t)),
+            [
+                "A / Enter: use or drop a type (kept at once). [x]: it".into(),
+                "battles as it. GBA save: only a save's partner gave it,".into(),
+                "so live battles without GBA save partners leave it out.".into(),
+            ]
+            .into_iter()
+            .chain(nav_hints("back"))
+            .collect(),
+        );
+        page.names = traits
+            .types
+            .iter()
+            .map(|&(t, _)| Some(type_name(rom.as_deref(), t)))
+            .collect();
+        page
+    }
+
+    /// Every ability our Chao `identity` got, one (or none) chosen for battles, each with the
+    /// ROM's description.
+    pub fn chao_abilities(identity: u64) -> Self {
+        let rom = loaded_rom();
+        let traits = traits_of(identity);
+        let mut page = Self::new(
+            format!("{}'s ability", chao_name(identity)),
+            ability_rows(identity, &traits, |a| ability_name(rom.as_deref(), a)),
+            [
+                "A / Enter: battle with it (kept at once). (o): its ability.".into(),
+                "GBA save: only a save's partner gave it, so live battles".into(),
+                "without GBA save partners leave it out.".into(),
+            ]
+            .into_iter()
+            .chain(nav_hints("back"))
+            .collect(),
+        );
+        // Row 0 is "None".
+        page.names = std::iter::once(None)
+            .chain(
+                traits
+                    .abilities
+                    .iter()
+                    .map(|&(a, _)| Some(ability_name(rom.as_deref(), a))),
+            )
+            .collect();
+        page.notes = std::iter::once(Some("It battles without an ability.".to_string()))
+            .chain(traits.abilities.iter().map(|&(a, _)| {
+                rom.as_ref()
+                    .and_then(|r| r.ability_description(a))
+                    .map(|d| ascii(&d.replace('\n', " ")))
+            }))
+            .collect();
+        page
     }
 }
 
@@ -981,10 +1251,65 @@ fn own_chao() -> Vec<(u64, String)> {
         .collect()
 }
 
+/// The name of our Chao with `identity` ("Chao" when it's not in the save).
+fn chao_name(identity: u64) -> String {
+    own_chao()
+        .into_iter()
+        .find(|(id, _)| *id == identity)
+        .map_or_else(|| "Chao".to_string(), |(_, name)| name)
+}
+
+/// The ROM's name of type `t` ("Type #t" without the ROM).
+fn type_name(rom: Option<&Rom>, t: u8) -> String {
+    rom.and_then(|r| r.type_name(t))
+        .map_or_else(|| format!("Type #{t}"), |n| ascii(&n))
+}
+
+/// The ROM's name of ability `a` ("Ability #a" without the ROM).
+fn ability_name(rom: Option<&Rom>, a: u8) -> String {
+    rom.and_then(|r| r.ability_name(a))
+        .map_or_else(|| format!("Ability #{a}"), |n| ascii(&n))
+}
+
 /// A Chao's row in the link machine's list: its name and how many moves it uses and knows.
 fn chao_row(name: &str, m: &Moves) -> String {
     let on = m.active.iter().filter(|&&id| id != 0).count();
     format!("{name:<7}  {on} of {} moves", m.known.len())
+}
+
+/// The rows of what a Chao battles with (`type_name` and `ability_name` name them): its moves,
+/// types and ability, each opening its page, then "Done".
+fn choice_rows(
+    identity: u64,
+    m: &Moves,
+    t: &Traits,
+    type_name: impl Fn(u8) -> String,
+    ability_name: impl Fn(u8) -> String,
+) -> Vec<(String, Action)> {
+    let on = m.active.iter().filter(|&&id| id != 0).count();
+    let types: Vec<String> = t.active_type_list().into_iter().map(type_name).collect();
+    vec![
+        (
+            format!("Moves: {on} of {} on", m.known.len()),
+            Action::ChaoMoves(identity),
+        ),
+        (
+            if types.is_empty() {
+                "Type: Normal (none from partners yet)".into()
+            } else {
+                format!("Type: {}", types.join("/"))
+            },
+            Action::ChaoTypes(identity),
+        ),
+        (
+            match t.ability {
+                0 => "Ability: none".into(),
+                a => format!("Ability: {}", ability_name(a)),
+            },
+            Action::ChaoAbilities(identity),
+        ),
+        ("Done".into(), Action::Back),
+    ]
 }
 
 /// A move's name, type and power from the ROM ("Name  Type 40").
@@ -1033,6 +1358,50 @@ fn move_rows(identity: u64, m: &Moves, describe: impl Fn(u16) -> String) -> Vec<
     rows
 }
 
+/// The rows of a Chao's types (`name` names one): "[x]" on the ones it battles as, "(GBA save)"
+/// on the ones only partners from a GBA save gave it, then "Done".
+fn type_rows(identity: u64, t: &Traits, name: impl Fn(u8) -> String) -> Vec<(String, Action)> {
+    let mut rows: Vec<(String, Action)> = t
+        .types
+        .iter()
+        .map(|&(id, marked)| {
+            let on = if t.is_type_active(id) { "[x]" } else { "[ ]" };
+            let save = if marked { "  (GBA save)" } else { "" };
+            (
+                format!("{on} {}{save}", name(id)),
+                Action::ToggleType { identity, id },
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        rows.push((
+            "No types from partners yet: it battles as Normal".into(),
+            Action::None,
+        ));
+    }
+    rows.push(("Done".into(), Action::Back));
+    rows
+}
+
+/// The rows of a Chao's abilities (`name` names one): "None", then each, "(o)" on the one it
+/// battles with and "(GBA save)" on the ones only partners from a GBA save gave it, then "Done".
+fn ability_rows(identity: u64, t: &Traits, name: impl Fn(u8) -> String) -> Vec<(String, Action)> {
+    let mark = |on: bool| if on { "(o)" } else { "( )" };
+    let mut rows = vec![(
+        format!("{} None", mark(t.ability == 0)),
+        Action::Ability { identity, id: 0 },
+    )];
+    rows.extend(t.abilities.iter().map(|&(id, marked)| {
+        let save = if marked { "  (GBA save)" } else { "" };
+        (
+            format!("{} {}{save}", mark(t.ability == id), name(id)),
+            Action::Ability { identity, id },
+        )
+    }));
+    rows.push(("Done".into(), Action::Back));
+    rows
+}
+
 /// Switches move `id` of our Chao `identity` on or off for battles and keeps it (`set_moves`);
 /// whether it's on now.
 pub fn toggle_move(identity: u64, id: u16) -> Result<bool, store::MoveRefused> {
@@ -1040,6 +1409,23 @@ pub fn toggle_move(identity: u64, id: u16) -> Result<bool, store::MoveRefused> {
     let on = m.toggle(id)?;
     set_moves(identity, m);
     Ok(on)
+}
+
+/// Switches type `id` of our Chao `identity` on or off for battles and keeps it (`set_traits`);
+/// whether it's on now.
+pub fn toggle_type(identity: u64, id: u8) -> Result<bool, store::TraitRefused> {
+    let mut t = traits_of(identity);
+    let on = t.toggle_type(id)?;
+    set_traits(identity, t);
+    Ok(on)
+}
+
+/// Our Chao `identity` battles with ability `id` (0: none) from now on (`set_traits`).
+pub fn choose_ability(identity: u64, id: u8) -> Result<(), store::TraitRefused> {
+    let mut t = traits_of(identity);
+    t.choose_ability(id)?;
+    set_traits(identity, t);
+    Ok(())
 }
 
 /// Takes the gift `species` (one of the ROM's first partners, once only). The message to show.
@@ -1086,6 +1472,16 @@ pub fn take_gift_candidate(species: u16) -> Result<Candidate, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_real_gba_name_counts_as_a_rom() {
+        use super::has_extension;
+        assert!(has_extension("emerald.gba", "gba"));
+        assert!(has_extension("Emerald.GBA", "gba"));
+        assert!(!has_extension("emerald.gba.zip", "gba"));
+        assert!(!has_extension("emerald.gba.7z", "gba"));
+        assert!(!has_extension("gba", "gba"));
+    }
+
     use super::*;
     use crate::gba::rom::Species;
 
@@ -1119,12 +1515,28 @@ mod tests {
 
     #[test]
     fn friends_get_the_active_moves_and_levels_of_every_chao() {
-        let shared = shared_of(&store());
+        let mut s = store();
+        // Chao 1 battles as its first partner's type and a later one's, with no ability.
+        let mut t = s.traits_of(1);
+        t.learn(&Partner {
+            species: 30,
+            types: [2, 2],
+            moves: [0; 4],
+            level: 5,
+            ability: 20,
+            from_save: false,
+        });
+        t.toggle_type(2).unwrap();
+        t.choose_ability(0).unwrap();
+        s.set_traits(1, t);
+        let shared = shared_of(&s, None);
         assert_eq!(shared.len(), 3);
         assert_eq!(
             (shared[0].species, shared[0].moves, shared[0].level),
             (25, [84, 45, 86, 98], 40)
         );
+        assert_eq!((shared[0].types, shared[0].ability), ([13, 2], 0));
+        assert_eq!(shared_of(&store(), None)[0].ability, 9);
         assert_eq!(
             (
                 shared[1].species,
@@ -1142,11 +1554,16 @@ mod tests {
         }
         others_learned(&theirs);
         let others = lock(&OTHERS);
-        assert_eq!(others[&theirs[0].identity].moves, [84, 45, 86, 98]);
+        assert_eq!(others[&theirs[0].identity].0.moves, [84, 45, 86, 98]);
         assert!(others.contains_key(&theirs[1].identity));
         assert!(!others.contains_key(&theirs[2].identity));
+        // What it battles with, as sent: no ability is none, not the species' first.
+        let t = &others[&theirs[0].identity].1;
+        assert_eq!((t.active_types, t.ability), ([13, 2], 0));
+        assert_eq!(others[&theirs[1].identity].1, Traits::default());
         drop(others);
         assert_eq!(lock(&OTHER_LEVELS)[&theirs[2].identity].level, 9);
+        assert_eq!(record(theirs[0].identity, false).traits.ability, 0);
     }
 
     #[test]
@@ -1201,6 +1618,60 @@ mod tests {
         assert_eq!(back.moves_of(2).active, [15, 0, 0, 0]);
         assert_eq!(back.level(3).level, 9);
         assert!(!back.partners.contains_key(&3));
+        // Its types and abilities, with the ones it battles with.
+        assert_eq!(back.traits_of(1), s.traits_of(1));
+        assert_eq!(back.traits_of(1).active_types, [13, 13]);
+        assert!(!back.traits.contains_key(&2));
+    }
+
+    #[test]
+    fn the_machine_lists_what_a_chao_battles_with() {
+        let mut m = Moves::default();
+        m.learn([10, 20, 0, 0], false);
+        let mut t = Traits::default();
+        let rows = choice_rows(7, &m, &t, |id| format!("T{id}"), |id| format!("A{id}"));
+        let texts: Vec<&str> = rows.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "Moves: 2 of 2 on",
+                "Type: Normal (none from partners yet)",
+                "Ability: none",
+                "Done"
+            ]
+        );
+        assert_eq!(rows[1].1, Action::ChaoTypes(7));
+        assert_eq!(rows[2].1, Action::ChaoAbilities(7));
+        assert!(rows[..3].iter().all(|(_, a)| a.opens_page()));
+        assert_eq!(rows[3].1, Action::Back);
+        let type_none = type_rows(7, &t, |id| format!("T{id}"));
+        assert_eq!(type_none[0].1, Action::None);
+        let ability_none = ability_rows(7, &t, |id| format!("A{id}"));
+        assert_eq!(ability_none[0].0, "(o) None");
+        assert_eq!(ability_none.len(), 2);
+        for (types, ability, from_save) in [([3, 3], 9, true), ([5, 6], 4, false)] {
+            t.learn(&Partner {
+                species: 1,
+                types,
+                moves: [0; 4],
+                level: 5,
+                ability,
+                from_save,
+            });
+        }
+        t.toggle_type(6).unwrap();
+        let rows = choice_rows(7, &m, &t, |id| format!("T{id}"), |id| format!("A{id}"));
+        assert_eq!(rows[1].0, "Type: T3/T6");
+        assert_eq!(rows[2].0, "Ability: A9");
+        let rows = type_rows(7, &t, |id| format!("T{id}"));
+        let texts: Vec<&str> = rows.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(texts, ["[x] T3  (GBA save)", "[ ] T5", "[x] T6", "Done"]);
+        assert_eq!(rows[1].1, Action::ToggleType { identity: 7, id: 5 });
+        let rows = ability_rows(7, &t, |id| format!("A{id}"));
+        let texts: Vec<&str> = rows.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(texts, ["( ) None", "(o) A9  (GBA save)", "( ) A4", "Done"]);
+        assert_eq!(rows[0].1, Action::Ability { identity: 7, id: 0 });
+        assert_eq!(rows[2].1, Action::Ability { identity: 7, id: 4 });
     }
 
     #[test]

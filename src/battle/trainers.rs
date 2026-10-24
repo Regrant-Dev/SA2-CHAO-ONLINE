@@ -388,6 +388,60 @@ impl Picker {
         self.notice = Some(text);
     }
 
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    /// The cursor of the list showing.
+    pub fn cursor_mut(&mut self) -> &mut usize {
+        match &mut self.view {
+            View::List(c) | View::TeachMove(c) => c,
+            View::Tier { cursor, .. }
+            | View::TeachChao { cursor, .. }
+            | View::TeachSlot { cursor, .. } => cursor,
+        }
+    }
+
+    /// Which list shows (another one clears the session's search): the view and what it's of.
+    pub fn view_key(&self) -> (usize, usize) {
+        match self.view {
+            View::List(_) => (0, 0),
+            View::Tier { tier, .. } => (1, tier),
+            View::TeachMove(_) => (2, 0),
+            View::TeachChao { move_id, .. } => (3, usize::from(move_id)),
+            View::TeachSlot { move_id, chao, .. } => (4, usize::from(move_id) << 8 | chao),
+        }
+    }
+
+    /// The search names of the list showing, one per item of its screen (`None`: always shows):
+    /// the trainers' and route groups' labels, the trainers, the TM moves and the Chao.
+    pub fn names(&self, ctx: &Ctx) -> Vec<Option<String>> {
+        let plan = &ctx.roster.plan;
+        match self.view {
+            View::List(_) => plan
+                .rungs()
+                .iter()
+                .map(|&r| Some(ctx.roster.rung_label(r)))
+                .chain([None])
+                .collect(),
+            View::Tier { tier, .. } => plan
+                .route
+                .get(tier)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .map(|&id| Some(ctx.roster.name(id)))
+                .collect(),
+            View::TeachMove(_) => ctx
+                .roster
+                .won_moves(ctx.progress)
+                .iter()
+                .map(|&m| Some(ctx.dex.move_name(m)))
+                .collect(),
+            View::TeachChao { .. } => ctx.own.iter().map(|e| Some(e.name.clone())).collect(),
+            View::TeachSlot { .. } => vec![None; 4],
+        }
+    }
+
     fn list_len(ctx: &Ctx) -> usize {
         ctx.roster.plan.rungs().len() + 1
     }
@@ -823,6 +877,7 @@ mod tests {
                 bytes: [0; crate::chao::CHAO_SIZE],
             },
             moves: None,
+            traits: None,
         }
     }
 

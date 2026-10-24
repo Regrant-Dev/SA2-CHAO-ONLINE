@@ -52,6 +52,7 @@ mod race;
 mod registry;
 mod room;
 mod saving;
+mod search;
 mod shots;
 mod skin_sync;
 mod skins;

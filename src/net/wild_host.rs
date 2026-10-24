@@ -29,7 +29,7 @@ use crate::chao_sim::land::{Blocker, Garden, Shape, V3};
 use crate::chao_sim::wild::{
     ANIMAL_LIMIT, CALL_REACH, CALL_SECS, GONE_FAR, LOST_Y, MAX_VISITORS, MIN_CAP, NEXT_SECS,
     ON_ENTRY, RESERVE, Rng, Roam, STAY_SECS, Spots, Swim, dist2, floor_below, in_pond,
-    land_spot_away, middle, to_pond, walk_toward,
+    land_spot_away, middle, scaled_cap, to_pond, walk_toward,
 };
 
 /// The sender id the host's messages carry.
@@ -213,6 +213,8 @@ struct Visit {
     /// The garden's wild area this run, and the print it was chosen with.
     section: Option<(u8, u32)>,
     cap: usize,
+    /// "No room" was logged and nothing has come since.
+    full_logged: bool,
     came: usize,
     started: Instant,
     next: Instant,
@@ -650,8 +652,9 @@ impl WildHost {
             .map(|p| (p.position[0], p.position[2]))
             .collect();
         let animals = gardens.animals(area);
+        let cap = scaled_cap(g.cap, around.len());
         for ((p, stay), id) in list.iter().zip(stay).zip(ids) {
-            if g.wild() >= g.cap.max(placed.min(MAX_VISITORS)) || g.room(animals) == 0 {
+            if g.wild() >= cap.max(placed.min(MAX_VISITORS)) || g.room(animals) == 0 {
                 break;
             }
             let Some((at, angle, place)) =
@@ -1198,6 +1201,7 @@ impl WildHost {
                     print: 0,
                     section: None,
                     cap: self.rng.between(MIN_CAP as u64, MAX_VISITORS as u64) as usize,
+                    full_logged: false,
                     came: 0,
                     started: now,
                     next: now,
@@ -1443,13 +1447,23 @@ impl WildHost {
         if g.ask.is_some() || g.frozen || now < g.next {
             return;
         }
+        let here = players.iter().filter(|p| p.area == area).count();
+        let cap = scaled_cap(g.cap, here);
         let (wild, room) = (g.wild(), g.room(animals));
-        if wild >= g.cap || room == 0 {
+        if wild >= cap || room == 0 {
+            if !g.full_logged {
+                g.full_logged = true;
+                crate::log!(
+                    "wild host: garden {area} has no room for more visitors (wild {wild} of {cap}, list {}, its own animals {animals})",
+                    g.list.len()
+                );
+            }
             g.next = now + delay;
             return;
         }
+        g.full_logged = false;
         let count = if g.came == 0 { ON_ENTRY } else { 1 }
-            .min(g.cap - wild)
+            .min(cap - wild)
             .min(room)
             .min(MAX_WILD_PICK);
         let pond_cells = !g.spots.pond_entries().is_empty();
@@ -2011,8 +2025,8 @@ mod tests {
     fn visitors_never_pass_the_cap_nor_the_games_animal_room() {
         let t0 = Instant::now();
         let (mut host, mut fake) = two(t0);
-        // 16 animals and drives already: room for 2 (20 - 2 kept - 16).
-        fake.animals = 16;
+        // 28 animals and drives already: room for 2 (32 - 2 kept - 28).
+        fake.animals = 28;
         let mut now = t0 + Duration::from_secs(2);
         let out = run(&mut host, &mut fake, 2, &mut now);
         let Some((_, Body::WildAsk { land, pond, .. })) = asks(&out).first().cloned() else {
@@ -2023,10 +2037,13 @@ mod tests {
         let out = run(&mut host, &mut fake, 60 * 120, &mut now);
         assert!(asks(&out).is_empty(), "no room for more");
         assert_eq!(entries(&out, 0).len(), 2);
-        // With room, up to the cap (6 or 7) and never more, over a long time.
+        // With room, up to the cap (6 or 7, and 3 more for the second player there) and never
+        // more, over a long time.
         fake.animals = 0;
-        let cap = host.gardens[0].as_ref().unwrap().cap;
-        assert!((MIN_CAP..=MAX_VISITORS).contains(&cap));
+        let base = host.gardens[0].as_ref().unwrap().cap;
+        assert!((MIN_CAP..=MAX_VISITORS).contains(&base));
+        let cap = scaled_cap(base, 2);
+        assert_eq!(cap, base + 3);
         let mut most = 0;
         for _ in 0..20 * 60 {
             let out = run(&mut host, &mut fake, 60, &mut now);
@@ -2057,7 +2074,7 @@ mod tests {
         let (mut host, mut fake, mut now, _) = with_visitors(t0);
         assert_eq!(host.gardens[0].as_ref().unwrap().list.len(), ON_ENTRY);
         // Room for none more: a partner sends the farthest roaming wild one away.
-        fake.animals = 15;
+        fake.animals = 26;
         bring(&mut host, &fake, 1, 77, now);
         let out = run(&mut host, &mut fake, 12, &mut now);
         let a = answers(&out, 1);
@@ -2076,7 +2093,7 @@ mod tests {
         assert_eq!(answers(&out, 1), [(WildRequest::Bring, 0, false)]);
         assert_eq!(answers(&out, 0), [(WildRequest::Bring, 0, false)]);
         // Nothing roaming left to send away: refused.
-        fake.animals = 18;
+        fake.animals = 28;
         for v in &mut host.gardens[0].as_mut().unwrap().list {
             if v.origin == Origin::Wild {
                 v.place = Place::Battle { by: 5, swim: None };
