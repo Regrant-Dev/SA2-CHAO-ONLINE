@@ -292,7 +292,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
   nothing to pick up closer to you, and press the action button to open its list of
   the save's party and boxes and the ones the mod keeps, with each one's level and types. The
   list's first row, **Moves, type & ability**, is for choosing what your Chao battle with
-  (below).
+  (below); the second, **Who can come here**, shows each garden's wild visitors (Wild visitors,
+  below).
 - Move through the list with Up/Down on the controller or keyboard, and the machine's screen
   shows the picture of the one highlighted. A or Enter picks it: it pops out of the machine's
   hatch as a partner, drawn as its picture, and walks into the garden. B, Esc or Backspace
@@ -300,7 +301,8 @@ and pictures are read from your ROM, and the save is only read, never changed.
   presses. When the garden is full of animals, a wild visitor leaves to make room.
 - **Long lists:** in every list of the link machine, Left/Right (D-pad or arrow keys) jump 10
   rows and PgUp/PgDn a page. Typing on the keyboard searches the list by name (the creature's,
-  the Chao's, the move's, type's or ability's), whatever the case and anywhere in the name: a
+  the Chao's, the garden's, the move's, type's or ability's), whatever the case and anywhere in
+  the name: a
   "Search:" line above the list shows what you typed and only the rows that match stay, with
   rows like **Done** always there. Backspace deletes a letter and Esc clears the search; with
   no search, they go back as before. While the list is open, letters only type into the search
@@ -348,19 +350,40 @@ and pictures are read from your ROM, and the save is only read, never changed.
   are kept in `gba/partners.txt`; in the Chao save absorbing one only adds the happiness an
   animal gives.
 
-**Wild visitors:** each garden is linked to one area of the GBA game, a different one each time
-you walk into it (each of its areas comes once before any comes again). The
+**Wild visitors:** each garden is linked to one area of the GBA game, and the area changes every
+10 minutes by the clock (each of its areas comes once before any comes again). It's the same for
+everyone with the same ROM: friends in the same garden at the same time have the same area,
+alone or together. The
 Neutral Garden gets grassy routes and woods, the Hero Garden sea, sky and shore areas, and the
-Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, not a save.
+Dark Garden caves, mountains and sandy or ashy routes. Some areas fit two gardens and come to
+both: grassy shore routes to the Neutral and Hero Gardens, routes and caves full of flying and
+water creatures to the Hero Garden as well as their own, and a cave with only water creatures
+to the Dark Garden as well as the Hero Garden. Only the ROM is needed, not a save.
 
-- The area's name shows for a few seconds at the top of the screen when you walk into the garden.
-- Wild creatures of that area come by now and then, picked with the same chances and levels as
-  in the GBA game: four when you arrive, then one every 20 to 50 seconds, up to 6 or 7 at a
+- The area's name shows for a few seconds at the top of the screen when you walk into the garden
+  and when it changes, with how many minutes it has left. When it changes, the visitors already
+  about stay until they leave, and new ones come from the new area.
+- Wild creatures of that area come by now and then, at the same levels as in the GBA game:
+  four when you arrive, then one every 20 to 50 seconds, up to 6 or 7 at a
   time. In a shared online garden 3 more can be about for each other player there, up to 20.
   They don't crowd out the garden's own animals: the mod lets a garden hold 32 animals instead
   of the game's 10.
   Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
   shiny, in the GBA game's shiny colours.
+- **Variety:** the rare creatures of an area come a lot more often than in the GBA game (one
+  that is 1% there comes about 4% of the time), and the common ones a little less often. Half
+  of the pond's visitors are fished up, more often with the better rods' creatures. Kinds that
+  just came are less likely to come again for a while, so the same few don't keep coming back
+  to back (alone and in shared gardens alike).
+- **Who can come here:** the link machine's second row. Choose a garden (the one you're in comes
+  first): the list shows its area now and for how many more minutes, then every kind that can
+  come from it with its levels, where it comes from (grass, rocks, pond or fishing) and its
+  chance. A chance is of the visitors to the grass (grass and rocks) or to the pond (pond and
+  fishing), before the kinds that just came count less. The line under the list shows the
+  highlighted one's types and abilities, and the machine's screen its picture. The **Next**
+  row names the area that comes next and in how many minutes; A shows who can come from it.
+  The list takes the search and Left/Right jumps of the other lists; B, Esc or Backspace goes
+  back.
 - Whistle and nearby ones come to you: land creatures walk over and stop a few steps away,
   and water creatures swim to the edge of the pond nearest you.
 - Carry one to a Chao and it absorbs it like a partner (Chao walking past leave visitors alone,
@@ -391,9 +414,10 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
 **Wild visitors in shared gardens:** online, a garden shared with friends has one set of wild
 visitors that everyone in it sees. The server keeps them and moves them about.
 
-- The player who has been in the garden longest picks its area and its visitors from their ROM.
-  When they leave, the next one takes over, and the visitors already there stay. The area's name
-  shows when you walk in. Your own visitors leave when the garden becomes shared; the first
+- The garden's area follows the same 10-minute clock. The player who has been in the garden
+  longest picks its visitors from that area with their ROM. When they leave, the next one takes
+  over, and the visitors already there stay. The area's name shows when you walk in and when it
+  changes. Your own visitors leave when the garden becomes shared; the first
   player's stay where they are as the garden's.
 - Each game draws them from its own ROM, so everyone needs the same ROM: a player with another
   ROM, or none, sees no shared visitors and no link machine there.

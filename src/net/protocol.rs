@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 28;
+pub const PROTOCOL_VERSION: u16 = 29;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -740,8 +740,9 @@ pub enum Body {
         list: Vec<WildEntry>,
     },
     /// From the host, to garden `area`'s picker: pick `land` visitors for the grass and `pond`
-    /// for the pond from `section` (none: choose the garden's area for this run). `fresh`: the
-    /// garden just became shared, and the picker may hand over its own visitors where they are.
+    /// for the pond from `section` (none: the garden's area in the host's clock window `slot`,
+    /// `rotation::area_at`). `fresh`: the garden just became shared, and the picker may hand
+    /// over its own visitors where they are.
     WildAsk {
         area: u8,
         ask: u16,
@@ -749,6 +750,7 @@ pub enum Body {
         land: u8,
         pond: u8,
         fresh: bool,
+        slot: u32,
     },
     /// To the host only: the picker's answer to ask `ask`, from `section`.
     WildPick {
@@ -2852,10 +2854,11 @@ impl Body {
                 land,
                 pond,
                 fresh,
+                slot,
             } => {
                 w.u8(tag::WILD_ASK).u8(*area).u16(*ask);
                 write_section(w, *section);
-                w.u8(*land).u8(*pond).u8(u8::from(*fresh));
+                w.u8(*land).u8(*pond).u8(u8::from(*fresh)).u32(*slot);
             }
             Self::WildPick {
                 area,
@@ -4126,6 +4129,7 @@ impl Body {
                 let section = read_section(r)?;
                 let (land, pond) = (r.u8()?, r.u8()?);
                 let fresh = wire_flag(r, "wild ask")?;
+                let slot = r.u32()?;
                 if !(1..=MAX_WILD_PICK).contains(&(usize::from(land) + usize::from(pond))) {
                     return Err(WireError::BadValue("wild ask"));
                 }
@@ -4136,6 +4140,7 @@ impl Body {
                     land,
                     pond,
                     fresh,
+                    slot,
                 }
             }
             tag::WILD_PICK => {
@@ -5156,6 +5161,7 @@ mod tests {
                     land: 2,
                     pond: 1,
                     fresh: true,
+                    slot: 2_988_000,
                 },
             },
             Message::Game {
@@ -5665,6 +5671,7 @@ mod tests {
             land,
             pond,
             fresh: false,
+            slot: 7,
         };
         assert!(decodes(ask(4, 1)));
         assert!(!decodes(ask(0, 0)) && !decodes(ask(5, 1)));

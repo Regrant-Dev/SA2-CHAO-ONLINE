@@ -1,26 +1,29 @@
-//! Wild visitors (re/chao-wild-visitors.md): creatures of the garden's area for this visit
-//! (`rotation`) come by now and then, picked from the area's wild tables with their chances and
-//! level ranges: land ones walk on the grass, water ones swim in the pond, and now and then one
-//! is shiny (the ROM's shiny colours). Each is an animal object made like a partner's
-//! (`scene::create`): a Chao the player hands it to absorbs it, which teaches them its moves,
-//! types and ability as a partner does (`Store::learn`). Each visitor knows four moves picked at
-//! random from the ones its kind learns by its level (`random_moves`), so two of a kind can teach
-//! different ones. Up to 5 are in a garden at once. Visitors are never saved: they go when the
-//! player leaves, except one the player carries out, which comes back in their hands in the next
-//! garden. A shared online garden has none of them: the server's visitors are shown there
-//! (`shared`), and when the garden is the player's alone again they stay as theirs (`adopt`).
-//! A visit is kept while the player battles one of its visitors in the karate arena
-//! (`snapshot`).
+//! Wild visitors (re/chao-wild-visitors.md): creatures of the garden's area for the clock's
+//! 10-minute window (`rotation`) come by now and then, picked from the area's wild tables with
+//! their level ranges and flatter chances than the GBA game's (`ways`; the garden's recent
+//! species less often, `Recent`): land ones walk on the grass, water ones swim in the pond, and
+//! now and then one is shiny (the ROM's shiny colours). Each is an animal object made like a
+//! partner's (`scene::create`): a Chao the player hands it to absorbs it, which teaches them its
+//! moves, types and ability as a partner does (`Store::learn`). Each visitor knows four moves
+//! picked at random from the ones its kind learns by its level (`random_moves`), so two of a kind
+//! can teach different ones. Up to 5 are in a garden at once. Visitors are never saved: they go
+//! when the player leaves, except one the player carries out, which comes back in their hands in
+//! the next garden. A shared online garden has none of them: the server's visitors are shown there
+//! (`shared`), and when the garden is the player's alone again they stay as theirs (`adopt`). A
+//! visit is kept while the player battles one of its visitors in the karate arena (`snapshot`).
 
 // Off the game (Linux builds) only the tests use the garden side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use super::rotation::Area;
+use super::rotation::{self, Area};
 use super::store::Partner;
 use crate::gba::rom::Rom;
-use crate::gba::world::WildSlot;
+use crate::gba::world::{WildMethod, WildSlot};
 
 /// config.ini `WildVisitors`.
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -44,17 +47,125 @@ pub use crate::chao_sim::wild::{
 /// Nothing comes (nor the area's name) until the garden has been up and not shared this long:
 /// a shared garden is only known once friends' states or the server's Chao arrive.
 const ALONE_MILLIS: u64 = 2500;
+
+/// How long a garden that isn't shared waits before its visitors come (`ALONE_MILLIS`): online,
+/// for friends' states or the server's Chao to say it's shared, unless it was shared earlier in
+/// this visit (the server handed it back, or the friends left: it's known to be ours now);
+/// offline nobody can turn up.
+pub fn alone_wait(online: bool, was_shared: bool) -> Duration {
+    if online && !was_shared {
+        Duration::from_millis(ALONE_MILLIS)
+    } else {
+        Duration::ZERO
+    }
+}
 /// One visitor in this many is shiny.
 pub const SHINY_ODDS: u64 = 1024;
 /// How long the area's name shows when entering the garden.
 const TITLE_SECS: u64 = 4;
 /// In water-only areas, creatures of this type id come to the grass (they fly).
 const FLYING: u8 = 2;
-/// Of a land visitor's picks, one in this many is from the rock table, when the area has one.
-const ROCKS_ONE_IN: u64 = 4;
-/// Of a pond visitor's picks, one in this many is from the fishing tables, when the area has
-/// both.
-const FISHING_ONE_IN: u64 = 4;
+/// Of a land visitor's picks, this share is from the rock tables, when the area has some.
+const ROCKS_SHARE: f64 = 0.25;
+/// Of a pond visitor's picks, this share is from the fishing tables, when the area has water
+/// tables too.
+const FISHING_SHARE: f64 = 0.5;
+/// A species' chance in its table is this share of the table's chances and the rest the same
+/// for each of the table's species, so rare ones come more often than in the GBA game.
+const TABLE_PART: f64 = 0.6;
+/// A garden's last this many visitors' species are its recent ones (`Recent`).
+pub const RECENT: usize = 8;
+/// For each time a species is among them, its chance is multiplied by this for the newest,
+/// rising evenly toward 1 with age (`Recent::factor`).
+const RECENT_NEWEST: f64 = 0.1;
+
+/// How much a rod's tables count among the fishing tables: the better rods more.
+fn rod_weight(rod: WildMethod) -> f64 {
+    match rod {
+        WildMethod::BasicRod => 1.0,
+        WildMethod::BetterRod => 2.0,
+        WildMethod::BestRod => 3.0,
+        _ => 0.0,
+    }
+}
+
+/// Where in its area a visitor is from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Where {
+    /// The land tables (and, in an area without them, the flying ones of the water and fishing
+    /// tables): it comes to the grass.
+    Grass,
+    /// The rock tables: to the grass.
+    Rocks,
+    /// The water tables: to the pond.
+    Pond,
+    /// The fishing tables: to the pond.
+    Fishing,
+}
+
+impl Where {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grass => "grass",
+            Self::Rocks => "rocks",
+            Self::Pond => "pond",
+            Self::Fishing => "fishing",
+        }
+    }
+}
+
+/// One slot a visitor can come from and how likely: its share of the visitors that come to the
+/// grass, or to the pond (a place's add up to 1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Way {
+    pub slot: WildSlot,
+    pub from: Where,
+    pub odds: f64,
+}
+
+/// The species of a garden's last `RECENT` visitors, the newest last: the more recently and
+/// often one came the less often it comes again (`factor`), so the same few don't come back to
+/// back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recent(VecDeque<u16>);
+
+impl Recent {
+    pub const fn new() -> Self {
+        Self(VecDeque::new())
+    }
+
+    /// What `species`' chance is multiplied by: for each time it's among them,
+    /// `RECENT_NEWEST + (1 - RECENT_NEWEST) × age / RECENT` (age 0 the newest).
+    pub fn factor(&self, species: u16) -> f64 {
+        self.0
+            .iter()
+            .rev()
+            .enumerate()
+            .filter(|&(_, &s)| s == species)
+            .map(|(age, _)| RECENT_NEWEST + (1.0 - RECENT_NEWEST) * age as f64 / RECENT as f64)
+            .product()
+    }
+
+    /// `species` came.
+    pub fn push(&mut self, species: u16) {
+        if self.0.len() >= RECENT {
+            self.0.pop_front();
+        }
+        self.0.push_back(species);
+    }
+}
+
+/// Each garden's recent species: alone and as the picker of a shared garden alike.
+static RECENTS: Mutex<[Recent; 3]> = Mutex::new([Recent::new(), Recent::new(), Recent::new()]);
+
+/// Runs `f` on garden `garden`'s recent species (a throwaway one for no garden).
+pub fn with_recent<R>(garden: u8, f: impl FnOnce(&mut Recent) -> R) -> R {
+    let mut all = RECENTS.lock().unwrap_or_else(|e| e.into_inner());
+    match all.get_mut(usize::from(garden).wrapping_sub(1)) {
+        Some(r) => f(r),
+        None => f(&mut Recent::new()),
+    }
+}
 
 /// One wild visitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,62 +219,176 @@ pub fn random_moves(learnset: &[(u8, u16)], level: u8, seed: u64) -> [u16; 4] {
     out
 }
 
-/// One slot of `slots` that `keep` allows, by the slots' chances.
-fn by_chance(slots: &[WildSlot], keep: &impl Fn(u16) -> bool, rng: &mut Rng) -> Option<WildSlot> {
-    let kept: Vec<&WildSlot> = slots.iter().filter(|s| keep(s.species)).collect();
-    let total: u64 = kept.iter().map(|s| u64::from(s.chance)).sum();
-    if total == 0 {
+/// Tables with their weights.
+type Tables<'a> = Vec<(f64, &'a [WildSlot])>;
+
+/// Some of `tables` has a slot `keep` allows.
+fn usable(tables: &Tables, keep: &impl Fn(u16) -> bool) -> bool {
+    tables
+        .iter()
+        .any(|&(w, t)| w > 0.0 && t.iter().any(|s| s.chance > 0 && keep(s.species)))
+}
+
+/// The ways of the slots of `tables` that `keep` allows, from `from`, their odds adding up to
+/// `share`: a table by its weight among those with such a slot, then a species by its blended
+/// chance (`TABLE_PART`), then one of that species' slots by their chances.
+fn table_ways(
+    tables: &Tables,
+    keep: &impl Fn(u16) -> bool,
+    from: Where,
+    share: f64,
+    out: &mut Vec<Way>,
+) {
+    let kept = |t: &[WildSlot]| -> Vec<WildSlot> {
+        t.iter()
+            .filter(|s| s.chance > 0 && keep(s.species))
+            .copied()
+            .collect()
+    };
+    let weights: f64 = tables
+        .iter()
+        .filter(|&&(w, t)| w > 0.0 && !kept(t).is_empty())
+        .map(|&(w, _)| w)
+        .sum();
+    if weights <= 0.0 {
+        return;
+    }
+    for &(w, t) in tables {
+        let slots = kept(t);
+        if w <= 0.0 || slots.is_empty() {
+            continue;
+        }
+        let mut species: Vec<(u16, f64)> = Vec::new();
+        for s in &slots {
+            match species.iter_mut().find(|(id, _)| *id == s.species) {
+                Some((_, c)) => *c += f64::from(s.chance),
+                None => species.push((s.species, f64::from(s.chance))),
+            }
+        }
+        let total: f64 = species.iter().map(|(_, c)| c).sum();
+        let even = (1.0 - TABLE_PART) / species.len() as f64;
+        for s in slots {
+            let of = species
+                .iter()
+                .find(|(id, _)| *id == s.species)
+                .map_or(0.0, |(_, c)| *c);
+            let blended = TABLE_PART * of / total + even;
+            out.push(Way {
+                slot: s,
+                from,
+                odds: share * w / weights * blended * f64::from(s.chance) / of,
+            });
+        }
+    }
+}
+
+/// The ways of two kinds of tables, the second's taking `second_share` when both have a slot
+/// `keep` allows (all when only one has).
+fn two(
+    first: (&Tables, Where),
+    second: (&Tables, Where),
+    second_share: f64,
+    keep: &impl Fn(u16) -> bool,
+) -> Vec<Way> {
+    let share = match (usable(first.0, keep), usable(second.0, keep)) {
+        (true, true) => second_share,
+        (false, true) => 1.0,
+        _ => 0.0,
+    };
+    let mut out = Vec::new();
+    table_ways(first.0, keep, first.1, 1.0 - share, &mut out);
+    table_ways(second.0, keep, second.1, share, &mut out);
+    out.retain(|w| w.odds > 0.0);
+    out
+}
+
+/// Every way a visitor can come to the pond (`pond`) or the grass of `area`, with its odds.
+/// Land: the land tables, or the rock tables `ROCKS_SHARE` of the time. Pond: the water tables,
+/// or the fishing tables `FISHING_SHARE` of the time, a rod's tables by `rod_weight`. In areas
+/// without land creatures the water and fishing ones of type `FLYING` come to the grass and the
+/// others to the pond. `types` gives a species' type ids.
+pub fn ways(area: &Area, pond: bool, types: impl Fn(u16) -> Option<[u8; 2]>) -> Vec<Way> {
+    fn even(tables: &[Vec<WildSlot>]) -> Tables<'_> {
+        tables.iter().map(|t| (1.0, t.as_slice())).collect()
+    }
+    let (land, rocks, water) = (even(&area.land), even(&area.rocks), even(&area.water));
+    let fishing: Tables = area
+        .fishing
+        .iter()
+        .map(|(rod, t)| (rod_weight(*rod), t.as_slice()))
+        .collect();
+    let flying = |species: u16| types(species).is_some_and(|t| t.contains(&FLYING));
+    let any = |_: u16| true;
+    if !area.land.is_empty() {
+        if pond {
+            two(
+                (&water, Where::Pond),
+                (&fishing, Where::Fishing),
+                FISHING_SHARE,
+                &any,
+            )
+        } else {
+            two(
+                (&land, Where::Grass),
+                (&rocks, Where::Rocks),
+                ROCKS_SHARE,
+                &any,
+            )
+        }
+    } else if pond {
+        two(
+            (&water, Where::Pond),
+            (&fishing, Where::Fishing),
+            FISHING_SHARE,
+            &|s| !flying(s),
+        )
+    } else {
+        two(
+            (&water, Where::Grass),
+            (&fishing, Where::Grass),
+            FISHING_SHARE,
+            &flying,
+        )
+    }
+}
+
+/// A number in 0..1 from `rng`.
+fn unit(rng: &mut Rng) -> f64 {
+    (rng.next() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// One of `weights`' indices by its weight; none when they're all 0.
+fn by_weight(weights: &[f64], rng: &mut Rng) -> Option<usize> {
+    let total: f64 = weights.iter().sum();
+    if total.is_nan() || total <= 0.0 {
         return None;
     }
-    let mut roll = rng.below(total);
-    for s in kept {
-        let c = u64::from(s.chance);
-        if roll < c {
-            return Some(*s);
+    let mut roll = unit(rng) * total;
+    for (i, &w) in weights.iter().enumerate() {
+        if roll < w {
+            return Some(i);
         }
-        roll -= c;
+        roll -= w;
     }
-    None
+    weights.iter().rposition(|&w| w > 0.0)
 }
 
-/// A slot from one of `tables` (a table at random among those with a slot `keep` allows).
-fn from_tables(
-    tables: &[&Vec<WildSlot>],
-    keep: &impl Fn(u16) -> bool,
-    rng: &mut Rng,
-) -> Option<WildSlot> {
-    let usable: Vec<&&Vec<WildSlot>> = tables
-        .iter()
-        .filter(|t| t.iter().any(|s| keep(s.species)))
-        .collect();
-    let table = usable.get(rng.below(usable.len() as u64) as usize)?;
-    by_chance(table, keep, rng)
-}
-
-/// A visitor from `area` for the pond (`pond`) or the grass. In areas without land creatures the
-/// water ones of type `FLYING` come to the grass and the others to the pond. `types` gives a
-/// species' type ids.
+/// A visitor from `area` for the pond (`pond`) or the grass (`ways`), `recent` species less
+/// often; it joins them. `types` gives a species' type ids.
 pub fn pick(
     area: &Area,
     pond: bool,
     types: impl Fn(u16) -> Option<[u8; 2]>,
+    recent: &mut Recent,
     rng: &mut Rng,
 ) -> Option<Visitor> {
-    let flying = |species: u16| types(species).is_some_and(|t| t.contains(&FLYING));
-    let any = |_: u16| true;
-    let slot = if !area.land.is_empty() {
-        if pond {
-            water_slot(area, &any, rng)?
-        } else if !area.rocks.is_empty() && rng.below(ROCKS_ONE_IN) == 0 {
-            from_tables(&all(&area.rocks), &any, rng)?
-        } else {
-            from_tables(&all(&area.land), &any, rng)?
-        }
-    } else if pond {
-        water_slot(area, &|s| !flying(s), rng)?
-    } else {
-        water_slot(area, &flying, rng)?
-    };
+    let ways = ways(area, pond, types);
+    let weights: Vec<f64> = ways
+        .iter()
+        .map(|w| w.odds * recent.factor(w.slot.species))
+        .collect();
+    let slot = ways[by_weight(&weights, rng)?].slot;
+    recent.push(slot.species);
     Some(Visitor {
         species: slot.species,
         level: rng.between(u64::from(slot.min_level), u64::from(slot.max_level)) as u8,
@@ -171,6 +396,71 @@ pub fn pick(
         ability_slot: rng.below(2) as u8,
         seed: rng.next(),
     })
+}
+
+/// One species that can come to an area: where from, its level range, and its odds (of the
+/// visitors that come to the grass for `Grass` and `Rocks`, or to the pond).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Chance {
+    pub species: u16,
+    pub from: Where,
+    pub min_level: u8,
+    pub max_level: u8,
+    pub odds: f64,
+}
+
+/// Who can come to `area` (the link machine's list): each species by where it's from, with the
+/// odds `pick` picks with before its recent species count, by place (grass, rocks, pond,
+/// fishing), the likeliest first.
+pub fn who_comes(area: &Area, types: impl Fn(u16) -> Option<[u8; 2]>) -> Vec<Chance> {
+    let mut out: Vec<Chance> = Vec::new();
+    for w in ways(area, false, &types)
+        .into_iter()
+        .chain(ways(area, true, &types))
+    {
+        let s = w.slot;
+        match out
+            .iter_mut()
+            .find(|c| c.species == s.species && c.from == w.from)
+        {
+            Some(c) => {
+                c.min_level = c.min_level.min(s.min_level);
+                c.max_level = c.max_level.max(s.max_level);
+                c.odds += w.odds;
+            }
+            None => out.push(Chance {
+                species: s.species,
+                from: w.from,
+                min_level: s.min_level,
+                max_level: s.max_level,
+                odds: w.odds,
+            }),
+        }
+    }
+    out.sort_by(|a, b| {
+        a.from
+            .cmp(&b.from)
+            .then(b.odds.total_cmp(&a.odds))
+            .then(a.species.cmp(&b.species))
+    });
+    out
+}
+
+/// Garden `garden`'s area for clock window `slot` when that's not the one it has (`section`, for
+/// window `of`; none on entering): the area, and whether its name shows (on entering, or when
+/// it's another area than before). `None` while it has `slot`'s, or there's no area for it.
+pub fn next_area(
+    areas: &[Area],
+    garden: u8,
+    section: Option<u8>,
+    of: Option<u32>,
+    slot: u32,
+) -> Option<(&Area, bool)> {
+    if of == Some(slot) {
+        return None;
+    }
+    let area = rotation::area_at(areas, garden, slot)?;
+    Some((area, section != Some(area.section)))
 }
 
 /// One of the player's own visitors where it is: handed over to a garden that turned shared, or
@@ -184,28 +474,11 @@ pub struct Placed {
     pub swimming: bool,
 }
 
-fn all(tables: &[Vec<WildSlot>]) -> Vec<&Vec<WildSlot>> {
-    tables.iter().collect()
-}
-
-/// From the water tables, or now and then (or when they have none `keep` allows) the fishing
-/// ones.
-fn water_slot(area: &Area, keep: &impl Fn(u16) -> bool, rng: &mut Rng) -> Option<WildSlot> {
-    let (water, fishing) = (all(&area.water), all(&area.fishing));
-    let fish_first = rng.below(FISHING_ONE_IN) == 0;
-    let (first, second) = if fish_first {
-        (&fishing, &water)
-    } else {
-        (&water, &fishing)
-    };
-    from_tables(first, keep, rng).or_else(|| from_tables(second, keep, rng))
-}
-
 #[cfg(target_arch = "x86")]
 pub use game::{
     adopt, adopt_visit, areas, battle_outcome, carry_out, creatures, give_to_player, is_visitor,
     local_in_hands, on_frame, pending, release, room_for_partner, snapshot, take, take_handover,
-    take_pending, visit_nth,
+    take_pending,
 };
 
 #[cfg(not(target_arch = "x86"))]
@@ -231,7 +504,7 @@ mod game {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::super::rotation::{self, Area};
+    use super::super::rotation;
     use super::super::scene::{
         D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_DISPLAY, OBJ_MAIN, create,
         data1, hooked, quietly, room, to_come,
@@ -278,6 +551,7 @@ mod game {
     struct Trip {
         garden: u8,
         area: Option<Area>,
+        slot: Option<u32>,
         cap: usize,
         came: usize,
         /// Each visitor and how long it has left.
@@ -291,12 +565,11 @@ mod game {
     struct Wild {
         /// The garden the visitors are in (0: none).
         garden: u8,
-        /// `area` is chosen for this visit.
-        chosen: bool,
-        /// Each garden's visits so far (from a random start), which pick its areas in turn.
-        visits: [u32; 3],
         area: Option<Area>,
-        title: Option<(String, Instant)>,
+        /// The clock window `area` is for (none: it's to be chosen).
+        slot: Option<u32>,
+        /// The area's name, the line under it, and until when they show.
+        title: Option<(String, String, Instant)>,
         areas: Option<Arc<Vec<Area>>>,
         areas_failed: bool,
         spots: Option<Spots>,
@@ -309,6 +582,8 @@ mod game {
         next: Option<Instant>,
         /// Since when the garden is up and not shared.
         alone_since: Option<Instant>,
+        /// The garden was shared earlier in this visit.
+        was_shared: bool,
         carrying: Option<Carried>,
         pending: Option<Carried>,
         /// The player whistled: visitors come to where they are until then.
@@ -334,9 +609,8 @@ mod game {
                 .map_or(1, |d| d.as_nanos() as u64);
             Wild {
                 garden: 0,
-                chosen: false,
-                visits: [0, 1, 2].map(|g| rotation::mix(seed ^ g) as u32 >> 8),
                 area: None,
+                slot: None,
                 title: None,
                 areas: None,
                 areas_failed: false,
@@ -348,6 +622,7 @@ mod game {
                 came: 0,
                 next: None,
                 alone_since: None,
+                was_shared: false,
                 carrying: None,
                 pending: None,
                 called: None,
@@ -551,6 +826,7 @@ mod game {
             // shared visitors take it, `shared`). Where they were is kept a while for the
             // server's first pick there.
             w.alone_since = None;
+            w.was_shared = true;
             w.title = None;
             w.restore.clear();
             if running(w)
@@ -571,17 +847,18 @@ mod game {
             return;
         }
         let alone = *w.alone_since.get_or_insert(now);
-        // Offline no friend can turn up, so there's nothing to wait for.
         let online = crate::online::my_id().is_some();
-        if online && now.duration_since(alone) < Duration::from_millis(ALONE_MILLIS) {
+        if now.duration_since(alone) < alone_wait(online, w.was_shared) {
             return;
         }
-        if !w.chosen && !choose_area(w, garden, now) {
+        // A new window: its area from now on (the visitors already here stay).
+        let slot = rotation::slot_now();
+        if w.slot != Some(slot) && !choose_area(w, garden, slot, now) && w.area.is_none() {
             return;
         }
-        if let Some((name, until)) = &w.title {
+        if let Some((name, line, until)) = &w.title {
             if now < *until {
-                crate::hud::top_title(name, "Wild visitors come from here this visit");
+                crate::hud::top_title(name, line);
             } else {
                 w.title = None;
             }
@@ -629,6 +906,7 @@ mod game {
     /// player comes back from battling one of them.
     fn enter(w: &mut Wild, garden: u8, now: Instant) {
         delete_all(w);
+        w.was_shared = false;
         if let Some(c) = w.carrying.take() {
             w.pending = Some(c);
         }
@@ -648,8 +926,8 @@ mod game {
                     " without the one that ran away"
                 }
             );
-            w.chosen = t.area.is_some();
             w.area = t.area;
+            w.slot = t.slot;
             w.cap = t.cap;
             w.came = t.came;
             w.restore = t
@@ -669,10 +947,8 @@ mod game {
             w.alone_since = None;
             return;
         }
-        w.chosen = false;
-        if let Some(n) = w.visits.get_mut(usize::from(garden.saturating_sub(1))) {
-            *n = n.wrapping_add(1);
-        }
+        w.area = None;
+        w.slot = None;
         w.spots = w
             .known_spots
             .get(usize::from(garden.saturating_sub(1)))
@@ -685,28 +961,28 @@ mod game {
         w.alone_since = None;
     }
 
-    /// The garden's area for this visit, and its name as the title. False while the ROM isn't
-    /// there (or has no area for this garden).
-    fn choose_area(w: &mut Wild, garden: u8, now: Instant) -> bool {
+    /// The garden's area for clock window `slot`, and its name as the title when it's entering
+    /// or another area. False while the ROM isn't there (or has no area for this garden).
+    fn choose_area(w: &mut Wild, garden: u8, slot: u32, now: Instant) -> bool {
         let (Some(areas), Some(rom)) = (load_areas(w), super::super::loaded_rom()) else {
             return false;
         };
-        let nth = w
-            .visits
-            .get(usize::from(garden.saturating_sub(1)))
-            .copied()
-            .unwrap_or(0);
-        let Some(area) = rotation::area_at(&areas, garden, nth) else {
+        let section = w.area.as_ref().map(|a| a.section);
+        let Some((area, titled)) = next_area(&areas, garden, section, w.slot, slot) else {
             return false;
         };
-        let name = super::super::ascii(&rom.map_section_name(area.section).unwrap_or_default());
-        log!(
-            "gba link: garden {garden}'s wild area this visit is section {}",
-            area.section
-        );
-        w.title = (!name.is_empty()).then(|| (name, now + Duration::from_secs(TITLE_SECS)));
+        if titled {
+            log!(
+                "gba link: garden {garden}'s wild area is section {} until the next window",
+                area.section
+            );
+            let name = super::super::ascii(&rom.map_section_name(area.section).unwrap_or_default());
+            let line = rotation::until_next(rotation::unix_now());
+            w.title =
+                (!name.is_empty()).then(|| (name, line, now + Duration::from_secs(TITLE_SECS)));
+        }
         w.area = Some(area.clone());
-        w.chosen = true;
+        w.slot = Some(slot);
         true
     }
 
@@ -732,16 +1008,6 @@ mod game {
     /// The ROM's wild areas (`rotation::areas`), read once.
     pub fn areas() -> Option<Arc<Vec<Area>>> {
         with(load_areas)
-    }
-
-    /// Garden `garden`'s visits so far, which pick its area in turn (`rotation::area_at`).
-    pub fn visit_nth(garden: u8) -> u32 {
-        with(|w| {
-            w.visits
-                .get(usize::from(garden.saturating_sub(1)))
-                .copied()
-                .unwrap_or(0)
-        })
     }
 
     /// Where our visitors were when garden `garden` turned shared, with its area's section, if
@@ -818,7 +1084,8 @@ mod game {
     }
 
     /// Garden `garden` is the player's own again, its shared visitors from map section `section`
-    /// now theirs (`adopt`): the visit goes on from that area, with no title.
+    /// now theirs (`adopt`): the visit goes on, with the clock window's area (its title only when
+    /// that's another area than `section`).
     pub fn adopt_visit(garden: u8, section: Option<u8>) {
         with(|w| {
             if w.garden != garden {
@@ -830,7 +1097,7 @@ mod game {
             });
             if let Some(area) = area {
                 w.area = Some(area);
-                w.chosen = true;
+                w.slot = None;
             }
             w.title = None;
             w.came = w.came.max(ON_ENTRY);
@@ -862,6 +1129,7 @@ mod game {
             w.trip = Some(Trip {
                 garden: w.garden,
                 area: w.area.clone(),
+                slot: w.slot,
                 cap: w.cap,
                 came: w.came,
                 kept: kept.into_iter().map(|(_, p, left)| (p, left)).collect(),
@@ -1067,12 +1335,15 @@ mod game {
         let entries = spots.pond_entries();
         let pond = to_pond(&mut w.rng, swimming, !entries.is_empty());
         let types = |s: u16| rom.species(s).map(|i| i.types);
-        let picked = pick(&area, pond, types, &mut w.rng)
-            .map(|v| (v, pond))
-            .or_else(|| {
-                let other = !pond && !entries.is_empty() && swimming < MAX_SWIMMING;
-                pick(&area, other, types, &mut w.rng).map(|v| (v, other))
-            });
+        let rng = &mut w.rng;
+        let picked = with_recent(garden, |recent| {
+            pick(&area, pond, types, recent, rng)
+                .map(|v| (v, pond))
+                .or_else(|| {
+                    let other = !pond && !entries.is_empty() && swimming < MAX_SWIMMING;
+                    pick(&area, other, types, recent, rng).map(|v| (v, other))
+                })
+        });
         w.came += 1;
         w.next = Some(if w.came < ON_ENTRY {
             now
@@ -1317,6 +1588,7 @@ mod tests {
         Area {
             section: 1,
             theme: Theme::Hero,
+            also: Vec::new(),
             land: if land {
                 vec![vec![slot(10, 90), slot(11, 10)]]
             } else {
@@ -1324,7 +1596,7 @@ mod tests {
             },
             water: vec![vec![slot(20, 60), slot(21, 40)]],
             rocks: Vec::new(),
-            fishing: vec![vec![slot(30, 100)]],
+            fishing: vec![(WildMethod::BestRod, vec![slot(30, 100)])],
         }
     }
 
@@ -1341,7 +1613,8 @@ mod tests {
         let mut rng = Rng::new(7);
         let mut out = std::collections::BTreeMap::new();
         for _ in 0..n {
-            if let Some(v) = pick(area, pond, types, &mut rng) {
+            // A fresh memory each time: the area's own odds.
+            if let Some(v) = pick(area, pond, types, &mut Recent::new(), &mut rng) {
                 assert!((3..=7).contains(&v.level));
                 assert!(v.ability_slot < 2);
                 *out.entry(v.species).or_insert(0) += 1;
@@ -1351,13 +1624,35 @@ mod tests {
     }
 
     #[test]
+    fn a_garden_handed_back_has_its_visitors_at_once() {
+        // Just in, online: a moment for friends' states or the server's Chao to come.
+        assert_eq!(alone_wait(true, false), Duration::from_millis(ALONE_MILLIS));
+        // Shared earlier this visit and ours now (the server handed it back, the friends
+        // left), or offline: nothing to wait for.
+        assert_eq!(alone_wait(true, true), Duration::ZERO);
+        assert_eq!(alone_wait(false, false), Duration::ZERO);
+    }
+
+    fn odds_of(ways: &[Way], species: u16) -> f64 {
+        ways.iter()
+            .filter(|w| w.slot.species == species)
+            .map(|w| w.odds)
+            .sum()
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
     fn picks_follow_the_chances() {
+        // 90 and 10 in the table: 60% of that and 40% shared evenly, 74 and 26.
         let land = count(&area(true), false, 10_000);
         assert_eq!(land.keys().copied().collect::<Vec<_>>(), [10, 11]);
-        assert!((8_700..9_300).contains(&land[&10]), "{land:?}");
-        // The pond: the water table, and about a quarter of the time fishing.
+        assert!((7_100..7_700).contains(&land[&10]), "{land:?}");
+        // The pond: the water table half the time, fishing the other half.
         let pond = count(&area(true), true, 10_000);
-        assert!((2_100..2_900).contains(&pond[&30]), "{pond:?}");
+        assert!((4_700..5_300).contains(&pond[&30]), "{pond:?}");
         assert!(pond[&20] > pond[&21]);
         // Without land creatures the flying one comes to the grass, the others to the pond.
         let grass = count(&area(false), false, 1_000);
@@ -1368,7 +1663,231 @@ mod tests {
         let mut dry = area(true);
         dry.water.clear();
         dry.fishing.clear();
-        assert!(pick(&dry, true, types, &mut Rng::new(1)).is_none());
+        assert!(pick(&dry, true, types, &mut Recent::new(), &mut Rng::new(1)).is_none());
+        assert!(ways(&dry, true, types).is_empty());
+    }
+
+    #[test]
+    fn rare_ones_come_more_often_than_in_the_gba_game() {
+        // The GBA game's land chances, a species each.
+        let chances = [20, 20, 10, 10, 10, 10, 5, 5, 4, 4, 1, 1];
+        let mut a = area(true);
+        a.land = vec![
+            (0..12)
+                .map(|i| slot(100 + i, chances[i as usize]))
+                .collect(),
+        ];
+        let ways = ways(&a, false, types);
+        let total: f64 = ways.iter().map(|w| w.odds).sum();
+        assert!(near(total, 1.0));
+        // 0.6 × chance + 0.4 / 12.
+        let even = 0.4 / 12.0;
+        assert!(near(odds_of(&ways, 100), 0.12 + even));
+        assert!(near(odds_of(&ways, 111), 0.006 + even));
+        // The rarest come about four times as often (1% to 3.9%), the commonest less often.
+        assert!(odds_of(&ways, 111) > 0.038 && odds_of(&ways, 100) < 0.16);
+        // A species in several slots counts once for the even part; its slots keep their
+        // chances between them (for its levels).
+        let mut b = area(true);
+        b.land = vec![vec![slot(1, 50), slot(1, 20), slot(2, 30)]];
+        let ways = super::ways(&b, false, types);
+        assert!(near(odds_of(&ways, 1), 0.6 * 0.7 + 0.2));
+        assert!(near(odds_of(&ways, 2), 0.6 * 0.3 + 0.2));
+        assert!(near(ways[0].odds / ways[1].odds, 50.0 / 20.0));
+        // Two tables (two maps): each half the time.
+        let mut c = area(true);
+        c.land = vec![vec![slot(1, 100)], vec![slot(2, 50), slot(3, 50)]];
+        let ways = super::ways(&c, false, types);
+        assert!(near(odds_of(&ways, 1), 0.5) && near(odds_of(&ways, 3), 0.25));
+        // Rocks a quarter of the time.
+        c.rocks = vec![vec![slot(4, 100)]];
+        let ways = super::ways(&c, false, types);
+        assert!(near(odds_of(&ways, 4), 0.25) && near(odds_of(&ways, 1), 0.375));
+        assert!(
+            ways.iter()
+                .all(|w| (w.from == Where::Rocks) == (w.slot.species == 4))
+        );
+        // The draws follow the odds.
+        let mut rng = Rng::new(21);
+        let n = 40_000;
+        let rocks = (0..n)
+            .filter(|_| {
+                pick(&c, false, types, &mut Recent::new(), &mut rng)
+                    .unwrap()
+                    .species
+                    == 4
+            })
+            .count();
+        assert!((9_400..10_600).contains(&rocks), "{rocks}");
+    }
+
+    #[test]
+    fn the_better_rods_fish_more_often() {
+        let mut a = area(true);
+        a.fishing = vec![
+            (WildMethod::BasicRod, vec![slot(30, 100)]),
+            (WildMethod::BetterRod, vec![slot(31, 100)]),
+            (WildMethod::BestRod, vec![slot(32, 100)]),
+        ];
+        let ways = ways(&a, true, types);
+        // Half the pond's from fishing, by the rods 1 : 2 : 3.
+        let fishing: f64 = ways
+            .iter()
+            .filter(|w| w.from == Where::Fishing)
+            .map(|w| w.odds)
+            .sum();
+        assert!(near(fishing, 0.5));
+        assert!(near(odds_of(&ways, 30), 0.5 / 6.0));
+        assert!(near(odds_of(&ways, 31), 1.0 / 6.0));
+        assert!(near(odds_of(&ways, 32), 0.25));
+        assert!(near(odds_of(&ways, 20) + odds_of(&ways, 21), 0.5));
+        // Without water tables the pond is all fishing.
+        a.water.clear();
+        let ways = super::ways(&a, true, types);
+        assert!(near(odds_of(&ways, 32), 0.5));
+        // An area without land: the flying one of the water table (and only it) to the grass,
+        // the rest to the pond.
+        let dry = area(false);
+        let grass = super::ways(&dry, false, types);
+        assert_eq!(grass.len(), 1);
+        assert!(grass[0].slot.species == 21 && near(grass[0].odds, 1.0));
+        assert_eq!(grass[0].from, Where::Grass);
+        let pond = super::ways(&dry, true, types);
+        assert!(near(odds_of(&pond, 20), 0.5) && near(odds_of(&pond, 30), 0.5));
+    }
+
+    #[test]
+    fn recent_species_come_less_often() {
+        let mut r = Recent::new();
+        assert!(near(r.factor(10), 1.0));
+        r.push(10);
+        r.push(10);
+        r.push(11);
+        // The newest a tenth as often; older ones less so, and twice is both.
+        assert!(near(r.factor(11), 0.1) && near(r.factor(12), 1.0));
+        assert!(near(
+            r.factor(10),
+            (0.1 + 0.9 / 8.0) * (0.1 + 0.9 * 2.0 / 8.0)
+        ));
+        // Only the last `RECENT` count.
+        for _ in 0..RECENT - 1 {
+            r.push(12);
+        }
+        assert!(near(r.factor(10), 1.0));
+        assert!(near(r.factor(11), 0.1 + 0.9 * 7.0 / 8.0));
+        r.push(12);
+        assert!(near(r.factor(11), 1.0) && r.factor(12) < 1e-3);
+        // Four species of equal odds: with the memory far fewer repeats back to back, and each
+        // still comes.
+        let mut a = area(true);
+        a.land = vec![(1..=4).map(|s| slot(s, 25)).collect()];
+        let run = |remember: bool| {
+            let mut rng = Rng::new(8);
+            let mut recent = Recent::new();
+            let mut seen = std::collections::BTreeMap::new();
+            let mut last = 0;
+            let mut repeats = 0;
+            for _ in 0..4_000 {
+                if !remember {
+                    recent = Recent::new();
+                }
+                let v = pick(&a, false, types, &mut recent, &mut rng).unwrap();
+                repeats += usize::from(v.species == last);
+                last = v.species;
+                *seen.entry(v.species).or_insert(0) += 1;
+            }
+            (repeats, seen)
+        };
+        let (forgetful, _) = run(false);
+        let (remembering, seen) = run(true);
+        assert!((850..1_150).contains(&forgetful), "{forgetful}");
+        assert!(remembering < 400, "{remembering}");
+        assert!(
+            seen.values().all(|&n| (900..1_100).contains(&n)),
+            "{seen:?}"
+        );
+        // Only one can come: it comes anyway.
+        let mut one = area(true);
+        one.land = vec![vec![slot(5, 100)]];
+        let mut recent = Recent::new();
+        let mut rng = Rng::new(2);
+        assert!((0..20).all(|_| pick(&one, false, types, &mut recent, &mut rng).is_some()));
+        // Each garden keeps its own.
+        with_recent(1, |r| *r = Recent::new());
+        with_recent(2, |r| *r = Recent::new());
+        with_recent(1, |r| r.push(7));
+        assert!(with_recent(1, |r| r.factor(7)) < 1.0);
+        assert!(near(with_recent(2, |r| r.factor(7)), 1.0));
+        with_recent(9, |r| r.push(7));
+        assert!(near(with_recent(9, |r| r.factor(7)), 1.0));
+    }
+
+    #[test]
+    fn who_comes_lists_each_species_by_place_with_the_picking_odds() {
+        let mut a = area(true);
+        a.land = vec![vec![slot(10, 90), slot(11, 10)], vec![slot(10, 100)]];
+        a.land[1][0].min_level = 9;
+        a.land[1][0].max_level = 12;
+        a.rocks = vec![vec![slot(40, 100)]];
+        let list = who_comes(&a, types);
+        let places: Vec<(u16, Where)> = list.iter().map(|c| (c.species, c.from)).collect();
+        assert_eq!(
+            places,
+            [
+                (10, Where::Grass),
+                (11, Where::Grass),
+                (40, Where::Rocks),
+                (20, Where::Pond),
+                (21, Where::Pond),
+                (30, Where::Fishing),
+            ]
+        );
+        // Species 10 is in both land tables: its levels and odds together.
+        assert_eq!((list[0].min_level, list[0].max_level), (3, 12));
+        let land = ways(&a, false, types);
+        assert!(near(list[0].odds, odds_of(&land, 10)));
+        // Each place's odds add up to 1, as the picking's do.
+        let grass: f64 = list
+            .iter()
+            .filter(|c| !matches!(c.from, Where::Pond | Where::Fishing))
+            .map(|c| c.odds)
+            .sum();
+        let pond: f64 = list
+            .iter()
+            .filter(|c| matches!(c.from, Where::Pond | Where::Fishing))
+            .map(|c| c.odds)
+            .sum();
+        assert!(near(grass, 1.0) && near(pond, 1.0));
+        assert!(near(list[2].odds, 0.25) && near(list[5].odds, 0.5));
+    }
+
+    #[test]
+    fn the_area_changes_with_the_window() {
+        let areas: Vec<Area> = (1..=4)
+            .map(|section| Area {
+                section,
+                theme: Theme::Neutral,
+                ..area(true)
+            })
+            .collect();
+        // Entering: the window's area, named.
+        let (a, titled) = next_area(&areas, 1, None, None, 100).unwrap();
+        assert!(titled);
+        assert_eq!(a, rotation::area_at(&areas, 1, 100).unwrap());
+        // The same window: it stays.
+        assert!(next_area(&areas, 1, Some(a.section), Some(100), 100).is_none());
+        // The next window: another area, named.
+        let (b, titled) = next_area(&areas, 1, Some(a.section), Some(100), 101).unwrap();
+        assert!(titled && b.section != a.section);
+        assert_eq!(b, rotation::area_at(&areas, 1, 101).unwrap());
+        // Back from a shared garden whose area is the window's: no name.
+        let (c, titled) = next_area(&areas, 1, Some(b.section), None, 101).unwrap();
+        assert!(!titled && c == b);
+        // One whose area was the last window's: the new one, named.
+        let (d, titled) = next_area(&areas, 1, Some(a.section), None, 101).unwrap();
+        assert!(titled && d == b);
+        // No area of the garden's theme.
+        assert!(next_area(&areas, 2, None, None, 100).is_none());
     }
 
     #[test]
@@ -1402,8 +1921,9 @@ mod tests {
         assert_eq!(seen.len(), 5);
         // Visitors get their own seeds.
         let mut rng = Rng::new(4);
-        let a = pick(&area(true), false, types, &mut rng).unwrap();
-        let b = pick(&area(true), false, types, &mut rng).unwrap();
+        let mut recent = Recent::new();
+        let a = pick(&area(true), false, types, &mut recent, &mut rng).unwrap();
+        let b = pick(&area(true), false, types, &mut recent, &mut rng).unwrap();
         assert_ne!(a.seed, b.seed);
     }
 
@@ -1412,7 +1932,11 @@ mod tests {
         let mut rng = Rng::new(99);
         let n = 200_000;
         let shiny = (0..n)
-            .filter(|_| pick(&area(true), false, types, &mut rng).unwrap().shiny)
+            .filter(|_| {
+                pick(&area(true), false, types, &mut Recent::new(), &mut rng)
+                    .unwrap()
+                    .shiny
+            })
             .count();
         let expected = n / SHINY_ODDS as usize;
         assert!(shiny > expected / 2 && shiny < expected * 2, "{shiny}");
@@ -1424,9 +1948,10 @@ mod tests {
         let areas = rotation::areas(&rom).unwrap();
         let types = |s: u16| rom.species(s).map(|i| i.types);
         let mut rng = Rng::new(11);
+        let mut recent = Recent::new();
         for a in &areas {
-            let land = pick(a, false, types, &mut rng);
-            let pond = pick(a, true, types, &mut rng);
+            let land = pick(a, false, types, &mut recent, &mut rng);
+            let pond = pick(a, true, types, &mut recent, &mut rng);
             assert!(land.is_some() || pond.is_some(), "section {}", a.section);
             for v in [land, pond].into_iter().flatten() {
                 let p = v.partner(&rom).unwrap();
@@ -1441,5 +1966,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn rom_who_comes_has_every_species_of_each_area() {
+        let Some(rom) = rom() else { return };
+        let areas = rotation::areas(&rom).unwrap();
+        let types = |s: u16| rom.species(s).map(|i| i.types);
+        let mut species: [std::collections::BTreeSet<u16>; 3] = Default::default();
+        let mut own: [std::collections::BTreeSet<u16>; 3] = Default::default();
+        let mut rarest = 1.0f64;
+        for a in &areas {
+            let list = who_comes(a, types);
+            // Every species of its tables can come (none is left out), and only those.
+            let mut listed: Vec<u16> = list.iter().map(|c| c.species).collect();
+            listed.sort();
+            listed.dedup();
+            let mut all: Vec<u16> = a.slots().map(|s| s.species).collect();
+            all.sort();
+            all.dedup();
+            assert_eq!(listed, all, "section {}", a.section);
+            for pond in [false, true] {
+                let of: Vec<&Chance> = list
+                    .iter()
+                    .filter(|c| matches!(c.from, Where::Pond | Where::Fishing) == pond)
+                    .collect();
+                let total: f64 = of.iter().map(|c| c.odds).sum();
+                assert!(of.is_empty() || near(total, 1.0), "{} {pond}", a.section);
+            }
+            for c in &list {
+                assert!(c.min_level <= c.max_level && c.odds > 0.0);
+                assert!(a.slots().any(|s| s.species == c.species
+                    && (c.min_level..=c.max_level).contains(&s.min_level)));
+                rarest = rarest.min(c.odds);
+            }
+            for g in 0..3 {
+                let theme = Theme::of_garden(g as u8 + 1).unwrap();
+                if a.fits(theme) {
+                    species[g].extend(all.iter().copied());
+                }
+                if a.theme == theme {
+                    own[g].extend(all.iter().copied());
+                }
+            }
+        }
+        // Nothing is as rare as the GBA game's 1%-of-one-table slots spread over many maps.
+        assert!(rarest > 0.003, "{rarest}");
+        // Species per garden (Neutral, Hero, Dark): with the areas it shares, and its own only.
+        assert_eq!(species.map(|s| s.len()), [78, 45, 50]);
+        assert_eq!(own.map(|s| s.len()), [75, 36, 49]);
     }
 }

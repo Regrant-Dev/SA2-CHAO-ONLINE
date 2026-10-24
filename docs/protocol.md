@@ -1,4 +1,4 @@
-# Network protocol (v28)
+# Network protocol (v29)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -121,8 +121,8 @@ Game bodies:
 | 71 | BattleLeave | to the host only, reliable | battle u16 (0: before a battle starts, taking back the sender's challenge, calling off their multi battle, or turning down (or leaving after accepting) a challenge or invite to them), reason u8 (0 the battle reached its end, 1 gave up, 2 left the battle) |
 | 72 | BattleEnd | from the host, reliable | battle u16 (0: a challenge or multi battle that never started), reason u8 (0 busy, 1 declined, 2 the ROM data differs, 3 forfeit: the opponent gave up, 4 disconnect: the opponent (a multi battle's starter) left the battle or the lobby, 5 timeout, 6 desync, 7 withdrawn, 8 replaced: the receiver took too long to choose in a multi battle and the computer plays their place), winner u8 (the winning side, 2 nobody) |
 | 73 | WildHello | to the host only, reliable, on connecting and when it changes | flags u8 (only bits 1 see: SharedVisitors on and the ROM read; 2 pick: WildVisitors on too; 4 machine: LinkMachine on too), print u32 (the ROM's visitor print, `net::wild_print`; non-zero exactly with bit 1). See Shared wild visitors |
-| 74 | WildList | from the host (0xFF), every 6 frames, unreliable | area u8 (1..=3), serial u16 (one more for each list the host sends; a game drops a list not newer than the last one it took, while that one is under 1.5 s old), section u8 (the garden's wild area this run, a map section id; 0xFF none yet), print u32 (its visitors' print; for an empty list with no area its picker's, 0 with no picker either), picker u8 (a player id, 0xFF none), learners u16 (a bit per owner id 0..=15 whose Chao can learn from these visitors now), count u8 (≤ 30), count × entry: id u16 (not 0, each once), creature, origin u8 (0 wild, 1 a partner), bringer u8 (the partner's bringer, a player id; 0xFF for a wild one), place u8 (0 on the ground, 1 swimming, 2 in a player's hands, 3 battled by a player), by u8 (that player's id, 0xFF for 0 and 1), v f32×3 (places 0, 1, 3: its world position; 2: its offset in the holder's frame, each axis ≤ 10), angle u16 (BAMS). A **creature** is species u16 (1..`SPECIES_COUNT`), level u8 (1..=100), ability u8 (an ability id, < `ABILITY_COUNT`), shiny u8 (0/1), moves u16×4 (each < `MOVE_COUNT`, at least one not 0, none twice): 13 bytes |
-| 75 | WildAsk | from the host to a garden's picker, reliable | area u8, ask u16, section u8 (0xFF: the picker chooses the garden's area), land u8, pond u8 (land + pond 1..=5), fresh u8 (0/1: the garden just became shared; the picker may hand over its own visitors where they are) |
+| 74 | WildList | from the host (0xFF), every 6 frames, unreliable | area u8 (1..=3), serial u16 (one more for each list the host sends; a game drops a list not newer than the last one it took, while that one is under 1.5 s old), section u8 (the garden's wild area in the host's clock window, a map section id; 0xFF none yet: no pick this window), print u32 (its visitors' print; for an empty list with no area its picker's, 0 with no picker either), picker u8 (a player id, 0xFF none), learners u16 (a bit per owner id 0..=15 whose Chao can learn from these visitors now), count u8 (≤ 30), count × entry: id u16 (not 0, each once), creature, origin u8 (0 wild, 1 a partner), bringer u8 (the partner's bringer, a player id; 0xFF for a wild one), place u8 (0 on the ground, 1 swimming, 2 in a player's hands, 3 battled by a player), by u8 (that player's id, 0xFF for 0 and 1), v f32×3 (places 0, 1, 3: its world position; 2: its offset in the holder's frame, each axis ≤ 10), angle u16 (BAMS). A **creature** is species u16 (1..`SPECIES_COUNT`), level u8 (1..=100), ability u8 (an ability id, < `ABILITY_COUNT`), shiny u8 (0/1), moves u16×4 (each < `MOVE_COUNT`, at least one not 0, none twice): 13 bytes |
+| 75 | WildAsk | from the host to a garden's picker, reliable | area u8, ask u16, section u8 (0xFF: the garden's area in window `slot`), land u8, pond u8 (land + pond 1..=5), fresh u8 (0/1: the garden just became shared; the picker may hand over its own visitors where they are), slot u32 (the host's clock window: Unix seconds, UTC, / 600) |
 | 76 | WildPick | to the host only, reliable | area u8, ask u16, section u8 (not 0xFF), count u8 (≤ 5), count × (creature, place u8 (0 the host puts it on the grass, 1 in the pond, 2 on the grass at v, 3 swimming at v), v f32×3, angle u16) |
 | 77 | WildBring | to the host only, reliable | area u8, key u64 (the partner's key in the sender's store), from_save u8 (0/1: from their GBA save), creature, place u8 (0 the host puts it, 2 at v), v f32×3, angle u16: a partner of the sender's comes into the garden (from the link machine, or one waiting there) |
 | 78 | WildCarry | to the host only, reliable | area u8, creature, offset f32×3 (each axis ≤ 10): the sender comes into the garden holding a visitor from elsewhere |
@@ -275,11 +275,20 @@ passed on); the ones the host sends, from a player, are dropped.
   its map section. Never 0. A player whose `WildHello` has no *see*, or whose print differs from
   a garden's visitors' (while it has none, its picker's), is never sent its list, never asked and
   never taught from it.
-- **Picker**: of the players settled in the garden with *see* and *pick* and the garden's print
-  (any print while the list is empty), the one there longest, the lower id on a tie, worked out
-  every frame. When they leave, the next one is picker at once; the list, the area and the cap
-  stay. An ask to a player who isn't picker any more is dropped and asked again of the new one;
-  one unanswered for 5 s is dropped.
+- **Picker**: of the players settled in the garden (their state not flagged 128, so a game still
+  loading in isn't asked for a garden it isn't in yet) with *see* and *pick* and the garden's
+  print (any print while the list is empty), the one there longest, the lower id on a tie, worked
+  out every frame. When they leave, the next one is picker at once; the list, the area and the
+  cap stay. An ask to a player who isn't picker any more is dropped and asked again of the new
+  one; one unanswered for 5 s is dropped and asked again 1 s later.
+- **Area**: a garden's area follows the host's clock in 10-minute windows (Unix seconds, UTC,
+  / 600). Every ask carries the host's window, and for section 0xFF the picker picks from the
+  garden's area in that window (`rotation::area_at`), so the picker's own clock doesn't matter.
+  The first pick of a window sets the garden's area (the list's section); later asks in that
+  window name it. When the host's window changes it forgets the area (the list says 0xFF until
+  the next pick) without ending the run or dropping visitors, and the next ask is for the new
+  window's. A pick answering an ask from the window before is still taken but doesn't set the
+  area. A new run has no area until its first pick, which is the window's area again.
 - **Coming**: a run starts with a cap of 6..=7 wild visitors, 3 more for each player in the
   garden after the first, at most 20 (`scaled_cap`), and asks for 4 at once (fresh while nothing
   has been picked this run, within 10 s of its start); then for one at a time, 20..50 s apart,
@@ -348,7 +357,10 @@ In a garden the host runs, the Chao of players who aren't in it are shown under 
 8..=15 (index 0..=3, a player's 4 brought rows; 32 ids in all over the three gardens, so at
 most 32 held Chao are shown at once and the rest wait): the present players' own first, then
 held ones, most recently online first, at most 4 of each player, 32 a garden. A garden runs with one player
-when held Chao wait there (two otherwise).
+when held Chao of other players wait there (two otherwise; a player's own held Chao are theirs
+again when they come in, so a garden with only them and their own Chao is their game's). A run
+goes on 15 s after a second player leaves it; one only ever run for held Chao goes back to the
+player's game as soon as none wait there.
 - Owner online elsewhere with their save loaded: awake, run as any Chao (life tick included);
   what changes goes to them as SaveChao. A cocoon that opens evolves it there
   (`chao_sim::evolve`): its new record goes to everyone (HeldChao) and to its owner (SaveChao).

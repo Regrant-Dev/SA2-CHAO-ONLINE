@@ -18,8 +18,9 @@
 //! - Other players' Chao: the types, ability and four moves theirs battle with and their battle
 //!   levels come online (`Body::Partners`), and exporting Chao files writes `partners.txt` next
 //!   to them, which is read from `chao/import`.
-//! - Wild visitors: each garden has an area of the ROM's wild tables each day (`rotation`), whose
-//!   creatures come by now and then and are absorbed like partners (`wild`).
+//! - Wild visitors: each garden has an area of the ROM's wild tables every 10 minutes
+//!   (`rotation`), whose creatures come by now and then and are absorbed like partners (`wild`).
+//!   The link machine lists who can come to each garden now and next (`Page::who_comes`).
 //! - In a garden the server runs, its visitors and the partners players bring are the server's,
 //!   shown in every game there from its own ROM (`shared`); the link machine is there too, each
 //!   player using it for themselves.
@@ -943,6 +944,14 @@ pub enum Action {
     ToggleType { identity: u64, id: u8 },
     /// Our Chao `identity` battles with ability `id` (0: none) (`choose_ability`).
     Ability { identity: u64, id: u8 },
+    /// The link machine's choice of garden for who can come there (`Page::who_gardens`).
+    WhoComes,
+    /// Who can come to garden `garden` (1..=3) from its wild area now (`Page::who_comes`).
+    WhoNow(u8),
+    /// The same for its next window's area.
+    WhoNext(u8),
+    /// A species that can come (picking it does nothing; the machine's screen shows it).
+    Look(u16),
     /// Back to the list before.
     Back,
 }
@@ -957,6 +966,9 @@ impl Action {
                 | Self::ChaoMoves(_)
                 | Self::ChaoTypes(_)
                 | Self::ChaoAbilities(_)
+                | Self::WhoComes
+                | Self::WhoNow(_)
+                | Self::WhoNext(_)
         )
     }
 }
@@ -1240,6 +1252,216 @@ impl Page {
             .collect();
         page
     }
+}
+
+/// The gardens' names by `CurrentChaoArea` 1..=3.
+const GARDEN_NAMES: [&str; 3] = ["Neutral Garden", "Hero Garden", "Dark Garden"];
+
+fn garden_name(garden: u8) -> &'static str {
+    GARDEN_NAMES
+        .get(usize::from(garden).wrapping_sub(1))
+        .copied()
+        .unwrap_or("Garden")
+}
+
+/// "1 minute", "N minutes".
+fn minutes(n: u64) -> String {
+    if n == 1 {
+        "1 minute".into()
+    } else {
+        format!("{n} minutes")
+    }
+}
+
+/// A visitor's odds as a percentage: whole from 10%, else to a tenth.
+fn percent(odds: f64) -> String {
+    let p = odds * 100.0;
+    if p >= 9.95 {
+        format!("{p:.0}%")
+    } else {
+        format!("{p:.1}%")
+    }
+}
+
+/// A level range ("Lv5", "Lv3-5").
+fn level_range(min: u8, max: u8) -> String {
+    if min == max {
+        format!("Lv{min}")
+    } else {
+        format!("Lv{min}-{max}")
+    }
+}
+
+/// The ROM's wild areas (read once in the game, `wild::areas`).
+fn wild_areas(rom: &Rom) -> Option<Arc<Vec<rotation::Area>>> {
+    #[cfg(target_arch = "x86")]
+    {
+        let _ = rom;
+        wild::areas()
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        rotation::areas(rom).map(Arc::new)
+    }
+}
+
+impl Page {
+    /// The link machine's choice of garden for who can come there: the one we're in (`here`)
+    /// first.
+    pub fn who_gardens(here: u8) -> Self {
+        let mut page = Self::new(
+            "Who can come here: which garden?".into(),
+            Vec::new(),
+            [
+                "A / Enter: its wild area now, how long it stays, and".into(),
+                "every kind that can come from it.".into(),
+            ]
+            .into_iter()
+            .chain(nav_hints("back"))
+            .collect(),
+        );
+        let mut gardens = vec![here];
+        gardens.extend((1..=3).filter(|&g| g != here));
+        for garden in gardens.into_iter().filter(|g| (1..=3).contains(g)) {
+            let name = garden_name(garden);
+            let text = if garden == here {
+                format!("{name} (here)")
+            } else {
+                name.to_string()
+            };
+            page.push(text, Action::WhoNow(garden), Some(name.to_string()));
+        }
+        page
+    }
+
+    /// Who can come to garden `garden` at `unix` (`next`: in the window after): its area (the
+    /// ROM's name), how long it lasts, now also the next window's area to see, then every
+    /// species that can come with its level range, where from and its odds (`wild::who_comes`,
+    /// what the picking uses), its types and abilities in its note.
+    pub fn who_comes(
+        rom: &Rom,
+        areas: &[rotation::Area],
+        garden: u8,
+        next: bool,
+        unix: u64,
+    ) -> Self {
+        let slot = rotation::slot_of(unix) + u32::from(next);
+        let left = minutes(rotation::minutes_left(unix));
+        let mut page = Self::new(
+            format!(
+                "Who can come to the {}{}",
+                garden_name(garden),
+                if next { " next" } else { "" }
+            ),
+            Vec::new(),
+            [
+                "%: of the visitors to the grass (grass, rocks) or to the".into(),
+                "pond (pond, fishing). Kinds that just came come less often.".into(),
+            ]
+            .into_iter()
+            .chain(nav_hints("back"))
+            .collect(),
+        );
+        let area_name = |a: &rotation::Area| {
+            rom.map_section_name(a.section)
+                .map(|n| ascii(&n))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Area {}", a.section))
+        };
+        let Some(area) = rotation::area_at(areas, garden, slot) else {
+            page.push(
+                "No wild area of the ROM for this garden".into(),
+                Action::None,
+                None,
+            );
+            return page;
+        };
+        if next {
+            page.push(
+                format!("{}: in {left}, for 10 minutes", area_name(area)),
+                Action::None,
+                None,
+            );
+        } else {
+            page.push(
+                format!("{}: for the next {left}", area_name(area)),
+                Action::None,
+                None,
+            );
+            if let Some(after) = rotation::area_at(areas, garden, slot + 1) {
+                page.push(
+                    format!("Next: {} in {left} (A: who comes)", area_name(after)),
+                    Action::WhoNext(garden),
+                    None,
+                );
+            }
+        }
+        let types = |s: u16| rom.species(s).map(|i| i.types);
+        for c in wild::who_comes(area, types) {
+            let name = rom
+                .species_name(c.species)
+                .map_or_else(|| format!("#{}", c.species), |n| ascii(&n));
+            let text = format!(
+                "{name:<10}  {:<8}  {:<7}  {:>5}",
+                level_range(c.min_level, c.max_level),
+                c.from.label(),
+                percent(c.odds)
+            );
+            page.notes.resize(page.rows.len(), None);
+            page.notes.push(species_note(rom, c.species));
+            page.push(text, Action::Look(c.species), Some(name));
+        }
+        page
+    }
+
+    /// `who_comes` from the player's ROM by the clock now.
+    pub fn who_comes_now(garden: u8, next: bool) -> Self {
+        let rom = match rom() {
+            Ok(rom) => rom,
+            Err(e) => {
+                let mut page = Self::new("Who can come here".into(), Vec::new(), Vec::new());
+                page.push(e, Action::None, None);
+                return page;
+            }
+        };
+        match wild_areas(&rom) {
+            Some(areas) => Self::who_comes(&rom, &areas, garden, next, rotation::unix_now()),
+            None => {
+                let mut page = Self::new("Who can come here".into(), Vec::new(), Vec::new());
+                page.push(
+                    "The ROM's wild tables can't be read".into(),
+                    Action::None,
+                    None,
+                );
+                page
+            }
+        }
+    }
+}
+
+/// A species' types and abilities from the ROM, for the line under the list.
+fn species_note(rom: &Rom, species: u16) -> Option<String> {
+    let info = rom.species(species)?;
+    let types: Vec<String> = type_names(rom, info.types)
+        .iter()
+        .map(|t| ascii(t))
+        .collect();
+    let mut abilities: Vec<String> = Vec::new();
+    for a in info.abilities.into_iter().filter(|&a| a != 0) {
+        let name = ability_name(Some(rom), a);
+        if !abilities.contains(&name) {
+            abilities.push(name);
+        }
+    }
+    Some(format!(
+        "{}  |  {}",
+        types.join("/"),
+        if abilities.is_empty() {
+            "No ability".to_string()
+        } else {
+            abilities.join(" or ")
+        }
+    ))
 }
 
 /// Our hatched Chao in the save, any garden: (identity, name).

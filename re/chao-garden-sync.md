@@ -620,7 +620,8 @@ on every (re)connect. Everyone follows `ServerChao` (sender `garden::SERVER`, 0x
 - **Timing.** Time the local game stood still (tab-out with "pause when inactive") doesn't count
   as the server going quiet (`PAUSE_GAP`), nor as friends' Chao, touches or holds going quiet
   (`Garden::stood_still` moves every kept time on by it). The server keeps a garden running 15 s
-  with too few players (`RUN_GRACE`), sends to players heard within 8 s, and pushes its Chao 5
+  with too few players once two were in it (`RUN_GRACE`, `Run::crowded`; one run only for held
+  Chao goes back as soon as none wait there), sends to players heard within 8 s, and pushes its Chao 5
   units out of players' way (their collision would shove the player).
 - **Paused players.** A connected player counts as in the garden of their last state however
   long ago (`present_in`): a paused game sends nothing at all. Their stream counts while it was
@@ -725,6 +726,12 @@ the DNA block `rec+0x438` (0xA4 bytes) without what a life changes in it: `DNA[0
 - **Owner comes back.** When their stream for that row arrives (or 5 s after they came in), the
   held copy goes and their game's runs it as before. Their game is never told of its own held
   Chao, so it never makes a copy of a Chao it has in its save.
+- **One player.** Held Chao waiting in a garden run it for a single player there
+  (`held_waiting`, looked at every `HELD_EVERY` frames), but never their own: those are on their
+  way back to them. A run for one player starts only on a look taken then (`membership`): one
+  taken while they were still elsewhere counts their own Chao as waiting there, and coming in on
+  it would run their garden until `RUN_GRACE` was over. A run only ever had for held Chao
+  (`Run::crowded` false) goes back to the player's game as soon as none wait there.
 - **Room.** A garden's ALW Chao category holds 32 (`0x8AB838`): present players' own first, then
   held ones, online owners first, then by last seen, 4 per player (their brought rows). The
   server's world can hold 64 (slot n ticks with n % 32, still every 96 frames). Held ids are

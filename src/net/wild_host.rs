@@ -6,7 +6,10 @@
 //! never has the ROM: one player in the garden, the picker (the one there longest with a ROM
 //! and WildVisitors on), picks the garden's area and its creatures from their ROM when asked
 //! (`WildAsk`, `WildPick`); every game shows the list (`WildList`) as copies drawn from its own
-//! ROM, and only games whose ROM has the same visitor print (`WildHello`) are sent it.
+//! ROM, and only games whose ROM has the same visitor print (`WildHello`) are sent it. The area
+//! follows the host's clock: an ask carries its 10-minute window (`rotation::slot_of`), the
+//! picker picks that window's area, and the garden's area is forgotten when the window changes,
+//! so the next ask is for the new one.
 //!
 //! Picking a visitor up, carrying it, putting it down, carrying one in from elsewhere and
 //! bringing a partner from the link machine go through here: the first claim wins. A Chao that
@@ -58,8 +61,10 @@ const BATTLE_LIMIT: Duration = Duration::from_secs(15 * 60);
 /// A run that ended mid-battle keeps its battled visitors this long after the battle, for a run
 /// on the same ground (the battler coming back).
 const KEEP_FROZEN: Duration = Duration::from_secs(3 * 60);
-/// An ask unanswered this long is dropped.
+/// An ask unanswered this long is dropped, and asked again this much later (the visitors it
+/// was for are still due).
 const ASK_LIMIT: Duration = Duration::from_secs(5);
+const ASK_AGAIN: Duration = Duration::from_secs(1);
 /// The first ask of a run may hand over the picker's own visitors this long after it starts.
 const HANDOVER: Duration = Duration::from_secs(10);
 /// Land spots this near the link machine are left out.
@@ -80,6 +85,8 @@ pub struct Seen {
     pub since: Instant,
     /// Loading on from a garden: not settled anywhere yet.
     pub loading: bool,
+    /// Their last state isn't between areas (`POSE_LOADING`): their game is in `area`.
+    pub settled: bool,
     pub position: V3,
     pub rotation_y: i32,
     pub action: u8,
@@ -197,6 +204,8 @@ struct Ask {
     serial: u16,
     to: u8,
     section: Option<u8>,
+    /// The clock window it was asked in.
+    slot: u32,
     land: u8,
     pond: u8,
     fresh: bool,
@@ -210,7 +219,7 @@ struct Visit {
     machine: Option<([f32; 3], i32)>,
     /// The print every visitor in the list is of (0 while it's empty).
     print: u32,
-    /// The garden's wild area this run, and the print it was chosen with.
+    /// The garden's wild area in this clock window, and the print it was chosen with.
     section: Option<(u8, u32)>,
     cap: usize,
     /// "No room" was logged and nothing has come since.
@@ -277,6 +286,8 @@ pub struct WildHost {
     asks: u16,
     rng: Rng,
     frames: u64,
+    /// The clock window (`rotation::slot_of`) of the last frame.
+    slot: u32,
     /// Answers decided between frames, sent with the next.
     out: Vec<Out>,
 }
@@ -293,6 +304,7 @@ impl Default for WildHost {
             asks: 0,
             rng: Rng::new(0x5A2C_57AD),
             frames: 0,
+            slot: 0,
             out: Vec::new(),
         }
     }
@@ -644,7 +656,11 @@ impl WildHost {
             crate::log!("wild host: player {from}'s pick for garden {area} didn't fit its ask");
             return;
         }
-        g.section = Some((section, print));
+        // An ask from the window before (out at most `ASK_LIMIT`) still brings its visitors,
+        // but its area isn't this window's.
+        if ask.slot == self.slot {
+            g.section = Some((section, print));
+        }
         g.came += list.len().max(1);
         let around: Vec<(f32, f32)> = players
             .iter()
@@ -1095,8 +1111,25 @@ impl WildHost {
 
     /// One frame (60 a second) of every garden's visitors; what to send goes to `out`.
     pub fn frame(&mut self, now: Instant, gardens: &impl Gardens, out: &mut Vec<Out>) {
+        let slot = crate::gba_link::rotation::slot_now();
+        self.frame_at(now, slot, gardens, out);
+    }
+
+    /// `frame` in clock window `slot`. A new window forgets every garden's area (the run, its
+    /// visitors and an ask out stay), so the next ask is for the new window's.
+    fn frame_at(&mut self, now: Instant, slot: u32, gardens: &impl Gardens, out: &mut Vec<Out>) {
         self.frames += 1;
         out.append(&mut self.out);
+        if slot != self.slot {
+            self.slot = slot;
+            for (i, g) in self.gardens.iter_mut().enumerate() {
+                if let Some(g) = g.as_mut()
+                    && g.section.take().is_some()
+                {
+                    crate::log!("wild host: a new window: garden {}'s area changes", i + 1);
+                }
+            }
+        }
         let players = gardens.players();
         // Battles that went on too long count as given up.
         let over: Vec<(u8, Reserved)> = self
@@ -1401,13 +1434,14 @@ impl WildHost {
         }
     }
 
-    /// The garden's picker now: of the players there who see and pick visitors with the
-    /// garden's print (any while it has none), the one there longest (the lower id on a tie).
+    /// The garden's picker now: of the players settled there (a game still loading in drops an
+    /// ask for a garden it isn't in yet) who see and pick visitors with the garden's print (any
+    /// while it has none), the one there longest (the lower id on a tie).
     fn picker(&self, index: usize, players: &[Seen]) -> Option<u8> {
         let g = self.gardens[index].as_ref()?;
         players
             .iter()
-            .filter(|p| p.area == index as u8 + 1)
+            .filter(|p| p.area == index as u8 + 1 && p.settled)
             .filter(|p| self.flags(p.id) & WILD_PICK != 0)
             .filter(|p| self.sees(p.id).is_some_and(|print| g.print_fits(print)))
             .min_by_key(|p| (p.since, p.id))
@@ -1438,7 +1472,7 @@ impl WildHost {
                 g.next = g.next.min(now);
             } else if now.duration_since(a.at) > ASK_LIMIT {
                 g.ask = None;
-                g.next = now + delay;
+                g.next = now + ASK_AGAIN;
             }
         }
         let (Some(to), Some(print)) = (picker, picker_print) else {
@@ -1486,6 +1520,7 @@ impl WildHost {
             serial: self.asks,
             to,
             section,
+            slot: self.slot,
             land: count as u8 - pond,
             pond,
             fresh,
@@ -1502,6 +1537,7 @@ impl WildHost {
                 land: ask.land,
                 pond: ask.pond,
                 fresh,
+                slot: ask.slot,
             },
         });
     }
@@ -1661,6 +1697,8 @@ mod tests {
         owner: HashMap<(u8, u8), (u64, Vec<u8>)>,
         locked: HashSet<(u8, (u8, u8))>,
         owners: Vec<OwnerSeen>,
+        /// The host's clock window.
+        slot: u32,
     }
 
     impl Gardens for Fake {
@@ -1696,6 +1734,7 @@ mod tests {
             area: 1,
             since,
             loading: false,
+            settled: true,
             position: at,
             rotation_y: 0,
             action: 0,
@@ -1717,6 +1756,7 @@ mod tests {
             owner: HashMap::new(),
             locked: HashSet::new(),
             owners: Vec::new(),
+            slot: 2_988_000,
         };
         let mut host = WildHost::default();
         for id in [0, 1] {
@@ -1737,7 +1777,7 @@ mod tests {
             for p in &mut fake.players {
                 p.heard = *now;
             }
-            host.frame(*now, fake, &mut out);
+            host.frame_at(*now, fake.slot, fake, &mut out);
         }
         out
     }
@@ -1763,6 +1803,11 @@ mod tests {
 
     /// Player `to`'s answer to the ask in `out`: as many land and pond visitors as it asks.
     fn answer(host: &mut WildHost, fake: &Fake, out: &[Out], now: Instant) -> u8 {
+        answer_from(host, fake, out, now, 33)
+    }
+
+    /// `answer`, from `section`.
+    fn answer_from(host: &mut WildHost, fake: &Fake, out: &[Out], now: Instant, section: u8) -> u8 {
         let Some((
             to,
             Body::WildAsk {
@@ -1789,7 +1834,7 @@ mod tests {
         let pick = Body::WildPick {
             area,
             ask,
-            section: 33,
+            section,
             list,
         };
         host.observe(to, &pick, now, fake);
@@ -1890,6 +1935,141 @@ mod tests {
         assert!(!a.is_empty());
         assert!(a.iter().all(|(to, b)| *to == 1
             && matches!(b, Body::WildAsk { section: Some(33), land, pond, fresh: false, .. } if land + pond == 1)));
+    }
+
+    fn ids(list: &[WildEntry]) -> Vec<u16> {
+        list.iter().map(|e| e.id).collect()
+    }
+
+    /// Steps until the next ask goes out (within an hour); what went out until then.
+    fn until_ask(host: &mut WildHost, fake: &mut Fake, now: &mut Instant) -> Vec<Out> {
+        let mut out = Vec::new();
+        for _ in 0..60 * 60 * 60 {
+            out.extend(run(host, fake, 1, now));
+            if !asks(&out).is_empty() {
+                return out;
+            }
+        }
+        panic!("no ask");
+    }
+
+    #[test]
+    fn a_new_window_changes_the_area_and_keeps_the_visitors_and_the_run() {
+        let t0 = Instant::now();
+        let (mut host, mut fake, mut now, out) = with_visitors(t0);
+        let (section, _, _, _, before) = list_to(&out, 1).unwrap();
+        assert_eq!((section, before.len()), (Some(33), ON_ENTRY));
+        let (started, came) = {
+            let g = host.gardens[0].as_ref().unwrap();
+            (g.started, g.came)
+        };
+        // The window changes: the area is forgotten, the visitors and the run stay.
+        fake.slot += 1;
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let (section, print, picker, _, list) = list_to(&out, 1).unwrap();
+        assert_eq!((section, print, picker), (None, PRINT, Some(0)));
+        assert_eq!(ids(&list), ids(&before));
+        let g = host.gardens[0].as_ref().unwrap();
+        assert_eq!((g.started, g.came), (started, came));
+        // The next ask is for the new window's area, not a fresh one.
+        let out = until_ask(&mut host, &mut fake, &mut now);
+        let a = asks(&out);
+        assert!(matches!(
+            a.first(),
+            Some((0, Body::WildAsk { section: None, fresh: false, slot, .. })) if *slot == fake.slot
+        ));
+        answer_from(&mut host, &fake, &out, now, 44);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let (section, _, _, _, list) = list_to(&out, 1).unwrap();
+        assert_eq!(section, Some(44));
+        assert!(ids(&before).iter().all(|id| ids(&list).contains(id)));
+        assert!(list.len() > before.len());
+        // The asks after are for it, until the window after.
+        let out = run(&mut host, &mut fake, 60 * 60, &mut now);
+        assert!(asks(&out).iter().all(|(_, b)| matches!(
+            b,
+            Body::WildAsk {
+                section: Some(44),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn picks_across_a_window_change_bring_their_visitors_but_not_their_area() {
+        let t0 = Instant::now();
+        let (mut host, mut fake) = two(t0);
+        let mut now = t0 + Duration::from_secs(2);
+        let out = run(&mut host, &mut fake, 2, &mut now);
+        let slot = fake.slot;
+        assert!(matches!(
+            asks(&out).first(),
+            Some((0, Body::WildAsk { section: None, fresh: true, slot: s, .. })) if *s == slot
+        ));
+        // The window changes before the answer comes: its visitors come, as they are.
+        fake.slot += 1;
+        run(&mut host, &mut fake, 1, &mut now);
+        answer(&mut host, &fake, &out, now);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let (section, _, _, _, list) = list_to(&out, 1).unwrap();
+        assert_eq!((section, list.len()), (None, ON_ENTRY));
+        // The next ask is the new window's, and its answer sets the area.
+        let out = until_ask(&mut host, &mut fake, &mut now);
+        assert!(matches!(
+            asks(&out).first(),
+            Some((0, Body::WildAsk { section: None, slot: s, .. })) if *s == slot + 1
+        ));
+        answer_from(&mut host, &fake, &out, now, 44);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        assert_eq!(list_to(&out, 1).unwrap().0, Some(44));
+        // An ask for that area answered after the next change: taken, the area forgotten.
+        let out = until_ask(&mut host, &mut fake, &mut now);
+        let had = host.gardens[0].as_ref().unwrap().list.len();
+        assert!(matches!(
+            asks(&out).first(),
+            Some((
+                _,
+                Body::WildAsk {
+                    section: Some(44),
+                    ..
+                }
+            ))
+        ));
+        fake.slot += 1;
+        run(&mut host, &mut fake, 1, &mut now);
+        answer_from(&mut host, &fake, &out, now, 44);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let (section, _, _, _, list) = list_to(&out, 1).unwrap();
+        assert_eq!(section, None);
+        assert!(list.len() > had);
+    }
+
+    #[test]
+    fn a_picker_still_loading_in_is_asked_once_settled_and_again_soon_after_no_answer() {
+        let t0 = Instant::now();
+        let (mut host, mut fake) = two(t0);
+        fake.players.truncate(1);
+        // The run starts while its one player's game still loads the garden: an ask now would
+        // be dropped (their game isn't in it yet).
+        fake.players[0].settled = false;
+        let mut now = t0 + Duration::from_secs(2);
+        assert!(asks(&run(&mut host, &mut fake, 120, &mut now)).is_empty());
+        // Settled: asked at once, for the first visitors.
+        fake.players[0].settled = true;
+        let a = asks(&run(&mut host, &mut fake, 1, &mut now));
+        assert!(
+            matches!(&a[..], [(0, Body::WildAsk { land, pond, fresh: true, .. })] if land + pond == ON_ENTRY as u8)
+        );
+        // Unanswered: dropped after `ASK_LIMIT` and asked again a moment later, not a whole
+        // visitor's delay later.
+        let frames = |d: Duration| (d.as_micros() / FRAME.as_micros()) as u32;
+        let out = run(&mut host, &mut fake, frames(ASK_LIMIT), &mut now);
+        assert!(asks(&out).is_empty());
+        let out = run(&mut host, &mut fake, frames(ASK_AGAIN) + 2, &mut now);
+        assert!(
+            matches!(&asks(&out)[..], [(0, Body::WildAsk { fresh: true, .. })]),
+            "asked again"
+        );
     }
 
     #[test]

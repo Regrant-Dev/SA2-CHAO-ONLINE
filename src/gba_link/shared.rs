@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use super::rotation::{self, Area};
 use super::store::Partner;
-use super::wild::{self, MAX_VISITORS, Placed, Rng, Visitor};
+use super::wild::{self, MAX_VISITORS, Placed, Recent, Rng, Visitor};
 use crate::gba::rom::{ABILITY_COUNT, MOVE_COUNT, Rom, SPECIES_COUNT};
 use crate::net::protocol::{
     Body, MAX_WILD_PICK, SERVER, WILD_MACHINE, WILD_PICK, WILD_SEE, WildArrive, WildCreature,
@@ -141,10 +141,7 @@ pub fn taught(rom: &Rom, origin: WildOrigin, c: &WildCreature) -> Option<Partner
 /// has it).
 pub fn in_the_wild(areas: &[Area], species: u16, level: u8) -> bool {
     areas.iter().any(|a| {
-        [&a.land, &a.water, &a.rocks, &a.fishing]
-            .into_iter()
-            .flatten()
-            .flatten()
+        a.slots()
             .any(|s| s.species == species && (s.min_level..=s.max_level).contains(&level))
     })
 }
@@ -181,26 +178,28 @@ pub struct Asked {
     pub land: u8,
     pub pond: u8,
     pub fresh: bool,
+    /// The server's clock window.
+    pub slot: u32,
 }
 
 /// The picker's answer to `ask` for garden `garden`: the section the visitors come from (the
-/// asked one; on a fresh ask the area of the visit `handover` was of; else the area of the
-/// garden's `nth` visit) and the visitors, the handed-over ones first where they are, then
-/// picked from that area's tables. `None` when there's no area to pick from.
+/// asked one, else the garden's area in the server's window) and the visitors: on a fresh ask
+/// the handed-over ones first where they are (whatever area they came from), then picked from
+/// that area's tables (the garden's `recent` species less often, `wild::pick`). `None` when
+/// there's no area to pick from.
 pub fn answer(
     areas: &[Area],
     rom: &Rom,
     garden: u8,
-    nth: u32,
     ask: Asked,
     handover: Option<(u8, Vec<Placed>)>,
+    recent: &mut Recent,
     rng: &mut Rng,
 ) -> Option<(u8, Vec<WildPicked>)> {
-    let handover = handover.filter(|(s, _)| ask.fresh && ask.section.is_none_or(|a| a == *s));
-    let section = match (ask.section, &handover) {
-        (Some(s), _) => s,
-        (None, Some((s, _))) => *s,
-        (None, None) => rotation::area_at(areas, garden, nth)?.section,
+    let handover = handover.filter(|_| ask.fresh);
+    let section = match ask.section {
+        Some(s) => s,
+        None => rotation::area_at(areas, garden, ask.slot)?.section,
     };
     let mut list = Vec::new();
     for p in handover.map(|(_, l)| l).unwrap_or_default() {
@@ -229,7 +228,7 @@ pub fn answer(
         if list.len() >= MAX_WILD_PICK {
             break;
         }
-        let Some(v) = wild::pick(area, in_pond, types, rng) else {
+        let Some(v) = wild::pick(area, in_pond, types, recent, rng) else {
             continue;
         };
         let Some(creature) = v.partner(rom).and_then(|p| creature_of(&v, &p)) else {
@@ -243,6 +242,12 @@ pub fn answer(
         list.push(WildPicked { creature, arrive });
     }
     Some((section, list))
+}
+
+/// The area a shared garden's title names: the list's, or while it has none (a new run, or the
+/// server's window just changed) the garden's area in our own window `slot`.
+pub fn shown_area(listed: Option<u8>, areas: Option<&[Area]>, garden: u8, slot: u32) -> Option<u8> {
+    listed.or_else(|| Some(rotation::area_at(areas?, garden, slot)?.section))
 }
 
 /// Who has a copy as far as our game goes: nobody (it follows the list), or the player, from
@@ -589,8 +594,10 @@ mod game {
         brought: Vec<(u64, Instant, Option<bool>)>,
         /// A partner from the link machine the host is asked to take, and when.
         machine: Option<(Bring, Instant)>,
-        titled: bool,
-        title: Option<(String, Instant)>,
+        /// The area whose name showed last.
+        titled: Option<u8>,
+        /// The area's name, the line under it, and until when they show.
+        title: Option<(String, String, Instant)>,
         rng: Rng,
     }
 
@@ -618,7 +625,7 @@ mod game {
                 carry_tried: false,
                 brought: Vec::new(),
                 machine: None,
-                titled: false,
+                titled: None,
                 title: None,
                 rng: Rng::new(seed ^ 0x5EED),
             }
@@ -784,6 +791,7 @@ mod game {
                 land,
                 pond,
                 fresh,
+                slot,
             } => {
                 if area != s.garden || print.is_none() || !wild::enabled() {
                     return;
@@ -796,16 +804,17 @@ mod game {
                     land,
                     pond,
                     fresh,
+                    slot,
                 };
                 let handover = if fresh {
                     wild::take_handover(area)
                 } else {
                     None
                 };
-                let nth = wild::visit_nth(area);
-                let Some((section, list)) =
-                    super::answer(&areas, &rom, area, nth, asked, handover, &mut s.rng)
-                else {
+                let rng = &mut s.rng;
+                let Some((section, list)) = wild::with_recent(area, |recent| {
+                    super::answer(&areas, &rom, area, asked, handover, recent, rng)
+                }) else {
                     return;
                 };
                 log!(
@@ -1054,7 +1063,7 @@ mod game {
         s.carry_tried = false;
         s.brought.clear();
         s.machine = None;
-        s.titled = false;
+        s.titled = None;
         s.title = None;
     }
 
@@ -1395,22 +1404,32 @@ mod game {
         }
     }
 
-    /// The garden's area for this run, once on entering.
+    /// The garden's area, on entering and when it changes (`shown_area`).
     fn title(s: &mut Shared) {
         let now = Instant::now();
-        if !s.titled
-            && let Some(section) = s.list.as_ref().and_then(|l| l.section)
+        let section = s.list.as_ref().and_then(|l| {
+            let areas = if l.section.is_none() {
+                wild::areas()
+            } else {
+                None
+            };
+            let areas = areas.as_deref().map(Vec::as_slice);
+            super::shown_area(l.section, areas, s.garden, rotation::slot_now())
+        });
+        if let Some(section) = section
+            && s.titled != Some(section)
             && let Some(rom) = loaded_rom()
         {
-            s.titled = true;
+            s.titled = Some(section);
             let name = ascii(&rom.map_section_name(section).unwrap_or_default());
+            let line = rotation::until_next(rotation::unix_now());
             if !name.is_empty() {
-                s.title = Some((name, now + Duration::from_secs(TITLE_SECS)));
+                s.title = Some((name, line, now + Duration::from_secs(TITLE_SECS)));
             }
         }
-        if let Some((name, until)) = &s.title {
+        if let Some((name, line, until)) = &s.title {
             if now < *until {
-                crate::hud::top_title(name, "Wild visitors come from here this visit");
+                crate::hud::top_title(name, line);
             } else {
                 s.title = None;
             }
@@ -1857,21 +1876,47 @@ mod tests {
     }
 
     #[test]
+    fn the_title_names_the_lists_area_or_our_windows() {
+        let areas: Vec<Area> = (1..=3)
+            .map(|section| Area {
+                section,
+                theme: rotation::Theme::Dark,
+                also: Vec::new(),
+                land: Vec::new(),
+                water: Vec::new(),
+                rocks: Vec::new(),
+                fishing: Vec::new(),
+            })
+            .collect();
+        assert_eq!(shown_area(Some(9), Some(&areas), 3, 7), Some(9));
+        assert_eq!(shown_area(Some(9), None, 3, 7), Some(9));
+        // Between the server's window change and its next pick: our window's area.
+        let ours = rotation::area_at(&areas, 3, 7).unwrap().section;
+        assert_eq!(shown_area(None, Some(&areas), 3, 7), Some(ours));
+        assert_ne!(shown_area(None, Some(&areas), 3, 8), Some(ours));
+        assert_eq!(shown_area(None, None, 3, 7), None);
+        assert_eq!(shown_area(None, Some(&areas), 1, 7), None);
+    }
+
+    #[test]
     fn rom_picks_answer_their_asks_from_each_gardens_areas() {
         let Some(rom) = rom() else { return };
         let areas = rotation::areas(&rom).unwrap();
         let mut rng = Rng::new(3);
+        let mut recent = Recent::new();
         for garden in 1..=3u8 {
-            for nth in 0..6 {
+            for slot in 2_988_000..2_988_006 {
                 let ask = Asked {
                     section: None,
                     land: 2,
                     pond: 1,
                     fresh: false,
+                    slot,
                 };
                 let (section, list) =
-                    answer(&areas, &rom, garden, nth, ask, None, &mut rng).unwrap();
-                let area = rotation::area_at(&areas, garden, nth).unwrap();
+                    answer(&areas, &rom, garden, ask, None, &mut recent, &mut rng).unwrap();
+                // The area of the server's window.
+                let area = rotation::area_at(&areas, garden, slot).unwrap();
                 assert_eq!(section, area.section);
                 assert!(list.len() <= 3);
                 let land = list.iter().filter(|p| p.arrive == WildArrive::Land).count();
@@ -1885,14 +1930,16 @@ mod tests {
                     assert_eq!(taught.ability, p.creature.ability);
                     assert!(!taught.from_save);
                 }
-                // The asked section is kept.
+                // The asked section is kept, whatever the window.
                 let ask = Asked {
                     section: Some(section),
                     land: 1,
                     pond: 0,
                     fresh: false,
+                    slot: slot + 1,
                 };
-                let (again, list) = answer(&areas, &rom, 3, 0, ask, None, &mut rng).unwrap();
+                let (again, list) =
+                    answer(&areas, &rom, 3, ask, None, &mut recent, &mut rng).unwrap();
                 assert_eq!(again, section);
                 assert!(list.iter().all(|p| p.arrive == WildArrive::Land));
             }
@@ -1906,8 +1953,9 @@ mod tests {
         let area = rotation::area_at(&areas, 1, 0).unwrap();
         let types = |s: u16| rom.species(s).map(|i| i.types);
         let mut rng = Rng::new(5);
+        let mut recent = Recent::new();
         let visitor = (0..50)
-            .find_map(|_| wild::pick(area, false, types, &mut rng))
+            .find_map(|_| wild::pick(area, false, types, &mut recent, &mut rng))
             .unwrap();
         let placed = Placed {
             visitor,
@@ -1921,9 +1969,19 @@ mod tests {
             land: 3,
             pond: 0,
             fresh: true,
+            slot: 0,
         };
         let handover = Some((area.section, vec![placed; 2]));
-        let (section, list) = answer(&areas, &rom, 1, 9, ask, handover.clone(), &mut rng).unwrap();
+        let (section, list) = answer(
+            &areas,
+            &rom,
+            1,
+            ask,
+            handover.clone(),
+            &mut recent,
+            &mut rng,
+        )
+        .unwrap();
         assert_eq!(section, area.section);
         assert_eq!(list.len(), 3);
         assert_eq!(
@@ -1934,17 +1992,34 @@ mod tests {
             }
         );
         assert_eq!(list[2].arrive, WildArrive::Land);
+        // Handed over from the last window's area: they come as they are, and the section is
+        // the server's window's.
+        let next = rotation::area_at(&areas, 1, 1).unwrap();
+        assert_ne!(next.section, area.section);
+        let (section, list) = answer(
+            &areas,
+            &rom,
+            1,
+            Asked { slot: 1, ..ask },
+            handover.clone(),
+            &mut recent,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(section, next.section);
+        assert_eq!(list.len(), 3);
+        assert!(matches!(list[1].arrive, WildArrive::LandAt { .. }));
         // Not a fresh ask: nothing handed over.
         let (_, list) = answer(
             &areas,
             &rom,
             1,
-            9,
             Asked {
                 fresh: false,
                 ..ask
             },
             handover,
+            &mut recent,
             &mut rng,
         )
         .unwrap();

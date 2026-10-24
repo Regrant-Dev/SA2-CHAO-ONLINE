@@ -6,7 +6,9 @@
 //! picked hops out of the machine's hatch into the garden (`super::bring_out`). Its first row,
 //! "Moves, type & ability", lists the player's Chao by name, then what one battles with: its
 //! moves (four), types (one or two) and ability (or none), each a page to choose from
-//! (`Page::chao_list`, `Page::chao_choices`). Every page takes the keyboard search and jumps of
+//! (`Page::chao_list`, `Page::chao_choices`). Its second, "Who can come here", lists each
+//! garden's wild area now and next and every creature that can come from it with its odds
+//! (`Page::who_gardens`, `Page::who_comes`). Every page takes the keyboard search and jumps of
 //! `crate::search`. A shared garden has it while it shows its
 //! shared visitors (`super::shared`): each player uses it for themselves, and the one picked
 //! comes out as a shared visitor once the server takes it.
@@ -436,7 +438,7 @@ impl List {
         }
         match self.page.rows.get(self.page.row)?.1 {
             Action::Bring(ref c) => Some(c.species),
-            Action::Gift(s) => Some(s),
+            Action::Gift(s) | Action::Look(s) => Some(s),
             _ => None,
         }
     }
@@ -1163,8 +1165,15 @@ mod game {
             Some(&Action::ChaoMoves(identity)) => Page::chao_moves(identity),
             Some(&Action::ChaoTypes(identity)) => Page::chao_types(identity),
             Some(&Action::ChaoAbilities(identity)) => Page::chao_abilities(identity),
+            Some(Action::WhoComes) => Page::who_gardens(sa2::current_chao_area() as u8),
+            Some(&Action::WhoNow(garden)) => Page::who_comes_now(garden, false),
+            Some(&Action::WhoNext(garden)) => Page::who_comes_now(garden, true),
             _ => {
                 let mut page = Page::open();
+                page.push_front(
+                    "Who can come here: each garden's wild visitors".into(),
+                    Action::WhoComes,
+                );
                 page.push_front(
                     "Moves, type & ability: choose what each Chao battles with".into(),
                     Action::ChaoList,
@@ -1262,6 +1271,8 @@ mod game {
             Outcome::Stay | Outcome::Searched => {}
             Outcome::Moved => play(sound::CURSOR),
             Outcome::Close | Outcome::Chose(Action::Back) => return up(s),
+            // A creature that can come: the machine's screen shows it, nothing more.
+            Outcome::Chose(Action::Look(_)) => {}
             Outcome::Chose(action) if action.opens_page() => {
                 s.list = Some(List::new(page(Some(&action))));
                 s.trail.push(action);
@@ -1434,6 +1445,132 @@ mod tests {
             text: text.into(),
             ..Typed::default()
         }
+    }
+
+    #[test]
+    fn who_can_come_asks_which_garden_ours_first() {
+        let page = Page::who_gardens(2);
+        let actions: Vec<Action> = page.rows.iter().map(|(_, a)| a.clone()).collect();
+        assert_eq!(
+            actions,
+            [Action::WhoNow(2), Action::WhoNow(1), Action::WhoNow(3)]
+        );
+        assert!(page.rows[0].0.ends_with("(here)"));
+        assert_eq!(page.name(1), Some("Neutral Garden"));
+        assert_eq!(Page::who_gardens(1).rows[0].1, Action::WhoNow(1));
+        // Out of a garden: all three, in order.
+        assert_eq!(Page::who_gardens(0).rows.len(), 3);
+        assert_eq!(Page::who_gardens(0).rows[0].1, Action::WhoNow(1));
+        // These open pages; a creature that can come doesn't, and shows on the screen.
+        assert!(Action::WhoComes.opens_page() && Action::WhoNow(1).opens_page());
+        assert!(Action::WhoNext(3).opens_page() && !Action::Look(5).opens_page());
+        let mut l = list(vec![Action::None, Action::Look(7), Action::Look(8)]);
+        assert_eq!(l.species(), Some(7));
+        assert_eq!(l.press(Key::Pick, 5), Outcome::Chose(Action::Look(7)));
+        // Searching for the garden: by its name.
+        let mut l = List::new(Page::who_gardens(3));
+        assert_eq!(l.typed(&typed("hero"), 5), Outcome::Searched);
+        assert_eq!(l.shown(), [2]);
+        assert_eq!(l.page.rows[l.page.row].1, Action::WhoNow(2));
+    }
+
+    fn rom() -> Option<crate::gba::rom::Rom> {
+        let home = std::env::var_os("HOME")?;
+        let path = std::path::Path::new(&home).join("Games/gba/emerald.gba");
+        if !path.exists() {
+            println!("skipped: no GBA ROM at {}", path.display());
+            return None;
+        }
+        Some(crate::gba::rom::Rom::open(&path).expect("ROM opens"))
+    }
+
+    #[test]
+    fn rom_who_can_come_lists_the_area_now_and_next() {
+        use super::super::{rotation, wild};
+        let Some(rom) = rom() else { return };
+        let areas = rotation::areas(&rom).unwrap();
+        let types = |s: u16| rom.species(s).map(|i| i.types);
+        // 3 minutes 20 into a window: 7 minutes left (rounded up).
+        let start = 1_792_800_000 / rotation::SLOT_SECS * rotation::SLOT_SECS;
+        let unix = start + 200;
+        let slot = rotation::slot_of(unix);
+        for garden in 1..=3u8 {
+            let page = Page::who_comes(&rom, &areas, garden, false, unix);
+            let area = rotation::area_at(&areas, garden, slot).unwrap();
+            let after = rotation::area_at(&areas, garden, slot + 1).unwrap();
+            let name =
+                |a: &rotation::Area| super::super::ascii(&rom.map_section_name(a.section).unwrap());
+            assert_eq!(
+                page.rows[0],
+                (
+                    format!("{}: for the next 7 minutes", name(area)),
+                    Action::None
+                )
+            );
+            assert_eq!(
+                page.rows[1],
+                (
+                    format!("Next: {} in 7 minutes (A: who comes)", name(after)),
+                    Action::WhoNext(garden)
+                )
+            );
+            // Then every species that can come, as the picking has them, each with its name
+            // to search by and its types and abilities in its note.
+            let chances = wild::who_comes(area, types);
+            assert_eq!(page.rows.len(), 2 + chances.len());
+            for (i, c) in chances.iter().enumerate() {
+                let (text, action) = &page.rows[2 + i];
+                assert_eq!(*action, Action::Look(c.species));
+                let species = super::super::ascii(&rom.species_name(c.species).unwrap());
+                assert_eq!(page.name(2 + i), Some(species.as_str()));
+                assert!(text.starts_with(&species) && text.contains(c.from.label()));
+                assert!(text.contains(&format!("Lv{}", c.min_level)) && text.ends_with('%'));
+                let note = page.note(2 + i).unwrap();
+                let first = rom.species(c.species).unwrap().types[0];
+                assert!(note.contains(&super::super::ascii(&rom.type_name(first).unwrap())));
+            }
+            assert!(page.note(0).is_none() && page.note(1).is_none());
+            // The next window's list: its area, from when, and no further.
+            let next = Page::who_comes(&rom, &areas, garden, true, unix);
+            assert_eq!(
+                next.rows[0].0,
+                format!("{}: in 7 minutes, for 10 minutes", name(after))
+            );
+            let later = wild::who_comes(after, types);
+            assert_eq!(next.rows.len(), 1 + later.len());
+            assert!(next.title.ends_with(" next"));
+        }
+        // Search and jumps on a long list: find a window whose area has many kinds.
+        let (unix, page) = (0..400u64)
+            .map(|w| start + w * rotation::SLOT_SECS)
+            .map(|t| (t, Page::who_comes(&rom, &areas, 1, false, t)))
+            .find(|(_, p)| p.rows.len() > 2 + 14)
+            .expect("a long list");
+        let mut l = List::new(page);
+        // The cursor starts on the next area's row; the area's own line can't be picked.
+        assert_eq!(l.page.row, 1);
+        assert_eq!(l.press(Key::JumpDown, 8), Outcome::Moved);
+        assert_eq!(l.page.row, 11);
+        assert!(l.species().is_some());
+        l.press(Key::JumpUp, 8);
+        assert_eq!(l.page.row, 1);
+        // Typing a creature's name keeps its rows and the unnamed lines.
+        let target = l.page.name(5).unwrap().to_string();
+        assert_eq!(l.typed(&typed(&target[..3]), 8), Outcome::Searched);
+        let shown = l.shown();
+        assert!(shown.contains(&0) && shown.contains(&1) && shown.contains(&5));
+        assert!(shown.iter().filter_map(|&i| l.page.name(i)).all(|n| {
+            n.to_ascii_lowercase()
+                .contains(&target[..3].to_ascii_lowercase())
+        }));
+        // Esc clears the search, then goes back.
+        let escape = Typed {
+            escape: true,
+            ..Typed::default()
+        };
+        assert_eq!(l.typed(&escape, 8), Outcome::Searched);
+        assert_eq!(l.typed(&escape, 8), Outcome::Close);
+        assert!(unix >= start);
     }
 
     #[test]

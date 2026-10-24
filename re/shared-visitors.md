@@ -38,7 +38,9 @@ as in `chao-wild-visitors.md`.
 | Run by the server, SharedVisitors off, no ROM, or another print | none | hidden |
 
 A garden the server runs with only one player in it (held Chao of absent players waiting
-there, `chao-garden-sync.md`) is shared in this sense too: that player is its picker.
+there, `chao-garden-sync.md`) is shared in this sense too: that player is its picker, asked as
+soon as their game is settled in it. A garden with only one player and their own Chao is never
+run, so its visitors are that player's own from the start.
 
 ### The visitor fingerprint (`net/wild_print.rs`)
 `visitor_print(rom) -> Option<u32>` (never 0) is FNV-1a 32 over:
@@ -74,7 +76,7 @@ visitors and no machine.
 | `spots` | `Spots::read(&run.world.garden)`, rebuilt when the fingerprint changes; land spots within `MACHINE_CLEAR` (8) of the machine spot are left out |
 | `machine` | `machine::find_spot(garden, tris, tree_spots, toys)` on the same ground (pure, so it is the spot every game finds) |
 | `print` | the print of every visitor in the list; set by the first visitor added, cleared when the list is empty |
-| `section` | the garden's wild area for this run (a map section id), `None` until the first pick |
+| `section` | the garden's wild area in the host's clock window (a map section id, with the print it was picked with), `None` until the window's first pick |
 | `cap` | 4..=5, drawn once per run (`MIN_CAP..=MAX_VISITORS`) |
 | `came` | wild visitors added this run |
 | `next` | the frame the next visitor is due (`NEXT_SECS` 20..50 s apart; `ON_ENTRY` = 3 right at the start) |
@@ -135,14 +137,31 @@ visitors and no machine.
 - When the run ends the list is dropped (unless frozen, section 6). The games then go back to
   their own visitors (section 4, "Shared → alone").
 
+### The area and the clock
+- A garden's area follows the host's clock: window `slot` = Unix seconds (UTC) / 600
+  (`rotation::slot_of`), worked out every frame (`WildHost.slot`). Every `WildAsk` carries the
+  host's window; with no section the picker picks from `rotation::area_at(areas, garden, slot)`
+  with that window, so the area never depends on the picker's own clock, and it is the same
+  area a player alone in that garden has in that window (`chao-wild-visitors.md` §6).
+- The first pick answering an ask of the current window sets `section`; later asks name it.
+- When the window changes the host forgets every garden's `section` (logged), and nothing else:
+  the run, `came`, its visitors and an ask that is out stay. The next ask has no section and the
+  new window, and lists say 0xFF meanwhile.
+- A pick answering an ask from the window before (asks last at most 5 s) is taken as usual, its
+  visitors added, but doesn't set `section`, so an old area is never kept into a new window.
+- A new run (the garden going shared again, another ground) starts with no section; its first
+  pick is the window's area again, so a run restarting doesn't change the area by itself.
+
 ### Hand-offs between players
-- **Picker**: of the players present in the garden (`present_in`, settled there) with *see*
-  and *pick* and a print equal to the garden's (any print while the list is empty), the one
+- **Picker**: of the players present in the garden (`present_in`) and settled there
+  (`Seen::settled`: their last state isn't `POSE_LOADING`; a game still loading in drops an ask
+  for a garden its `shared.rs` doesn't see it in yet) with *see* and *pick* and a print equal to the garden's (any print while the list is empty), the one
   with the earliest `Player.since` (time in that garden), the lower id on a tie. It is worked
   out every frame, so when the picker leaves the next one takes over at once. The list, the
   section and the cap stay as they are. An ask to a player who stopped being picker is dropped
   and asked again of the new one.
-- **Ask timeout**: an ask unanswered for 5 s is dropped; the next comes `NEXT_SECS` later.
+- **Ask timeout**: an ask unanswered for 5 s (`ASK_LIMIT`) is dropped and asked again 1 s
+  later (`ASK_AGAIN`): the visitors it was for are still due.
 - The keeper of trees and toys (`keeper.rs`) is a separate role; the visitor picker doesn't
   follow it.
 
@@ -163,7 +182,7 @@ id twice). 13 bytes. Positions are f32 (finite, |v| ≤ 1e6, `MAX_COORD`); angle
 |---|---|---|---|
 | 73 | WildHello | to the host, reliable | flags u8 (bits 1, 2, 4 only), print u32 (0 with flag 1 clear) |
 | 74 | WildList | from the host, every 6 frames, unreliable | area u8 (1..=3), serial u16 (one more for each list the host sends), section u8 (0xFF none yet), print u32, picker u8 (a player id, 0xFF none), learners u16 (bit per owner id 0..=15: their Chao can learn now), count u8 (≤ 8), count × entry. Entry: id u16 (not 0), creature, origin u8 (0 wild, 1 partner), bringer u8 (a player id; 0xFF for wild), place u8 (0 roam, 1 swim, 2 held, 3 battle), by u8 (holder or battler, 0xFF otherwise), v f32×3 (ground and battle: world position; held: the offset in the holder's frame), angle u16. 33 bytes an entry, 276 at most |
-| 75 | WildAsk | from the host to the picker, reliable | area u8, ask u16, section u8 (0xFF: choose the area), land u8, pond u8 (land + pond 1..=5), fresh u8 (0/1: may hand over its own visitors with their places) |
+| 75 | WildAsk | from the host to the picker, reliable | area u8, ask u16, section u8 (0xFF: the garden's area in window `slot`), land u8, pond u8 (land + pond 1..=5), fresh u8 (0/1: may hand over its own visitors with their places), slot u32 (the host's clock window) |
 | 76 | WildPick | to the host, reliable | area u8, ask u16, section u8 (not 0xFF), count u8 (≤ 5), count × (creature, place u8 (0 the server places it on land, 1 in the pond, 2 on land at v, 3 swimming at v), v f32×3, angle u16) |
 | 77 | WildBring | to the host, reliable | area u8, key u64, from_save u8 (0/1), creature, place u8 (0 the server places it, 2 at v), v f32×3, angle u16 |
 | 78 | WildCarry | to the host, reliable | area u8, creature, offset f32×3 |
@@ -182,10 +201,11 @@ None of them changes a save or stops the server.
 - **WildHello**: kept per session. Losing *see* or changing print takes the player out of the
   picker choice and the list's receivers; their held visitor is put down where they are.
 - **WildPick**: only from the asked player, for the outstanding ask, in that garden. `count` ≤
-  land + pond; swimmers ≤ pond. On a not-fresh ask: `section` equals the garden's and places 2
-  and 3 are refused. On a fresh ask: the section becomes the garden's and placed entries (up to
+  land + pond; swimmers ≤ pond; `section` equals the asked one when the ask names one. On a
+  not-fresh ask places 2 and 3 are refused. On a fresh ask placed entries (up to
   `MAX_VISITORS`) are kept where they are when a land spot (place 2) or pond cell (place 3) is
-  within 15 units, else placed by the server. Each entry is added only while there is room.
+  within 15 units, else placed by the server. The section becomes the garden's when the ask is
+  of the host's current window. Each entry is added only while there is room.
 - **WildBring**: from a player present in that garden with *see* and *machine*, print equal to
   the garden's (an empty list's: its section's, else its picker's; any with neither), at most 4
   partner visitors of theirs there, no visitor of theirs with that key already. Place 2 is kept
@@ -246,8 +266,10 @@ None of them changes a save or stops the server.
 - The info card (`card.rs`) lists copies with the local creatures. A copy's partner comes from
   its entry (types from the ROM), not from `waiting_in`. Held copies say who holds them;
   battled ones "Battling <name>".
-- When entering a garden whose list has a section, the area's name (the game's own ROM's map
-  section name) shows once as the title.
+- The title names the list's section, or while it has none (a new run, or the host's window
+  just changed) the garden's area in the game's own window (`shared::shown_area`): the area's
+  name (the game's own ROM's map section name) and the minutes its window has left
+  (`rotation::until_next`) show for 4 s on entering and whenever that section changes.
 
 ### What the player does
 | Action | The game | Then |
@@ -271,23 +293,27 @@ once).
   there), except one in hand, which is carried in with `WildCarry` once the garden's list comes:
   on ok that same object becomes the copy (`wild::release`, our main and display put on it).
 - Where they were (creature, position, facing, swimming) and the visit's section are kept for
-  30 s (`wild::take_handover`). A fresh first ask that comes meanwhile is answered with that
-  section and those visitors in place (places 2 and 3), the asked count filled up with new
-  picks, so the first player's visitors come back as the garden's where they were.
+  30 s (`wild::take_handover`). A fresh first ask that comes meanwhile is answered with those
+  visitors in place (places 2 and 3), whatever area they came from, and the asked count filled
+  up with new picks from the asked section or the ask's window's area, so the first player's
+  visitors come back as the garden's where they were.
 
 ### Shared → alone
 When `garden::server_runs()` turns false with no friends left in the garden, the game adopts
 its copies instead of deleting them: wild ones become its own visitors (`Live` with the
-creature's four moves, `born` now, a new `stay`), the list's section becomes the visit's area
-(no title). Partner copies of its own become its waiting partners' objects again (`scene`);
-other players' partner copies go.
+creature's four moves, `born` now, a new `stay`), and the visit goes on with the area of the
+game's own window (`wild::next_area`): its name shows only when that is another area than the
+list's section. Partner copies of its own become its waiting partners' objects again (`scene`);
+other players' partner copies go. With nothing to adopt the game's own visitors come at once
+(`wild::alone_wait`: the garden was shared this visit, so there's no waiting for friends' states).
 
 ### Picking for the server
 On a `WildAsk` the picker's game picks with its own `wild::pick` on the asked section's tables
-(or, for section 0xFF, the next area of its `rotation` for that garden, bumping its `visits`
-once), the creature's moves with `random_moves` at its level, ability slot at random turned
-into the ability id, shiny 1 in `SHINY_ODDS`. It answers with as many as it could pick (0 when
-its ROM has no such area).
+(or, for section 0xFF, the garden's area in the ask's window, `rotation::area_at`), with its
+odds and the picker's memory of the garden's recent species (`wild::Recent`,
+`chao-wild-visitors.md` §6), the creature's moves with `random_moves` at its level, ability slot
+at random turned into the ability id, shiny 1 in `SHINY_ODDS`. It answers with as many as it could pick (0 when its ROM
+has no such area).
 
 ### Pure local state
 A wild `Visitor` carries its four moves (chosen with `random_moves` when it is picked) so a
@@ -362,7 +388,7 @@ Only wild visitors are battled, not partners. Y with no Chao to battle with only
 In a shared garden the game sends `WildBattle 0` and waits up to 3 s for `WildAnswer` kind 3
 (the card says "Asking to battle..."). Refused: "Someone else is with that visitor". No answer
 in time, or a yes once the player can't go any more: `WildBattle 3`. Granted: the visitor is
-`Battle { by }` and others see it busy. Alone, the game takes a **snapshot** of the visit (`wild.rs`: garden, area and `chosen`,
+`Battle { by }` and others see it busy. Alone, the game takes a **snapshot** of the visit (`wild.rs`: garden, area and its window,
 `cap`, `came`, each visitor's creature, partner, position, swimming or not, the time it has
 left, and which one is battled).
 

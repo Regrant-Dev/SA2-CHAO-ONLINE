@@ -122,6 +122,8 @@ struct Player {
     garden: u8,
     left: Option<Instant>,
     place: u8,
+    /// Their last state was between areas (`POSE_LOADING`): not settled anywhere yet.
+    loading: bool,
     position: [f32; 3],
     rotation_y: i32,
     character: u8,
@@ -150,6 +152,8 @@ struct Run {
     fingerprint: u32,
     /// Since when too few players are here (it goes back to their games after `RUN_GRACE`).
     short: Option<Instant>,
+    /// It had `MIN_PLAYERS` at some time (else it's run only for held Chao, with no grace).
+    crowded: bool,
     /// The link machine's box in its ground, while there is one (`WildHost::machine_blocker`).
     machine: Option<Blocker>,
 }
@@ -426,6 +430,7 @@ impl ChaoHost {
                 garden,
                 left,
                 place,
+                loading,
                 position: state.position,
                 rotation_y: state.rotation[1],
                 character: state.character,
@@ -1316,17 +1321,25 @@ impl ChaoHost {
         let area = index as u8 + 1;
         let here = self.present_in(area);
         let land = self.land(index).map(|(f, g)| (f, g.clone()));
-        // One player is enough when Chao held for others wait there.
-        let enough = here.len() >= MIN_PLAYERS || (!here.is_empty() && self.held_here[index]);
+        // One player is enough when Chao held for others wait there. That's looked at every
+        // `HELD_EVERY` frames; a run doesn't start on an old look (one taken while the player
+        // was still on their way in had their own Chao waiting for them there).
+        let held = self.held_here[index]
+            && (self.runs[index].is_some() || here.len() != 1 || self.held_waiting(area, now));
+        let enough = here.len() >= MIN_PLAYERS || (!here.is_empty() && held);
         if let Some(run) = self.runs[index].as_mut() {
+            run.crowded |= here.len() >= MIN_PLAYERS;
             run.short = if enough {
                 None
             } else {
                 Some(run.short.unwrap_or(now))
             };
         }
+        // The grace is for a player stepping out of a shared run a moment: a run only ever had
+        // for held Chao goes back at once when they're gone.
         let grace = self.runs[index]
             .as_ref()
+            .filter(|r| r.crowded)
             .and_then(|r| r.short)
             .is_some_and(|since| now.duration_since(since) < RUN_GRACE);
         let Some((fingerprint, garden)) = land.filter(|_| enough || grace) else {
@@ -1356,6 +1369,7 @@ impl ChaoHost {
                 slots: BTreeMap::new(),
                 fingerprint,
                 short: None,
+                crowded: here.len() >= MIN_PLAYERS,
                 machine: None,
             });
         }
@@ -2139,6 +2153,7 @@ impl Gardens for ChaoHost {
                 area: p.area,
                 since: p.since,
                 loading: p.left.is_some(),
+                settled: !p.loading,
                 position: p.position,
                 rotation_y: p.rotation_y,
                 action: p.action,
@@ -4739,5 +4754,127 @@ mod tests {
                     .all(|l| l.iter().all(|e| e.id != v.id))
             );
         }
+    }
+
+    /// Whether `out` has the server's Chao in it (it ran a garden).
+    fn ran(out: &[Out]) -> bool {
+        out.iter()
+            .any(|o| matches!(o.body, Body::ServerChao { .. } | Body::HeldChao { .. }))
+    }
+
+    /// The asks for visitors that went to player `to` in `out`.
+    fn asked(out: &[Out], to: u8) -> usize {
+        out.iter()
+            .filter(|o| o.to == To::One(to) && matches!(o.body, Body::WildAsk { .. }))
+            .count()
+    }
+
+    #[test]
+    fn walking_alone_from_the_lobby_into_ones_own_chaos_garden_runs_nothing() {
+        // Coming in at each point between two looks at the held Chao.
+        for k in 0..5 {
+            let t0 = Instant::now();
+            let mut host = two_keys(t0);
+            host.observe(0, &brings(&[(1, 0, kid(1))], true), t0);
+            // Player1 a while in the lobby, their Chao waiting for them in the Neutral Garden;
+            // Player2 in the lobby too.
+            let lobby = [(0, state(0, [0.0; 3])), (3, state(0, [0.0; 3]))];
+            let enter = ms(3000 + 100 * k);
+            let out = live(&mut host, &lobby, ms(0), enter, t0);
+            assert!(!ran(&out));
+            assert!(host.held_here[0], "their Chao waits there");
+            // In they come: the load, then their game runs it and streams it.
+            let loading = [(0, moving(1, true)), (3, state(0, [0.0; 3]))];
+            let mut out = live(&mut host, &loading, enter, enter + ms(1500), t0);
+            let stream = Body::GardenChao {
+                owner: 0,
+                list: vec![GardenChao {
+                    index: 0,
+                    ..GardenChao::default()
+                }],
+            };
+            let settled = [
+                (0, state(1, [0.0; 3])),
+                (0, stream),
+                (3, state(0, [0.0; 3])),
+            ];
+            let (settle, until) = (enter + ms(1500), enter + ms(10_000));
+            out.extend(live(&mut host, &settled, settle, until, t0));
+            assert!(host.runs[0].is_none(), "coming in {k}");
+            assert!(host.shown.is_empty());
+            assert!(!ran(&out), "coming in {k}");
+        }
+    }
+
+    /// Player2 (player 3) leaves a Chao in the Neutral Garden and is in the lobby; Player1
+    /// (player 0) sees and picks visitors, and is in the lobby until `t0 + 2 s`.
+    fn alone_with_player_2s_chao(t0: Instant) -> ChaoHost {
+        use super::super::protocol::{WILD_PICK, WILD_SEE};
+        let mut host = two_keys(t0);
+        host.observe(3, &brings(&[(1, 0, kid(2))], true), t0);
+        let hello = Body::WildHello {
+            flags: WILD_SEE | WILD_PICK,
+            print: 7,
+        };
+        host.observe(0, &hello, t0);
+        let lobby = [(0, state(0, [0.0; 3])), (3, state(0, [0.0; 3]))];
+        assert!(!ran(&live(&mut host, &lobby, ms(0), ms(2000), t0)));
+        host
+    }
+
+    #[test]
+    fn alone_with_anothers_chao_the_garden_runs_and_asks_for_visitors_once_settled() {
+        let t0 = Instant::now();
+        let mut host = alone_with_player_2s_chao(t0);
+        // Player1 loads into the garden: it runs for Player2's Chao, but their game, not in the
+        // garden yet, isn't asked for its visitors.
+        let loading = [(0, moving(1, true)), (3, state(0, [0.0; 3]))];
+        let out = live(&mut host, &loading, ms(2000), ms(3000), t0);
+        assert!(host.runs[0].is_some());
+        assert_eq!(asked(&out, 0), 0);
+        // Settled: asked at once.
+        let settled = [(0, state(1, [0.0; 3])), (3, state(0, [0.0; 3]))];
+        let out = live(&mut host, &settled, ms(3000), ms(3100), t0);
+        assert_eq!(asked(&out, 0), 1);
+        // No answer (lost, or their game couldn't): asked again a moment after it's dropped.
+        let out = live(&mut host, &settled, ms(3100), ms(9500), t0);
+        assert_eq!(asked(&out, 0), 1);
+    }
+
+    #[test]
+    fn a_run_only_for_anothers_chao_goes_back_at_once_when_it_goes() {
+        let t0 = Instant::now();
+        let mut host = alone_with_player_2s_chao(t0);
+        let settled = [(0, state(1, [0.0; 3])), (3, state(0, [0.0; 3]))];
+        live(&mut host, &settled, ms(2000), ms(4000), t0);
+        assert!(host.runs[0].is_some());
+        // Player2 takes their Chao to another garden: nothing is left for the server to run.
+        host.observe(3, &brings(&[(2, 0, kid(2))], true), t0 + ms(4000));
+        live(&mut host, &settled, ms(4000), ms(5000), t0);
+        assert!(host.runs[0].is_none(), "no grace for a run nobody shared");
+    }
+
+    #[test]
+    fn a_friend_stepping_out_of_a_shared_run_leaves_it_running_a_while() {
+        let t0 = Instant::now();
+        let mut host = running(t0);
+        let stream = Body::GardenChao {
+            owner: 0,
+            list: vec![GardenChao {
+                index: 0,
+                position: [10.0, 0.0, 10.0],
+                ..GardenChao::default()
+            }],
+        };
+        // Player 3 goes to the lobby a moment.
+        let each = [
+            (0, state(1, [0.0; 3])),
+            (0, stream),
+            (3, state(0, [0.0; 3])),
+        ];
+        live(&mut host, &each, ms(200), ms(10_000), t0);
+        assert!(host.runs[0].is_some(), "the run waits for them a while");
+        live(&mut host, &each, ms(10_000), ms(16_000), t0);
+        assert!(host.runs[0].is_none(), "then it's player 0's game's again");
     }
 }

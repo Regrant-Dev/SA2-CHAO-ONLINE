@@ -136,7 +136,7 @@ seconds instead. The garden is up when `game::in_garden()` and not `game::betwee
 
 ### Areas and garden themes
 An area is a region section: the union of the first wild header of each of its maps. 64
-sections have wild creatures. Each goes to one garden by the first rule that matches:
+sections have wild creatures. Each goes to a garden (its theme) by the first rule that matches:
 
 1. No land table on any of its maps (water and fishing only) → **Hero**.
 2. A map of type 5 (underwater) or 6 (ocean route) → **Hero**.
@@ -150,14 +150,27 @@ sections have wild creatures. Each goes to one garden by the first rule that mat
 A slot's chance counts half for each type of a two-type species. Section 85 is an open-air tower
 mapped as type 4: it goes to Hero.
 
-| Theme | Sections | Distinct species sets (land + water + fishing) | Species |
-|---|---|---|---|
-| Neutral | 13 | 12 | 73 |
-| Hero | 32 | 15 | 36 |
-| Dark | 19 | 19 | 55 |
+Some areas fit a second garden too (`rotation::also_of`), each other than their theme's:
 
-Without the fishing tables Hero has 11 distinct sets: most of its water-only routes and towns
-share one three-species surf table.
+- **Hero**: land tables, and type ids 2 (flying) and 11 (water) make up at least a third of its
+  land slots by chance.
+- **Neutral**: land tables, a map of type 3 (route), and tall grass at least 3% of its maps'
+  blocks.
+- **Dark**: no land tables, and a map of type 4 or 8 (a cave with water creatures only).
+
+| Garden | Its theme's sections | Also | All | Species (land, water, rocks, fishing), its theme's / all |
+|---|---|---|---|---|
+| Neutral | 13 | 2 (19, 25: grassy shore routes) | 15 | 75 / 78 |
+| Hero | 32 | 5 (29: a route; 67, 68, 72, 210: caves of flying and water creatures) | 37 | 36 / 45 |
+| Dark | 19 | 1 (61: a cave of water creatures) | 20 | 49 / 50 |
+
+No area fits more than two gardens. With the shared ones the Hero Garden has 10 areas with land
+tables (5 of its own).
+
+Hero's own 32 sections have 15 distinct sets of land, water and fishing tables, 11 without the
+fishing tables: most of its water-only routes and towns share one three-species surf table.
+
+Sections by theme:
 
 - Neutral: section ids 16, 17, 18, 29, 31, 32, 33, 34, 35, 36, 38, 57, 59.
 - Hero: 2, 6, 7, 8, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 30, 37, 39..49, 50, 51, 61, 85.
@@ -172,24 +185,52 @@ of flying creatures), rule 6 thirteen.
 ## 6. The mod's wild visitors (`src/gba_link/rotation.rs`, `wild.rs`)
 
 - **Areas** (`rotation::areas`): the sections above, in the order the wild headers first name
-  them, each with its maps' land, water, rock and fishing tables (each rod's table on its own),
-  and the theme by the rules of §5. Map types and block behaviours come from
+  them, each with its maps' land, water, rock and fishing tables (each rod's table on its own,
+  with its rod), its theme by the rules of §5 and the other gardens it fits (`also`). Map types and block behaviours come from
   `gba::terrain` (map header +0x17; layout and tileset attributes).
-- **The visit's area** (`rotation::pick`): with `n` areas for the garden, visit `v` is
-  position `v mod n` of a Fisher-Yates shuffle of them seeded by splitmix64 of
-  `(v / n) << 8 | garden`, so each area comes once per round of `n` visits. When a round's
+- **The garden's area** (`rotation::pick`, `area_at`): the clock picks it, in 10-minute windows:
+  window `v` = Unix seconds (UTC) / 600 (`rotation::slot_of`). A garden's areas are the ones of
+  its theme and the ones that fit it too (`Area::fits`), in the order of the ROM. With `n` areas
+  for the garden,
+  window `v` is position `v mod n` of a Fisher-Yates shuffle of them seeded by splitmix64 of
+  `(v / n) << 8 | garden`, so each area comes once per round of `n` windows. When a round's
   first area is the one the round before ended on, its first two swap, so no area comes two
-  visits running; with 2 areas they alternate, `(v + garden) mod 2`. `v` goes up by one each
-  time the player walks into that garden, from a random start each time the game starts.
+  windows running; with 2 areas they alternate, `(v + garden) mod 2`. Every game with the same
+  ROM has the same area for a garden in the same window, alone or shared (the server's side is
+  in `shared-visitors.md`, "The area and the clock").
+- **A new window** (`wild::next_area`): every frame the garden is the player's alone, the
+  window is worked out again; when it isn't the one the visit's area is for, the area becomes
+  the new window's. New visitors then come from it; the ones about stay until they go as usual.
+  The area's name (its ROM section name) shows at the top for 4 s with the minutes its window
+  has left (`rotation::until_next`) on entering the garden and whenever the area changes
+  (`hud::top_title`).
 - **Spots** (`wild::Spots`): land cells whose middle's highest probe hit is solid, and water
   cells whose highest hit is water with solid floor at least 3 below it (the surface height is
   kept per cell). Visitors come into the pond at water cells with at least three water
   neighbours.
-- **Picks** (`wild::pick`): a table at random among the area's tables of the kind, then a slot by
-  its chance, level uniform in the slot's range, ability slot 0 or 1 at random, shiny 1 in 1024.
-  Land: the land tables, or a rock table one time in four when there is one. Pond: the water
-  tables, or the fishing tables one time in four. In an area without land tables, type id 2
-  creatures of the water and fishing tables go to the grass and the others to the pond.
+- **Odds** (`wild::ways`): every slot a visitor to the grass, or to the pond, can come from,
+  with its odds (a place's add up to 1):
+  - Grass: the land tables, the rock tables 1/4 of the time (when there are any). Pond: the water
+    tables, the fishing tables 1/2 of the time (when there are both). In an area without land
+    tables, type id 2 creatures of the water and fishing tables go to the grass and the others
+    to the pond, with the same 1/2.
+  - Among a kind's tables: the land, water and rock tables (one per map) count the same; a rod's
+    fishing table counts 1 (basic), 2 (better) or 3 (best).
+  - In a table, species `s` (chance `c_s`, the sum of its slots', of the table's total `C`, among
+    `k` species) has `0.6 × c_s / C + 0.4 / k`, shared among its slots by their chances (for its
+    levels). On the GBA game's land table with a species per slot, the 1% slots become 3.9% and
+    the 20% ones 15.3%.
+- **Picks** (`wild::pick`): a slot by its odds times the garden's recent factor, level uniform
+  in the slot's range, ability slot 0 or 1 at random, shiny 1 in 1024.
+- **Recent species** (`wild::Recent`): each garden keeps the species of its last 8 visitors
+  (`wild::with_recent`, the same memory for the player's own visitors and for the ones they pick
+  as a shared garden's picker; not saved). For each time a species is among them its odds are
+  multiplied by `0.1 + 0.9 × age / 8` (age 0 the newest). With four species of the same odds,
+  back-to-back repeats go from 1 in 4 to about 1 in 17.
+- **Who can come** (`wild::who_comes`, the link machine's list, `Page::who_comes`): the odds of
+  `ways` added up by species and where from (grass, rocks, pond, fishing) with the level range
+  of its slots, grass first, the likeliest first; recent species aren't counted there. A
+  percentage is of the visitors to the grass (grass, rocks) or to the pond (pond, fishing).
 - **Objects**: each visitor is an animal of id 3 with no record (as partners), made only while
   the category-2 count plus 2 plus the garden's waiting partners that have no object yet is
   below the limit at 0x8AB840 (2 entries stay free for the game's own animals and drives, and
@@ -218,6 +259,8 @@ of flying creatures), rule 6 thirteen.
   keeps writing through that pointer, so it is deleted only once it is let go of, and a carried
   one waits for the next garden that isn't shared. Nothing comes, and the area's name doesn't
   show, until a garden has been up and not shared for 2.5 s, as friends' states and the
-  server's Chao arrive a little after the area loads.
+  server's Chao arrive a little after the area loads (`alone_wait`). A garden that was shared
+  earlier in the same visit (the server handed it back, or the friends left) is known to be the
+  player's, so its visitors come at once.
 - **Without the absorb hook** (§2: the bytes at 0x56708E aren't as expected) no visitor comes:
   a Chao absorbing one would take the game's own animal path into the Chao save.
