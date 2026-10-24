@@ -148,10 +148,10 @@ visitors and no machine.
 
 ---
 
-## 3. Messages (protocol 27)
+## 3. Messages
 
-`PROTOCOL_VERSION` 27. Players with an older one are turned away by their Hello. All new bodies are game
-bodies, tags 73..=86. The referee consumes every to-the-host body (never passed on) and drops
+Players with a different `PROTOCOL_VERSION` are turned away by their Hello. The shared-visitor
+bodies are game bodies, tags 73..=86. The referee consumes every to-the-host body (never passed on) and drops
 the from-the-host ones when a player sends them; a game takes the from-the-host ones only from
 `SERVER` (0xFF), as `ItemSteer`.
 

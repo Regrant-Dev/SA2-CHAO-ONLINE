@@ -1,4 +1,4 @@
-# Network protocol (v26)
+# Network protocol (v28)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -114,12 +114,12 @@ Game bodies:
 | 64 | Partners | reliable, on connecting and when someone joins, a Chao absorbs a partner, is taught a TM move, has its four moves, its types or its ability chosen or gains battle XP | count u8 (≤ 32), count × (identity u64 (`ChaoData::identity`), species u16, types u8×2, ability u8 (0: none), moves u16×4, level u8 (1..=100)): every one of the sender's Chao with a GBA link partner, a learned move or a battle level: its last partner's species (0 without one), the types (the same twice for one; Normal without a partner) and ability it battles with, the four moves it battles with (not its whole lists) and its battle level (ROM ids, checked against the ROM's id ranges), in as many lists as needed. Battles against copies of their Chao use it, and the status balloon shows their battle levels |
 | 65 | BattleChallenge | to the host only, reliable | to u8, format u8 (0 singles, 1 doubles), save partners u8 (1: what partners from a GBA save taught counts; 0: both teams leave it out, each game its own), actual levels u8 (1: each Chao battles at its own battle level; 0: every Chao at level 50, both games for both teams), dex u32, team: the sender challenges player `to` to a live battle (see Live battles). `dex` is a fingerprint of the ROM data the battle runs on. A team is count u8 (1..=6), count × (0x800 bytes `ChaoData` (must pass `ChaoData::validate`), species u16, types u8×2, ability u8, moves u16×4, level u8 (1..=100): the Chao's battle profile, ROM ids checked against the ROM's id ranges, 0 for none) |
 | 66 | BattleOffer | from the host, reliable | from u8, format u8, save partners u8, actual levels u8 (as the challenge's): player `from` challenges the receiver |
-| 67 | BattleAnswer | to the host only, reliable | to u8 (the challenger), answer u8 (0 decline, 1 accept, 2 busy: their game can't take a challenge now), dex u32, team (with count 1..=6 when accepting, 0 otherwise) |
+| 67 | BattleAnswer | to the host only, reliable | to u8 (the challenger, or the starter of a multi battle the sender is invited to), answer u8 (0 decline, 1 accept, 2 busy: their game can't take a challenge now), dex u32, team (with count 1..=6 when accepting, at most 3 for a multi battle; 0 otherwise) |
 | 68 | BattleStart | from the host, to both players, reliable | battle u16, format u8, side u8 (the receiver's: 0 the challenger, 1 the accepter), opponent u8, seed u64, the opponent's team |
-| 69 | BattleChoice | to the host only, reliable | battle u16, step u16, check u32 (the sender's battle checksum before this step), count u8 (≤ 2), count × pick: the sender's choices for this step (none when they have nothing to choose). A pick is pos u8 (0..=1), kind u8 (0 move, 1 the out-of-PP move, 2 switch, 3 send in for a fainted fighter), value u8 (a move index 0..=3, 0 for kind 1, a team member 0..=5), target u8 (side × 2 + pos, 0xFF none), pass u8 (the team member a passing move hands on to, 0xFF none) |
-| 70 | BattleStep | from the host, to both players, reliable | battle u16, step u16, seed u64, count u8 (≤ 4), count × (side u8 (0..=1), pick): both players' choices for the step and its rolls' seed |
-| 71 | BattleLeave | to the host only, reliable | battle u16 (0: before a battle starts, taking back the sender's challenge or turning down one to them), reason u8 (0 the battle reached its end, 1 gave up, 2 left the battle) |
-| 72 | BattleEnd | from the host, reliable | battle u16 (0: a challenge that never started a battle), reason u8 (0 busy, 1 declined, 2 the ROM data differs, 3 forfeit: the opponent gave up, 4 disconnect: the opponent left the battle or the lobby, 5 timeout, 6 desync, 7 withdrawn), winner u8 (the winning side, 2 nobody) |
+| 69 | BattleChoice | to the host only, reliable | battle u16, step u16, check u32 (the sender's battle checksum before this step), count u8 (≤ 2), count × pick: the sender's choices for this step (none when they have nothing to choose; in a multi battle only the picks for the sender's own place count). A pick is pos u8 (0..=1), kind u8 (0 move, 1 the out-of-PP move, 2 switch, 3 send in for a fainted fighter), value u8 (a move index 0..=3, 0 for kind 1, a team member 0..=5), target u8 (side × 2 + pos, 0xFF none), pass u8 (the team member a passing move hands on to, 0xFF none) |
+| 70 | BattleStep | from the host, to the battle's players, reliable | battle u16, step u16, seed u64, count u8 (≤ 4), count × (side u8 (0..=1), pick): every player's choices for the step (in a multi battle those of the players still in it; none for the places the computer plays) and its rolls' seed |
+| 71 | BattleLeave | to the host only, reliable | battle u16 (0: before a battle starts, taking back the sender's challenge, calling off their multi battle, or turning down (or leaving after accepting) a challenge or invite to them), reason u8 (0 the battle reached its end, 1 gave up, 2 left the battle) |
+| 72 | BattleEnd | from the host, reliable | battle u16 (0: a challenge or multi battle that never started), reason u8 (0 busy, 1 declined, 2 the ROM data differs, 3 forfeit: the opponent gave up, 4 disconnect: the opponent (a multi battle's starter) left the battle or the lobby, 5 timeout, 6 desync, 7 withdrawn, 8 replaced: the receiver took too long to choose in a multi battle and the computer plays their place), winner u8 (the winning side, 2 nobody) |
 | 73 | WildHello | to the host only, reliable, on connecting and when it changes | flags u8 (only bits 1 see: SharedVisitors on and the ROM read; 2 pick: WildVisitors on too; 4 machine: LinkMachine on too), print u32 (the ROM's visitor print, `net::wild_print`; non-zero exactly with bit 1). See Shared wild visitors |
 | 74 | WildList | from the host (0xFF), every 6 frames, unreliable | area u8 (1..=3), serial u16 (one more for each list the host sends; a game drops a list not newer than the last one it took, while that one is under 1.5 s old), section u8 (the garden's wild area this run, a map section id; 0xFF none yet), print u32 (its visitors' print; for an empty list with no area its picker's, 0 with no picker either), picker u8 (a player id, 0xFF none), learners u16 (a bit per owner id 0..=15 whose Chao can learn from these visitors now), count u8 (≤ 30), count × entry: id u16 (not 0, each once), creature, origin u8 (0 wild, 1 a partner), bringer u8 (the partner's bringer, a player id; 0xFF for a wild one), place u8 (0 on the ground, 1 swimming, 2 in a player's hands, 3 battled by a player), by u8 (that player's id, 0xFF for 0 and 1), v f32×3 (places 0, 1, 3: its world position; 2: its offset in the holder's frame, each axis ≤ 10), angle u16 (BAMS). A **creature** is species u16 (1..`SPECIES_COUNT`), level u8 (1..=100), ability u8 (an ability id, < `ABILITY_COUNT`), shiny u8 (0/1), moves u16×4 (each < `MOVE_COUNT`, at least one not 0, none twice): 13 bytes |
 | 75 | WildAsk | from the host to a garden's picker, reliable | area u8, ask u16, section u8 (0xFF: the picker chooses the garden's area), land u8, pond u8 (land + pond 1..=5), fresh u8 (0/1: the garden just became shared; the picker may hand over its own visitors where they are) |
@@ -134,6 +134,12 @@ Game bodies:
 | 84 | WildAnswer | from the host (0xFF) to one player, reliable | kind u8 (0 take, 1 carry, 2 bring, 3 battle), id u16 (the visitor's; 0 when refused before it had one), key u64 (a bring's key, else 0), ok u8 (0/1) |
 | 85 | WildTaught | from the host (0xFF) to every session of a Chao's owner, reliable | identity u64 (`ChaoData::identity`), origin u8 (0 wild, 1 a partner from a GBA save, 2 another partner), creature: that Chao absorbed this visitor |
 | 86 | WildUsed | from the host (0xFF) to a partner's bringer, reliable | garden u8 (1..=3), key u64: their partner waiting in that garden was absorbed and waits no more |
+| 87 | MultiInvite | to the host only, reliable | save partners u8, actual levels u8 (as a challenge's), dex u32, team (count 1..=3), then 3 × seat for places 1..=3 (the sender's ally, foe 1, foe 2): kind u8 (0 a player: id u8 (< 8); 1 the computer: team, count 1..=3). The sender starts a multi battle as place 0 (see Multi battles) |
+| 88 | MultiOffer | from the host, reliable | from u8 (the starter), place u8 (1..=3, the receiver's), save partners u8, actual levels u8, players u8×4 (each place's player, 0xFF the computer): the receiver is invited; they answer with `BattleAnswer` to `from` |
+| 89 | MultiStatus | from the host to a multi battle's starter, reliable | place u8 (1..=3), status u8 (0 accepted, 1 declined, 2 busy (away, in another battle, or a bad answer), 3 didn't answer in time, 4 left after accepting, 5 has a different ROM): what the player invited to that place did. A place not taken is open |
+| 90 | MultiFill | to the host only, reliable | place u8 (1..=3), team (count 1..=3): the starter gives an open place to the computer |
+| 91 | MultiStart | from the host, to each player of a multi battle, reliable | battle u16, seed u64, place u8 (0..=3, the receiver's), actual levels u8, then 4 × (player u8 (0xFF the computer), team (count 1..=3)): every place's player and team |
+| 92 | MultiTakeover | from the host, to the other players of a multi battle, reliable | battle u16, place u8 (0..=3), reason u8 (3 gave up, 4 left the battle or the lobby, 8 too slow to choose): that place's player is gone and the computer plays it from the next step on |
 
 ## Skins (`net/files.rs`, `skin_sync.rs`)
 
@@ -156,7 +162,7 @@ skins built on a character's skeleton (rigged) show the character to others.
 `PlayerState.flags` (`game::POSE_*`): 1 spin ball (jump), 2 blending into `anim`, 4 waiting at
 a synced start, 8 "start now", 16 in a Chao Race the state is the player's racing Chao (position
 and rotation y are the Chao's, `frame` its race progress), 32 busy: in a live karate fight, a
-Chao battle or a live battle's challenge.
+Chao battle, a live battle's challenge or a multi battle's invites.
 
 `PlayerState.room`: (0xFF, 0) = none, (creator id, kind) = in that player's room; kind 1 =
 Race, 2 = Co-op (the creator's setting; any non-zero kind is a room). A room exists
@@ -221,6 +227,40 @@ passed on.
   and the battle ends on the host once both games have said so. If the other game has chosen
   for a step, or chooses after, it gets `BattleEnd` desync with no winner.
 - The battle never touches either save.
+
+### Multi battles (net/battles.rs, battle/online.rs)
+
+Doubles with four places, each a player's or the computer's: place = side × 2 + pos, the
+starter is place 0 (side 0), their ally place 1, the foes places 2 and 3. Each place has its own
+team of 1..=3 Chao and plays only its own.
+- `MultiInvite` from a player in no challenge or battle, inviting each player at most once and
+  not themselves, sets one up; otherwise the starter gets `BattleEnd` busy. Each invited player
+  in the lobby and in nothing else gets `MultiOffer`; any other invited place is open at once
+  (`MultiStatus` busy). Nobody in a setup can be challenged or invited elsewhere.
+- An invited player's `BattleAnswer` to the starter: an accept with the same `dex` and at most 3
+  Chao takes the place (`MultiStatus` accepted); anything else opens it (`MultiStatus` with why;
+  another ROM or too big a team also sends that player `BattleEnd`). `BattleLeave` 0 from an
+  invited player opens their place (declined, or left once accepted); from the starter it calls
+  the battle off (`BattleEnd` withdrawn to the others; disconnect when they leave the lobby).
+  The starter fills an open place with `MultiFill`. An invite waits 2 minutes for its answer
+  (then `BattleEnd` timeout to that player, `MultiStatus` timeout to the starter); a setup not
+  started in 5 minutes ends with `BattleEnd` timeout for everyone in it.
+- Once every place is a player's who accepted or the computer's, `MultiStart` goes to each
+  player with one battle id and seed. Every game builds the battle the same way: side 0's team
+  is place 0's Chao then place 1's, side 1's place 2's then place 3's (fighters as for a live
+  battle, under the level rule); each place sends in, switches to and passes on to only its own,
+  and a place whose own Chao are all down stays empty. Each game shows its own side on the left.
+- Each step: every player still in the battle sends `BattleChoice`; the host keeps the picks
+  for the sender's own place. Once all are in, different checksums end it for everyone (desync);
+  otherwise `BattleStep` goes to them all with a new seed. Each game plays every place with
+  picks from them; a place with none (the computer's), or whose picks the battle refuses, gets
+  the battle AI's choices from that seed and place, the same in every game.
+- A player who gives up (`BattleLeave` 1), leaves the battle (2) or the lobby, or takes more
+  than 2 minutes to choose once someone has (they get `BattleEnd` replaced) is out of it: the
+  others get `MultiTakeover`, and the computer plays that place from then on. The battle ends in
+  the games, when a side has no Chao left; each game's `BattleLeave` 0 says so, as for a live
+  battle (a game that chooses after another said so gets `BattleEnd` desync). A step nobody
+  chooses for in 10 minutes ends it for everyone (`BattleEnd` timeout, no winner).
 
 ## Shared wild visitors (net/wild_host.rs, net/wild_print.rs)
 

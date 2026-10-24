@@ -1,8 +1,9 @@
 //! One battle from the karate menu to the result: picking singles or doubles, your team and the
 //! opponents (or a trainer from the GBA game, `trainers`, a friend online, `online`, or a wild
-//! visitor from a garden, `wild`), then the turns (your choices from menus, the opponents' from
-//! the AI or the friend's game) played out beat by beat, and the XP the player's Chao earn from
-//! trainer, wild and live battles (`levels`).
+//! visitor from a garden, `wild`), or a multi battle (each of the four places a friend's or the
+//! computer's, the player choosing only for their own), then the turns (your choices from
+//! menus, the opponents' from the AI or the friends' games) played out beat by beat, and the XP
+//! the player's Chao earn from trainer, wild and live battles (`levels`).
 //!
 //! No game access here: `update` takes the buttons pressed this frame and returns `Command`s for
 //! the arena (game.rs), and `screen` says what the HUD shows. A live battle's messages come in
@@ -19,8 +20,9 @@ use crate::gba_link::store::{MoveRefused, Moves, TraitRefused, Traits};
 use crate::log;
 use crate::net::protocol::{
     ANSWER_ACCEPT, ANSWER_BUSY, ANSWER_DECLINE, BattleMember, BattlePick, Body, END_BUSY,
-    END_DECLINED, END_DESYNC, END_DISCONNECT, END_FORFEIT, END_ROM_DIFFERS, END_TIMEOUT,
-    END_WITHDRAWN, LEAVE_GAVE_UP, LEAVE_LEFT, LEAVE_OVER,
+    END_DECLINED, END_DESYNC, END_DISCONNECT, END_FORFEIT, END_REPLACED, END_ROM_DIFFERS,
+    END_TIMEOUT, END_WITHDRAWN, LEAVE_GAVE_UP, LEAVE_LEFT, LEAVE_OVER, MAX_MULTI_TEAM, MultiSeat,
+    SEAT_ACCEPTED, SEAT_DECLINED, SEAT_LEFT, SEAT_ROM_DIFFERS, SEAT_TIMEOUT,
 };
 use crate::search::{self, Edit, Search, Typed};
 
@@ -34,7 +36,7 @@ use super::ladder::Progress;
 use super::levels::{self, Level};
 use super::mirror;
 use super::narrate::{self, Beat, Cue, Names, Sound, View};
-use super::online::{self, Incoming};
+use super::online::{self, Incoming, Invite, MultiStart};
 use super::rng::Rng;
 use super::team::{self, Dex};
 use super::trainers::{self, Creature, Picker, Roster};
@@ -72,6 +74,12 @@ const END_LOST: u8 = 0xFF;
 /// A challenge or answer the host says nothing more about is given up after this many frames
 /// (the host's own limit is shorter).
 const WAIT_LIMIT: u32 = 150 * 60;
+/// The same for a multi battle's invites (the host calls one off after 5 minutes).
+const MULTI_WAIT_LIMIT: u32 = 330 * 60;
+/// The setup screen of a multi battle: the team, the three other places, the two rules, then
+/// starting it.
+const PLAN_ROWS: usize = 7;
+const PLAN_START: usize = 6;
 
 /// A Chao to battle with: a copy of its record (the save is never touched), its name and, for
 /// the player's own, every move, type and ability it got (`None` for other players' Chao: their
@@ -113,6 +121,70 @@ enum Against {
     Copies(Vec<usize>),
 }
 
+/// Who has one of a multi battle's other places (ally, foe 1, foe 2) as its starter sets it up.
+#[derive(Clone)]
+enum Holder {
+    /// A friend online at Chao Karate, invited.
+    Friend { id: u8, name: String },
+    /// The computer, with this team.
+    Computer { label: String, team: Vec<Entry> },
+}
+
+impl Holder {
+    fn label(&self) -> String {
+        match self {
+            Holder::Friend { name, .. } => format!("{name} (live)"),
+            Holder::Computer { label, team } => format!("Computer: {label} ({})", team.len()),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Holder::Friend { name, .. } => name.clone(),
+            Holder::Computer { .. } => "the computer".into(),
+        }
+    }
+}
+
+/// An invited place's answer so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    Waiting,
+    Accepted,
+    /// Not taken (`SEAT_*`): the starter can give it to the computer.
+    Refused(u8),
+    /// The computer's.
+    Computer,
+}
+
+/// A multi battle as its starter sets it up: their own team (up to `MAX_MULTI_TEAM`), then who
+/// has each other place.
+#[derive(Clone, Default)]
+struct Plan {
+    picked: Vec<usize>,
+    /// The ally's place, then the foes' (places 1..=3); set once the team is picked.
+    seats: Option<[Holder; 3]>,
+    /// Once the invites are out: each of those places' answer.
+    answers: Option<[Answer; 3]>,
+    /// Frames waited for the answers.
+    waited: u32,
+}
+
+impl Plan {
+    fn seat(&self, place: usize) -> Option<&Holder> {
+        self.seats.as_ref()?.get(place.checked_sub(1)?)
+    }
+
+    fn friends(&self) -> bool {
+        self.seats
+            .iter()
+            .flatten()
+            .any(|h| matches!(h, Holder::Friend { .. }))
+    }
+}
+
+const PLACE_NAMES: [&str; 3] = ["Ally", "Foe 1", "Foe 2"];
+
 /// "Can't battle now" to player `to`'s challenge.
 pub fn busy_answer(to: u8) -> Body {
     answer(to, ANSWER_BUSY)
@@ -146,6 +218,45 @@ fn ended(event: &Incoming, with: u8) -> Option<u8> {
         Incoming::Lost => Some(END_LOST),
         _ => None,
     }
+}
+
+/// What the end of a multi battle's invite to us (`END_*`, or `END_LOST`) says.
+fn invite_note(reason: u8, name: &str) -> String {
+    match reason {
+        END_WITHDRAWN => format!("{name} called the multi battle off."),
+        END_DISCONNECT => format!("{name} left."),
+        END_TIMEOUT => "Time ran out waiting for the multi battle.".into(),
+        END_BUSY => "The multi battle couldn't take that team.".into(),
+        _ => end_note(reason, name),
+    }
+}
+
+/// What the host said about our invite to a multi battle's place (`SEAT_*`).
+fn seat_note(status: u8, name: &str) -> String {
+    match status {
+        SEAT_ACCEPTED => format!("{name} accepted."),
+        SEAT_DECLINED => format!("{name} turned the battle down."),
+        SEAT_TIMEOUT => format!("{name} didn't answer in time."),
+        SEAT_LEFT => format!("{name} left."),
+        SEAT_ROM_DIFFERS => format!("{name}'s GBA ROM is a different one."),
+        _ => format!("{name} can't battle right now."),
+    }
+}
+
+/// Why an invited place wasn't taken (`SEAT_*`), for the waiting list.
+fn refused(status: u8) -> &'static str {
+    match status {
+        SEAT_DECLINED => "turned it down",
+        SEAT_TIMEOUT => "didn't answer",
+        SEAT_LEFT => "left",
+        SEAT_ROM_DIFFERS => "has a different GBA ROM",
+        _ => "can't battle now",
+    }
+}
+
+/// "A and B".
+fn pair(a: &str, b: &str) -> String {
+    format!("{a} and {b}")
 }
 
 /// What a live battle's end (`END_*`, or `END_LOST`) says.
@@ -286,6 +397,8 @@ pub struct Session {
     actual_levels: bool,
     /// The level rule of the challenge being answered.
     offer_actual_levels: bool,
+    /// The challenge being answered is an invite to a multi battle.
+    offer_invite: Option<Invite>,
     /// The player's Chao's battle levels, by identity (the ones not here are at a new Chao's).
     levels: BTreeMap<u64, Level>,
     /// The notice to show as the menu closes after `Command::Released`.
@@ -319,6 +432,8 @@ struct Waiting {
     actual_levels: bool,
     /// Frames waited.
     waited: u32,
+    /// Accepted an invite to a multi battle (from `with`, its starter).
+    multi: bool,
 }
 
 enum State {
@@ -336,6 +451,25 @@ enum State {
         live: Option<(u8, String)>,
         /// Choosing a Chao's moves ("Choose moves").
         moves: Option<Choosing>,
+        /// Picking the team for a multi battle being set up.
+        multi: Option<Box<Plan>>,
+    },
+    /// Setting up a multi battle (`PLAN_ROWS`).
+    Multi {
+        plan: Box<Plan>,
+        cursor: usize,
+    },
+    /// Choosing who has place `place` (1..=3) of the multi battle: a friend or a computer team;
+    /// only the computer's once the invites are out (a place nobody took).
+    Seat {
+        plan: Box<Plan>,
+        place: usize,
+        cursor: usize,
+    },
+    /// The multi battle's invites are out: each place's answer, and calling it off.
+    MultiWait {
+        plan: Box<Plan>,
+        cursor: usize,
     },
     Opponent {
         format: Format,
@@ -523,6 +657,7 @@ impl Session {
             offer_save_partners: true,
             actual_levels: false,
             offer_actual_levels: false,
+            offer_invite: None,
             levels: BTreeMap::new(),
             farewell: None,
             wild: None,
@@ -545,6 +680,7 @@ impl Session {
             foe: None,
             live: None,
             moves: None,
+            multi: None,
         };
         self
     }
@@ -613,15 +749,17 @@ impl Session {
         self.wild.is_some()
             || matches!(
                 self.state,
-                State::Offer { .. } | State::Waiting(_) | State::Fight(_)
+                State::Offer { .. } | State::Waiting(_) | State::Fight(_) | State::MultiWait { .. }
             )
             || matches!(&self.state, State::Team { live: Some(_), .. })
+            || matches!(&self.state, State::Seat { plan, .. } if plan.answers.is_some())
     }
 
     /// Waiting on the host: a challenge, an answer or a live battle still going.
     pub fn waits_on_host(&self) -> bool {
         match &self.state {
-            State::Offer { .. } | State::Waiting(_) => true,
+            State::Offer { .. } | State::Waiting(_) | State::MultiWait { .. } => true,
+            State::Seat { plan, .. } => plan.answers.is_some(),
             State::Team { live, .. } => live.is_some(),
             State::Fight(f) => f.link.as_ref().is_some_and(|l| l.open()),
             _ => false,
@@ -640,10 +778,13 @@ impl Session {
             } => {
                 self.outbox.push(answer(from, ANSWER_DECLINE));
             }
-            State::Waiting(_) => self.outbox.push(Body::BattleLeave {
+            State::Waiting(_) | State::MultiWait { .. } => self.outbox.push(Body::BattleLeave {
                 battle: 0,
                 reason: LEAVE_LEFT,
             }),
+            State::Seat { plan, .. } if plan.answers.is_some() => {
+                self.outbox.push(leave(0, LEAVE_LEFT));
+            }
             State::Fight(mut f) => {
                 f.abandon();
                 if let Some(link) = &mut f.link {
@@ -666,6 +807,7 @@ impl Session {
             match event {
                 Incoming::Offer { from, .. } => self.outbox.push(answer(from, ANSWER_BUSY)),
                 Incoming::Start(start) => self.outbox.push(leave(start.battle, LEAVE_LEFT)),
+                Incoming::MultiStart(start) => self.outbox.push(leave(start.battle, LEAVE_LEFT)),
                 _ => {}
             }
             return;
@@ -677,6 +819,8 @@ impl Session {
                     self.outbox.push(answer(from, ANSWER_BUSY));
                 } else if let Incoming::Start(start) = event {
                     self.outbox.push(leave(start.battle, LEAVE_LEFT));
+                } else if let Incoming::MultiStart(start) = event {
+                    self.outbox.push(leave(start.battle, LEAVE_LEFT));
                 } else {
                     f.network(event, &mut self.queued);
                 }
@@ -686,6 +830,8 @@ impl Session {
                 state @ (State::Format { .. }
                 | State::Trainers(_)
                 | State::Opponent { .. }
+                | State::Multi { .. }
+                | State::Seat { .. }
                 | State::Team { live: None, .. }),
                 Incoming::Offer {
                     from,
@@ -693,15 +839,19 @@ impl Session {
                     format,
                     save_partners,
                     actual_levels,
+                    multi,
                 },
-            ) if online::enabled() => {
+            ) if online::enabled()
+                && !matches!(&state, State::Seat { plan, .. } if plan.answers.is_some()) =>
+            {
                 log!(
                     "battle: {name} challenges us ({format:?}, save partners {save_partners}, \
-                     actual levels {actual_levels})"
+                     actual levels {actual_levels}, multi {multi:?})"
                 );
                 drop(state);
                 self.offer_save_partners = save_partners;
                 self.offer_actual_levels = actual_levels;
+                self.offer_invite = multi;
                 self.queued.push(Command::Cue(Cue::Sound(Sound::Confirm)));
                 State::Offer {
                     from,
@@ -715,17 +865,43 @@ impl Session {
                 self.outbox.push(answer(from, ANSWER_BUSY));
                 state
             }
-            (State::Waiting(w), Incoming::Start(start)) if start.opponent == w.with => {
+            (State::MultiWait { plan, cursor }, event) => {
+                self.plan_event(plan, event, |plan| State::MultiWait { plan, cursor })
+            }
+            (
+                State::Seat {
+                    plan,
+                    place,
+                    cursor,
+                },
+                event,
+            ) if plan.answers.is_some() => self.plan_event(plan, event, |plan| State::Seat {
+                plan,
+                place,
+                cursor,
+            }),
+            (State::Waiting(w), Incoming::Start(start)) if start.opponent == w.with && !w.multi => {
                 self.start_live(*w, start)
+            }
+            (State::Waiting(w), Incoming::MultiStart(start)) if w.multi => {
+                self.start_multi(start, &w.picked)
             }
             (state, Incoming::Start(start)) => {
                 // A battle nobody here waits for any more.
                 self.outbox.push(leave(start.battle, LEAVE_LEFT));
                 state
             }
+            (state, Incoming::MultiStart(start)) => {
+                self.outbox.push(leave(start.battle, LEAVE_LEFT));
+                state
+            }
             (State::Waiting(w), event) => match ended(&event, w.with) {
                 Some(reason) => {
-                    self.notice = Some(end_note(reason, &w.name));
+                    self.notice = Some(if w.multi {
+                        invite_note(reason, &w.name)
+                    } else {
+                        end_note(reason, &w.name)
+                    });
                     if w.challenger {
                         State::Opponent {
                             format: w.format,
@@ -747,7 +923,11 @@ impl Session {
                 event,
             ) if ended(&event, from).is_some() => {
                 let reason = ended(&event, from).unwrap_or(END_DISCONNECT);
-                self.notice = Some(end_note(reason, &name));
+                self.notice = Some(if self.offer_invite.is_some() {
+                    invite_note(reason, &name)
+                } else {
+                    end_note(reason, &name)
+                });
                 let mut out = Vec::new();
                 let state = self.offer_over(&mut out);
                 self.queued.append(&mut out);
@@ -756,6 +936,338 @@ impl Session {
             (state, _) => state,
         };
         self.note_live();
+    }
+
+    /// A message from the host while our multi battle's invites are out; `stay` is the state
+    /// to go on in.
+    fn plan_event(
+        &mut self,
+        mut plan: Box<Plan>,
+        event: Incoming,
+        stay: impl FnOnce(Box<Plan>) -> State,
+    ) -> State {
+        match event {
+            Incoming::Status { place, status } if (1..=3).contains(&place) => {
+                let name = plan.seat(place).map_or_else(String::new, Holder::name);
+                if let Some(answers) = plan.answers.as_mut()
+                    && answers[place - 1] != Answer::Computer
+                {
+                    answers[place - 1] = if status == SEAT_ACCEPTED {
+                        Answer::Accepted
+                    } else {
+                        self.notice = Some(seat_note(status, &name));
+                        Answer::Refused(status)
+                    };
+                    self.queued.push(sound(Sound::Cursor));
+                }
+                stay(plan)
+            }
+            Incoming::MultiStart(start) => self.start_multi(start, &plan.picked),
+            Incoming::Start(start) => {
+                self.outbox.push(leave(start.battle, LEAVE_LEFT));
+                stay(plan)
+            }
+            Incoming::End {
+                battle: 0, reason, ..
+            } => {
+                self.notice = Some(match reason {
+                    END_TIMEOUT => "Time ran out waiting for the multi battle.".into(),
+                    END_LOST => end_note(END_LOST, ""),
+                    _ => "The multi battle can't start right now.".into(),
+                });
+                plan.answers = None;
+                State::Multi {
+                    plan,
+                    cursor: PLAN_START,
+                }
+            }
+            Incoming::Lost => {
+                self.notice = Some(end_note(END_LOST, ""));
+                plan.answers = None;
+                State::Multi {
+                    plan,
+                    cursor: PLAN_START,
+                }
+            }
+            _ => stay(plan),
+        }
+    }
+
+    /// The multi battle's setup screen.
+    fn plan_screen(&self, plan: &Plan, cursor: usize) -> Screen {
+        let seats = plan
+            .seats
+            .clone()
+            .unwrap_or_else(|| self.default_seats(&plan.picked));
+        let team: Vec<String> = plan
+            .picked
+            .iter()
+            .filter_map(|&i| Some(self.own.get(i)?.name.clone()))
+            .collect();
+        let mut items = vec![format!("Your team: {}", team.join(", "))];
+        for (name, h) in PLACE_NAMES.iter().zip(&seats) {
+            items.push(format!("{name}: {}", h.label()));
+        }
+        items.push(self.save_rule_label());
+        items.push(self.level_rule_label());
+        items.push(if plan.friends() {
+            "Send the invites".into()
+        } else {
+            "Start".into()
+        });
+        let detail = match cursor {
+            0 => format!("A: pick your team again (up to {MAX_MULTI_TEAM} Chao)."),
+            1..=3 => match &seats[cursor - 1] {
+                Holder::Friend { name, .. } => format!(
+                    "{name} picks up to {MAX_MULTI_TEAM} of their Chao and chooses for them from \
+                     their game. A: change."
+                ),
+                Holder::Computer { team, .. } => format!(
+                    "The computer plays this place with copies of {}. A: change.",
+                    team.iter()
+                        .map(|e| e.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+            4 => self.opponent_detail(&Against::SaveRule),
+            5 => self.opponent_detail(&Against::LevelRule),
+            _ => format!(
+                "You and {} against {}.{}",
+                seats[0].name(),
+                pair(&seats[1].name(), &seats[2].name()),
+                if plan.friends() {
+                    " The battle starts once every friend in it accepts."
+                } else {
+                    ""
+                }
+            ),
+        };
+        Screen {
+            title: "Multi battle".into(),
+            items,
+            cursor: Some(cursor),
+            detail: Some(detail),
+            hint: "A: choose  B: back",
+            ..Screen::default()
+        }
+    }
+
+    /// Most Chao on the team being picked: `MAX_MULTI_TEAM` for a multi battle.
+    fn team_limit(&self, multi: bool) -> usize {
+        if multi { MAX_MULTI_TEAM } else { TEAM_SIZE }
+    }
+
+    /// The computer's teams for a multi battle's places: copies of the player's other Chao
+    /// (of the team itself when there are no others), then each ready-made team, up to
+    /// `MAX_MULTI_TEAM` to a team.
+    fn computer_teams(&self, picked: &[usize]) -> Vec<Holder> {
+        let mut out = Vec::new();
+        let mut add = |label: &str, members: Vec<Entry>| {
+            let chunks = members.len().div_ceil(MAX_MULTI_TEAM);
+            for (i, team) in members.chunks(MAX_MULTI_TEAM).enumerate() {
+                out.push(Holder::Computer {
+                    label: if chunks > 1 {
+                        format!("{label} {}", i + 1)
+                    } else {
+                        label.to_string()
+                    },
+                    team: team.to_vec(),
+                });
+            }
+        };
+        let others: Vec<Entry> = (0..self.own.len())
+            .filter(|i| !picked.contains(i))
+            .map(|i| self.own[i].clone())
+            .collect();
+        if others.is_empty() {
+            let team = picked.iter().map(|&i| self.own[i].clone()).collect();
+            add("Copies of your team", team);
+        } else {
+            add("Copies of your other Chao", others);
+        }
+        for l in &self.lineups {
+            add(&l.label, l.members.clone());
+        }
+        out
+    }
+
+    /// Who has the other places of a new multi battle: the computer's first teams.
+    fn default_seats(&self, picked: &[usize]) -> [Holder; 3] {
+        let teams = self.computer_teams(picked);
+        std::array::from_fn(|i| teams[i % teams.len()].clone())
+    }
+
+    /// Who can have one of the multi battle's places: the friends at Chao Karate, then the
+    /// computer's teams (only those once the invites are out).
+    fn seat_options(&self, plan: &Plan) -> Vec<Holder> {
+        let mut out: Vec<Holder> = Vec::new();
+        if plan.answers.is_none() {
+            out.extend(self.friends.iter().map(|f| Holder::Friend {
+                id: f.id,
+                name: f.name.clone(),
+            }));
+        }
+        out.extend(self.computer_teams(&plan.picked));
+        out
+    }
+
+    /// Chao as they go to a live battle (`save_partners`: its rule), at the levels here.
+    fn wire_entries(&self, entries: &[Entry], save_partners: bool) -> Vec<BattleMember> {
+        entries
+            .iter()
+            .map(|e| online::member(&e.chao, &self.profile_ruled(e, save_partners)))
+            .collect()
+    }
+
+    /// Sends the multi battle's invites to the friends in it.
+    fn invite(&mut self, plan: &mut Plan) {
+        let Some(seats) = plan.seats.clone() else {
+            return;
+        };
+        let wire = seats.each_ref().map(|h| match h {
+            Holder::Friend { id, .. } => MultiSeat::Player(*id),
+            Holder::Computer { team, .. } => {
+                MultiSeat::Computer(self.wire_entries(team, self.save_partners))
+            }
+        });
+        let team = self.wire_team(&plan.picked, self.save_partners);
+        self.outbox.push(Body::MultiInvite {
+            seats: wire,
+            save_partners: self.save_partners,
+            actual_levels: self.actual_levels,
+            dex: self.dex_print,
+            team,
+        });
+        log!(
+            "battle: multi battle invites to {}",
+            seats
+                .iter()
+                .map(Holder::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        plan.answers = Some(seats.each_ref().map(|h| match h {
+            Holder::Friend { .. } => Answer::Waiting,
+            Holder::Computer { .. } => Answer::Computer,
+        }));
+        plan.waited = 0;
+    }
+
+    /// A multi battle with no friends in it: the player and the computer's three places, here
+    /// alone.
+    fn local_multi(&self, plan: &Plan) -> Option<Fight> {
+        let seats = plan.seats.as_ref()?;
+        let team = |h: &Holder| match h {
+            Holder::Computer { team, .. } => self.chao_members(team),
+            Holder::Friend { .. } => Vec::new(),
+        };
+        let mine: Vec<Entry> = plan.picked.iter().map(|&i| self.own[i].clone()).collect();
+        let mut ours = self.chao_members(&mine);
+        let first = ours.len();
+        ours.extend(team(&seats[0]));
+        let mut theirs = team(&seats[1]);
+        let their_first = theirs.len();
+        theirs.extend(team(&seats[2]));
+        let mut fight = Fight::new(Format::Doubles, [ours, theirs], self.dex.clone(), self.seed)?;
+        fight.battle.set_split(0, first);
+        fight.battle.set_split(1, their_first);
+        fight.mine = Some(0);
+        fight.intro = Some(format!(
+            "A multi battle: you and {} against {}!",
+            seats[0].name(),
+            pair(&seats[1].name(), &seats[2].name())
+        ));
+        self.take_part(&mut fight, &plan.picked);
+        Some(fight)
+    }
+
+    /// The host started the multi battle we set up or accepted (the `picked` Chao are ours).
+    fn start_multi(&mut self, start: MultiStart, picked: &[usize]) -> State {
+        let at = online::place_slot(start.place);
+        let places_ok = start.seats[start.place].player.is_some()
+            && start.seats.iter().all(|s| !s.team.is_empty());
+        let members = |side: usize| -> Vec<Member> {
+            start.seats[side * 2..side * 2 + 2]
+                .iter()
+                .flat_map(|s| self.live_members(&s.team, start.actual_levels))
+                .collect()
+        };
+        let teams = [members(0), members(1)];
+        let fight = places_ok
+            .then(|| {
+                Fight::from_side(
+                    Format::Doubles,
+                    teams,
+                    self.dex.clone(),
+                    start.seed,
+                    at.side,
+                )
+            })
+            .flatten();
+        let Some(mut fight) = fight else {
+            self.outbox.push(leave(start.battle, LEAVE_LEFT));
+            self.notice = Some("That battle can't start.".into());
+            return State::Format { cursor: 0 };
+        };
+        self.live_battle = Some(start.battle);
+        for (side, first) in start.splits().into_iter().enumerate() {
+            fight.battle.set_split(side, first);
+        }
+        fight.mine = Some(at.pos);
+        fight.own_first = if at.pos == 0 {
+            0
+        } else {
+            start.seats[at.side * 2].team.len()
+        };
+        let name = |place: usize| -> String {
+            let s = &start.seats[place];
+            match s.player {
+                _ if place == start.place => "you".into(),
+                Some(_) => s.name.clone(),
+                None => "the computer".into(),
+            }
+        };
+        let (ally, foes) = (at.side * 2 + 1 - at.pos, 2 - at.side * 2);
+        fight.intro = Some(format!(
+            "A multi battle: you and {} against {}!",
+            name(ally),
+            pair(&name(foes), &name(foes + 1))
+        ));
+        fight.foe_levels = start.seats[foes..foes + 2]
+            .iter()
+            .flat_map(|s| s.team.iter().map(|m| m.level))
+            .collect();
+        fight.fair = !start.actual_levels;
+        self.take_part(&mut fight, picked);
+        let others: Vec<(usize, String)> = (0..4)
+            .filter(|&p| p != start.place && start.seats[p].player.is_some())
+            .map(|p| (p, start.seats[p].name.clone()))
+            .collect();
+        log!(
+            "battle: multi battle {} at place {} with {:?}",
+            start.battle,
+            start.place,
+            others
+        );
+        fight.link = Some(Link {
+            battle: start.battle,
+            opponent: crate::net::protocol::SERVER,
+            name: others
+                .iter()
+                .map(|o| o.1.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            step: 1,
+            ready: None,
+            outbox: Vec::new(),
+            ended: None,
+            closed: false,
+            others,
+            notes: Vec::new(),
+        });
+        self.queued.push(Command::Cue(Cue::Sound(Sound::Confirm)));
+        State::Fight(Box::new(fight))
     }
 
     /// A team of the picked Chao as it goes to a live battle (`save_partners`: its rule).
@@ -870,6 +1382,7 @@ impl Session {
             challenger: true,
             actual_levels: self.actual_levels,
             waited: 0,
+            multi: false,
         }))
     }
 
@@ -910,6 +1423,8 @@ impl Session {
                     outbox: Vec::new(),
                     ended: None,
                     closed: false,
+                    others: Vec::new(),
+                    notes: Vec::new(),
                 });
                 self.queued.push(Command::Cue(Cue::Sound(Sound::Confirm)));
                 State::Fight(Box::new(fight))
@@ -1396,9 +1911,9 @@ impl Session {
         fight.own_levels = fight.own_ids.iter().map(|&id| self.level_of(id)).collect();
     }
 
-    /// The format menu's items: singles, doubles, and the trainers when on.
+    /// The format menu's items: singles, doubles, the multi battle, and the trainers when on.
     fn formats(&self) -> usize {
-        if self.trainers.is_some() { 3 } else { 2 }
+        if self.trainers.is_some() { 4 } else { 3 }
     }
 
     /// The player's picked Chao as fighters.
@@ -1739,6 +2254,18 @@ impl Session {
                 .collect(),
             // A press on its way as the challenge came doesn't move it either.
             State::Offer { age, .. } if *age >= OFFER_GRACE => vec![None; 2],
+            State::Multi { .. } => vec![None; PLAN_ROWS],
+            State::Seat { plan, .. } => self
+                .seat_options(plan)
+                .into_iter()
+                .map(|h| {
+                    Some(match h {
+                        Holder::Friend { name, .. } => name,
+                        Holder::Computer { label, .. } => label,
+                    })
+                })
+                .collect(),
+            State::MultiWait { .. } => vec![None; 4],
             _ => return None,
         })
     }
@@ -1749,6 +2276,9 @@ impl Session {
             State::Format { cursor }
             | State::Opponent { cursor, .. }
             | State::Offer { cursor, .. }
+            | State::Multi { cursor, .. }
+            | State::Seat { cursor, .. }
+            | State::MultiWait { cursor, .. }
             | State::Team {
                 moves: None,
                 cursor,
@@ -1776,6 +2306,9 @@ impl Session {
             },
             State::Opponent { .. } => (6, 0, 0),
             State::Offer { .. } => (7, 0, 0),
+            State::Multi { .. } => (8, 0, 0),
+            State::Seat { place, .. } => (9, *place, 0),
+            State::MultiWait { .. } => (10, 0, 0),
             _ => return None,
         })
     }
@@ -1922,7 +2455,7 @@ impl Session {
                     if self.own.is_empty() {
                         self.notice = Some("You have no Chao to battle with.".into());
                         State::Format { cursor }
-                    } else if cursor == 2
+                    } else if cursor == 3
                         && let Some(roster) = &self.trainers
                     {
                         out.push(sound(Sound::Confirm));
@@ -1941,6 +2474,7 @@ impl Session {
                             foe: None,
                             live: None,
                             moves: None,
+                            multi: (cursor == 2).then(Box::default),
                         }
                     }
                 } else {
@@ -1959,7 +2493,7 @@ impl Session {
                     };
                     match picker.update(&ctx, pressed, &mut out) {
                         trainers::Step::Stay => State::Trainers(picker),
-                        trainers::Step::Back => State::Format { cursor: 2 },
+                        trainers::Step::Back => State::Format { cursor: 3 },
                         trainers::Step::Fight(id) => {
                             let double = roster.foes.get(&id).is_some_and(|f| f.double);
                             State::Team {
@@ -1973,6 +2507,7 @@ impl Session {
                                 foe: Some(id),
                                 live: None,
                                 moves: None,
+                                multi: None,
                             }
                         }
                         trainers::Step::Taught {
@@ -2004,6 +2539,7 @@ impl Session {
                 foe,
                 live,
                 moves: Some(choosing),
+                multi,
             } => State::Team {
                 format,
                 cursor,
@@ -2011,6 +2547,7 @@ impl Session {
                 foe,
                 live,
                 moves: self.choose(choosing, pressed, &mut out),
+                multi,
             },
             State::Team {
                 format,
@@ -2019,6 +2556,7 @@ impl Session {
                 foe,
                 live,
                 moves: None,
+                multi,
             } => {
                 // The Chao, "Choose moves", then "Done".
                 let (moves_row, done) = (self.own.len(), self.own.len() + 1);
@@ -2026,13 +2564,16 @@ impl Session {
                 if step(&mut cursor, len, pressed) {
                     out.push(sound(Sound::Cursor));
                 }
-                let stay = |cursor, picked, foe, live| State::Team {
+                let limit = self
+                    .team_limit(multi.is_some() || (live.is_some() && self.offer_invite.is_some()));
+                let stay = |cursor, picked, foe, live, multi| State::Team {
                     format,
                     cursor,
                     picked,
                     foe,
                     live,
                     moves: None,
+                    multi,
                 };
                 if pressed & buttons::B != 0 && self.wild.is_some() {
                     out.push(sound(Sound::Back));
@@ -2049,6 +2590,7 @@ impl Session {
                             age: OFFER_GRACE,
                         },
                         (Some(id), Some(roster), None) => State::Trainers(Picker::at(roster, id)),
+                        _ if multi.is_some() => State::Format { cursor: 2 },
                         _ => State::Format {
                             cursor: usize::from(format == Format::Doubles),
                         },
@@ -2066,13 +2608,14 @@ impl Session {
                             section: None,
                             cursor: 0,
                         }),
+                        multi,
                     }
                 } else if pressed & buttons::A != 0 && cursor == done {
                     if picked.is_empty() {
                         self.notice = Some("Pick at least one Chao.".into());
-                        stay(cursor, picked, foe, live)
+                        stay(cursor, picked, foe, live, multi)
                     } else if let Some((from, name)) = live {
-                        // Accept the challenge with this team.
+                        // Accept the challenge (or the multi battle's invite) with this team.
                         let team = self.wire_team(&picked, self.offer_save_partners);
                         self.outbox.push(Body::BattleAnswer {
                             to: from,
@@ -2090,7 +2633,15 @@ impl Session {
                             challenger: false,
                             actual_levels: self.offer_actual_levels,
                             waited: 0,
+                            multi: self.offer_invite.is_some(),
                         }))
+                    } else if let Some(mut plan) = multi {
+                        out.push(sound(Sound::Confirm));
+                        if plan.seats.is_none() {
+                            plan.seats = Some(self.default_seats(&picked));
+                        }
+                        plan.picked = picked;
+                        State::Multi { plan, cursor: 1 }
                     } else if self.wild.is_some() {
                         match self.wild_fight(&picked) {
                             Some(fight) => {
@@ -2099,7 +2650,7 @@ impl Session {
                             }
                             None => {
                                 self.notice = Some("That battle can't start.".into());
-                                stay(cursor, picked, foe, None)
+                                stay(cursor, picked, foe, None, None)
                             }
                         }
                     } else if let Some(id) = foe {
@@ -2110,7 +2661,7 @@ impl Session {
                             }
                             None => {
                                 self.notice = Some("That battle can't start.".into());
-                                stay(cursor, picked, foe, None)
+                                stay(cursor, picked, foe, None, None)
                             }
                         }
                     } else {
@@ -2125,19 +2676,204 @@ impl Session {
                     if let Some(i) = picked.iter().position(|&p| p == cursor) {
                         picked.remove(i);
                         out.push(sound(Sound::Back));
-                    } else if picked.len() < TEAM_SIZE {
+                    } else if picked.len() < limit {
                         picked.push(cursor);
                         out.push(sound(Sound::Confirm));
                         // A full team goes straight to "Done".
-                        if picked.len() == TEAM_SIZE {
+                        if picked.len() == limit {
                             cursor = done;
                         }
                     } else {
-                        self.notice = Some(format!("A team has at most {TEAM_SIZE} Chao."));
+                        self.notice = Some(format!("A team has at most {limit} Chao."));
                     }
-                    stay(cursor, picked, foe, live)
+                    stay(cursor, picked, foe, live, multi)
                 } else {
-                    stay(cursor, picked, foe, live)
+                    stay(cursor, picked, foe, live, multi)
+                }
+            }
+            State::Multi {
+                mut plan,
+                mut cursor,
+            } => {
+                if step(&mut cursor, PLAN_ROWS, pressed) {
+                    out.push(sound(Sound::Cursor));
+                }
+                if pressed & buttons::B != 0 {
+                    out.push(sound(Sound::Back));
+                    State::Team {
+                        format: Format::Doubles,
+                        cursor: self.own.len() + 1,
+                        picked: plan.picked.clone(),
+                        foe: None,
+                        live: None,
+                        moves: None,
+                        multi: Some(plan),
+                    }
+                } else if pressed & buttons::A == 0 {
+                    State::Multi { plan, cursor }
+                } else {
+                    match cursor {
+                        0 => {
+                            out.push(sound(Sound::Confirm));
+                            State::Team {
+                                format: Format::Doubles,
+                                cursor: 0,
+                                picked: plan.picked.clone(),
+                                foe: None,
+                                live: None,
+                                moves: None,
+                                multi: Some(plan),
+                            }
+                        }
+                        1..=3 => {
+                            out.push(sound(Sound::Confirm));
+                            State::Seat {
+                                plan,
+                                place: cursor,
+                                cursor: 0,
+                            }
+                        }
+                        4 => {
+                            self.save_partners = !self.save_partners;
+                            out.push(sound(Sound::Cursor));
+                            State::Multi { plan, cursor }
+                        }
+                        5 => {
+                            self.actual_levels = !self.actual_levels;
+                            out.push(sound(Sound::Cursor));
+                            State::Multi { plan, cursor }
+                        }
+                        _ if plan.friends() => {
+                            out.push(sound(Sound::Confirm));
+                            self.invite(&mut plan);
+                            State::MultiWait { plan, cursor: 0 }
+                        }
+                        _ => match self.local_multi(&plan) {
+                            Some(fight) => {
+                                out.push(sound(Sound::Confirm));
+                                State::Fight(Box::new(fight))
+                            }
+                            None => {
+                                self.notice = Some("Those teams can't battle.".into());
+                                State::Multi { plan, cursor }
+                            }
+                        },
+                    }
+                }
+            }
+            State::Seat {
+                mut plan,
+                place,
+                mut cursor,
+            } => {
+                let mut options = self.seat_options(&plan);
+                if step(&mut cursor, options.len(), pressed) {
+                    out.push(sound(Sound::Cursor));
+                }
+                let back = |plan: Box<Plan>| {
+                    if plan.answers.is_some() {
+                        State::MultiWait {
+                            plan,
+                            cursor: place - 1,
+                        }
+                    } else {
+                        State::Multi {
+                            plan,
+                            cursor: place,
+                        }
+                    }
+                };
+                if pressed & buttons::B != 0 {
+                    out.push(sound(Sound::Back));
+                    back(plan)
+                } else if pressed & buttons::A != 0 && cursor < options.len() {
+                    let holder = options.swap_remove(cursor);
+                    let elsewhere = |id: u8| {
+                        (1..=3).any(|p| {
+                            p != place
+                                && matches!(plan.seat(p), Some(Holder::Friend { id: o, .. }) if *o == id)
+                        })
+                    };
+                    match &holder {
+                        Holder::Friend { id, name }
+                            if self.friends.iter().any(|f| f.id == *id && f.busy) =>
+                        {
+                            self.notice = Some(format!("{name} is in another battle."));
+                            State::Seat {
+                                plan,
+                                place,
+                                cursor,
+                            }
+                        }
+                        Holder::Friend { id, name } if elsewhere(*id) => {
+                            self.notice = Some(format!("{name} already has a place."));
+                            State::Seat {
+                                plan,
+                                place,
+                                cursor,
+                            }
+                        }
+                        _ => {
+                            out.push(sound(Sound::Confirm));
+                            if let Some(answers) = plan.answers.as_mut()
+                                && let Holder::Computer { team, .. } = &holder
+                            {
+                                // A place nobody took goes to the computer.
+                                let team = self.wire_entries(team, self.save_partners);
+                                self.outbox.push(Body::MultiFill {
+                                    place: place as u8,
+                                    team,
+                                });
+                                answers[place - 1] = Answer::Computer;
+                            }
+                            if let Some(seats) = plan.seats.as_mut() {
+                                seats[place - 1] = holder;
+                            }
+                            back(plan)
+                        }
+                    }
+                } else {
+                    State::Seat {
+                        plan,
+                        place,
+                        cursor,
+                    }
+                }
+            }
+            State::MultiWait {
+                mut plan,
+                mut cursor,
+            } => {
+                plan.waited += 1;
+                if step(&mut cursor, 4, pressed) {
+                    out.push(sound(Sound::Cursor));
+                }
+                let gone = plan.waited > MULTI_WAIT_LIMIT;
+                let refused = cursor < 3
+                    && matches!(
+                        plan.answers.as_ref().map(|a| a[cursor]),
+                        Some(Answer::Refused(_))
+                    );
+                if gone {
+                    self.notice = Some("Time ran out waiting for the multi battle.".into());
+                }
+                if gone || pressed & buttons::B != 0 || (pressed & buttons::A != 0 && cursor == 3) {
+                    out.push(sound(Sound::Back));
+                    self.outbox.push(leave(0, LEAVE_LEFT));
+                    plan.answers = None;
+                    State::Multi {
+                        plan,
+                        cursor: PLAN_START,
+                    }
+                } else if pressed & buttons::A != 0 && refused {
+                    out.push(sound(Sound::Confirm));
+                    State::Seat {
+                        plan,
+                        place: cursor + 1,
+                        cursor: 0,
+                    }
+                } else {
+                    State::MultiWait { plan, cursor }
                 }
             }
             State::Opponent {
@@ -2158,6 +2894,7 @@ impl Session {
                         foe: None,
                         live: None,
                         moves: None,
+                        multi: None,
                     }
                 } else if pressed & buttons::A != 0 && cursor < options.len() {
                     match options.swap_remove(cursor).1 {
@@ -2220,6 +2957,7 @@ impl Session {
                         foe: None,
                         live: Some((from, name)),
                         moves: None,
+                        multi: None,
                     }
                 } else if pressed & (buttons::A | buttons::B) != 0 {
                     self.outbox.push(answer(from, ANSWER_DECLINE));
@@ -2237,9 +2975,19 @@ impl Session {
             }
             State::Waiting(mut w) => {
                 w.waited += 1;
-                let gone = w.waited > WAIT_LIMIT;
+                // A multi battle waits for every place to be filled.
+                let limit = if w.multi {
+                    MULTI_WAIT_LIMIT
+                } else {
+                    WAIT_LIMIT
+                };
+                let gone = w.waited > limit;
                 if gone {
-                    self.notice = Some(end_note(END_TIMEOUT, &w.name));
+                    self.notice = Some(if w.multi {
+                        invite_note(END_TIMEOUT, &w.name)
+                    } else {
+                        end_note(END_TIMEOUT, &w.name)
+                    });
                 }
                 if gone || pressed & buttons::B != 0 {
                     out.push(sound(Sound::Back));
@@ -2278,7 +3026,11 @@ impl Session {
     pub fn screen(&self) -> Screen {
         let s = match &self.state {
             State::Format { cursor } => {
-                let mut items = vec!["Singles (1 on 1)".into(), "Doubles (2 on 2)".into()];
+                let mut items = vec![
+                    "Singles (1 on 1)".into(),
+                    "Doubles (2 on 2)".into(),
+                    "Multi battle".into(),
+                ];
                 if self.trainers.is_some() {
                     items.push("Trainers".into());
                 }
@@ -2290,6 +3042,11 @@ impl Session {
                         match cursor {
                             0 => "One Chao a side at a time.",
                             1 => "Two Chao a side at a time; some moves hit both foes.",
+                            2 => {
+                                "Doubles with four teams: you, an ally and two foes, each a friend \
+                                 online at Chao Karate or the computer, with up to 3 Chao each. \
+                                 You choose only for your own Chao."
+                            }
                             _ => {
                                 "The GBA game's trainers: route trainers, the gym leaders, the \
                                  league and the champion, each opening once the one before is \
@@ -2318,8 +3075,11 @@ impl Session {
                 picked,
                 foe,
                 live,
+                multi,
                 ..
             } => {
+                let invited = live.is_some() && self.offer_invite.is_some();
+                let limit = self.team_limit(multi.is_some() || invited);
                 let mut items: Vec<String> = Vec::new();
                 let mut bars = Vec::new();
                 for (i, e) in self.own.iter().enumerate() {
@@ -2353,6 +3113,15 @@ impl Session {
                          gave it."
                             .into(),
                     ),
+                    _ if multi.is_some() => Some(
+                        "Battle with the Chao you picked, in that order: next, who has the \
+                              other places."
+                            .into(),
+                    ),
+                    _ if invited => Some(format!(
+                        "Accept {}'s invite with the Chao you picked, in that order.",
+                        live.as_ref().map_or("", |l| l.1.as_str())
+                    )),
                     _ => Some(match (wild, against, live) {
                         (Some(name), _, _) => format!(
                             "Start with the Chao you picked, in that order, against wild {name} \
@@ -2373,16 +3142,22 @@ impl Session {
                 };
                 Screen {
                     title: match (wild, against, live) {
+                        _ if multi.is_some() => {
+                            format!("Your team for the multi battle (up to {limit})")
+                        }
+                        (None, None, Some((_, name))) if invited => {
+                            format!("Your team for {name}'s multi battle (up to {limit})")
+                        }
                         (Some(name), _, _) => {
-                            format!("Your team against wild {name} (up to {TEAM_SIZE})")
+                            format!("Your team against wild {name} (up to {limit})")
                         }
                         (None, Some(f), _) => {
-                            format!("Your team against {} (up to {TEAM_SIZE})", f.name)
+                            format!("Your team against {} (up to {limit})", f.name)
                         }
                         (None, None, Some((_, name))) => {
-                            format!("Your team against {name} (up to {TEAM_SIZE})")
+                            format!("Your team against {name} (up to {limit})")
                         }
-                        (None, None, None) => format!("Your team (up to {TEAM_SIZE})"),
+                        (None, None, None) => format!("Your team (up to {limit})"),
                     },
                     items,
                     cursor: Some(*cursor),
@@ -2413,6 +3188,41 @@ impl Session {
                     disabled,
                     cursor: Some(*cursor),
                     hint: "A: battle  B: back",
+                    ..Screen::default()
+                }
+            }
+            State::Offer { name, cursor, .. } if self.offer_invite.is_some() => {
+                let invite = self.offer_invite.as_ref();
+                let who = |place: usize| -> String {
+                    match invite {
+                        Some(i) if i.place == place => "you".into(),
+                        Some(i) if i.players[place].is_some() => i.names[place].clone(),
+                        _ => "the computer".into(),
+                    }
+                };
+                let mine = invite.map_or(1, |i| i.place) / 2;
+                let (ours, theirs) = (mine * 2, 2 - mine * 2);
+                Screen {
+                    title: format!("{name} invites you to a multi battle!"),
+                    items: vec!["Accept".into(), "Decline".into()],
+                    cursor: Some(*cursor),
+                    detail: Some(format!(
+                        "{} against {}. Accept, then pick up to {MAX_MULTI_TEAM} Chao; you choose \
+                         only for yours.{} {}",
+                        pair(&who(ours), &who(ours + 1)),
+                        pair(&who(theirs), &who(theirs + 1)),
+                        if self.offer_save_partners {
+                            ""
+                        } else {
+                            " Rule: GBA save partners not allowed (what they taught is left out)."
+                        },
+                        if self.offer_actual_levels {
+                            "Rule: actual levels (each Chao at its own battle level)."
+                        } else {
+                            "Rule: Level 50 (every Chao at level 50)."
+                        }
+                    )),
+                    hint: "A: choose  B: decline",
                     ..Screen::default()
                 }
             }
@@ -2448,6 +3258,15 @@ impl Session {
                 hint: "A: choose  B: decline",
                 ..Screen::default()
             },
+            State::Waiting(w) if w.multi => Screen {
+                title: "Waiting for the others to answer...".into(),
+                detail: Some(format!(
+                    "{}'s multi battle starts once every place is filled.",
+                    w.name
+                )),
+                hint: "B: leave",
+                ..Screen::default()
+            },
             State::Waiting(w) => Screen {
                 title: if w.challenger {
                     format!("Waiting for {} to answer...", w.name)
@@ -2466,6 +3285,93 @@ impl Session {
                 },
                 ..Screen::default()
             },
+            State::Multi { plan, cursor } => self.plan_screen(plan, *cursor),
+            State::Seat {
+                plan,
+                place,
+                cursor,
+            } => {
+                let options = self.seat_options(plan);
+                let disabled = options
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| {
+                        matches!(h, Holder::Friend { id, .. }
+                            if self.friends.iter().any(|f| f.id == *id && f.busy))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let detail = options.get(*cursor).map(|h| match h {
+                    Holder::Friend { name, .. } => format!(
+                        "{name} picks up to {MAX_MULTI_TEAM} of their Chao and chooses for them \
+                         from their game."
+                    ),
+                    Holder::Computer { team, .. } => format!(
+                        "The computer plays this place with copies of {}.",
+                        team.iter()
+                            .map(|e| e.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+                let place_name = PLACE_NAMES[place.clamp(&1, &3) - 1];
+                Screen {
+                    title: if plan.answers.is_some() {
+                        format!("{place_name}: the computer's team")
+                    } else {
+                        format!("{place_name} in the multi battle")
+                    },
+                    items: options.iter().map(Holder::label).collect(),
+                    disabled,
+                    cursor: Some(*cursor),
+                    detail,
+                    hint: "A: choose  B: back",
+                    ..Screen::default()
+                }
+            }
+            State::MultiWait { plan, cursor } => {
+                let mut items: Vec<String> = (1..=3)
+                    .map(|place| {
+                        let holder = plan.seat(place);
+                        let name = holder.map_or_else(String::new, Holder::name);
+                        let answer = plan.answers.as_ref().map(|a| a[place - 1]);
+                        let what = match answer {
+                            Some(Answer::Accepted) => format!("{name}, accepted"),
+                            Some(Answer::Refused(status)) => {
+                                format!("{name}: {}", refused(status))
+                            }
+                            Some(Answer::Computer) => {
+                                holder.map_or_else(String::new, Holder::label)
+                            }
+                            _ => format!("{name}, waiting..."),
+                        };
+                        format!("{}: {what}", PLACE_NAMES[place - 1])
+                    })
+                    .collect();
+                items.push("Call it off".into());
+                let refused_here = *cursor < 3
+                    && matches!(
+                        plan.answers.as_ref().map(|a| a[*cursor]),
+                        Some(Answer::Refused(_))
+                    );
+                Screen {
+                    title: "Multi battle: waiting for answers...".into(),
+                    items,
+                    cursor: Some(*cursor),
+                    detail: Some(
+                        if refused_here {
+                            "A: give this place to the computer."
+                        } else if *cursor == 3 {
+                            "Call the battle off and go back to setting it up."
+                        } else {
+                            "The battle starts once every place is filled."
+                        }
+                        .into(),
+                    ),
+                    hint: "A: choose  B: call it off",
+                    ..Screen::default()
+                }
+            }
             State::Fight(f) => f.screen(),
             State::Done => Screen::default(),
         };
@@ -2566,6 +3472,10 @@ struct Link {
     ended: Option<(u8, Option<usize>)>,
     /// We told the host we're done with it (its end, giving up, leaving).
     closed: bool,
+    /// A multi battle: the other players still in it (place, name).
+    others: Vec<(usize, String)>,
+    /// What happened to the others (gone, the computer playing their places), for the result.
+    notes: Vec<String>,
 }
 
 impl Link {
@@ -2610,6 +3520,11 @@ struct Fight {
     me: usize,
     /// A live battle (the other side is a friend's game).
     link: Option<Link>,
+    /// A multi battle: the place (position on side `me`) the player plays; the computer or
+    /// other players play the rest. None: the player plays their whole side.
+    mine: Option<usize>,
+    /// Where the player's own Chao start in side `me`'s team (a multi battle's second place).
+    own_first: usize,
     ai: Rng,
     names: FightNames,
     records: [Vec<Option<ChaoData>>; 2],
@@ -2704,6 +3619,8 @@ impl Fight {
             battle,
             me,
             link: None,
+            mine: None,
+            own_first: 0,
             ai: Rng::new(seed ^ 0x5EED_0A11),
             names: FightNames { names, dex },
             records,
@@ -2850,7 +3767,7 @@ impl Fight {
     /// for other battles or Chao at level 100.
     fn earn(&mut self, won: bool, levels: &mut BTreeMap<u64, Level>) -> Vec<Gain> {
         let takers: Vec<usize> = (0..self.own_ids.len())
-            .filter(|&m| self.took_part.get(m) == Some(&true))
+            .filter(|&m| self.took_part.get(self.own_first + m) == Some(&true))
             .collect();
         let k = takers.len();
         let foe_side = self.foe();
@@ -2900,7 +3817,7 @@ impl Fight {
                 *l = level;
             }
             out.push(Gain {
-                name: self.names.fighter(0, m),
+                name: self.names.fighter(0, self.own_first + m),
                 identity,
                 xp,
                 level: level.level,
@@ -2918,7 +3835,7 @@ impl Fight {
             Some(ready)
         });
         if let Some((seed, picks)) = ready {
-            let events = online::apply_step(&mut self.battle, seed, &picks);
+            let events = self.apply(seed, &picks);
             self.enqueue(&events);
             self.play(0, out);
             return;
@@ -2949,11 +3866,27 @@ impl Fight {
         }
     }
 
-    /// The player gives up: a loss (the friend's game is told).
+    /// A step of a live battle (its seed and every player's picks).
+    fn apply(&mut self, seed: u64, picks: &[(u8, BattlePick)]) -> Vec<Event> {
+        if self.mine.is_some() {
+            online::apply_multi_step(&mut self.battle, seed, picks)
+        } else {
+            online::apply_step(&mut self.battle, seed, picks)
+        }
+    }
+
+    /// A seed for a step of a multi battle played here alone.
+    fn local_seed(&mut self) -> u64 {
+        u64::from(self.ai.next_u32()) << 32 | u64::from(self.ai.next_u32())
+    }
+
+    /// The player gives up: a loss (the friend's game is told; in a multi battle the computer
+    /// plays their place).
     fn give_up(&mut self, out: &mut Vec<Command>) {
         out.push(sound(Sound::Confirm));
         self.gave_up = true;
-        out.push(Command::Cue(Cue::Result { winner: Some(1) }));
+        let winner = self.mine.is_none().then_some(1);
+        out.push(Command::Cue(Cue::Result { winner }));
         self.stage = Stage::Result;
         if let Some(link) = &mut self.link {
             link.close(LEAVE_GAVE_UP);
@@ -2982,6 +3915,31 @@ impl Fight {
             }
             Incoming::Left(id) if id == link.opponent => {
                 self.remote_end(END_DISCONNECT, Some(self.me), out)
+            }
+            Incoming::Takeover { battle, place, why } if battle == link.battle && link.open() => {
+                let Some(i) = link.others.iter().position(|o| o.0 == place) else {
+                    return;
+                };
+                let (_, name) = link.others.remove(i);
+                let note = match why {
+                    END_FORFEIT => format!("{name} gave up; the computer plays their place."),
+                    END_REPLACED => {
+                        format!("{name} took too long to choose; the computer plays their place.")
+                    }
+                    _ => format!("{name} left the battle; the computer plays their place."),
+                };
+                log!("battle: {note}");
+                link.notes.push(note.clone());
+                if self.stage == Stage::Playing {
+                    self.queue.push_back(Beat {
+                        text: Some(note),
+                        cues: Vec::new(),
+                        updates: Vec::new(),
+                        frames: INTRO_FRAMES,
+                    });
+                } else if self.stage != Stage::Result {
+                    self.message = Some(note);
+                }
             }
             Incoming::Lost => self.remote_end(END_LOST, None, out),
             _ => {}
@@ -3072,7 +4030,7 @@ impl Fight {
                     .pending_replacements()
                     .iter()
                     .copied()
-                    .filter(|s| s.side == self.me)
+                    .filter(|s| s.side == self.me && self.mine.is_none_or(|p| p == s.pos))
                     .collect();
                 if slots.is_empty() {
                     self.do_replace(Vec::new());
@@ -3099,7 +4057,8 @@ impl Fight {
     fn next_choice(&mut self, from: usize) {
         for pos in from..self.battle.format().slots() {
             let at = Slot::new(self.me, pos);
-            if self.battle.alive(at) && !self.battle.forced(at) {
+            let ours = self.mine.is_none_or(|p| p == pos);
+            if ours && self.battle.alive(at) && !self.battle.forced(at) {
                 self.stage = Stage::Choose {
                     pos,
                     menu: Menu::Main(0),
@@ -3114,6 +4073,19 @@ impl Fight {
         if self.link.is_some() {
             let picks = online::choice_picks(&self.choices, &self.passes);
             self.send_choice(picks);
+            return;
+        }
+        if self.mine.is_some() {
+            // A multi battle here alone: the computer plays the other places.
+            let picks: Vec<(u8, BattlePick)> = online::choice_picks(&self.choices, &self.passes)
+                .into_iter()
+                .map(|p| (self.me as u8, p))
+                .collect();
+            let seed = self.local_seed();
+            let events = self.apply(seed, &picks);
+            self.choices.clear();
+            self.passes.clear();
+            self.enqueue(&events);
             return;
         }
         let mut all = self.choices.clone();
@@ -3141,6 +4113,16 @@ impl Fight {
             self.send_choice(online::replace_picks(&picks));
             return;
         }
+        if self.mine.is_some() {
+            let picks: Vec<(u8, BattlePick)> = online::replace_picks(&picks)
+                .into_iter()
+                .map(|p| (self.me as u8, p))
+                .collect();
+            let seed = self.local_seed();
+            let events = self.apply(seed, &picks);
+            self.enqueue(&events);
+            return;
+        }
         picks.extend(ai::replacements(&self.battle, 1));
         let events = match self.battle.replace(&picks) {
             Ok(events) => events,
@@ -3158,26 +4140,57 @@ impl Fight {
     /// an earlier choice), or None when it can.
     fn unavailable(&self, member: usize, taken: &[usize]) -> Option<Unavailable> {
         let f = self.battle.team(self.me).get(member)?;
+        let bench = match self.mine {
+            Some(pos) => self.battle.bench_for(Slot::new(self.me, pos)),
+            None => self.battle.bench(self.me),
+        };
         if f.fainted() {
             Some(Unavailable::Fainted)
         } else if taken.contains(&member) {
             Some(Unavailable::ComingIn)
-        } else if !self.battle.bench(self.me).contains(&member) {
+        } else if !bench.contains(&member) {
             Some(Unavailable::InBattle)
         } else {
             None
         }
     }
 
+    /// The members of side `me` the player sends in and switches to: their own place's in a
+    /// multi battle.
+    fn roster(&self) -> std::ops::Range<usize> {
+        let len = self.battle.team(self.me).len();
+        match self.mine {
+            Some(pos) => match self.battle.split(self.me) {
+                Some(first) if pos == 0 => 0..first.min(len),
+                Some(first) => first.min(len)..len,
+                None => 0..len,
+            },
+            None => 0..len,
+        }
+    }
+
+    /// Moves `cursor` (a member of `roster`) up or down it; whether it moved.
+    fn step_member(&self, cursor: &mut usize, pressed: u32) -> bool {
+        let r = self.roster();
+        let mut row = cursor
+            .saturating_sub(r.start)
+            .min(r.len().saturating_sub(1));
+        let moved = step(&mut row, r.len(), pressed);
+        *cursor = r.start + row;
+        moved
+    }
+
     /// The first member that can come in, for the cursor.
     fn first_free(&self, taken: &[usize]) -> usize {
-        (0..self.battle.team(self.me).len())
+        let r = self.roster();
+        let start = r.start;
+        r.into_iter()
             .find(|&m| self.unavailable(m, taken).is_none())
-            .unwrap_or(0)
+            .unwrap_or(start)
     }
 
     fn has_free(&self, taken: &[usize]) -> bool {
-        (0..self.battle.team(self.me).len()).any(|m| self.unavailable(m, taken).is_none())
+        self.roster().any(|m| self.unavailable(m, taken).is_none())
     }
 
     /// Members already picked to come in by a switch or a passing move.
@@ -3342,8 +4355,7 @@ impl Fight {
                 }
             }
             Menu::Pass { index, mut cursor } => {
-                let len = self.battle.team(self.me).len();
-                if step(&mut cursor, len, pressed) {
+                if self.step_member(&mut cursor, pressed) {
                     out.push(sound(Sound::Cursor));
                 }
                 set(self, Menu::Pass { index, cursor });
@@ -3368,8 +4380,7 @@ impl Fight {
                 }
             }
             Menu::Switch(mut cursor) => {
-                let len = self.battle.team(self.me).len();
-                if step(&mut cursor, len, pressed) {
+                if self.step_member(&mut cursor, pressed) {
                     out.push(sound(Sound::Cursor));
                 }
                 set(self, Menu::Switch(cursor));
@@ -3407,7 +4418,7 @@ impl Fight {
         out: &mut Vec<Command>,
     ) {
         let taken: Vec<usize> = picks.iter().map(|p| p.1).collect();
-        if step(&mut cursor, self.battle.team(self.me).len(), pressed) {
+        if self.step_member(&mut cursor, pressed) {
             out.push(sound(Sound::Cursor));
         }
         if pressed & (buttons::A | buttons::B) != 0 {
@@ -3472,7 +4483,7 @@ impl Fight {
                     level,
                     // Only at the Chao's own level (not under the Level 50 rule).
                     xp: (side == 0)
-                        .then(|| self.own_levels.get(member))
+                        .then(|| self.own_levels.get(member.checked_sub(self.own_first)?))
                         .flatten()
                         .filter(|_| !self.fair)
                         .map(|l| (l.fraction() * 1000.0) as u16),
@@ -3501,12 +4512,14 @@ impl Fight {
 
     /// The team list for switching or sending in.
     fn team_list(&self, s: &mut Screen, taken: &[usize], cursor: usize) {
-        let len = self.battle.team(self.me).len();
-        s.items = (0..len).map(|m| self.member_line(m, taken)).collect();
-        s.disabled = (0..len)
+        let r = self.roster();
+        s.items = r.clone().map(|m| self.member_line(m, taken)).collect();
+        s.disabled = r
+            .clone()
             .filter(|&m| self.unavailable(m, taken).is_some())
+            .map(|m| m - r.start)
             .collect();
-        s.cursor = Some(cursor);
+        s.cursor = Some(cursor.saturating_sub(r.start));
         if let Some(f) = self.battle.team(self.me).get(cursor) {
             let types = type_names(&self.names.dex, f.types);
             let moves: Vec<String> = f
@@ -3545,13 +4558,26 @@ impl Fight {
         } else {
             "Chao"
         };
-        let mut items = vec![
-            format!("Your Chao standing: {mine} of {my_team}"),
-            format!("Foe's {foes} standing: {theirs} of {their_team}"),
-            format!("Turns: {}", self.battle.turn()),
-        ];
+        let mut items = if self.mine.is_some() {
+            vec![
+                format!("Your side's Chao standing: {mine} of {my_team}"),
+                format!("Foes' Chao standing: {theirs} of {their_team}"),
+            ]
+        } else {
+            vec![
+                format!("Your Chao standing: {mine} of {my_team}"),
+                format!("Foe's {foes} standing: {theirs} of {their_team}"),
+            ]
+        };
+        items.push(format!("Turns: {}", self.battle.turn()));
+        if let Some(link) = &self.link {
+            items.extend(link.notes.iter().cloned());
+        }
         if let Some(((reason, winner), name)) = ended {
             items.push(match (reason, winner) {
+                (END_REPLACED, _) => {
+                    "You took too long to choose; the computer played your place.".into()
+                }
                 (END_TIMEOUT, Some(w)) if w == self.me => {
                     format!("{name} took too long to choose.")
                 }
@@ -3598,7 +4624,18 @@ impl Fight {
                 };
             }
             Stage::Remote { give_up } => {
-                let name = self.link.as_ref().map_or("", |l| l.name.as_str());
+                let name = match &self.link {
+                    Some(l) if self.mine.is_some() => {
+                        let names: Vec<&str> = l.others.iter().map(|o| o.1.as_str()).collect();
+                        match names[..] {
+                            [] => "the host".to_string(),
+                            [one] => one.to_string(),
+                            [ref rest @ .., last] => pair(&rest.join(", "), last),
+                        }
+                    }
+                    Some(l) => l.name.clone(),
+                    None => String::new(),
+                };
                 match give_up {
                     None => {
                         s.title = format!("Waiting for {name}...");
@@ -3851,7 +4888,7 @@ mod tests {
     #[test]
     fn b_on_the_first_screen_closes() {
         let mut s = session(2, Vec::new());
-        assert_eq!(s.screen().items.len(), 2);
+        assert_eq!(s.screen().items.len(), 3);
         let out = s.update(buttons::B, false);
         assert!(out.contains(&Command::Closed));
         assert!(s.done());
@@ -3862,7 +4899,7 @@ mod tests {
         let mut s = session(0, Vec::new());
         s.update(buttons::A, false);
         assert!(s.screen().message.is_some());
-        assert_eq!(s.screen().items.len(), 2);
+        assert_eq!(s.screen().items.len(), 3);
     }
 
     #[test]
@@ -4546,10 +5583,13 @@ mod tests {
     #[test]
     fn without_trainers_the_menu_has_no_trainers_item() {
         let s = session(1, Vec::new());
-        assert_eq!(s.screen().items, ["Singles (1 on 1)", "Doubles (2 on 2)"]);
+        assert_eq!(
+            s.screen().items,
+            ["Singles (1 on 1)", "Doubles (2 on 2)", "Multi battle"]
+        );
         let s = session(1, Vec::new()).with_trainers(Arc::new(roster()), Progress::default());
-        assert_eq!(s.screen().items.len(), 3);
-        assert_eq!(s.screen().items[2], "Trainers");
+        assert_eq!(s.screen().items.len(), 4);
+        assert_eq!(s.screen().items[3], "Trainers");
     }
 
     #[test]
@@ -4746,6 +5786,7 @@ mod tests {
             format: Format::Singles,
             save_partners: true,
             actual_levels: false,
+            multi: None,
         });
         assert_eq!(s.take_outgoing(), [busy_answer(4)]);
         assert!(s.screen().title.contains("wild Wildmon"));
@@ -5220,6 +6261,7 @@ mod tests {
             format: Format::Singles,
             save_partners: true,
             actual_levels: false,
+            multi: None,
         };
         // Turned down.
         let mut s = session(1, Vec::new());
@@ -5402,5 +6444,487 @@ mod tests {
         assert_eq!(team[0].types, [1, 1]);
         // The picker itself shows the Chao as they are.
         assert_eq!(s.own_profiles[0].types, [0, 0]);
+    }
+    // ---- multi battles ----
+
+    /// Picks the first `count` Chao on the team screen showing and chooses "Done".
+    fn pick_team(s: &mut Session, count: usize) {
+        for _ in 0..count {
+            s.update(buttons::A, false);
+            s.update(buttons::DOWN, false);
+        }
+        while !s.screen().items[s.screen().cursor.unwrap()].starts_with("Done") {
+            s.update(buttons::UP, false);
+        }
+        s.update(buttons::A, false);
+    }
+
+    /// From the format menu to the multi battle's setup with the first `count` Chao.
+    fn to_plan(s: &mut Session, count: usize) {
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(
+            s.screen().title,
+            format!("Your team for the multi battle (up to {MAX_MULTI_TEAM})")
+        );
+        pick_team(s, count);
+        assert_eq!(s.screen().title, "Multi battle");
+    }
+
+    /// Moves the cursor of the list showing to row `row`.
+    fn cursor_to(s: &mut Session, row: usize) {
+        for _ in 0..20 {
+            if s.screen().cursor == Some(row) {
+                return;
+            }
+            s.update(buttons::DOWN, false);
+        }
+        panic!("no row {row}: {:?}", s.screen());
+    }
+
+    #[test]
+    fn a_multi_battle_with_the_computer_plays_here_alone() {
+        // A team is at most 3: the third goes straight to "Done", a fourth is refused.
+        let mut s = session(4, Vec::new());
+        s.update(buttons::DOWN, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        for _ in 0..3 {
+            s.update(buttons::A, false);
+            s.update(buttons::DOWN, false);
+        }
+        assert_eq!(s.screen().cursor, Some(0));
+        cursor_to(&mut s, 3);
+        s.update(buttons::A, false);
+        assert_eq!(
+            s.screen().message.as_deref(),
+            Some("A team has at most 3 Chao.")
+        );
+        let mut s = session(4, Vec::new());
+        to_plan(&mut s, 3);
+        let screen = s.screen();
+        assert_eq!(screen.items[0], "Your team: Own0, Own1, Own2");
+        assert_eq!(
+            screen.items[1..4],
+            [
+                "Ally: Computer: Copies of your other Chao (1)",
+                "Foe 1: Computer: Copies of your other Chao (1)",
+                "Foe 2: Computer: Copies of your other Chao (1)",
+            ]
+        );
+        assert_eq!(screen.items[PLAN_START], "Start");
+        assert!(s.take_outgoing().is_empty());
+        cursor_to(&mut s, PLAN_START);
+        s.update(buttons::A, false);
+        let State::Fight(f) = &s.state else {
+            panic!("no fight: {:?}", s.screen());
+        };
+        assert_eq!(
+            (f.mine, f.battle.split(0), f.battle.split(1)),
+            (Some(0), Some(3), Some(1))
+        );
+        let mut over = false;
+        for _ in 0..200_000 {
+            if s.done() {
+                break;
+            }
+            if let State::Fight(f) = &s.state {
+                over |= matches!(f.battle.phase(), Phase::Over(_));
+                // The player chooses only for their own place.
+                if let Stage::Choose { pos, .. } = f.stage {
+                    assert_eq!(pos, 0);
+                    assert_eq!(s.screen().choosing, Some(Slot::new(0, 0)));
+                }
+                if let Stage::Replace { slots, .. } = &f.stage {
+                    assert!(slots.iter().all(|s| s.pos == 0));
+                    // Only their own Chao are in the list.
+                    assert_eq!(s.screen().items.len(), 3);
+                }
+            }
+            s.update(buttons::A, true);
+        }
+        assert!(s.done() && over);
+        // Nothing went to a host, and a battle with copies gives no XP.
+        assert!(s.take_outgoing().is_empty());
+        assert!(s.gains().is_empty());
+    }
+
+    /// Four players' games with a host between them (`IDS4`), each with the others as friends
+    /// at Chao Karate.
+    struct Lobby4 {
+        host: crate::net::battles::Battles,
+        s: Vec<Session>,
+        out: Vec<Vec<Command>>,
+        now: std::time::Instant,
+    }
+
+    const IDS4: [u8; 4] = [1, 2, 3, 4];
+
+    impl Lobby4 {
+        fn new() -> Lobby4 {
+            let mut host = crate::net::battles::Battles::default();
+            let mut s: Vec<Session> = Vec::new();
+            for (i, &id) in IDS4.iter().enumerate() {
+                host.joined(id);
+                let mut game = session(3, Vec::new());
+                for (j, e) in game.own.iter_mut().enumerate() {
+                    e.chao = chao(200 + i as i16 * 200 + j as i16 * 50);
+                }
+                game.set_friends(
+                    IDS4.iter()
+                        .filter(|&&o| o != id)
+                        .map(|&o| Friend {
+                            id: o,
+                            name: format!("P{o}"),
+                            busy: false,
+                        })
+                        .collect(),
+                );
+                s.push(game);
+            }
+            Lobby4 {
+                host,
+                s,
+                out: vec![Vec::new(); 4],
+                now: std::time::Instant::now(),
+            }
+        }
+
+        fn pump(&mut self) {
+            let now = self.now;
+            loop {
+                let mut out = Vec::new();
+                for (i, s) in self.s.iter_mut().enumerate() {
+                    for body in s.take_outgoing() {
+                        assert!(self.host.observe(IDS4[i], &body, now, &mut out));
+                    }
+                }
+                self.host.tick(now, &mut out);
+                if out.is_empty() {
+                    return;
+                }
+                for o in out {
+                    use crate::net::referee::To;
+                    let To::One(to) = o.to else { panic!("{o:?}") };
+                    let i = IDS4.iter().position(|&id| id == to).unwrap();
+                    let event = online::incoming(o.body, |id| format!("P{id}")).unwrap();
+                    self.s[i].network(event);
+                }
+            }
+        }
+
+        /// A frame of every game, pressing `pressed` in the ones in `who`.
+        fn frame(&mut self, pressed: u32, who: &[usize]) {
+            for (i, (s, out)) in self.s.iter_mut().zip(&mut self.out).enumerate() {
+                let p = if who.contains(&i) { pressed } else { 0 };
+                out.extend(s.update(p, true));
+            }
+            self.pump();
+        }
+
+        fn fight(&self, i: usize) -> &Fight {
+            match &self.s[i].state {
+                State::Fight(f) => f,
+                _ => panic!("no fight: {:?}", self.s[i].screen()),
+            }
+        }
+
+        /// Player 1 sets up a multi battle: player 2 its ally, player 3 foe 1, the computer foe
+        /// 2, and sends the invites.
+        fn invite(&mut self) {
+            let s = &mut self.s[0];
+            to_plan(s, 2);
+            // The ally: the first friend.
+            s.update(buttons::A, false);
+            assert_eq!(s.screen().title, "Ally in the multi battle");
+            assert_eq!(
+                s.screen().items[..3],
+                ["P2 (live)", "P3 (live)", "P4 (live)"]
+            );
+            s.update(buttons::A, false);
+            // Foe 1: player 2 has a place already; player 3.
+            s.update(buttons::DOWN, false);
+            s.update(buttons::A, false);
+            s.update(buttons::A, false);
+            assert_eq!(
+                s.screen().message.as_deref(),
+                Some("P2 already has a place.")
+            );
+            s.update(buttons::DOWN, false);
+            s.update(buttons::A, false);
+            let screen = s.screen();
+            assert_eq!(screen.items[1..3], ["Ally: P2 (live)", "Foe 1: P3 (live)"]);
+            assert_eq!(screen.items[PLAN_START], "Send the invites");
+            cursor_to(s, PLAN_START);
+            s.update(buttons::A, false);
+            assert_eq!(s.screen().title, "Multi battle: waiting for answers...");
+            self.pump();
+        }
+
+        /// Player `i` accepts the invite with `count` Chao.
+        fn accept(&mut self, i: usize, count: usize) {
+            let s = &mut self.s[i];
+            assert_eq!(s.screen().title, "P1 invites you to a multi battle!");
+            see_offer(s);
+            s.update(buttons::A, false);
+            assert_eq!(
+                s.screen().title,
+                format!("Your team for P1's multi battle (up to {MAX_MULTI_TEAM})")
+            );
+            pick_team(s, count);
+            self.pump();
+        }
+
+        /// Frames with A in every game until all show the result.
+        fn play_out(&mut self, who: &[usize]) {
+            for _ in 0..400_000 {
+                if who.iter().all(
+                    |&i| matches!(&self.s[i].state, State::Fight(f) if f.stage == Stage::Result),
+                ) {
+                    return;
+                }
+                self.frame(buttons::A, who);
+            }
+            panic!("not over");
+        }
+    }
+
+    #[test]
+    fn a_multi_battle_plays_the_same_in_every_game() {
+        let mut l = Lobby4::new();
+        l.invite();
+        let detail = l.s[2].screen().detail.unwrap();
+        assert!(
+            detail.starts_with("you and the computer against P1 and P2."),
+            "{detail}"
+        );
+        assert!(detail.contains("Rule: Level 50"));
+        assert!(l.s[0].busy() && l.s[1].busy() && !l.s[3].busy());
+        l.accept(1, 3);
+        assert_eq!(l.s[1].screen().title, "Waiting for the others to answer...");
+        assert_eq!(l.s[0].screen().items[0], "Ally: P2, accepted");
+        l.accept(2, 1);
+        for i in 0..3 {
+            assert!(
+                matches!(&l.s[i].state, State::Fight(f) if f.link.is_some()),
+                "{i}"
+            );
+        }
+        // Each game plays its own place, its side on the left.
+        let places: Vec<(usize, Option<usize>, usize)> = (0..3)
+            .map(|i| (l.fight(i).me, l.fight(i).mine, l.fight(i).own_first))
+            .collect();
+        assert_eq!(places, [(0, Some(0), 0), (0, Some(1), 2), (1, Some(0), 0)]);
+        let sizes: Vec<usize> = (0..2)
+            .map(|side| l.fight(0).battle.team(side).len())
+            .collect();
+        assert_eq!(sizes, [5, 2]);
+        let mut waited = Vec::new();
+        for _ in 0..400_000 {
+            if (0..3).all(|i| matches!(&l.s[i].state, State::Fight(f) if f.stage == Stage::Result))
+            {
+                break;
+            }
+            let titles: Vec<String> = (0..3).map(|i| l.s[i].screen().title).collect();
+            for t in titles {
+                if t.starts_with("Waiting for") && !waited.contains(&t) {
+                    waited.push(t);
+                }
+            }
+            for i in 0..3 {
+                if let State::Fight(f) = &l.s[i].state
+                    && let Stage::Choose { pos, .. } = f.stage
+                {
+                    assert_eq!(Some(pos), f.mine);
+                }
+            }
+            l.frame(buttons::A, &[0, 1, 2]);
+        }
+        assert!(
+            waited.contains(&"Waiting for P2 and P3...".to_string()),
+            "{waited:?}"
+        );
+        assert!(
+            waited.contains(&"Waiting for P1 and P2...".to_string()),
+            "{waited:?}"
+        );
+        let checks: Vec<u32> = (0..3)
+            .map(|i| online::checksum(&l.fight(i).battle))
+            .collect();
+        assert!(checks.iter().all(|&c| c == checks[0]));
+        assert!(matches!(l.fight(0).battle.phase(), Phase::Over(_)));
+        let titles: Vec<String> = (0..3).map(|i| l.s[i].screen().title).collect();
+        assert_eq!(titles[0], titles[1]);
+        assert!(
+            titles == ["You won!", "You won!", "You lost..."]
+                || titles == ["You lost...", "You lost...", "You won!"]
+                || titles.iter().all(|t| t == "It's a draw."),
+            "{titles:?}"
+        );
+        // Each earned XP for their own Chao.
+        for i in 0..3 {
+            let gains = l.s[i].gains();
+            assert!(!gains.is_empty(), "{i}");
+            let own: Vec<u64> = l.s[i].own.iter().map(|e| e.chao.identity()).collect();
+            assert!(gains.iter().all(|g| own.contains(&g.identity)));
+        }
+        // Done: nothing more goes out.
+        for _ in 0..RESULT_WAIT + 1 {
+            l.frame(0, &[]);
+        }
+        l.frame(buttons::A, &[0, 1, 2]);
+        for s in &mut l.s[..3] {
+            assert!(s.done());
+            s.abandon();
+            assert!(s.take_outgoing().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_turned_down_place_goes_to_the_computer() {
+        let mut l = Lobby4::new();
+        l.invite();
+        l.accept(1, 1);
+        // Player 3 turns it down.
+        see_offer(&mut l.s[2]);
+        l.s[2].update(buttons::DOWN, false);
+        l.s[2].update(buttons::A, false);
+        l.pump();
+        let screen = l.s[0].screen();
+        assert_eq!(
+            screen.message.as_deref(),
+            Some("P3 turned the battle down.")
+        );
+        assert_eq!(screen.items[1], "Foe 1: P3: turned it down");
+        // Give it to the computer: only its teams are offered.
+        cursor_to(&mut l.s[0], 1);
+        l.s[0].update(buttons::A, false);
+        let screen = l.s[0].screen();
+        assert_eq!(screen.title, "Foe 1: the computer's team");
+        assert!(screen.items.iter().all(|i| i.starts_with("Computer: ")));
+        l.s[0].update(buttons::A, false);
+        let sent = l.s[0].take_outgoing();
+        assert!(matches!(&sent[..], [Body::MultiFill { place: 2, team }] if team.len() == 1));
+        let mut out = Vec::new();
+        l.host.observe(1, &sent[0], l.now, &mut out);
+        assert_eq!(out.len(), 2);
+        for o in out {
+            use crate::net::referee::To;
+            let To::One(to) = o.to else { panic!() };
+            let event = online::incoming(o.body, |id| format!("P{id}")).unwrap();
+            l.s[usize::from(to) - 1].network(event);
+        }
+        assert!(matches!(&l.s[0].state, State::Fight(_)));
+        assert!(matches!(&l.s[1].state, State::Fight(_)));
+        assert!(!matches!(&l.s[2].state, State::Fight(_)));
+        assert!(
+            l.fight(0)
+                .intro
+                .as_deref()
+                .unwrap()
+                .contains("against the computer and")
+        );
+    }
+
+    #[test]
+    fn a_multi_battle_can_be_called_off_or_left_before_it_starts() {
+        let mut l = Lobby4::new();
+        l.invite();
+        l.accept(1, 1);
+        // Called off: the ones invited hear of it.
+        l.s[0].update(buttons::B, false);
+        l.pump();
+        assert_eq!(l.s[0].screen().title, "Multi battle");
+        for i in [1, 2] {
+            assert_eq!(
+                l.s[i].screen().message.as_deref(),
+                Some("P1 called the multi battle off."),
+                "{i}"
+            );
+            assert!(!l.s[i].busy());
+        }
+        // Sent again, and player 2 leaves after accepting.
+        let s = &mut l.s[0];
+        cursor_to(s, PLAN_START);
+        s.update(buttons::A, false);
+        l.pump();
+        l.accept(1, 1);
+        l.s[1].update(buttons::B, false);
+        l.pump();
+        let screen = l.s[0].screen();
+        assert_eq!(screen.items[0], "Ally: P2: left");
+        assert_eq!(screen.message.as_deref(), Some("P2 left."));
+        // Leaving the karate area calls it off.
+        l.s[0].abandon();
+        l.pump();
+        assert_eq!(
+            l.s[2].screen().message.as_deref(),
+            Some("P1 called the multi battle off.")
+        );
+        assert!(IDS4.iter().all(|&id| !l.host.in_battle(id)));
+    }
+
+    #[test]
+    fn the_computer_takes_over_a_player_who_leaves_a_multi_battle() {
+        let mut l = Lobby4::new();
+        l.invite();
+        l.accept(1, 2);
+        l.accept(2, 2);
+        // Player 2 leaves once they chose.
+        for _ in 0..10_000 {
+            if matches!(&l.s[1].state, State::Fight(f) if matches!(f.stage, Stage::Remote { .. })) {
+                break;
+            }
+            l.frame(buttons::A, &[1]);
+        }
+        l.s[1].abandon();
+        l.pump();
+        let note = "P2 left the battle; the computer plays their place.";
+        for i in [0, 2] {
+            let link = l.fight(i).link.as_ref().unwrap();
+            assert_eq!(link.notes, [note], "{i}");
+            assert!(link.others.iter().all(|o| o.1 != "P2"));
+        }
+        // The others play it to its end.
+        l.play_out(&[0, 2]);
+        assert!(matches!(l.fight(0).battle.phase(), Phase::Over(_)));
+        assert_eq!(
+            online::checksum(&l.fight(0).battle),
+            online::checksum(&l.fight(2).battle)
+        );
+        assert!(l.s[0].screen().items.contains(&note.to_string()));
+        // Player 2 earned nothing; the ones who played it to the end did.
+        l.frame(0, &[]);
+        assert!(l.s[1].gains().is_empty());
+        assert!(!l.out[1].contains(&Command::Levels));
+        assert!(!l.s[0].gains().is_empty() && !l.s[2].gains().is_empty());
+    }
+
+    #[test]
+    fn giving_up_a_multi_battle_lets_the_computer_play_on() {
+        let mut l = Lobby4::new();
+        l.invite();
+        l.accept(1, 1);
+        l.accept(2, 1);
+        for _ in 0..10_000 {
+            if matches!(&l.s[2].state, State::Fight(f) if matches!(f.stage, Stage::Remote { .. })) {
+                break;
+            }
+            l.frame(buttons::A, &[2]);
+        }
+        let s = &mut l.s[2];
+        s.update(buttons::B, false);
+        s.update(buttons::DOWN, false);
+        s.update(buttons::A, false);
+        assert_eq!(s.screen().title, "You gave up.");
+        l.pump();
+        assert_eq!(
+            l.fight(0).link.as_ref().unwrap().notes,
+            ["P3 gave up; the computer plays their place."]
+        );
+        l.play_out(&[0, 1]);
+        l.frame(0, &[]);
+        assert!(l.s[2].gains().is_empty());
     }
 }

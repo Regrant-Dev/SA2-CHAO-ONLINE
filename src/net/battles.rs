@@ -17,14 +17,31 @@
 //!   once both games say it's over; a player still choosing after the other said so gets a
 //!   desync end.
 //!
+//! Multi battles (doubles, each of the four places a player's or the computer's):
+//!
+//! - The starter's `MultiInvite` goes to each invited player as `MultiOffer`; each answers
+//!   with `BattleAnswer` (to the starter). The starter hears of each answer (`MultiStatus`),
+//!   and fills a place nobody took with the computer (`MultiFill`) or calls the battle off
+//!   (`BattleLeave` 0). It starts (`MultiStart` to every player, with all four teams) once every
+//!   place is filled; an invite runs out after `OFFER_LIMIT`, the whole setup after
+//!   `SETUP_LIMIT`.
+//! - Each step waits for the choices of every player still in it, then goes to them all; a
+//!   place the computer plays has no choices in it, and every game picks the computer's from
+//!   the step's seed. Different checksums end it for everyone (desync).
+//! - A player who gives up, leaves or takes more than `STEP_LIMIT` to choose once someone has
+//!   is out (the slow one gets `BattleEnd` replaced): the others hear of it (`MultiTakeover`)
+//!   and the computer plays that place from then on. The battle ends in the games as any does,
+//!   when a side has no Chao left.
+//!
 //! Its messages come "from" the host (`SERVER`); players' copies of them are dropped.
 
 use std::time::{Duration, Instant};
 
 use super::protocol::{
-    ANSWER_ACCEPT, ANSWER_BUSY, BattleMember, BattlePick, Body, END_BUSY, END_DECLINED, END_DESYNC,
-    END_DISCONNECT, END_FORFEIT, END_ROM_DIFFERS, END_TIMEOUT, END_WITHDRAWN, LEAVE_GAVE_UP,
-    LEAVE_OVER, MAX_PLAYERS, NO_WINNER, SERVER,
+    ANSWER_ACCEPT, ANSWER_BUSY, BattleMember, BattlePick, Body, COMPUTER, END_BUSY, END_DECLINED,
+    END_DESYNC, END_DISCONNECT, END_FORFEIT, END_REPLACED, END_ROM_DIFFERS, END_TIMEOUT,
+    END_WITHDRAWN, LEAVE_GAVE_UP, LEAVE_OVER, MAX_MULTI_TEAM, MAX_PLAYERS, MultiSeat, NO_WINNER,
+    SEAT_ACCEPTED, SEAT_BUSY, SEAT_DECLINED, SEAT_LEFT, SEAT_ROM_DIFFERS, SEAT_TIMEOUT, SERVER,
 };
 use super::referee::{Out, To};
 
@@ -36,6 +53,8 @@ pub const STEP_LIMIT: Duration = Duration::from_secs(120);
 pub const IDLE_LIMIT: Duration = Duration::from_secs(600);
 /// A player can challenge the same player again after this long.
 pub const CHALLENGE_GAP: Duration = Duration::from_secs(5);
+/// A multi battle that hasn't started this long after its invites is called off.
+pub const SETUP_LIMIT: Duration = Duration::from_secs(300);
 
 struct Challenge {
     from: u8,
@@ -66,11 +85,73 @@ impl Live {
     }
 }
 
+/// A multi battle place while the battle is set up.
+enum Seat {
+    /// A player: invited at `since` (`team` none until they accept), or in with their team.
+    Player {
+        id: u8,
+        team: Option<Vec<BattleMember>>,
+        since: Instant,
+    },
+    /// Its player didn't take it: the starter fills it or calls the battle off.
+    Open,
+    Computer(Vec<BattleMember>),
+}
+
+/// A multi battle being set up: place 0 is its starter's.
+struct Setup {
+    starter: u8,
+    seats: [Seat; 4],
+    actual_levels: bool,
+    dex: u32,
+    since: Instant,
+}
+
+impl Setup {
+    /// The place player `id` has (invited or in).
+    fn place_of(&self, id: u8) -> Option<usize> {
+        self.seats
+            .iter()
+            .position(|s| matches!(s, Seat::Player { id: p, .. } if *p == id))
+    }
+}
+
+/// A multi battle under way.
+struct Multi {
+    id: u16,
+    /// Each place's player (side * 2 + pos); none: the computer plays it, from the start or
+    /// since its player went.
+    players: [Option<u8>; 4],
+    step: u16,
+    /// Each place's checksum and picks for `step`.
+    choices: [Option<(u32, Vec<BattlePick>)>; 4],
+    opened: Instant,
+    first: Option<Instant>,
+    /// Each place's game said the battle is over.
+    over: [bool; 4],
+}
+
+impl Multi {
+    fn place_of(&self, player: u8) -> Option<usize> {
+        self.players.iter().position(|&p| p == Some(player))
+    }
+
+    /// The places whose players still play (their game hasn't reached the end), with them.
+    fn playing(&self) -> Vec<(usize, u8)> {
+        (0..4)
+            .filter(|&p| !self.over[p])
+            .filter_map(|p| Some((p, self.players[p]?)))
+            .collect()
+    }
+}
+
 #[derive(Default)]
 pub struct Battles {
     present: [bool; MAX_PLAYERS],
     challenges: Vec<Challenge>,
     live: Vec<Live>,
+    setups: Vec<Setup>,
+    multis: Vec<Multi>,
     next_id: u16,
     seeds: u64,
     /// Ends for players whose opponent left, sent on the next `tick`.
@@ -91,6 +172,17 @@ fn end(to: u8, battle: u16, reason: u8, winner: u8) -> Out {
     }
 }
 
+fn status(to: u8, place: usize, status: u8) -> Out {
+    Out {
+        to: To::One(to),
+        from: SERVER,
+        body: Body::MultiStatus {
+            place: place as u8,
+            status,
+        },
+    }
+}
+
 impl Battles {
     pub fn joined(&mut self, id: u8) {
         if let Some(p) = self.present.get_mut(usize::from(id)) {
@@ -98,13 +190,28 @@ impl Battles {
         }
     }
 
-    /// In a challenge, or a battle their game hasn't finished.
+    /// In a challenge, a multi battle's setup, or a battle their game hasn't finished.
     fn busy(&self, id: u8) -> bool {
         self.challenges.iter().any(|c| c.from == id || c.to == id)
             || self
                 .live
                 .iter()
                 .any(|l| l.players.contains(&id) && !l.over[l.side_of(id)])
+            || self.setups.iter().any(|s| s.place_of(id).is_some())
+            || self
+                .multis
+                .iter()
+                .any(|m| m.place_of(id).is_some_and(|p| !m.over[p]))
+    }
+
+    /// Player `id` is in a challenge, a setup or a battle (`busy`), for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn in_battle(&self, id: u8) -> bool {
+        self.busy(id)
+    }
+
+    fn present(&self, id: u8) -> bool {
+        self.present.get(usize::from(id)).copied() == Some(true)
     }
 
     /// A new random seed (`RandomState` is seeded from the system's randomness).
@@ -124,7 +231,7 @@ impl Battles {
         loop {
             self.next_id = self.next_id.wrapping_add(1).max(1);
             let id = self.next_id;
-            if !self.live.iter().any(|l| l.id == id) {
+            if !self.live.iter().any(|l| l.id == id) && !self.multis.iter().any(|m| m.id == id) {
                 return id;
             }
         }
@@ -181,6 +288,7 @@ impl Battles {
                     .iter()
                     .position(|c| c.from == *to && c.to == from)
                 else {
+                    self.multi_answer(from, *to, *answer, *dex, team, now, out);
                     return true;
                 };
                 let c = self.challenges.remove(i);
@@ -233,8 +341,12 @@ impl Battles {
                     .iter()
                     .position(|l| l.id == *battle && l.players.contains(&from))
                 else {
-                    // Over already (or never ours): that game waits for nothing.
-                    out.push(end(from, *battle, END_DESYNC, NO_WINNER));
+                    if let Some(i) = self.multi_of(*battle, from) {
+                        self.multi_choice(i, from, *step, *check, picks, now, out);
+                    } else {
+                        // Over already (or never ours): that game waits for nothing.
+                        out.push(end(from, *battle, END_DESYNC, NO_WINNER));
+                    }
                     return true;
                 };
                 let seed = self.seed();
@@ -298,6 +410,8 @@ impl Battles {
                         out.push(end(c.from, 0, END_DECLINED, NO_WINNER));
                     }
                 }
+                // A multi battle called off, or an invite turned down (or left after accepting).
+                self.leave_setups(from, END_WITHDRAWN, out);
             }
             Body::BattleLeave { battle, reason } => {
                 let Some(i) = self
@@ -305,6 +419,9 @@ impl Battles {
                     .iter()
                     .position(|l| l.id == *battle && l.players.contains(&from))
                 else {
+                    if let Some(i) = self.multi_of(*battle, from) {
+                        self.multi_leave(i, from, *reason, now, out);
+                    }
                     return true;
                 };
                 let l = &mut self.live[i];
@@ -343,12 +460,394 @@ impl Battles {
                 };
                 out.push(end(l.players[other], l.id, why, winner));
             }
+            Body::MultiInvite {
+                seats,
+                save_partners,
+                actual_levels,
+                dex,
+                team,
+            } => {
+                let rules = (*save_partners, *actual_levels);
+                self.invite(from, seats, rules, *dex, team, now, out);
+            }
+            Body::MultiFill { place, team } => {
+                let place = usize::from(*place);
+                if let Some(i) = self.setups.iter().position(|s| s.starter == from)
+                    && let Some(seat @ Seat::Open) = self.setups[i].seats.get_mut(place)
+                {
+                    *seat = Seat::Computer(team.clone());
+                    self.try_start(i, now, out);
+                }
+            }
             // Only the host sends these.
             Body::BattleOffer { .. } | Body::BattleStart { .. } | Body::BattleStep { .. } => {}
             Body::BattleEnd { .. } => {}
+            Body::MultiOffer { .. }
+            | Body::MultiStatus { .. }
+            | Body::MultiStart { .. }
+            | Body::MultiTakeover { .. } => {}
             _ => return false,
         }
         true
+    }
+
+    /// Player `from`'s multi battle invite, with its rules (save partners, actual levels).
+    #[allow(clippy::too_many_arguments)]
+    fn invite(
+        &mut self,
+        from: u8,
+        seats: &[MultiSeat; 3],
+        (save_partners, actual_levels): (bool, bool),
+        dex: u32,
+        team: &[BattleMember],
+        now: Instant,
+        out: &mut Vec<Out>,
+    ) {
+        let ids: Vec<u8> = seats
+            .iter()
+            .filter_map(|s| match s {
+                MultiSeat::Player(id) => Some(*id),
+                MultiSeat::Computer(_) => None,
+            })
+            .collect();
+        let twice = ids
+            .iter()
+            .enumerate()
+            .any(|(i, id)| *id == from || ids[..i].contains(id));
+        if self.busy(from) || twice || team.len() > MAX_MULTI_TEAM {
+            out.push(end(from, 0, END_BUSY, NO_WINNER));
+            return;
+        }
+        let mut setup = Setup {
+            starter: from,
+            seats: [Seat::Open, Seat::Open, Seat::Open, Seat::Open],
+            actual_levels,
+            dex,
+            since: now,
+        };
+        setup.seats[0] = Seat::Player {
+            id: from,
+            team: Some(team.to_vec()),
+            since: now,
+        };
+        for (i, seat) in seats.iter().enumerate() {
+            setup.seats[i + 1] = match seat {
+                MultiSeat::Computer(team) => Seat::Computer(team.clone()),
+                MultiSeat::Player(id) if self.present(*id) && !self.busy(*id) => Seat::Player {
+                    id: *id,
+                    team: None,
+                    since: now,
+                },
+                MultiSeat::Player(_) => {
+                    out.push(status(from, i + 1, SEAT_BUSY));
+                    Seat::Open
+                }
+            };
+        }
+        let players = setup.seats.each_ref().map(|s| match s {
+            Seat::Player { id, .. } => *id,
+            _ => COMPUTER,
+        });
+        for (place, seat) in setup.seats.iter().enumerate().skip(1) {
+            if let Seat::Player { id, .. } = seat {
+                out.push(Out {
+                    to: To::One(*id),
+                    from: SERVER,
+                    body: Body::MultiOffer {
+                        from,
+                        place: place as u8,
+                        save_partners,
+                        actual_levels,
+                        players,
+                    },
+                });
+            }
+        }
+        self.setups.push(setup);
+        let i = self.setups.len() - 1;
+        self.try_start(i, now, out);
+    }
+
+    /// Player `from`'s answer to `starter`'s multi battle invite, if it's one.
+    #[allow(clippy::too_many_arguments)]
+    fn multi_answer(
+        &mut self,
+        from: u8,
+        starter: u8,
+        answer: u8,
+        dex: u32,
+        team: &[BattleMember],
+        now: Instant,
+        out: &mut Vec<Out>,
+    ) {
+        let found = self.setups.iter().enumerate().find_map(|(i, s)| {
+            let place = s.place_of(from).filter(|_| s.starter == starter)?;
+            matches!(s.seats[place], Seat::Player { team: None, .. }).then_some((i, place))
+        });
+        let Some((i, place)) = found else {
+            return;
+        };
+        let s = &mut self.setups[i];
+        let refused = if answer != ANSWER_ACCEPT {
+            Some(if answer == ANSWER_BUSY {
+                SEAT_BUSY
+            } else {
+                SEAT_DECLINED
+            })
+        } else if dex != s.dex {
+            out.push(end(from, 0, END_ROM_DIFFERS, NO_WINNER));
+            Some(SEAT_ROM_DIFFERS)
+        } else if team.len() > MAX_MULTI_TEAM {
+            out.push(end(from, 0, END_BUSY, NO_WINNER));
+            Some(SEAT_BUSY)
+        } else {
+            None
+        };
+        out.push(status(starter, place, refused.unwrap_or(SEAT_ACCEPTED)));
+        if refused.is_some() {
+            s.seats[place] = Seat::Open;
+        } else {
+            s.seats[place] = Seat::Player {
+                id: from,
+                team: Some(team.to_vec()),
+                since: now,
+            };
+            self.try_start(i, now, out);
+        }
+    }
+
+    /// Player `id` leaves the multi battle setups they're in: theirs is called off (the others
+    /// get `why`), and a place they were invited to opens for the starter.
+    fn leave_setups(&mut self, id: u8, why: u8, out: &mut Vec<Out>) {
+        self.setups.retain_mut(|s| {
+            if s.starter == id {
+                for seat in &s.seats[1..] {
+                    if let Seat::Player { id: other, .. } = seat {
+                        out.push(end(*other, 0, why, NO_WINNER));
+                    }
+                }
+                return false;
+            }
+            if let Some(place) = s.place_of(id) {
+                let accepted = matches!(s.seats[place], Seat::Player { team: Some(_), .. });
+                out.push(status(
+                    s.starter,
+                    place,
+                    if accepted { SEAT_LEFT } else { SEAT_DECLINED },
+                ));
+                s.seats[place] = Seat::Open;
+            }
+            true
+        });
+    }
+
+    /// Starts setup `i` once every place is filled.
+    fn try_start(&mut self, i: usize, now: Instant, out: &mut Vec<Out>) {
+        let ready = self.setups[i]
+            .seats
+            .iter()
+            .all(|s| matches!(s, Seat::Player { team: Some(_), .. } | Seat::Computer(_)));
+        if !ready {
+            return;
+        }
+        let s = self.setups.remove(i);
+        let id = self.new_id();
+        let seed = self.seed();
+        let players = s.seats.each_ref().map(|seat| match seat {
+            Seat::Player { id, .. } => Some(*id),
+            _ => None,
+        });
+        let seats = s.seats.map(|seat| match seat {
+            Seat::Player {
+                id,
+                team: Some(team),
+                ..
+            } => (id, team),
+            Seat::Computer(team) => (COMPUTER, team),
+            _ => (COMPUTER, Vec::new()),
+        });
+        crate::log!("battles: multi battle {id} starts ({players:?})");
+        for (place, player) in players.iter().enumerate() {
+            if let Some(p) = player {
+                out.push(Out {
+                    to: To::One(*p),
+                    from: SERVER,
+                    body: Body::MultiStart {
+                        battle: id,
+                        seed,
+                        place: place as u8,
+                        actual_levels: s.actual_levels,
+                        seats: seats.clone(),
+                    },
+                });
+            }
+        }
+        self.multis.push(Multi {
+            id,
+            players,
+            step: 1,
+            choices: Default::default(),
+            opened: now,
+            first: None,
+            over: [false; 4],
+        });
+    }
+
+    /// The multi battle `battle` player `from` is in.
+    fn multi_of(&self, battle: u16, from: u8) -> Option<usize> {
+        self.multis
+            .iter()
+            .position(|m| m.id == battle && m.place_of(from).is_some())
+    }
+
+    /// Player `from`'s choices for a multi battle step (only their own place's count).
+    #[allow(clippy::too_many_arguments)]
+    fn multi_choice(
+        &mut self,
+        i: usize,
+        from: u8,
+        step: u16,
+        check: u32,
+        picks: &[BattlePick],
+        now: Instant,
+        out: &mut Vec<Out>,
+    ) {
+        let m = &mut self.multis[i];
+        let Some(place) = m.place_of(from) else {
+            return;
+        };
+        if m.over.contains(&true) && !m.over[place] {
+            // Another game finished the battle and this one plays on: they went apart.
+            out.push(end(from, m.id, END_DESYNC, NO_WINNER));
+            m.players[place] = None;
+            self.multi_try_step(i, now, out);
+            return;
+        }
+        if step != m.step || m.choices[place].is_some() || m.over[place] {
+            return;
+        }
+        let own: Vec<BattlePick> = picks
+            .iter()
+            .filter(|p| usize::from(p.pos) == place % 2)
+            .copied()
+            .collect();
+        m.choices[place] = Some((check, own));
+        m.first.get_or_insert(now);
+        self.multi_try_step(i, now, out);
+    }
+
+    /// Sends multi battle `i`'s step once every player still in it chose (or ends it when they
+    /// went apart, or when nobody plays it any more).
+    fn multi_try_step(&mut self, i: usize, now: Instant, out: &mut Vec<Out>) {
+        let playing = self.multis[i].playing();
+        if playing.is_empty() {
+            self.multis.remove(i);
+            return;
+        }
+        let m = &self.multis[i];
+        if playing.iter().any(|&(p, _)| m.choices[p].is_none()) {
+            return;
+        }
+        let checks: Vec<u32> = playing
+            .iter()
+            .filter_map(|&(p, _)| Some(m.choices[p].as_ref()?.0))
+            .collect();
+        if checks.iter().any(|&c| c != checks[0]) {
+            crate::log!(
+                "battles: multi battle {} went apart at step {}",
+                m.id,
+                m.step
+            );
+            for &(_, player) in &playing {
+                out.push(end(player, m.id, END_DESYNC, NO_WINNER));
+            }
+            self.multis.remove(i);
+            return;
+        }
+        let seed = self.seed();
+        let m = &mut self.multis[i];
+        let picks: Vec<(u8, BattlePick)> = playing
+            .iter()
+            .filter_map(|&(p, _)| Some((p, m.choices[p].as_ref()?)))
+            .flat_map(|(p, (_, picks))| picks.iter().map(move |&pick| ((p / 2) as u8, pick)))
+            .collect();
+        for &(_, player) in &playing {
+            out.push(Out {
+                to: To::One(player),
+                from: SERVER,
+                body: Body::BattleStep {
+                    battle: m.id,
+                    step: m.step,
+                    seed,
+                    picks: picks.clone(),
+                },
+            });
+        }
+        m.step = m.step.wrapping_add(1);
+        m.choices = Default::default();
+        m.opened = now;
+        m.first = None;
+    }
+
+    /// Player `from` is done with multi battle `i` (`LEAVE_*`).
+    fn multi_leave(&mut self, i: usize, from: u8, reason: u8, now: Instant, out: &mut Vec<Out>) {
+        let m = &mut self.multis[i];
+        let Some(place) = m.place_of(from) else {
+            return;
+        };
+        if reason == LEAVE_OVER {
+            // At its end each game knows the result. A game that already chose for another
+            // step plays on: they went apart.
+            m.over[place] = true;
+            for (p, player) in m.playing() {
+                if m.choices[p].is_some() {
+                    out.push(end(player, m.id, END_DESYNC, NO_WINNER));
+                    m.players[p] = None;
+                }
+            }
+            if m.playing().is_empty() {
+                self.multis.remove(i);
+            }
+            return;
+        }
+        if m.over.contains(&true) {
+            // The battle reached its end: nothing to take over.
+            m.players[place] = None;
+            if m.playing().is_empty() {
+                self.multis.remove(i);
+            }
+            return;
+        }
+        let why = if reason == LEAVE_GAVE_UP {
+            END_FORFEIT
+        } else {
+            END_DISCONNECT
+        };
+        self.take_over(i, &[place], why, now, out);
+    }
+
+    /// The computer plays multi battle `i`'s `places` from now on (their players went, `why`):
+    /// the others hear of it, and the step goes on without them.
+    fn take_over(&mut self, i: usize, places: &[usize], why: u8, now: Instant, out: &mut Vec<Out>) {
+        let m = &mut self.multis[i];
+        for &place in places {
+            m.players[place] = None;
+            m.choices[place] = None;
+        }
+        for &place in places {
+            for (_, player) in m.playing() {
+                out.push(Out {
+                    to: To::One(player),
+                    from: SERVER,
+                    body: Body::MultiTakeover {
+                        battle: m.id,
+                        place: place as u8,
+                        reason: why,
+                    },
+                });
+            }
+        }
+        self.multi_try_step(i, now, out);
     }
 
     /// Player `id` left the lobby: their challenges and battle end (sent on the next `tick`).
@@ -377,6 +876,24 @@ impl Battles {
             false
         });
         self.recent.retain(|&(a, b, _)| a != id && b != id);
+        let mut out = Vec::new();
+        self.leave_setups(id, END_DISCONNECT, &mut out);
+        let now = Instant::now();
+        for i in (0..self.multis.len()).rev() {
+            let m = &mut self.multis[i];
+            let Some(place) = m.place_of(id) else {
+                continue;
+            };
+            if m.over.contains(&true) {
+                m.players[place] = None;
+                if m.playing().is_empty() {
+                    self.multis.remove(i);
+                }
+            } else {
+                self.take_over(i, &[place], END_DISCONNECT, now, &mut out);
+            }
+        }
+        self.queued.append(&mut out);
     }
 
     /// Offers and steps that waited too long.
@@ -413,6 +930,55 @@ impl Battles {
         });
         self.recent
             .retain(|&(_, _, at)| now.duration_since(at) < CHALLENGE_GAP);
+        self.setups.retain_mut(|s| {
+            if now.duration_since(s.since) >= SETUP_LIMIT {
+                for seat in &s.seats {
+                    if let Seat::Player { id, .. } = seat {
+                        out.push(end(*id, 0, END_TIMEOUT, NO_WINNER));
+                    }
+                }
+                return false;
+            }
+            for place in 1..4 {
+                if let Seat::Player {
+                    id,
+                    team: None,
+                    since,
+                } = s.seats[place]
+                    && now.duration_since(since) >= OFFER_LIMIT
+                {
+                    out.push(end(id, 0, END_TIMEOUT, NO_WINNER));
+                    out.push(status(s.starter, place, SEAT_TIMEOUT));
+                    s.seats[place] = Seat::Open;
+                }
+            }
+            true
+        });
+        for i in (0..self.multis.len()).rev() {
+            let m = &self.multis[i];
+            match m.first {
+                Some(at) if now.duration_since(at) >= STEP_LIMIT => {
+                    // The ones still to choose are out; the computer plays their places.
+                    let slow: Vec<(usize, u8)> = m
+                        .playing()
+                        .into_iter()
+                        .filter(|&(p, _)| m.choices[p].is_none())
+                        .collect();
+                    for &(_, player) in &slow {
+                        out.push(end(player, m.id, END_REPLACED, NO_WINNER));
+                    }
+                    let places: Vec<usize> = slow.iter().map(|s| s.0).collect();
+                    self.take_over(i, &places, END_REPLACED, now, out);
+                }
+                None if now.duration_since(m.opened) >= IDLE_LIMIT => {
+                    for (_, player) in m.playing() {
+                        out.push(end(player, m.id, END_TIMEOUT, NO_WINNER));
+                    }
+                    self.multis.remove(i);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -809,5 +1375,473 @@ mod tests {
         assert!(b.observe(2, &fake, now, &mut out));
         assert!(out.is_empty());
         assert!(!b.observe(2, &Body::Chat { text: "hi".into() }, now, &mut out));
+    }
+    // ---- multi battles ----
+
+    fn mteam(n: usize) -> Vec<BattleMember> {
+        vec![team()[0].clone(); n]
+    }
+
+    fn send(b: &mut Battles, from: u8, body: Body, now: Instant) -> Vec<Out> {
+        let mut out = Vec::new();
+        assert!(b.observe(from, &body, now, &mut out));
+        out
+    }
+
+    fn statuses(out: &[Out]) -> Vec<(u8, u8, u8)> {
+        out.iter()
+            .filter_map(|o| match (o.to, &o.body) {
+                (To::One(to), Body::MultiStatus { place, status }) => Some((to, *place, *status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn takeovers(out: &[Out]) -> Vec<(u8, u8, u8)> {
+        out.iter()
+            .filter_map(|o| match (o.to, &o.body) {
+                (To::One(to), Body::MultiTakeover { place, reason, .. }) => {
+                    Some((to, *place, *reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The steps sent: to whom, with which picks (side, pos).
+    fn steps(out: &[Out]) -> Vec<(u8, Vec<(u8, u8)>)> {
+        out.iter()
+            .filter_map(|o| match (o.to, &o.body) {
+                (To::One(to), Body::BattleStep { picks, .. }) => {
+                    Some((to, picks.iter().map(|(s, p)| (*s, p.pos)).collect()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn invite(seats: [MultiSeat; 3]) -> Body {
+        Body::MultiInvite {
+            seats,
+            save_partners: false,
+            actual_levels: true,
+            dex: 9,
+            team: mteam(2),
+        }
+    }
+
+    fn accept(to: u8, dex: u32, n: usize) -> Body {
+        Body::BattleAnswer {
+            to,
+            answer: ANSWER_ACCEPT,
+            dex,
+            team: mteam(n),
+        }
+    }
+
+    /// Players 1 to 4 in the lobby; 1 invites 2 (its ally) and 3 (foe 1), the computer foe 2.
+    fn invited(b: &mut Battles, now: Instant) -> Vec<Out> {
+        for id in 1..=4 {
+            b.joined(id);
+        }
+        let seats = [
+            MultiSeat::Player(2),
+            MultiSeat::Player(3),
+            MultiSeat::Computer(mteam(3)),
+        ];
+        send(b, 1, invite(seats), now)
+    }
+
+    /// ... and both accept: the battle's id.
+    fn multi_started(b: &mut Battles, now: Instant) -> u16 {
+        invited(b, now);
+        send(b, 2, accept(1, 9, 3), now);
+        let out = send(b, 3, accept(1, 9, 1), now);
+        let ids: Vec<u16> = out
+            .iter()
+            .filter_map(|o| match &o.body {
+                Body::MultiStart { battle, .. } => Some(*battle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        ids[0]
+    }
+
+    fn mpick(pos: u8) -> BattlePick {
+        BattlePick { pos, ..pick() }
+    }
+
+    fn mchoose(
+        b: &mut Battles,
+        from: u8,
+        id: u16,
+        step: u16,
+        check: u32,
+        now: Instant,
+    ) -> Vec<Out> {
+        let pos = u8::from(from == 2);
+        let body = Body::BattleChoice {
+            battle: id,
+            step,
+            check,
+            picks: vec![mpick(pos)],
+        };
+        send(b, from, body, now)
+    }
+
+    #[test]
+    fn a_multi_battle_starts_once_every_invited_player_accepts() {
+        let now = Instant::now();
+        let mut b = Battles::default();
+        let out = invited(&mut b, now);
+        let offers: Vec<(To, Body)> = out.into_iter().map(|o| (o.to, o.body)).collect();
+        let offer = |place: u8| Body::MultiOffer {
+            from: 1,
+            place,
+            save_partners: false,
+            actual_levels: true,
+            players: [1, 2, 3, COMPUTER],
+        };
+        assert_eq!(offers, [(To::One(2), offer(1)), (To::One(3), offer(2))]);
+        assert!(b.busy(1) && b.busy(2) && b.busy(3) && !b.busy(4));
+        // Nobody can challenge them meanwhile.
+        let challenge = Body::BattleChallenge {
+            to: 2,
+            format: 0,
+            save_partners: true,
+            actual_levels: true,
+            dex: 9,
+            team: team(),
+        };
+        assert_eq!(
+            ends(&send(&mut b, 4, challenge, now)),
+            [(4, 0, END_BUSY, NO_WINNER)]
+        );
+        let out = send(&mut b, 2, accept(1, 9, 3), now);
+        assert_eq!(statuses(&out), [(1, 1, SEAT_ACCEPTED)]);
+        let decline = Body::BattleAnswer {
+            to: 1,
+            answer: ANSWER_DECLINE,
+            dex: 0,
+            team: Vec::new(),
+        };
+        let out = send(&mut b, 3, decline, now);
+        assert_eq!(statuses(&out), [(1, 2, SEAT_DECLINED)]);
+        assert!(!b.busy(3));
+        // Only the starter fills a place, and only one nobody has.
+        let fill = |place: u8| Body::MultiFill {
+            place,
+            team: mteam(2),
+        };
+        assert!(send(&mut b, 2, fill(2), now).is_empty());
+        assert!(send(&mut b, 1, fill(1), now).is_empty());
+        let out = send(&mut b, 1, fill(2), now);
+        // To whom, the battle, its seed, their place, the players and the team sizes.
+        type Started = (To, u16, u64, u8, [u8; 4], [usize; 4]);
+        let starts: Vec<Started> = out
+            .iter()
+            .filter_map(|o| match &o.body {
+                Body::MultiStart {
+                    battle,
+                    seed,
+                    place,
+                    actual_levels: true,
+                    seats,
+                } => Some((
+                    o.to,
+                    *battle,
+                    *seed,
+                    *place,
+                    seats.each_ref().map(|s| s.0),
+                    seats.each_ref().map(|s| s.1.len()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!((starts[0].0, starts[0].3), (To::One(1), 0));
+        assert_eq!((starts[1].0, starts[1].3), (To::One(2), 1));
+        assert_eq!(starts[0].4, [1, 2, COMPUTER, COMPUTER]);
+        assert_eq!(starts[0].5, [2, 3, 2, 3]);
+        // One battle and seed for everyone.
+        assert_eq!((starts[0].1, starts[0].2), (starts[1].1, starts[1].2));
+        assert!(b.busy(1) && b.busy(2) && b.setups.is_empty());
+    }
+
+    #[test]
+    fn multi_invites_that_cant_be_taken() {
+        let now = Instant::now();
+        let mut b = Battles::default();
+        for id in 1..=3 {
+            b.joined(id);
+        }
+        let computer = || MultiSeat::Computer(mteam(1));
+        // Twice the same player, or themselves.
+        for seats in [
+            [MultiSeat::Player(2), MultiSeat::Player(2), computer()],
+            [MultiSeat::Player(1), computer(), computer()],
+        ] {
+            let out = send(&mut b, 1, invite(seats), now);
+            assert_eq!(ends(&out), [(1, 0, END_BUSY, NO_WINNER)]);
+        }
+        // Someone not in the lobby: their place is open at once.
+        let out = send(
+            &mut b,
+            1,
+            invite([computer(), MultiSeat::Player(6), MultiSeat::Player(2)]),
+            now,
+        );
+        assert_eq!(statuses(&out), [(1, 2, SEAT_BUSY)]);
+        // Busy already.
+        let out = send(&mut b, 1, invite([computer(), computer(), computer()]), now);
+        assert_eq!(ends(&out), [(1, 0, END_BUSY, NO_WINNER)]);
+        // Another ROM, or too big a team.
+        let out = send(&mut b, 2, accept(1, 8, 1), now);
+        assert_eq!(ends(&out), [(2, 0, END_ROM_DIFFERS, NO_WINNER)]);
+        assert_eq!(statuses(&out), [(1, 3, SEAT_ROM_DIFFERS)]);
+        // An answer to an invite that isn't theirs.
+        assert!(send(&mut b, 3, accept(1, 9, 1), now).is_empty());
+        let mut b = Battles::default();
+        invited(&mut b, now);
+        let out = send(&mut b, 2, accept(1, 9, MAX_MULTI_TEAM + 1), now);
+        assert_eq!(ends(&out), [(2, 0, END_BUSY, NO_WINNER)]);
+        assert_eq!(statuses(&out), [(1, 1, SEAT_BUSY)]);
+        // An all-computer battle starts at once.
+        let mut b = Battles::default();
+        b.joined(1);
+        let out = send(&mut b, 1, invite([computer(), computer(), computer()]), now);
+        assert!(matches!(
+            &out[..],
+            [Out {
+                to: To::One(1),
+                body: Body::MultiStart { place: 0, .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn multi_invites_run_out_or_are_called_off() {
+        let now = Instant::now();
+        // Unanswered.
+        let mut b = Battles::default();
+        invited(&mut b, now);
+        send(&mut b, 2, accept(1, 9, 1), now);
+        let mut out = Vec::new();
+        b.tick(now + OFFER_LIMIT, &mut out);
+        assert_eq!(ends(&out), [(3, 0, END_TIMEOUT, NO_WINNER)]);
+        assert_eq!(statuses(&out), [(1, 2, SEAT_TIMEOUT)]);
+        // The whole setup.
+        let mut out = Vec::new();
+        b.tick(now + SETUP_LIMIT, &mut out);
+        assert_eq!(
+            ends(&out),
+            [
+                (1, 0, END_TIMEOUT, NO_WINNER),
+                (2, 0, END_TIMEOUT, NO_WINNER)
+            ]
+        );
+        assert!(!b.busy(1) && !b.busy(2));
+        // Called off by the starter: the ones invited hear of it.
+        let mut b = Battles::default();
+        invited(&mut b, now);
+        send(&mut b, 2, accept(1, 9, 1), now);
+        let leave = Body::BattleLeave {
+            battle: 0,
+            reason: LEAVE_LEFT,
+        };
+        let out = send(&mut b, 1, leave.clone(), now);
+        assert_eq!(
+            ends(&out),
+            [
+                (2, 0, END_WITHDRAWN, NO_WINNER),
+                (3, 0, END_WITHDRAWN, NO_WINNER)
+            ]
+        );
+        assert!(!b.busy(2) && !b.busy(3));
+        // A player who accepted and then left: their place opens for the starter.
+        let mut b = Battles::default();
+        invited(&mut b, now);
+        send(&mut b, 2, accept(1, 9, 1), now);
+        let out = send(&mut b, 2, leave, now);
+        assert_eq!(statuses(&out), [(1, 1, SEAT_LEFT)]);
+        assert!(!b.busy(2) && b.busy(3));
+        // The starter leaves the lobby.
+        b.left(1);
+        let mut out = Vec::new();
+        b.tick(now, &mut out);
+        assert_eq!(ends(&out), [(3, 0, END_DISCONNECT, NO_WINNER)]);
+        assert!(b.setups.is_empty());
+    }
+
+    #[test]
+    fn a_multi_step_waits_for_every_player_in_it() {
+        let now = Instant::now();
+        let mut b = Battles::default();
+        let id = multi_started(&mut b, now);
+        assert!(mchoose(&mut b, 1, id, 1, 5, now).is_empty());
+        // Player 2's pick for player 1's place doesn't count.
+        let body = Body::BattleChoice {
+            battle: id,
+            step: 1,
+            check: 5,
+            picks: vec![mpick(0), mpick(1)],
+        };
+        assert!(send(&mut b, 2, body, now).is_empty());
+        let out = mchoose(&mut b, 3, id, 1, 5, now);
+        let picks = vec![(0, 0), (0, 1), (1, 0)];
+        assert_eq!(
+            steps(&out),
+            [(1, picks.clone()), (2, picks.clone()), (3, picks)]
+        );
+        // Different checksums: it ends for everyone.
+        mchoose(&mut b, 1, id, 2, 6, now);
+        mchoose(&mut b, 2, id, 2, 6, now);
+        let out = mchoose(&mut b, 3, id, 2, 7, now);
+        assert_eq!(
+            ends(&out),
+            [
+                (1, id, END_DESYNC, NO_WINNER),
+                (2, id, END_DESYNC, NO_WINNER),
+                (3, id, END_DESYNC, NO_WINNER)
+            ]
+        );
+        assert!(b.multis.is_empty() && !b.busy(1));
+    }
+
+    #[test]
+    fn the_computer_takes_over_a_player_who_goes() {
+        let now = Instant::now();
+        let mut b = Battles::default();
+        let id = multi_started(&mut b, now);
+        // Player 2 gives up after player 1 chose.
+        mchoose(&mut b, 1, id, 1, 5, now);
+        let give_up = Body::BattleLeave {
+            battle: id,
+            reason: LEAVE_GAVE_UP,
+        };
+        let out = send(&mut b, 2, give_up, now);
+        assert_eq!(takeovers(&out), [(1, 1, END_FORFEIT), (3, 1, END_FORFEIT)]);
+        assert!(!b.busy(2));
+        // The step goes out without them.
+        let out = mchoose(&mut b, 3, id, 1, 5, now);
+        assert_eq!(
+            steps(&out),
+            [(1, vec![(0, 0), (1, 0)]), (3, vec![(0, 0), (1, 0)])]
+        );
+        // Player 3 takes too long.
+        mchoose(&mut b, 1, id, 2, 5, now);
+        let mut out = Vec::new();
+        b.tick(now + STEP_LIMIT / 2, &mut out);
+        assert!(out.is_empty());
+        b.tick(Instant::now() + STEP_LIMIT, &mut out);
+        assert_eq!(ends(&out), [(3, id, END_REPLACED, NO_WINNER)]);
+        assert_eq!(takeovers(&out), [(1, 2, END_REPLACED)]);
+        assert_eq!(steps(&out), [(1, vec![(0, 0)])]);
+        // Choices from players no longer in it are turned away.
+        let out = mchoose(&mut b, 3, id, 3, 5, now);
+        assert_eq!(ends(&out), [(3, id, END_DESYNC, NO_WINNER)]);
+        // The last player leaves the lobby: the battle is gone.
+        b.left(1);
+        let mut out = Vec::new();
+        b.tick(now, &mut out);
+        assert!(out.is_empty());
+        assert!(b.multis.is_empty());
+    }
+
+    #[test]
+    fn a_player_leaving_the_lobby_is_taken_over_and_the_end_comes_from_the_games() {
+        let now = Instant::now();
+        let mut b = Battles::default();
+        let id = multi_started(&mut b, now);
+        mchoose(&mut b, 1, id, 1, 5, now);
+        mchoose(&mut b, 2, id, 1, 5, now);
+        b.left(3);
+        let mut out = Vec::new();
+        b.tick(now, &mut out);
+        assert_eq!(
+            takeovers(&out),
+            [(1, 2, END_DISCONNECT), (2, 2, END_DISCONNECT)]
+        );
+        assert_eq!(steps(&out).len(), 2);
+        // One game reaches the end while the other already chose again: they went apart.
+        mchoose(&mut b, 2, id, 2, 5, now);
+        let over = Body::BattleLeave {
+            battle: id,
+            reason: LEAVE_OVER,
+        };
+        let out = send(&mut b, 1, over.clone(), now);
+        assert_eq!(ends(&out), [(2, id, END_DESYNC, NO_WINNER)]);
+        assert!(b.multis.is_empty());
+        // Both reach it: it goes quietly.
+        let mut b = Battles::default();
+        let id = multi_started(&mut b, now);
+        let over = Body::BattleLeave {
+            battle: id,
+            reason: LEAVE_OVER,
+        };
+        for p in [1, 2] {
+            assert!(send(&mut b, p, over.clone(), now).is_empty());
+        }
+        assert!(!b.busy(1) && b.busy(3));
+        assert!(send(&mut b, 3, over, now).is_empty());
+        assert!(b.multis.is_empty());
+    }
+
+    #[test]
+    fn hostile_multi_messages_change_nothing() {
+        let now = Instant::now();
+        let mut b = Battles::default();
+        let id = multi_started(&mut b, now);
+        // Players' copies of the host's messages.
+        for body in [
+            Body::MultiOffer {
+                from: 2,
+                place: 1,
+                save_partners: true,
+                actual_levels: true,
+                players: [COMPUTER; 4],
+            },
+            Body::MultiStatus {
+                place: 1,
+                status: SEAT_ACCEPTED,
+            },
+            Body::MultiStart {
+                battle: id,
+                seed: 1,
+                place: 0,
+                actual_levels: true,
+                seats: std::array::from_fn(|_| (COMPUTER, mteam(1))),
+            },
+            Body::MultiTakeover {
+                battle: id,
+                place: 1,
+                reason: END_FORFEIT,
+            },
+            Body::MultiFill {
+                place: 2,
+                team: mteam(1),
+            },
+            accept(1, 9, 1),
+        ] {
+            for from in [1, 2, 4] {
+                assert!(send(&mut b, from, body.clone(), now).is_empty(), "{body:?}");
+            }
+        }
+        // Someone not in it choosing, or leaving.
+        let out = mchoose(&mut b, 4, id, 1, 5, now);
+        assert_eq!(ends(&out), [(4, id, END_DESYNC, NO_WINNER)]);
+        let leave = Body::BattleLeave {
+            battle: id,
+            reason: LEAVE_GAVE_UP,
+        };
+        assert!(send(&mut b, 4, leave, now).is_empty());
+        // A step for later, or twice.
+        assert!(mchoose(&mut b, 1, id, 2, 5, now).is_empty());
+        assert!(mchoose(&mut b, 1, id, 1, 5, now).is_empty());
+        assert!(mchoose(&mut b, 1, id, 1, 5, now).is_empty());
+        mchoose(&mut b, 2, id, 1, 5, now);
+        assert_eq!(steps(&mchoose(&mut b, 3, id, 1, 5, now)).len(), 3);
     }
 }

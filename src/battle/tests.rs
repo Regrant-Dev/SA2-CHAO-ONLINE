@@ -1353,3 +1353,120 @@ fn ai_spares_its_ally_from_everyone_hitting_moves() {
         );
     }
 }
+
+/// A multi battle: side 0's first place has 2 Chao and its second 3, side 1's first place 1
+/// and its second 2.
+fn multi(seed: u64) -> Battle {
+    let m = [mv(1, NORMAL, 40)];
+    let team = |side: usize, sizes: [usize; 2]| -> Vec<Fighter> {
+        (0..2)
+            .flat_map(|place| {
+                (0..sizes[place]).map(move |i| {
+                    let name = format!("s{side}p{place}m{i}");
+                    fighter(&name, [NORMAL; 2], 100 + i as u16, &m)
+                })
+            })
+            .collect()
+    };
+    let mut b = Battle::new(
+        Format::Doubles,
+        [team(0, [2, 3]), team(1, [1, 2])],
+        chart(),
+        rules(),
+        seed,
+    )
+    .unwrap();
+    b.set_split(0, 2);
+    b.set_split(1, 1);
+    b
+}
+
+#[test]
+fn a_multi_battle_keeps_each_places_team_its_own() {
+    let mut b = multi(3);
+    b.start();
+    // Each place's first Chao leads.
+    assert_eq!(
+        [P, P2, O, O2].map(|s| b.member(s)),
+        [Some(0), Some(2), Some(0), Some(1)]
+    );
+    assert_eq!(
+        (b.owner(0, 1), b.owner(0, 2), b.owner(1, 0)),
+        (Some(0), Some(1), Some(0))
+    );
+    // Only a place's own come in.
+    assert_eq!(b.bench_for(P), [1]);
+    assert_eq!(b.bench_for(P2), [3, 4]);
+    assert!(b.bench_for(O).is_empty());
+    assert_eq!(b.bench_for(O2), [2]);
+    let switches: Vec<Action> = b
+        .legal_actions(P)
+        .into_iter()
+        .filter(|a| matches!(a, Action::Switch { .. }))
+        .collect();
+    assert_eq!(switches, [Action::Switch { member: 1 }]);
+    let others = [use_move(P2, 0), use_move(O, 0), use_move(O2, 0)];
+    let mut choices = vec![switch(P, 3)];
+    choices.extend(others);
+    assert_eq!(b.play_turn(&choices), Err(BattleError::Invalid(P)));
+    // P2's lead and O's only Chao go down: O's place stays empty, P2 sends in its own.
+    b.member_mut(0, 2).hp = 1;
+    b.member_mut(1, 0).hp = 1;
+    b.play_turn(&[
+        aimed(P, 0, O),
+        aimed(P2, 0, O2),
+        aimed(O, 0, P2),
+        aimed(O2, 0, P2),
+    ])
+    .unwrap();
+    assert_eq!(b.phase(), Phase::Replacements);
+    assert_eq!(b.pending_replacements(), [P2]);
+    assert_eq!(b.member(O), None);
+    assert_eq!(b.replace(&[(P2, 1)]), Err(BattleError::Invalid(P2)));
+    b.replace(&[(P2, 3)]).unwrap();
+    assert_eq!(b.member(P2), Some(3));
+    // The battle goes on with one foe, each place sending in only its own, to the end.
+    let mut rng = Rng::new(5);
+    let mut came_in = Vec::new();
+    for _ in 0..500 {
+        let ev = match b.phase() {
+            Phase::Actions => {
+                let mut c = ai::choose(&b, 0, &mut rng);
+                c.extend(ai::choose(&b, 1, &mut rng));
+                assert!(c.iter().all(|c| c.at != O), "{c:?}");
+                b.play_turn(&c).unwrap()
+            }
+            Phase::Replacements => {
+                let mut r = ai::replacements(&b, 0);
+                r.extend(ai::replacements(&b, 1));
+                b.replace(&r).unwrap()
+            }
+            Phase::Over(_) => break,
+        };
+        came_in.extend(ev.into_iter().filter_map(|e| match e {
+            Event::SwitchedIn { at, member } => Some((at, member)),
+            _ => None,
+        }));
+    }
+    assert_eq!(b.phase(), Phase::Over(Outcome::Won(0)));
+    for (at, member) in came_in {
+        assert_eq!(b.owner(at.side, member), Some(at.pos), "{at:?} {member}");
+    }
+}
+
+#[test]
+fn only_doubles_teams_with_two_places_split() {
+    let a = || vec![fighter("a", [NORMAL; 2], 100, &[mv(1, NORMAL, 40)]); 2];
+    let mut b = Battle::new(Format::Singles, [a(), a()], chart(), rules(), 1).unwrap();
+    b.set_split(0, 1);
+    assert_eq!(b.split(0), None);
+    let mut b = Battle::new(Format::Doubles, [a(), a()], chart(), rules(), 1).unwrap();
+    b.set_split(0, 0);
+    b.set_split(1, 2);
+    assert_eq!((b.split(0), b.split(1)), (None, None));
+    b.start();
+    b.set_split(0, 1);
+    assert_eq!(b.split(0), None);
+    // Without a split the whole side's bench is a slot's.
+    assert_eq!(b.bench_for(P), b.bench(0));
+}

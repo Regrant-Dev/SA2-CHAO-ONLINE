@@ -55,7 +55,7 @@ retrying: `while true; do target/.../fakepeer client 127.0.0.1:43902 fakepeer; s
 | `FAKEPEER_RACE_PICK=cat,course,level` | Pick this Chao Race every 30 s (reaches you in its party) |
 | `FAKEPEER_KARATE=1` | 5 s after you reach the karate area (in its party), start a live karate fight against you and replay the recorded fight, or a pretend one (once per run) |
 | `FAKEPEER_KARATE_FILE=<file>` | Where a live fight you lead against fakepeer is recorded (default `target/karate-fight.rec`) |
-| `FAKEPEER_BATTLE=accept` | Accept your live Chao battle challenges with its `FAKEPEER_CHAO` Chao (Normal, basic moves), choosing with the battle AI. `singles` or `doubles`: also challenge you 5 s after you reach the karate area (again a minute after each battle) |
+| `FAKEPEER_BATTLE=accept` | Accept your live Chao battle challenges and multi battle invites with its `FAKEPEER_CHAO` Chao (Normal, basic moves; up to 3 for a multi battle), choosing with the battle AI for its own Chao. `singles` or `doubles`: also challenge you 5 s after you reach the karate area (again a minute after each battle). `multi`: invite you to a multi battle as its ally against two computer places (copies of its Chao) at those times; `multi-foe`: as foe 1, the other two places the computer's. A place nobody takes it gives to the computer |
 | `FAKEPEER_ROM=<file>` | The GBA ROM for live battles and shared wild visitors (the same as your game's; default `~/Games/gba/emerald.gba`) |
 | `FAKEPEER_WILD=<mode>[,<mode>]` | Share the garden's wild visitors with you (its ROM's visitor print, seeing, picking, with the machine). `pick`: answer the host's asks from its ROM (it picks while it was in the garden first). `take`: every 30 s pick up the visitor nearest it, hold it 10 s, put it down; with `carry` it goes to the lobby holding it instead and comes back 10 s later; with `absorb` it hands it to your nearest Chao. `whistle`: whistle 2 s every 20 s. `battle-won` / `battle-lost`: every 40 s reserve the nearest visitor, go to the karate area and send that result 25 s later (longer than a run with one player in it lasts), then come back. `hostile`: every 5 s send visitor messages with unknown ids, picks without an ask and values out of range |
 | `FAKEPEER_WILD_LEAVE=<secs>` | With `FAKEPEER_WILD`: go to the lobby for good after that many seconds (your game takes over picking) |
@@ -90,6 +90,30 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
   between your choices; its log shows each step and the result. `FAKEPEER_BATTLE=doubles`: the
   challenge pops up on the karate menu; accept it and you play side 1 (your Chao still on the
   left).
+- **Multi battle, one fakepeer:** `FAKEPEER_CHAO=... FAKEPEER_BATTLE=accept`: battle menu >
+  Multi battle, up to 3 Chao, Ally = "fakepeer (live)", the foes the computer, Send the invites;
+  its log shows `accepting player N's multi battle invite to place 1` and `multi battle ...
+  starts at place 1`. Only your Chao get menus; "Waiting for fakepeer..." between your choices;
+  every Chao has a box. Put fakepeer at Foe 1 instead: your side is on the left, it's against
+  you. `FAKEPEER_BATTLE=multi` (or `multi-foe`): its invite pops up on the karate menu ("fakepeer
+  invites you to a multi battle!", your place and the rules); accept with up to 3 Chao.
+- **Multi battle, several fakepeers:** one hosts and the others join it, each with its own name
+  and `FAKEPEER_BATTLE=accept`:
+
+  ```sh
+  FAKEPEER_CHAO=a.sa2chao FAKEPEER_BATTLE=accept target/.../fakepeer host 43902 fp1
+  FAKEPEER_CHAO=b.sa2chao FAKEPEER_BATTLE=accept target/.../fakepeer client 127.0.0.1:43902 fp2
+  FAKEPEER_CHAO=c.sa2chao FAKEPEER_BATTLE=accept target/.../fakepeer client 127.0.0.1:43902 fp3
+  ```
+
+  Join the game to it; set up you and fp1 against fp2 and fp3 (four players), or you against fp1
+  and the computer with fp2 as your ally, and so on. Stop one fakepeer mid-battle: the others
+  show "fp2 left the battle; the computer plays their place." and the battle plays on to its
+  end with the same result in every log. Stop one after it accepted but before the others did:
+  its place shows "left", and A on it gives it to the computer; with `multi`, fakepeer does that
+  itself when you decline.
+- **Multi battle, computer only:** Multi battle with the computer in all three other places:
+  Start plays it in your game alone (no XP).
 - **Chat:** T, type, Enter; fakepeer answers "heard: ...".
 - **Shared wild visitors:** `FAKEPEER_WILD=pick` with SharedVisitors on and the same ROM: in
   a garden the server runs, the visitors fakepeer picks show as copies (its log: `wild: picked

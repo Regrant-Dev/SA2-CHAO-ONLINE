@@ -38,7 +38,7 @@ pub fn choose(battle: &Battle, side: usize, rng: &mut Rng) -> Vec<Choice> {
             })
             .collect();
         let action = if best == 0 && battle.can_switch(at) && rng.percent(SWITCH_CHANCE) {
-            better_member(battle, side, &taken)
+            better_member(battle, at, &taken)
                 .map(|member| Action::Switch { member })
                 .unwrap_or(action)
         } else {
@@ -61,7 +61,7 @@ pub fn replacements(battle: &Battle, side: usize) -> Vec<(Slot, usize)> {
             continue;
         }
         if let Some(m) =
-            better_member(battle, side, &taken).or_else(|| first_free(battle, side, &taken))
+            better_member(battle, slot, &taken).or_else(|| first_free(battle, slot, &taken))
         {
             taken.push(m);
             out.push((slot, m));
@@ -70,13 +70,17 @@ pub fn replacements(battle: &Battle, side: usize) -> Vec<(Slot, usize)> {
     out
 }
 
-fn first_free(battle: &Battle, side: usize, taken: &[usize]) -> Option<usize> {
-    battle.bench(side).into_iter().find(|m| !taken.contains(m))
+fn first_free(battle: &Battle, at: Slot, taken: &[usize]) -> Option<usize> {
+    battle
+        .bench_for(at)
+        .into_iter()
+        .find(|m| !taken.contains(m))
 }
 
-/// The bench member with the best type matchup against the foes on the field, if any can hurt
-/// them at all.
-fn better_member(battle: &Battle, side: usize, taken: &[usize]) -> Option<usize> {
+/// The member that can come in at `at` with the best type matchup against the foes on the
+/// field, if any can hurt them at all.
+fn better_member(battle: &Battle, at: Slot, taken: &[usize]) -> Option<usize> {
+    let side = at.side;
     let foes: Vec<&Fighter> = battle
         .slots()
         .into_iter()
@@ -84,7 +88,7 @@ fn better_member(battle: &Battle, side: usize, taken: &[usize]) -> Option<usize>
         .filter_map(|s| battle.fighter(s))
         .collect();
     battle
-        .bench(side)
+        .bench_for(at)
         .into_iter()
         .filter(|m| !taken.contains(m))
         .map(|m| (m, matchup(battle, &battle.team(side)[m], &foes)))
@@ -171,7 +175,7 @@ fn best_move(battle: &Battle, at: Slot, rng: &mut Rng) -> (Action, u32) {
         // Fainting on purpose only pays with others left to carry on, and even then rarely.
         let score = match m.data.effect {
             effects::SELF_FAINT | effects::FAINT_LOWER_TARGET
-                if battle.bench(at.side).is_empty() =>
+                if battle.bench_for(at).is_empty() =>
             {
                 0
             }

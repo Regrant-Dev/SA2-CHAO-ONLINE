@@ -11,6 +11,11 @@
 //!   own level.
 //! - Choices go as `BattlePick`s; a step plays the same in both games (`apply_step`), a side
 //!   whose choices the battle refuses getting the computer's instead.
+//! - Multi battles (doubles, each of the four places a player's or the computer's): every game
+//!   builds both sides' teams from all four places' teams the host sends (`multi_battle`),
+//!   each side's first place's Chao first, and plays each step with `apply_multi_step`: a place
+//!   without choices in the step (the computer's, or one whose player went) gets the
+//!   computer's, from the step's seed.
 //! - The mailbox between the network thread (online.rs) and the battle menu (game.rs, on the
 //!   game thread): what came in and what goes out. The network thread holds the lobby's lock
 //!   while it calls in here, so nothing here waits on the battle.
@@ -22,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::chao::ChaoData;
 use crate::gba_link::Profile;
 use crate::net::protocol::{
-    BattleMember, BattlePick, Body, PICK_MOVE, PICK_NONE, PICK_OUT_OF_PP, PICK_REPLACE,
+    BattleMember, BattlePick, Body, COMPUTER, PICK_MOVE, PICK_NONE, PICK_OUT_OF_PP, PICK_REPLACE,
     PICK_SWITCH, SERVER,
 };
 
@@ -306,6 +311,113 @@ pub fn apply_step(battle: &mut Battle, seed: u64, picks: &[(u8, BattlePick)]) ->
     Vec::new()
 }
 
+/// A multi battle place (side * 2 + pos) as its slot.
+pub fn place_slot(place: usize) -> Slot {
+    Slot::new(place / 2 % 2, place % 2)
+}
+
+fn place_of(at: Slot) -> usize {
+    at.side.min(1) * 2 + at.pos.min(1)
+}
+
+/// Plays one step of a multi battle, as every game does: each place's picks are the ones for
+/// its slot in `picks` (side, pick). A place with none (the computer's, or one whose player
+/// went) gets the computer's choices, each place's from its own roll of `seed`, and so does a
+/// place whose choices the battle refuses.
+pub fn apply_multi_step(battle: &mut Battle, seed: u64, picks: &[(u8, BattlePick)]) -> Vec<Event> {
+    battle.reseed(seed);
+    let mine: [Vec<BattlePick>; 4] = std::array::from_fn(|place| {
+        let at = place_slot(place);
+        picks
+            .iter()
+            .filter(|(s, p)| usize::from(*s) == at.side && usize::from(p.pos) == at.pos)
+            .map(|p| p.1)
+            .collect()
+    });
+    let mut computer: [bool; 4] = std::array::from_fn(|place| mine[place].is_empty());
+    let ai_rng = |place: usize| Rng::new(seed ^ AI_SALT ^ (0x100 + place as u64));
+    for _ in 0..5 {
+        let result = match battle.phase() {
+            Phase::Actions => {
+                let mut choices = Vec::new();
+                for (place, picks) in mine.iter().enumerate() {
+                    let at = place_slot(place);
+                    if computer[place] {
+                        let ai = ai::choose(battle, at.side, &mut ai_rng(place));
+                        choices.extend(ai.into_iter().filter(|c| c.at == at));
+                    } else {
+                        let (c, passes) = turn_choices(at.side, picks);
+                        choices.extend(c);
+                        for (at, member) in passes {
+                            battle.pick_pass(at, member);
+                        }
+                    }
+                }
+                battle.play_turn(&choices)
+            }
+            Phase::Replacements => {
+                let mut all = Vec::new();
+                for (place, picks) in mine.iter().enumerate() {
+                    let at = place_slot(place);
+                    if computer[place] {
+                        let ai = ai::replacements(battle, at.side);
+                        all.extend(ai.into_iter().filter(|r| r.0 == at));
+                    } else {
+                        all.extend(replacements_of(at.side, picks));
+                    }
+                }
+                battle.replace(&all)
+            }
+            Phase::Over(_) => return Vec::new(),
+        };
+        match result {
+            Ok(events) => return events,
+            Err(BattleError::Invalid(at) | BattleError::Missing(at)) if !computer[place_of(at)] => {
+                crate::log!(
+                    "battle: place {}'s choices refused; the computer chooses",
+                    place_of(at)
+                );
+                computer[place_of(at)] = true;
+            }
+            Err(e) if computer != [true; 4] => {
+                crate::log!("battle: step refused ({e:?}); the computer chooses");
+                computer = [true; 4];
+            }
+            Err(e) => {
+                crate::log!("battle: step refused ({e:?})");
+                return Vec::new();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// The battle a multi battle's start begins, the same in every game (not started yet): each
+/// side's team is its first place's Chao, then its second's.
+pub fn multi_battle(dex: &Dex, start: &MultiStart) -> Option<Battle> {
+    let team = |side: usize| -> Vec<Fighter> {
+        start.seats[side * 2..side * 2 + 2]
+            .iter()
+            .flat_map(|s| &s.team)
+            .map(|m| fighter_of(m, dex, start.actual_levels))
+            .collect()
+    };
+    let mut battle = Battle::new(
+        Format::Doubles,
+        [team(0), team(1)],
+        dex.chart().clone(),
+        dex.rules(),
+        start.seed,
+    )
+    .ok()?;
+    battle.set_move_table(dex.table());
+    battle.set_sound_moves(dex.sound_moves().to_vec());
+    for (side, first) in start.splits().into_iter().enumerate() {
+        battle.set_split(side, first);
+    }
+    Some(battle)
+}
+
 /// A team of `chao` with no partners (Normal, the basic moves) at level 50, for a test player
 /// (`fakepeer`).
 pub fn plain_team(rom: &crate::gba::rom::Rom, chao: &[ChaoData]) -> Vec<BattleMember> {
@@ -323,12 +435,14 @@ pub fn plain_team(rom: &crate::gba::rom::Rom, chao: &[ChaoData]) -> Vec<BattleMe
         .collect()
 }
 
-/// One side of a live battle run by the computer, for a test player (`fakepeer`): the same
-/// battle as the other game's, with choices from the battle AI.
+/// One side of a live battle (or one place of a multi battle) run by the computer, for a test
+/// player (`fakepeer`): the same battle as the other games', with choices from the battle AI.
 pub struct Duel {
     battle: Battle,
     pub id: u16,
     pub side: usize,
+    /// A multi battle: the place (position) it plays.
+    pub pos: Option<usize>,
     step: u16,
     sent: bool,
     ai: Rng,
@@ -369,9 +483,26 @@ impl Duel {
             battle,
             id: start.battle,
             side: start.side,
+            pos: None,
             step: 1,
             sent: false,
             ai: Rng::new(start.seed ^ AI_SALT),
+        })
+    }
+
+    /// The place `start` gives us in a multi battle.
+    pub fn multi(dex: &Dex, start: &MultiStart) -> Option<Duel> {
+        let mut battle = multi_battle(dex, start)?;
+        battle.start();
+        let at = place_slot(start.place);
+        Some(Duel {
+            battle,
+            id: start.battle,
+            side: at.side,
+            pos: Some(at.pos),
+            step: 1,
+            sent: false,
+            ai: Rng::new(start.seed ^ AI_SALT ^ start.place as u64),
         })
     }
 
@@ -380,9 +511,18 @@ impl Duel {
         if self.sent {
             return None;
         }
+        let ours = |at: Slot| self.pos.is_none_or(|pos| pos == at.pos);
         let picks = match self.battle.phase() {
-            Phase::Actions => choice_picks(&ai::choose(&self.battle, self.side, &mut self.ai), &[]),
-            Phase::Replacements => replace_picks(&ai::replacements(&self.battle, self.side)),
+            Phase::Actions => {
+                let mut choices = ai::choose(&self.battle, self.side, &mut self.ai);
+                choices.retain(|c| ours(c.at));
+                choice_picks(&choices, &[])
+            }
+            Phase::Replacements => {
+                let mut picks = ai::replacements(&self.battle, self.side);
+                picks.retain(|p| ours(p.0));
+                replace_picks(&picks)
+            }
             Phase::Over(_) => return None,
         };
         self.sent = true;
@@ -401,7 +541,16 @@ impl Duel {
         }
         self.step = self.step.wrapping_add(1);
         self.sent = false;
-        apply_step(&mut self.battle, seed, picks)
+        if self.pos.is_some() {
+            apply_multi_step(&mut self.battle, seed, picks)
+        } else {
+            apply_step(&mut self.battle, seed, picks)
+        }
+    }
+
+    /// Its battle's checksum (the same in every game that played the same steps).
+    pub fn check(&self) -> u32 {
+        checksum(&self.battle)
     }
 
     pub fn over(&self) -> Option<Outcome> {
@@ -419,7 +568,7 @@ impl Duel {
 /// What came in from the host for the battle menu.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Incoming {
-    /// Player `from` (`name`) challenges us.
+    /// Player `from` (`name`) challenges us, or invites us to a multi battle (`multi`).
     Offer {
         from: u8,
         name: String,
@@ -427,8 +576,22 @@ pub enum Incoming {
         /// The challenge's rules (`Body::BattleChallenge`).
         save_partners: bool,
         actual_levels: bool,
+        multi: Option<Invite>,
     },
     Start(Start),
+    MultiStart(MultiStart),
+    /// What the player invited to place `place` of our multi battle did (`SEAT_*`).
+    Status {
+        place: usize,
+        status: u8,
+    },
+    /// The player at `place` of multi battle `battle` went (`why`, an `END_*`): the computer
+    /// plays it.
+    Takeover {
+        battle: u16,
+        place: usize,
+        why: u8,
+    },
     Step {
         battle: u16,
         step: u16,
@@ -454,6 +617,41 @@ pub struct Start {
     pub opponent: u8,
     pub seed: u64,
     pub team: Vec<BattleMember>,
+}
+
+/// An invite to a multi battle: our place (1..=3, side * 2 + pos) and every place's player
+/// (none: the computer) and name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Invite {
+    pub place: usize,
+    pub players: [Option<u8>; 4],
+    pub names: [String; 4],
+}
+
+/// A multi battle place as it starts: its player (none: the computer), their name and team.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seat {
+    pub player: Option<u8>,
+    pub name: String,
+    pub team: Vec<BattleMember>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiStart {
+    pub battle: u16,
+    pub seed: u64,
+    /// Our place (side * 2 + pos).
+    pub place: usize,
+    /// The level rule (each Chao at its own level, or all at 50).
+    pub actual_levels: bool,
+    pub seats: [Seat; 4],
+}
+
+impl MultiStart {
+    /// How many of each side's team are its first place's.
+    pub fn splits(&self) -> [usize; 2] {
+        [self.seats[0].team.len(), self.seats[2].team.len()]
+    }
 }
 
 #[derive(Default)]
@@ -498,6 +696,65 @@ pub fn incoming(body: Body, name: impl Fn(u8) -> String) -> Option<Incoming> {
             format: format_of(format),
             save_partners,
             actual_levels,
+            multi: None,
+        },
+        Body::MultiOffer {
+            from,
+            place,
+            save_partners,
+            actual_levels,
+            players,
+        } => Incoming::Offer {
+            from,
+            name: name(from),
+            format: Format::Doubles,
+            save_partners,
+            actual_levels,
+            multi: Some(Invite {
+                place: usize::from(place),
+                players: players.map(|p| (p != COMPUTER).then_some(p)),
+                names: players.map(|p| {
+                    if p == COMPUTER {
+                        String::new()
+                    } else {
+                        name(p)
+                    }
+                }),
+            }),
+        },
+        Body::MultiStart {
+            battle,
+            seed,
+            place,
+            actual_levels,
+            seats,
+        } => Incoming::MultiStart(MultiStart {
+            battle,
+            seed,
+            place: usize::from(place),
+            actual_levels,
+            seats: seats.map(|(p, team)| Seat {
+                player: (p != COMPUTER).then_some(p),
+                name: if p == COMPUTER {
+                    String::new()
+                } else {
+                    name(p)
+                },
+                team,
+            }),
+        }),
+        Body::MultiStatus { place, status } => Incoming::Status {
+            place: usize::from(place),
+            status,
+        },
+        Body::MultiTakeover {
+            battle,
+            place,
+            reason,
+        } => Incoming::Takeover {
+            battle,
+            place: usize::from(place),
+            why: reason,
         },
         Body::BattleStart {
             battle,
@@ -844,6 +1101,251 @@ mod tests {
         assert_eq!(duels[0].over(), Some(Outcome::Won(1)));
     }
 
+    /// A team of `n` Chao with `points` in each stat (more for each next one).
+    fn chao_team(points: i16, n: usize) -> Vec<BattleMember> {
+        use crate::chao::CHAO_SIZE;
+        (0..n)
+            .map(|i| {
+                let mut c = ChaoData {
+                    bytes: [0; CHAO_SIZE],
+                };
+                c.bytes[0x80] = 2;
+                c.bytes[0x81] = 1;
+                for s in 0..7 {
+                    let v = points + i as i16 * 50;
+                    c.bytes[0x38 + s * 2..0x3A + s * 2].copy_from_slice(&v.to_le_bytes());
+                }
+                BattleMember {
+                    chao: Box::new(c),
+                    species: 0,
+                    types: [0, 0],
+                    ability: 0,
+                    moves: [1, 2, 3, 4],
+                    level: 5,
+                }
+            })
+            .collect()
+    }
+
+    /// Plays a multi battle through the host, every human place's game choosing with the
+    /// battle AI; `humans` are the places players have (place 0 always), the computer plays
+    /// the rest. Each human's game at its end.
+    fn play_multi(humans: &[usize]) -> Vec<Duel> {
+        let dex = Dex::for_tests(&moves(), TypeChart::default());
+        let teams = [
+            chao_team(300, 3),
+            chao_team(500, 2),
+            chao_team(400, 3),
+            chao_team(200, 1),
+        ];
+        play_multi_with(&dex, &teams, humans)
+    }
+
+    /// The same with this ROM data and these places' teams.
+    fn play_multi_with(dex: &Dex, teams: &[Vec<BattleMember>; 4], humans: &[usize]) -> Vec<Duel> {
+        use crate::net::battles::Battles;
+        use crate::net::protocol::{ANSWER_ACCEPT, MultiSeat};
+        let id = |place: usize| place as u8 + 1;
+        let now = std::time::Instant::now();
+        let mut host = Battles::default();
+        for &p in humans {
+            host.joined(id(p));
+        }
+        let seats = [1, 2, 3].map(|p| {
+            if humans.contains(&p) {
+                MultiSeat::Player(id(p))
+            } else {
+                MultiSeat::Computer(teams[p].clone())
+            }
+        });
+        let invite = Body::MultiInvite {
+            seats,
+            save_partners: true,
+            actual_levels: false,
+            dex: dex_print(dex),
+            team: teams[0].clone(),
+        };
+        let mut out = Vec::new();
+        host.observe(1, &invite, now, &mut out);
+        for o in std::mem::take(&mut out) {
+            let crate::net::referee::To::One(to) = o.to else {
+                panic!("{o:?}");
+            };
+            let Some(Incoming::Offer {
+                from,
+                multi: Some(invite),
+                ..
+            }) = incoming(o.body, |id| format!("P{id}"))
+            else {
+                panic!("no invite");
+            };
+            assert_eq!((from, id(invite.place)), (1, to));
+            let answer = Body::BattleAnswer {
+                to: from,
+                answer: ANSWER_ACCEPT,
+                dex: dex_print(dex),
+                team: teams[invite.place].clone(),
+            };
+            host.observe(to, &answer, now, &mut out);
+        }
+        let mut games: Vec<(u8, Duel)> = out
+            .drain(..)
+            .filter_map(|o| {
+                let crate::net::referee::To::One(to) = o.to else {
+                    return None;
+                };
+                match incoming(o.body, |id| format!("P{id}"))? {
+                    Incoming::MultiStart(start) => {
+                        assert_eq!(id(start.place), to);
+                        Some((to, Duel::multi(dex, &start).unwrap()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(games.len(), humans.len());
+        let mut steps = 0;
+        while games.iter().all(|g| g.1.over().is_none()) {
+            let checks: Vec<u32> = games.iter().map(|g| g.1.check()).collect();
+            assert!(checks.iter().all(|&c| c == checks[0]), "step {steps}");
+            for (to, d) in &mut games {
+                if let Some(body) = d.choice() {
+                    host.observe(*to, &body, now, &mut out);
+                }
+            }
+            assert_eq!(out.len(), humans.len(), "step {steps}: {out:?}");
+            for o in out.drain(..) {
+                let crate::net::referee::To::One(to) = o.to else {
+                    panic!("{o:?}");
+                };
+                let Some(Incoming::Step {
+                    step, seed, picks, ..
+                }) = incoming(o.body, |_| String::new())
+                else {
+                    panic!("no step");
+                };
+                // Only the humans' places choose: the computer's have no picks.
+                for (side, pick) in &picks {
+                    let place = usize::from(*side) * 2 + usize::from(pick.pos);
+                    assert!(humans.contains(&place), "{place}");
+                }
+                let game = games.iter_mut().find(|g| g.0 == to).unwrap();
+                // Every place sends in only its own Chao.
+                for e in game.1.step(step, seed, &picks) {
+                    if let Event::SwitchedIn { at, member } = e {
+                        assert_eq!(game.1.battle.owner(at.side, member), Some(at.pos));
+                    }
+                }
+            }
+            steps += 1;
+            assert!(steps < 3000);
+        }
+        games.into_iter().map(|g| g.1).collect()
+    }
+
+    #[test]
+    fn four_games_fed_the_same_steps_play_the_same_multi_battle() {
+        for humans in [&[0, 1, 2, 3][..], &[0, 2], &[0, 1], &[0, 3, 1]] {
+            let games = play_multi(humans);
+            let first = &games[0];
+            assert!(first.over().is_some());
+            for g in &games {
+                assert_eq!(g.over(), first.over(), "{humans:?}");
+                assert_eq!(g.turn(), first.turn());
+                assert_eq!(g.check(), first.check());
+            }
+        }
+    }
+
+    #[test]
+    fn multi_battles_with_the_roms_moves_play_the_same_in_every_game() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path = std::path::Path::new(&home).join("Games/gba/emerald.gba");
+        if !path.exists() {
+            println!("skipped: no GBA ROM at {}", path.display());
+            return;
+        }
+        let rom = crate::gba::rom::Rom::open(&path).expect("ROM opens");
+        let dex = Dex::from_rom(&rom).expect("dex");
+        // Moves that force a foe out and pass a Chao's state on, among others, from the ROM.
+        let by_effect = |effect: u8| {
+            (1..crate::gba::rom::MOVE_COUNT)
+                .find(|&id| dex.move_data(id).is_some_and(|m| m.effect == effect))
+                .unwrap()
+        };
+        let special = [
+            by_effect(super::super::effects::FORCE_SWITCH),
+            by_effect(super::super::effects::PASS_STATE),
+        ];
+        let mut rng = Rng::new(17);
+        for round in 0..6 {
+            let teams: [Vec<BattleMember>; 4] = std::array::from_fn(|place| {
+                let mut team = chao_team(200 + place as i16 * 150, 1 + (place + round) % 3);
+                for m in &mut team {
+                    for slot in 0..4 {
+                        m.moves[slot] = loop {
+                            let id = 1 + rng.below(u32::from(crate::gba::rom::MOVE_COUNT) - 1);
+                            if dex.move_data(id as u16).is_some() {
+                                break id as u16;
+                            }
+                        };
+                    }
+                    m.moves[rng.below(4) as usize] = special[rng.below(2) as usize];
+                }
+                team
+            });
+            let humans: &[usize] = [&[0, 1, 2, 3][..], &[0, 3], &[0, 1, 2]][round % 3];
+            let games = play_multi_with(&dex, &teams, humans);
+            assert!(games[0].over().is_some());
+            for g in &games {
+                assert_eq!((g.over(), g.check()), (games[0].over(), games[0].check()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_place_without_choices_is_played_by_the_computer_the_same_way() {
+        let dex = Dex::for_tests(&moves(), TypeChart::default());
+        let start = MultiStart {
+            battle: 1,
+            seed: 41,
+            place: 0,
+            actual_levels: false,
+            seats: [300, 500, 400, 200].map(|points| Seat {
+                player: None,
+                name: String::new(),
+                team: chao_team(points, 2),
+            }),
+        };
+        let mut a = multi_battle(&dex, &start).unwrap();
+        let mut b = multi_battle(&dex, &start).unwrap();
+        assert_eq!((a.split(0), a.split(1)), (Some(2), Some(2)));
+        assert_eq!(a.start(), b.start());
+        // Place 0 switches to place 1's Chao (refused: the computer chooses for it), and
+        // nobody chooses for the others.
+        let wrong = BattlePick {
+            pos: 0,
+            kind: PICK_SWITCH,
+            value: 3,
+            target: PICK_NONE,
+            pass: PICK_NONE,
+        };
+        for seed in [7, 8, 9] {
+            let ea = apply_multi_step(&mut a, seed, &[(0, wrong)]);
+            let eb = apply_multi_step(&mut b, seed, &[(0, wrong)]);
+            assert!(!ea.is_empty());
+            assert_eq!(ea, eb);
+            assert_eq!(checksum(&a), checksum(&b));
+            assert!(!ea.contains(&Event::SwitchedIn {
+                at: Slot::new(0, 0),
+                member: 3
+            }));
+        }
+        assert!(a.turn() >= 1);
+    }
+
     #[test]
     fn only_the_hosts_messages_reach_the_menu() {
         take_incoming();
@@ -864,6 +1366,7 @@ mod tests {
                 format: Format::Doubles,
                 save_partners: false,
                 actual_levels: true,
+                multi: None,
             }]
         );
     }

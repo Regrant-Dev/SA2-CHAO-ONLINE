@@ -300,7 +300,7 @@ impl Battle {
                 self.raise_stat(at, Stat::Attack, 12, false, ev);
             }
             Primary::PassState => {
-                let bench = self.bench(at.side);
+                let bench = self.bench_for(at);
                 let picked = self
                     .pass_picks
                     .iter()

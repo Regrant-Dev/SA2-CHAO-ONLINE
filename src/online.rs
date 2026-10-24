@@ -867,7 +867,11 @@ fn pump(online: &mut Online, now: Instant) {
                     body @ (Body::BattleOffer { .. }
                     | Body::BattleStart { .. }
                     | Body::BattleStep { .. }
-                    | Body::BattleEnd { .. }),
+                    | Body::BattleEnd { .. }
+                    | Body::MultiOffer { .. }
+                    | Body::MultiStatus { .. }
+                    | Body::MultiStart { .. }
+                    | Body::MultiTakeover { .. }),
             } => {
                 let remote = &online.remote;
                 crate::battle::online::received(from, body, |id| {
@@ -881,7 +885,9 @@ fn pump(online: &mut Online, now: Instant) {
                     Body::BattleChallenge { .. }
                     | Body::BattleAnswer { .. }
                     | Body::BattleChoice { .. }
-                    | Body::BattleLeave { .. },
+                    | Body::BattleLeave { .. }
+                    | Body::MultiInvite { .. }
+                    | Body::MultiFill { .. },
                 ..
             } => {}
             // Shared wild visitors (net/wild_host.rs): the host's are for our game (only from the

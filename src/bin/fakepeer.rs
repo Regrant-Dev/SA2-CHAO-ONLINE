@@ -44,7 +44,12 @@
 //! your team > its name, "live") with its FAKEPEER_CHAO Chao (Normal, basic moves), choosing
 //! with the battle AI; FAKEPEER_BATTLE=singles or doubles also challenges you once you have been
 //! in the karate area for 5 s (again a minute after each battle). It needs the same GBA ROM as
-//! your game: FAKEPEER_ROM, default ~/Games/gba/emerald.gba.
+//! your game: FAKEPEER_ROM, default ~/Games/gba/emerald.gba. Multi battles: with `accept` it
+//! also takes your multi battle invites (up to 3 of its Chao) and plays its place;
+//! FAKEPEER_BATTLE=multi invites you as its ally against two computer places (copies of its
+//! Chao), `multi-foe` invites you as a foe (its ally and yours the computer), at the same times
+//! as a challenge. A place nobody takes it gives to the computer. Several fakepeers (one
+//! hosting, the others joining it) play several places.
 //!
 //! Shared wild visitors: set FAKEPEER_WILD to a comma-separated list of modes and it sends
 //! `WildHello` with the visitor print of FAKEPEER_ROM (seeing, picking and with the machine), so
@@ -76,9 +81,10 @@ use sa2_chao_online::gba::world::{WildMap, WildMethod};
 use sa2_chao_online::net::protocol::ChaoLock;
 use sa2_chao_online::net::protocol::{
     ANSWER_ACCEPT, ANSWER_BUSY, Body, BroughtChao, GardenChao, GardenItem, ItemId, ItemPlace,
-    KarateFighter, KarateState, LEAVE_OVER, MAX_CARRIED_CHAO, MAX_CHAT, Message, PlayerState,
-    RACE_PROGRESS_UNKNOWN, SERVER, WILD_MACHINE, WILD_PICK, WILD_SEE, WildArrive, WildCreature,
-    WildEntry, WildPicked, WildPlace, WildRequest, WildStep,
+    KarateFighter, KarateState, LEAVE_LEFT, LEAVE_OVER, MAX_CARRIED_CHAO, MAX_CHAT, MAX_MULTI_TEAM,
+    Message, MultiSeat, PlayerState, RACE_PROGRESS_UNKNOWN, SEAT_ACCEPTED, SERVER, WILD_MACHINE,
+    WILD_PICK, WILD_SEE, WildArrive, WildCreature, WildEntry, WildPicked, WildPlace, WildRequest,
+    WildStep,
 };
 use sa2_chao_online::net::roster::key_from_hex;
 use sa2_chao_online::net::session::{Client, Event, Host, Identity, Session};
@@ -236,6 +242,12 @@ fn main() {
     let challenge_format: Option<u8> = match battle_mode.as_str() {
         "singles" => Some(0),
         "doubles" => Some(1),
+        _ => None,
+    };
+    // A multi battle to start: you as its ally (place 1) or as foe 1 (place 2).
+    let multi_place: Option<usize> = match battle_mode.as_str() {
+        "multi" => Some(1),
+        "multi-foe" => Some(2),
         _ => None,
     };
     let mut duel: Option<Duel> = None;
@@ -478,23 +490,43 @@ fn main() {
                         body @ (Body::BattleOffer { .. }
                         | Body::BattleStart { .. }
                         | Body::BattleStep { .. }
-                        | Body::BattleEnd { .. }),
+                        | Body::BattleEnd { .. }
+                        | Body::MultiOffer { .. }
+                        | Body::MultiStatus { .. }
+                        | Body::MultiStart { .. }
+                        | Body::MultiTakeover { .. }),
                 } => match live::incoming(body, |id| format!("player {id}")) {
                     Some(Incoming::Offer {
                         from,
                         format,
                         actual_levels: levels,
+                        multi,
                         ..
                     }) => {
                         let body = match &battle_setup {
                             Some((dex, team)) if duel.is_none() => {
-                                println!("battle: accepting player {from}'s {format:?} challenge");
+                                let team = match &multi {
+                                    Some(invite) => {
+                                        println!(
+                                            "battle: accepting player {from}'s multi battle \
+                                             invite to place {}",
+                                            invite.place
+                                        );
+                                        team.iter().take(MAX_MULTI_TEAM).cloned().collect()
+                                    }
+                                    None => {
+                                        println!(
+                                            "battle: accepting player {from}'s {format:?} challenge"
+                                        );
+                                        team.clone()
+                                    }
+                                };
                                 actual_levels = levels;
                                 Body::BattleAnswer {
                                     to: from,
                                     answer: ANSWER_ACCEPT,
                                     dex: live::dex_print(dex),
-                                    team: team.clone(),
+                                    team,
                                 }
                             }
                             _ => Body::BattleAnswer {
@@ -514,6 +546,42 @@ fn main() {
                             );
                             duel = Duel::new(dex, &start, team, actual_levels);
                         }
+                    }
+                    Some(Incoming::MultiStart(start)) => {
+                        if let Some((dex, _)) = &battle_setup {
+                            let players = start.seats.each_ref().map(|s| s.player);
+                            println!(
+                                "battle: multi battle {} starts at place {} (players {players:?})",
+                                start.battle, start.place
+                            );
+                            duel = Duel::multi(dex, &start);
+                        } else {
+                            let body = Body::BattleLeave {
+                                battle: start.battle,
+                                reason: LEAVE_LEFT,
+                            };
+                            session.send(body, true, now);
+                        }
+                    }
+                    Some(Incoming::Status { place, status }) => {
+                        println!("battle: multi battle place {place}: status {status}");
+                        if status != SEAT_ACCEPTED
+                            && let Some((_, team)) = &battle_setup
+                        {
+                            // Nobody took it: the computer plays it.
+                            let team = team.iter().take(MAX_MULTI_TEAM).cloned().collect();
+                            let body = Body::MultiFill {
+                                place: place as u8,
+                                team,
+                            };
+                            session.send(body, true, now);
+                        }
+                    }
+                    Some(Incoming::Takeover { battle, place, why }) => {
+                        println!(
+                            "battle: multi battle {battle}: the computer plays place {place} \
+                             (reason {why})"
+                        );
                     }
                     Some(Incoming::Step {
                         battle,
@@ -631,6 +699,31 @@ fn main() {
                 actual_levels,
                 dex: live::dex_print(dex),
                 team: team.clone(),
+            };
+            session.send(body, true, now);
+            last_challenge = Some(now);
+        }
+        if let (Some(place), Some((dex, team)), Some((player, since))) =
+            (multi_place, &battle_setup, battle_seen)
+            && duel.is_none()
+            && now.duration_since(since) > Duration::from_secs(5)
+            && last_challenge.is_none_or(|at| now.duration_since(at) > Duration::from_secs(60))
+        {
+            println!("battle: inviting player {player} to a multi battle at place {place}");
+            let ours: Vec<_> = team.iter().take(MAX_MULTI_TEAM).cloned().collect();
+            let seats = [1, 2, 3].map(|p| {
+                if p == place {
+                    MultiSeat::Player(player)
+                } else {
+                    MultiSeat::Computer(ours.clone())
+                }
+            });
+            let body = Body::MultiInvite {
+                seats,
+                save_partners: true,
+                actual_levels: false,
+                dex: live::dex_print(dex),
+                team: ours,
             };
             session.send(body, true, now);
             last_challenge = Some(now);

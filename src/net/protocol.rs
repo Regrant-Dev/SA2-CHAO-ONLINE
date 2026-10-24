@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 27;
+pub const PROTOCOL_VERSION: u16 = 28;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -668,6 +668,56 @@ pub enum Body {
         reason: u8,
         winner: u8,
     },
+    /// To the host only (net/battles.rs): the sender starts a multi battle (doubles, each of
+    /// the four places its own player's or the computer's) as place 0 with `team`; `seats` are
+    /// places 1..=3 (their ally, then the two foes). The rules and `dex` are as a challenge's.
+    MultiInvite {
+        seats: [MultiSeat; 3],
+        save_partners: bool,
+        actual_levels: bool,
+        dex: u32,
+        team: Vec<BattleMember>,
+    },
+    /// From the host: player `from` invites the receiver to place `place` (1..=3) of a multi
+    /// battle, with its rules; `players` are every place's player (`COMPUTER`: the computer's).
+    /// Answered with `BattleAnswer` to `from`.
+    MultiOffer {
+        from: u8,
+        place: u8,
+        save_partners: bool,
+        actual_levels: bool,
+        players: [u8; 4],
+    },
+    /// From the host, to a multi battle's starter: what the player invited to place `place`
+    /// (1..=3) did (`SEAT_*`). A place they didn't take waits for the starter's `MultiFill`.
+    MultiStatus {
+        place: u8,
+        status: u8,
+    },
+    /// To the host only: the starter gives open place `place` (1..=3) of their multi battle to
+    /// the computer, with this team.
+    MultiFill {
+        place: u8,
+        team: Vec<BattleMember>,
+    },
+    /// From the host, to each player of a multi battle once every place is filled: it starts,
+    /// the receiver at `place` (0..=3). `seats` are every place's player (`COMPUTER`) and team;
+    /// `seed` is the battle's first roll and `actual_levels` the level rule.
+    MultiStart {
+        battle: u16,
+        seed: u64,
+        place: u8,
+        actual_levels: bool,
+        seats: [(u8, Vec<BattleMember>); 4],
+    },
+    /// From the host, to the other players of a multi battle: the player at `place` is gone
+    /// (`END_FORFEIT` gave up, `END_DISCONNECT` left, `END_REPLACED` too slow to choose), and
+    /// the computer plays that place from the next step on.
+    MultiTakeover {
+        battle: u16,
+        place: u8,
+        reason: u8,
+    },
     /// To the host only (net/wild_host.rs): whether the sender sees shared wild visitors and
     /// what they may do (`WILD_SEE`, `WILD_PICK`, `WILD_MACHINE`), and their ROM's visitor
     /// fingerprint (`net::wild_print`; 0 without `WILD_SEE`). On connecting and on change.
@@ -777,6 +827,18 @@ pub enum Body {
 
 /// Most Chao on a live battle team.
 pub const MAX_BATTLE_TEAM: usize = 6;
+/// Most Chao a player (or the computer) brings to a multi battle.
+pub const MAX_MULTI_TEAM: usize = 3;
+/// A multi battle place's player when the computer plays it.
+pub const COMPUTER: u8 = 0xFF;
+/// `MultiStatus::status`: accepted, turned it down, couldn't (busy, away, or a bad answer),
+/// didn't answer in time, left after accepting, has a different GBA ROM.
+pub const SEAT_ACCEPTED: u8 = 0;
+pub const SEAT_DECLINED: u8 = 1;
+pub const SEAT_BUSY: u8 = 2;
+pub const SEAT_TIMEOUT: u8 = 3;
+pub const SEAT_LEFT: u8 = 4;
+pub const SEAT_ROM_DIFFERS: u8 = 5;
 /// `BattleAnswer::answer`.
 pub const ANSWER_DECLINE: u8 = 0;
 pub const ANSWER_ACCEPT: u8 = 1;
@@ -803,6 +865,9 @@ pub const END_DISCONNECT: u8 = 4;
 pub const END_TIMEOUT: u8 = 5;
 pub const END_DESYNC: u8 = 6;
 pub const END_WITHDRAWN: u8 = 7;
+/// A multi battle went on without the receiver: they took too long to choose, and the computer
+/// plays their place.
+pub const END_REPLACED: u8 = 8;
 /// `BattleEnd::winner` for nobody.
 pub const NO_WINNER: u8 = 2;
 
@@ -928,6 +993,15 @@ pub struct BattleMember {
     pub moves: [u16; 4],
     /// Its battle level (1..=100).
     pub level: u8,
+}
+
+/// One of a multi battle's places as its starter fills it (`Body::MultiInvite`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MultiSeat {
+    /// Invite this player.
+    Player(u8),
+    /// The computer, with this team (1..=`MAX_MULTI_TEAM`).
+    Computer(Vec<BattleMember>),
 }
 
 /// One fighter's choice in a live battle step.
@@ -1449,6 +1523,12 @@ mod tag {
     pub const WILD_ANSWER: u8 = 84;
     pub const WILD_TAUGHT: u8 = 85;
     pub const WILD_USED: u8 = 86;
+    pub const MULTI_INVITE: u8 = 87;
+    pub const MULTI_OFFER: u8 = 88;
+    pub const MULTI_STATUS: u8 = 89;
+    pub const MULTI_FILL: u8 = 90;
+    pub const MULTI_START: u8 = 91;
+    pub const MULTI_TAKEOVER: u8 = 92;
 }
 
 fn write_battle_team(w: &mut Writer, team: &[BattleMember]) {
@@ -1468,9 +1548,35 @@ fn write_battle_team(w: &mut Writer, team: &[BattleMember]) {
 
 /// A live battle team of `min..=MAX_BATTLE_TEAM` Chao, their ids in the ROM's ranges.
 fn read_battle_team(r: &mut Reader, min: usize) -> Result<Vec<BattleMember>> {
+    read_team_of(r, min, MAX_BATTLE_TEAM)
+}
+
+/// A multi battle place's team: 1..=`MAX_MULTI_TEAM` Chao.
+fn read_multi_team(r: &mut Reader) -> Result<Vec<BattleMember>> {
+    read_team_of(r, 1, MAX_MULTI_TEAM)
+}
+
+/// A multi battle place (0..=3, or 1..=3 without the starter's).
+fn multi_place(r: &mut Reader, first: u8) -> Result<u8> {
+    match r.u8()? {
+        p if (first..4).contains(&p) => Ok(p),
+        _ => Err(WireError::BadValue("multi place")),
+    }
+}
+
+/// A multi battle place's player: a player id or `COMPUTER`.
+fn multi_player(r: &mut Reader) -> Result<u8> {
+    match r.u8()? {
+        p if usize::from(p) < MAX_PLAYERS || p == COMPUTER => Ok(p),
+        _ => Err(WireError::BadValue("multi player")),
+    }
+}
+
+/// A team of `min..=max` Chao, their ids in the ROM's ranges.
+fn read_team_of(r: &mut Reader, min: usize, max: usize) -> Result<Vec<BattleMember>> {
     use crate::gba::rom::{ABILITY_COUNT, MOVE_COUNT, SPECIES_COUNT, TYPE_COUNT};
     let count = usize::from(r.u8()?);
-    if !(min..=MAX_BATTLE_TEAM).contains(&count) {
+    if !(min..=max).contains(&count) {
         return Err(WireError::BadValue("battle team"));
     }
     (0..count)
@@ -2644,6 +2750,78 @@ impl Body {
                 winner,
             } => {
                 w.u8(tag::BATTLE_END).u16(*battle).u8(*reason).u8(*winner);
+            }
+            Self::MultiInvite {
+                seats,
+                save_partners,
+                actual_levels,
+                dex,
+                team,
+            } => {
+                w.u8(tag::MULTI_INVITE)
+                    .u8(u8::from(*save_partners))
+                    .u8(u8::from(*actual_levels))
+                    .u32(*dex);
+                write_battle_team(w, team);
+                for seat in seats {
+                    match seat {
+                        MultiSeat::Player(id) => {
+                            w.u8(0).u8(*id);
+                        }
+                        MultiSeat::Computer(team) => {
+                            w.u8(1);
+                            write_battle_team(w, team);
+                        }
+                    }
+                }
+            }
+            Self::MultiOffer {
+                from,
+                place,
+                save_partners,
+                actual_levels,
+                players,
+            } => {
+                w.u8(tag::MULTI_OFFER)
+                    .u8(*from)
+                    .u8(*place)
+                    .u8(u8::from(*save_partners))
+                    .u8(u8::from(*actual_levels))
+                    .bytes(players);
+            }
+            Self::MultiStatus { place, status } => {
+                w.u8(tag::MULTI_STATUS).u8(*place).u8(*status);
+            }
+            Self::MultiFill { place, team } => {
+                w.u8(tag::MULTI_FILL).u8(*place);
+                write_battle_team(w, team);
+            }
+            Self::MultiStart {
+                battle,
+                seed,
+                place,
+                actual_levels,
+                seats,
+            } => {
+                w.u8(tag::MULTI_START)
+                    .u16(*battle)
+                    .bytes(&seed.to_le_bytes())
+                    .u8(*place)
+                    .u8(u8::from(*actual_levels));
+                for (player, team) in seats {
+                    w.u8(*player);
+                    write_battle_team(w, team);
+                }
+            }
+            Self::MultiTakeover {
+                battle,
+                place,
+                reason,
+            } => {
+                w.u8(tag::MULTI_TAKEOVER)
+                    .u16(*battle)
+                    .u8(*place)
+                    .u8(*reason);
             }
             Self::WildHello { flags, print } => {
                 w.u8(tag::WILD_HELLO).u8(*flags).u32(*print);
@@ -3819,13 +3997,88 @@ impl Body {
                 let battle = r.u16()?;
                 let reason = r.u8()?;
                 let winner = r.u8()?;
-                if reason > END_WITHDRAWN || winner > NO_WINNER {
+                if reason > END_REPLACED || winner > NO_WINNER {
                     return Err(WireError::BadValue("battle end"));
                 }
                 Self::BattleEnd {
                     battle,
                     reason,
                     winner,
+                }
+            }
+            tag::MULTI_INVITE => {
+                let save_partners = wire_flag(r, "battle rule")?;
+                let actual_levels = wire_flag(r, "battle rule")?;
+                let dex = r.u32()?;
+                let team = read_multi_team(r)?;
+                let mut seat = || -> Result<MultiSeat> {
+                    match r.u8()? {
+                        0 => Ok(MultiSeat::Player(player_id(r)?)),
+                        1 => Ok(MultiSeat::Computer(read_multi_team(r)?)),
+                        _ => Err(WireError::BadValue("multi seat")),
+                    }
+                };
+                let seats = [seat()?, seat()?, seat()?];
+                Self::MultiInvite {
+                    seats,
+                    save_partners,
+                    actual_levels,
+                    dex,
+                    team,
+                }
+            }
+            tag::MULTI_OFFER => Self::MultiOffer {
+                from: player_id(r)?,
+                place: multi_place(r, 1)?,
+                save_partners: wire_flag(r, "battle rule")?,
+                actual_levels: wire_flag(r, "battle rule")?,
+                players: [
+                    multi_player(r)?,
+                    multi_player(r)?,
+                    multi_player(r)?,
+                    multi_player(r)?,
+                ],
+            },
+            tag::MULTI_STATUS => {
+                let place = multi_place(r, 1)?;
+                let status = r.u8()?;
+                if status > SEAT_ROM_DIFFERS {
+                    return Err(WireError::BadValue("multi status"));
+                }
+                Self::MultiStatus { place, status }
+            }
+            tag::MULTI_FILL => Self::MultiFill {
+                place: multi_place(r, 1)?,
+                team: read_multi_team(r)?,
+            },
+            tag::MULTI_START => {
+                let battle = r.u16()?;
+                let seed = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
+                let place = multi_place(r, 0)?;
+                let actual_levels = wire_flag(r, "battle rule")?;
+                let mut seat = || -> Result<(u8, Vec<BattleMember>)> {
+                    Ok((multi_player(r)?, read_multi_team(r)?))
+                };
+                let seats = [seat()?, seat()?, seat()?, seat()?];
+                Self::MultiStart {
+                    battle,
+                    seed,
+                    place,
+                    actual_levels,
+                    seats,
+                }
+            }
+            tag::MULTI_TAKEOVER => {
+                let battle = r.u16()?;
+                let place = multi_place(r, 0)?;
+                let reason = r.u8()?;
+                if ![END_FORFEIT, END_DISCONNECT, END_REPLACED].contains(&reason) {
+                    return Err(WireError::BadValue("multi takeover"));
+                }
+                Self::MultiTakeover {
+                    battle,
+                    place,
+                    reason,
                 }
             }
             tag::WILD_HELLO => {
@@ -4763,6 +5016,67 @@ mod tests {
                 },
             },
             Message::Game {
+                from: 1,
+                body: Body::MultiInvite {
+                    seats: [
+                        MultiSeat::Player(2),
+                        MultiSeat::Computer(vec![battle_member(); MAX_MULTI_TEAM]),
+                        MultiSeat::Player(7),
+                    ],
+                    save_partners: false,
+                    actual_levels: true,
+                    dex: 0xDEAD_BEEF,
+                    team: vec![battle_member()],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::MultiOffer {
+                    from: 1,
+                    place: 3,
+                    save_partners: true,
+                    actual_levels: false,
+                    players: [1, COMPUTER, 4, 2],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::MultiStatus {
+                    place: 2,
+                    status: SEAT_ROM_DIFFERS,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::MultiFill {
+                    place: 1,
+                    team: vec![battle_member(); 2],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::MultiStart {
+                    battle: 4,
+                    seed: 0x0123_4567_89AB_CDEF,
+                    place: 3,
+                    actual_levels: true,
+                    seats: [
+                        (1, vec![battle_member()]),
+                        (COMPUTER, vec![battle_member(); 2]),
+                        (3, vec![battle_member(); 3]),
+                        (2, vec![battle_member()]),
+                    ],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::MultiTakeover {
+                    battle: 4,
+                    place: 1,
+                    reason: END_REPLACED,
+                },
+            },
+            Message::Game {
                 from: 2,
                 body: Body::WildHello {
                     flags: WILD_SEE | WILD_PICK | WILD_MACHINE,
@@ -5102,7 +5416,7 @@ mod tests {
         }));
         assert!(!decodes(Body::BattleEnd {
             battle: 1,
-            reason: END_WITHDRAWN + 1,
+            reason: END_REPLACED + 1,
             winner: 0
         }));
         assert!(!decodes(Body::BattleEnd {
@@ -5123,6 +5437,91 @@ mod tests {
             },
         };
         assert!(start.encode().len() < 32 * 1100);
+    }
+
+    #[test]
+    fn multi_battle_messages_stay_in_range() {
+        let decodes =
+            |body: Body| Message::decode(&Message::Game { from: 1, body }.encode()).is_ok();
+        let invite = |team: Vec<BattleMember>, seat: MultiSeat| Body::MultiInvite {
+            seats: [MultiSeat::Player(2), seat, MultiSeat::Player(3)],
+            save_partners: true,
+            actual_levels: true,
+            dex: 1,
+            team,
+        };
+        let one = || vec![battle_member()];
+        assert!(decodes(invite(one(), MultiSeat::Computer(one()))));
+        // Teams of 1 to 3, players in range.
+        assert!(!decodes(invite(Vec::new(), MultiSeat::Computer(one()))));
+        assert!(!decodes(invite(
+            vec![battle_member(); 4],
+            MultiSeat::Computer(one())
+        )));
+        assert!(!decodes(invite(one(), MultiSeat::Computer(Vec::new()))));
+        assert!(!decodes(invite(one(), MultiSeat::Player(8))));
+        assert!(!decodes(invite(one(), MultiSeat::Player(COMPUTER))));
+        let offer = |place: u8, players: [u8; 4]| Body::MultiOffer {
+            from: 1,
+            place,
+            save_partners: true,
+            actual_levels: true,
+            players,
+        };
+        assert!(decodes(offer(1, [0, 1, COMPUTER, 7])));
+        assert!(!decodes(offer(0, [0, 1, 2, 3])));
+        assert!(!decodes(offer(4, [0, 1, 2, 3])));
+        assert!(!decodes(offer(1, [0, 1, 8, 3])));
+        let status = |place: u8, status: u8| Body::MultiStatus { place, status };
+        assert!(decodes(status(3, SEAT_ACCEPTED)));
+        assert!(!decodes(status(0, SEAT_ACCEPTED)));
+        assert!(!decodes(status(1, SEAT_ROM_DIFFERS + 1)));
+        let fill = |place: u8, n: usize| Body::MultiFill {
+            place,
+            team: vec![battle_member(); n],
+        };
+        assert!(decodes(fill(2, 3)));
+        assert!(!decodes(fill(2, 4)));
+        assert!(!decodes(fill(0, 1)));
+        let start = |place: u8, n: usize, player: u8| Body::MultiStart {
+            battle: 1,
+            seed: 1,
+            place,
+            actual_levels: false,
+            seats: [
+                (player, vec![battle_member(); n]),
+                (COMPUTER, one()),
+                (COMPUTER, one()),
+                (COMPUTER, one()),
+            ],
+        };
+        assert!(decodes(start(0, 3, 5)));
+        assert!(!decodes(start(4, 1, 5)));
+        assert!(!decodes(start(0, 0, 5)));
+        assert!(!decodes(start(0, 4, 5)));
+        assert!(!decodes(start(0, 1, 9)));
+        let takeover = |place: u8, reason: u8| Body::MultiTakeover {
+            battle: 1,
+            place,
+            reason,
+        };
+        for reason in [END_FORFEIT, END_DISCONNECT, END_REPLACED] {
+            assert!(decodes(takeover(0, reason)));
+        }
+        assert!(!decodes(takeover(4, END_FORFEIT)));
+        assert!(!decodes(takeover(1, END_DESYNC)));
+        // Four full teams fit in one reliable message.
+        let full = Message::Game {
+            from: SERVER,
+            body: Body::MultiStart {
+                battle: 1,
+                seed: 1,
+                place: 0,
+                actual_levels: false,
+                seats: std::array::from_fn(|_| (COMPUTER, vec![battle_member(); MAX_MULTI_TEAM])),
+            },
+        };
+        assert!(full.encode().len() < 32 * 1100);
     }
 
     #[test]

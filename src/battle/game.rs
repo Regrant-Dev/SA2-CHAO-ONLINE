@@ -16,10 +16,10 @@
 //! input, the picker opens on its own at the team screen against it, and when it ends the karate
 //! area is left for that garden.
 //!
-//! Live battles (online.rs): the friends in the karate area are offered in the opponent list,
-//! a friend's challenge opens the picker on its own at the mode select (or interrupts it), and
-//! the session's messages go to the host. Anywhere else, or in another battle, a challenge is
-//! turned down at once.
+//! Live battles (online.rs): the friends in the karate area are offered in the opponent list
+//! and the multi battle's places, a friend's challenge or multi battle invite opens the picker
+//! on its own at the mode select (or interrupts it), and the session's messages go to the host.
+//! Anywhere else, or in another battle, a challenge or invite is turned down at once.
 
 // The hook only exists in the 32-bit game build.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
@@ -205,6 +205,7 @@ fn refuse_all() {
         match event {
             Incoming::Offer { from, .. } => online::send(vec![session::busy_answer(from)]),
             Incoming::Start(start) => online::send(vec![session::left(start.battle)]),
+            Incoming::MultiStart(start) => online::send(vec![session::left(start.battle)]),
             _ => {}
         }
     }
@@ -243,6 +244,10 @@ fn network(g: &mut Game, k: Karate) {
                     }
                 }
                 Incoming::Start(start) => {
+                    online::send(vec![session::left(start.battle)]);
+                    continue;
+                }
+                Incoming::MultiStart(start) => {
                     online::send(vec![session::left(start.battle)]);
                     continue;
                 }

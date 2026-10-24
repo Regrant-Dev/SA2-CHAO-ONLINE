@@ -433,8 +433,8 @@ and ability name and number is read from it. A GBA save isn't needed.
 **Starting one:** go to Chao Karate in the Chao Stadium. On the karate menu, press Down on the
 last button to reach **BATTLE** and press A. Then pick:
 
-1. **Singles** (one Chao a side at a time) or **Doubles** (two a side), or **Trainers** to
-   battle the GBA game's trainers (below).
+1. **Singles** (one Chao a side at a time) or **Doubles** (two a side), **Multi battle**
+   (doubles with four teams, below), or **Trainers** to battle the GBA game's trainers (below).
 2. **Your team:** up to 6 of the Chao in your save, each with its battle level and a bar of
    its XP toward the next. A picks or drops the Chao under the cursor; they go out in the order
    you picked them. The line below the list shows the Chao's battle level and XP, types,
@@ -544,8 +544,11 @@ in `gba/partners.txt` (never in your save). XP comes only from battles:
   for each of the other team's Chao that fainted (less for one below your Chao's battle level,
   whatever the level rule). Against a team of fewer than three, each of its Chao counts as one
   of a team of three, so a smaller team gives less.
+- In a multi battle with friends, each player's Chao earn as in a live battle, by the other
+  side's Chao (both foes' teams); a multi battle with only the computer gives none.
 - Only a battle played to the end gives XP: none when either player gives up, leaves or runs
-  out of time, and none for a live battle whose two games went apart.
+  out of time (in a multi battle, none for the one who did), and none for a live battle whose
+  games went apart.
 
 After the battle's last messages "<Chao> grew to Lv 23!" shows for each Chao that went up (A
 moves on, as with the other messages), and the result screen lists the XP each one earned. The
@@ -609,10 +612,38 @@ on both teams battles at level 50; the default) or **actual levels** (each Chao 
 own battle level). The challenge shows the rule to your friend, and both games apply it to
 both teams. The XP a live battle gives doesn't depend on it.
 
-A challenge that comes while you're elsewhere, in
+**Multi battles:** doubles where each of the four Chao in the ring is its own player's: yours,
+your ally's and the two foes'. Each place is a friend online at Chao Karate or the computer, and
+each brings up to 3 Chao and sends in only its own. Choose **Multi battle** in the battle menu,
+pick up to 3 of your Chao, then set it up:
+
+- **Ally**, **Foe 1** and **Foe 2:** A shows who can have that place: your friends at Chao
+  Karate ("busy" ones can't), then the computer's teams (copies of your other Chao, of a
+  friend's Chao, or of the imported ones, up to 3 to a team). A friend can have only one place.
+- The two live rules, as for challenges, for the friends in it.
+- **Start** (only the computer in the other places: you battle here alone) or **Send the
+  invites**. The screen then shows each friend's answer. When one turns it down, doesn't
+  answer in 2 minutes or leaves, A on their place gives it to one of the computer's teams; **Call
+  it off** (or B) takes the invites back. The battle starts once every friend in it has accepted.
+
+An invite pops up as a challenge does, saying who invited you, your place (who's on your side
+and who's against you) and the rules: **Accept** and pick up to 3 Chao, or **Decline**. Until it
+starts, "Waiting for the others to answer..." shows (B leaves, and your place opens again for
+the one who invited you).
+
+In the battle each game shows your side on the left, every Chao's box at the top, and the menus
+only for your own Chao; once you've chosen, "Waiting for ..." names the other players in it. The
+computer plays its places. A player who gives up, leaves the karate area, goes offline or takes
+more than 2 minutes to choose once someone has is out, and earns no XP: the others see who
+went ("... left the battle; the computer plays their place.", also on the result screen) and
+the battle goes on. It ends when a side has no Chao left, with the same result for everyone
+still in it. Multi battles with friends need the same GBA ROM in every game.
+
+A challenge or invite that comes while you're elsewhere, in
 another battle or in live karate is turned down on its own. **Live battles with friends
-online** in the mod's settings (GBA link group) turns them off: friends' challenges are turned
-down and the list has no live entries.
+online** in the mod's settings (GBA link group) turns them off: friends' challenges and invites
+are turned down, and the lists have no friends in them (multi battles are then with the
+computer only).
 
 Battles never change your save: every Chao in them is a copy, win or lose.
 

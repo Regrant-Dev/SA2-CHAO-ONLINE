@@ -5,6 +5,10 @@
 //! weather, status and the other end-of-turn effects. Fainted fighters are replaced through
 //! `replace` before the next turn. Every call returns the `Event`s it caused, in order.
 //!
+//! In a multi battle (doubles, `set_split`) each side's team is two players' teams, one for
+//! each place: a place sends in, switches to and passes on to only its own Chao, and once its
+//! own are all down it stays empty while the other place battles on.
+//!
 //! - `moves`: using a move: the checks before it, targets, hits and damage.
 //! - `status`: status moves and the stat, status and condition changes moves cause.
 //! - `turn_end`: the end of a turn.
@@ -115,6 +119,9 @@ pub struct Battle {
     sound_moves: Vec<u16>,
     /// For the next turn: who a fighter's passing move hands on to.
     pass_picks: Vec<(Slot, usize)>,
+    /// A multi battle: each side's members before this are its first place's, the rest its
+    /// second's.
+    split: [Option<usize>; 2],
 }
 
 /// Turn order: switches first, then priority, speed and a random tie-break.
@@ -159,7 +166,31 @@ impl Battle {
             move_table: Vec::new(),
             sound_moves: Vec::new(),
             pass_picks: Vec::new(),
+            split: [None; 2],
         })
+    }
+
+    /// Makes `side`'s team two places' teams (a multi battle, before `start`): members
+    /// `..first` are its first place's, the rest its second's. Only for doubles, with members
+    /// on both sides of `first`.
+    pub fn set_split(&mut self, side: usize, first: usize) {
+        if self.format == Format::Doubles
+            && !self.started
+            && side < 2
+            && (1..self.teams[side].len()).contains(&first)
+        {
+            self.split[side] = Some(first);
+        }
+    }
+
+    /// The members of `side`'s team that are its first place's in a multi battle.
+    pub fn split(&self, side: usize) -> Option<usize> {
+        self.split.get(side).copied().flatten()
+    }
+
+    /// The place (position) team member `member` of `side` belongs to in a multi battle.
+    pub fn owner(&self, side: usize, member: usize) -> Option<usize> {
+        self.split(side).map(|first| usize::from(member >= first))
     }
 
     /// The moves a random-move effect can call (the ROM's move table). Without it, it picks
@@ -187,11 +218,24 @@ impl Battle {
         self.started = true;
         let mut entered = Vec::new();
         for side in 0..2 {
-            let leads: Vec<usize> = (0..self.teams[side].len())
-                .filter(|&m| !self.teams[side][m].fainted())
-                .take(self.format.slots())
-                .collect();
-            for (pos, m) in leads.into_iter().enumerate() {
+            let leads: Vec<(usize, usize)> = match self.split[side] {
+                // Each place's first Chao able to battle.
+                Some(_) => (0..2)
+                    .filter_map(|pos| {
+                        (0..self.teams[side].len())
+                            .find(|&m| {
+                                !self.teams[side][m].fainted() && self.owner(side, m) == Some(pos)
+                            })
+                            .map(|m| (pos, m))
+                    })
+                    .collect(),
+                None => (0..self.teams[side].len())
+                    .filter(|&m| !self.teams[side][m].fainted())
+                    .take(self.format.slots())
+                    .enumerate()
+                    .collect(),
+            };
+            for (pos, m) in leads {
                 let at = Slot::new(side, pos);
                 self.place(at, m, &mut ev);
                 let v = &mut self.teams[side][m].volatile;
@@ -295,6 +339,14 @@ impl Battle {
     pub fn bench(&self, side: usize) -> Vec<usize> {
         (0..self.teams[side].len())
             .filter(|&m| !self.teams[side][m].fainted() && !self.active[side].contains(&Some(m)))
+            .collect()
+    }
+
+    /// Team members that can come in at `at`: the side's, or in a multi battle its place's own.
+    pub fn bench_for(&self, at: Slot) -> Vec<usize> {
+        self.bench(at.side)
+            .into_iter()
+            .filter(|&m| self.owner(at.side, m).is_none_or(|pos| pos == at.pos))
             .collect()
     }
 
@@ -408,7 +460,7 @@ impl Battle {
             });
         }
         if self.can_switch(at) {
-            for member in self.bench(at.side) {
+            for member in self.bench_for(at) {
                 out.push(Action::Switch { member });
             }
         }
@@ -675,7 +727,7 @@ impl Battle {
             let dup = picks[..i]
                 .iter()
                 .any(|p| p.0 == slot || (p.0.side == slot.side && p.1 == member));
-            if !self.pending.contains(&slot) || dup || !self.bench(slot.side).contains(&member) {
+            if !self.pending.contains(&slot) || dup || !self.bench_for(slot).contains(&member) {
                 return Err(BattleError::Invalid(slot));
             }
         }
@@ -723,7 +775,7 @@ impl Battle {
                 Action::OutOfPp => self.usable_moves(c.at).is_empty(),
                 Action::Switch { member } => {
                     self.can_switch(c.at)
-                        && self.bench(c.at.side).contains(&member)
+                        && self.bench_for(c.at).contains(&member)
                         && !choices[..i].iter().any(|o| {
                             o.at.side == c.at.side && o.action == Action::Switch { member }
                         })
@@ -745,7 +797,14 @@ impl Battle {
             for pos in 0..self.format.slots() {
                 let at = Slot::new(side, pos);
                 if self.fighter(at).is_some_and(Fighter::fainted) {
-                    if bench > 0 {
+                    if self.split[side].is_some() {
+                        // A place sends in only its own.
+                        if self.bench_for(at).is_empty() {
+                            self.active[side][pos] = None;
+                        } else {
+                            self.pending.push(at);
+                        }
+                    } else if bench > 0 {
                         bench -= 1;
                         self.pending.push(at);
                     } else {
@@ -990,7 +1049,7 @@ impl Battle {
 
     /// Forces the fighter at `at` out for a random bench member; whether it went.
     fn force_out(&mut self, at: Slot, ev: &mut Vec<Event>) -> bool {
-        let bench = self.bench(at.side);
+        let bench = self.bench_for(at);
         if bench.is_empty() {
             return false;
         }
