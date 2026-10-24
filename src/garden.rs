@@ -2941,12 +2941,20 @@ extern "C" fn heard(call: u32, id: u32, at: usize, a: i32, b: i32, c: i32) {
     }
 }
 
-/// A sound call in the Chao code: noted (`heard`), then the call goes on as it was. Registers
-/// and the caller's arguments kept.
+/// Set while the animal code runs for a GBA link creature (`gba_link::scene::quietly`): the
+/// Chao code's sound calls then play nothing and aren't noted.
+#[cfg(target_arch = "x86")]
+pub static SOUNDS_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A sound call in the Chao code: noted (`heard`), then the call goes on as it was (nothing
+/// while `SOUNDS_QUIET`; the caller pops the arguments). Registers and the caller's arguments
+/// kept.
 #[cfg(target_arch = "x86")]
 #[unsafe(naked)]
 unsafe extern "C" fn sound_at_thunk() {
     std::arch::naked_asm!(
+        "cmp byte ptr [{quiet}], 0",
+        "jne 2f",
         "push eax",
         "push ecx",
         "push edx",
@@ -2963,6 +2971,9 @@ unsafe extern "C" fn sound_at_thunk() {
         "pop eax",
         "push {sound}",
         "ret",
+        "2:",
+        "ret",
+        quiet = sym SOUNDS_QUIET,
         call = const SOUND_AT,
         heard = sym heard,
         sound = const SOUND_AT_FN,

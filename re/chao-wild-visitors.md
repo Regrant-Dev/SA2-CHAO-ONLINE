@@ -195,8 +195,9 @@ of flying creatures), rule 6 thirteen.
   go does it take one of the 2 entries. A carried visitor handed over in the next garden does
   the same. The main wrapper runs the animal's own main, silenced: the animal code's five calls
   to the positional sound call 0x4372E0 (0x57B43D, 0x57BF3B, 0x57C4B3, 0x57C5FB, 0x57C6E9:
-  ids 0x1011, 0x1010 twice, 0x1031, 0x1020) go through a check that skips them while one of our
-  creatures' mains runs (partners too); in mode 0 a visitor in a
+  ids 0x1011, 0x1010 twice, 0x1031, 0x1020) are among the Chao code's sound calls garden.rs
+  already redirects, and its hook plays nothing while one of our creatures' mains runs
+  (`garden::SOUNDS_QUIET`, partners too); in mode 0 a visitor in a
   pond cell below that cell's surface swims: its position is set each frame to the surface
   − 1.5 (bobbing 0.2), moving 0.06 a frame between neighbouring pond cells, its `Data1+0xC`
   turned along its way and its Data2 velocity zeroed. The absorb hook (§2) treats a visitor as a
