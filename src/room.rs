@@ -595,6 +595,16 @@ pub fn on_stage_select() -> bool {
     read::<i32>(GAME_MODE) == MODE_MENUS && read::<i32>(CURRENT_MENU) == MENU_STAGE_SELECT
 }
 
+/// Stage Select's step while the player browses the map (sub-menu 2, the one its own confirm
+/// runs from; the jump table at 0x6725FC). The others slide panels in or out or are on their
+/// way somewhere already (9 and 10 go to Chao World), so a pick only goes in from this one.
+const SUB_MENU_BROWSING: i32 = 2;
+
+/// Stage Select is up and waiting for a pick: the only time `go` may run.
+pub fn stage_select_ready() -> bool {
+    on_stage_select() && read::<i32>(CURRENT_SUB_MENU) == SUB_MENU_BROWSING
+}
+
 /// Call every frame on the game thread.
 pub fn on_frame(connected: bool) {
     let mut r = ROOM.lock().unwrap_or_else(|e| e.into_inner());
@@ -631,7 +641,10 @@ pub fn on_frame(connected: bool) {
     }
 
     if let Some((pick, leader)) = r.incoming.take() {
-        if selecting && !leaving {
+        if selecting && !leaving && !stage_select_ready() {
+            // Stage Select is between steps: try again when it settles.
+            r.incoming = Some((pick, leader));
+        } else if selecting && !leaving {
             log!("room: {leader} picked {pick:?}, going along");
             hud::toast(format!("Party: {leader} picked a stage"));
             go(pick);
@@ -651,8 +664,23 @@ pub fn on_frame(connected: bool) {
     }
 }
 
+/// Saves the menus' working state for their return after the stage (0x673AE0, no
+/// arguments): Stage Select's confirm calls it first, and the menus restore Stage Select from
+/// that copy when the stage ends. Without it they come back from a stale copy and draw the map
+/// with its models unloaded (a crash at 0x41DD16).
+const SAVE_MENU_STATE: usize = 0x0067_3AE0;
+/// The menu panels it copies from (null outside the menus).
+const MENU_PANELS: usize = 0x00C7_7F00;
+
 /// Does what Stage Select does when a stage is picked, with the leader's values.
 pub fn go(pick: Pick) {
+    if read::<usize>(MENU_PANELS) != 0 {
+        // SAFETY: the game's own no-argument call, on the game thread with the menus up.
+        unsafe {
+            let save: extern "C" fn() = std::mem::transmute(SAVE_MENU_STATE);
+            save();
+        }
+    }
     write::<i16>(LAST_LEVEL, read(CURRENT_LEVEL));
     write(CURRENT_LEVEL, pick.level);
     write(MISSION_NUM, pick.mission);

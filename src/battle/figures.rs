@@ -1,5 +1,6 @@
-//! A trainer's creatures in the arena: each stands where a Chao would, drawn as its ROM picture
-//! (`gba_link::billboard`) on the far side of the ring. The director's motions for it become
+//! A trainer's creatures (or a wild visitor) in the arena: each stands where a Chao would, drawn
+//! as its ROM picture (`gba_link::billboard`, a shiny visitor in its shiny colours) on the far
+//! side of the ring. The director's motions for it become
 //! simple moves of the picture: a hop for an action, a shake when hit, a slide down into the
 //! floor when it faints.
 //!
@@ -39,15 +40,17 @@ enum Anim {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Figure {
     pub species: u16,
+    pub shiny: bool,
     /// Where it stands (the director's place, with its lift).
     pub at: [f32; 3],
     anim: Anim,
 }
 
 impl Figure {
-    pub fn new(species: u16, at: [f32; 3]) -> Figure {
+    pub fn new(species: u16, shiny: bool, at: [f32; 3]) -> Figure {
         Figure {
             species,
+            shiny,
             at,
             anim: Anim::Still,
         }
@@ -116,7 +119,7 @@ impl Figure {
 pub use game::{clear, motion as play, place, show};
 
 #[cfg(not(target_arch = "x86"))]
-pub fn show(_slot: Slot, _species: Option<u16>, _at: [f32; 3]) {}
+pub fn show(_slot: Slot, _species: Option<u16>, _shiny: bool, _at: [f32; 3]) {}
 #[cfg(not(target_arch = "x86"))]
 pub fn place(_slot: Slot, _at: [f32; 3]) {}
 #[cfg(not(target_arch = "x86"))]
@@ -154,11 +157,12 @@ mod game {
         f.slots.get_mut(slot.side)?.get_mut(slot.pos)
     }
 
-    /// The creature `species` stands at `slot` (`None`: nobody, or a Chao, stands there).
-    pub fn show(slot: Slot, species: Option<u16>, at: [f32; 3]) {
+    /// The creature `species` (`shiny`: in its shiny colours) stands at `slot` (`None`:
+    /// nobody, or a Chao, stands there).
+    pub fn show(slot: Slot, species: Option<u16>, shiny: bool, at: [f32; 3]) {
         let mut f = lock();
         if let Some(s) = slot_mut(&mut f, slot) {
-            *s = species.map(|sp| Figure::new(sp, at));
+            *s = species.map(|sp| Figure::new(sp, shiny, at));
         }
         if species.is_some() && f.object == 0 {
             f.object = crate::puppet::create_display_object(NAME, display, deleted);
@@ -211,7 +215,12 @@ mod game {
         let _ = std::panic::catch_unwind(|| {
             let figures: Vec<Figure> = lock().slots.iter().flatten().flatten().copied().collect();
             for fig in figures.iter().filter(|f| !f.gone()) {
-                crate::gba_link::billboard::draw(fig.species, fig.draw_at(), false);
+                crate::gba_link::billboard::draw_picture(
+                    fig.species,
+                    fig.shiny,
+                    fig.draw_at(),
+                    false,
+                );
             }
         });
     }
@@ -223,7 +232,7 @@ mod tests {
 
     #[test]
     fn actions_hop_hits_shake_and_a_faint_goes_down_for_good() {
-        let mut f = Figure::new(5, [5.0, 8.0, 19.0]);
+        let mut f = Figure::new(5, false, [5.0, 8.0, 19.0]);
         assert_eq!(f.draw_at(), [5.0, 8.0 + BILLBOARD_DROP, 19.0]);
         f.motion(motion::ATTACKS[0]);
         for _ in 0..HOP_FRAMES / 2 {

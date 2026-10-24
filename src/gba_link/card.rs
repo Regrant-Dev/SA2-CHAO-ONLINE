@@ -1,6 +1,7 @@
 //! The info card of a creature in the garden (a wild visitor or a partner brought in): its name,
 //! level, types, ability, stats and the moves a Chao that absorbs it learns, all from the ROM.
-//! It shows for the one the player holds, else the nearest within `RANGE`.
+//! It shows for the one the player holds, else the nearest within `RANGE`. A wild visitor's
+//! card also has the button that battles it (`wild_battle`).
 
 // Off the game (Linux builds) only the tests use the text side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
@@ -9,6 +10,7 @@ use crate::gba::rom::Rom;
 
 use super::ascii;
 use super::store::Partner;
+use crate::net::protocol::WildPlace;
 
 /// A creature's card shows when the player is this close to it (across).
 pub const RANGE: f32 = 7.0;
@@ -76,6 +78,17 @@ pub fn lines(rom: &Rom, partner: &Partner, shiny: bool) -> Vec<String> {
     out
 }
 
+/// The card's line about who has a shared garden's visitor (`place`), when someone other than
+/// the player (`me`) holds it, or someone battles it (`name` gives a player's name).
+pub fn note(place: WildPlace, me: Option<u8>, name: impl Fn(u8) -> String) -> Option<String> {
+    match place {
+        WildPlace::Held { by } if Some(by) != me => Some(format!("Held by {}", name(by))),
+        WildPlace::Battle { by } if Some(by) == me => Some("Battling you".into()),
+        WildPlace::Battle { by } => Some(format!("Battling {}", name(by))),
+        _ => None,
+    }
+}
+
 /// The creature whose card shows: the one the player holds (`held`), else the nearest of
 /// `creatures` (object, position) within `RANGE` of `player` (across, and close in height).
 pub fn pick(held: usize, player: [f32; 3], creatures: &[(usize, [f32; 3])]) -> Option<usize> {
@@ -102,8 +115,8 @@ pub fn on_frame() {}
 #[cfg(target_arch = "x86")]
 mod game {
     use super::super::store::Partner;
-    use super::super::{loaded_rom, scene, wild, with_store};
-    use super::{lines, pick};
+    use super::super::{loaded_rom, scene, shared, wild, with_store};
+    use super::{lines, note, pick};
     use crate::game as sa2;
     use crate::hud;
 
@@ -123,6 +136,28 @@ mod game {
         // (object, position, what it teaches, shiny)
         let mut found: Vec<(usize, [f32; 3], Partner, bool)> = wild::creatures();
         let garden = sa2::current_chao_area() as u8;
+        // A shared garden's: from its list entry, with who holds or battles it.
+        let mut notes: Vec<(usize, String)> = Vec::new();
+        let copies = shared::creatures();
+        if !copies.is_empty() {
+            let me = shared::me();
+            let others = crate::online::others();
+            let name = |id: u8| {
+                others
+                    .iter()
+                    .find(|(o, _, _)| *o == id)
+                    .map_or_else(|| format!("player {id}"), |(_, n, _)| n.clone())
+            };
+            for (object, at, entry) in copies {
+                let Some(partner) = shared::partner_of(&rom, &entry.creature, false) else {
+                    continue;
+                };
+                if let Some(n) = note(entry.place, me, name) {
+                    notes.push((object, n));
+                }
+                found.push((object, at, partner, entry.creature.shiny));
+            }
+        }
         for (object, at, key) in scene::creatures() {
             let partner = with_store(|s| {
                 s.waiting_in(garden)
@@ -140,7 +175,13 @@ mod game {
         let Some((_, _, partner, shiny)) = found.iter().find(|c| c.0 == object) else {
             return;
         };
-        let text = lines(&rom, partner, *shiny);
+        let mut text = lines(&rom, partner, *shiny);
+        if let Some((_, n)) = notes.iter().find(|(o, _)| *o == object) {
+            text.push(n.clone());
+        }
+        if let Some(battle) = super::super::wild_battle::card(object, partner, *shiny) {
+            text.push(battle.into());
+        }
         let size = hud::menu_font();
         let (w, _) = hud::screen_size();
         let cols = text.iter().map(|l| l.chars().count()).max().unwrap_or(0) + 2;
@@ -172,6 +213,25 @@ mod tests {
         assert_eq!(pick(0, [100.0, 0.0, 0.0], &c), None);
         // Far above or below doesn't count.
         assert_eq!(pick(0, [3.0, 30.0, 0.0], &c[1..2]), None);
+    }
+
+    #[test]
+    fn a_shared_visitor_says_who_has_it() {
+        let name = |id: u8| format!("P{id}");
+        assert_eq!(note(WildPlace::Roam, Some(1), name), None);
+        assert_eq!(note(WildPlace::Held { by: 1 }, Some(1), name), None);
+        assert_eq!(
+            note(WildPlace::Held { by: 3 }, Some(1), name).as_deref(),
+            Some("Held by P3")
+        );
+        assert_eq!(
+            note(WildPlace::Battle { by: 3 }, Some(1), name).as_deref(),
+            Some("Battling P3")
+        );
+        assert_eq!(
+            note(WildPlace::Battle { by: 1 }, Some(1), name).as_deref(),
+            Some("Battling you")
+        );
     }
 
     #[test]

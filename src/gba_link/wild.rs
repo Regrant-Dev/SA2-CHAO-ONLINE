@@ -7,16 +7,18 @@
 //! random from the ones its kind learns by its level (`random_moves`), so two of a kind can teach
 //! different ones. Up to 5 are in a garden at once. Visitors are never saved: they go when the
 //! player leaves, except one the player carries out, which comes back in their hands in the next
-//! garden.
+//! garden. A shared online garden has none of them: the server's visitors are shown there
+//! (`shared`), and when the garden is the player's alone again they stay as theirs (`adopt`).
+//! A visit is kept while the player battles one of its visitors in the karate arena
+//! (`snapshot`).
 
 // Off the game (Linux builds) only the tests use the garden side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::rotation::{Area, mix};
+use super::rotation::Area;
 use super::store::Partner;
-use crate::chao_sim::land::{GRID_COLS, GRID_ROWS, Garden, Tri, V3, cell_of, probe};
 use crate::gba::rom::Rom;
 use crate::gba::world::WildSlot;
 
@@ -31,27 +33,17 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Most visitors in a garden at once; each visit to a garden allows `MIN_CAP..=MAX_VISITORS`.
-pub const MAX_VISITORS: usize = 5;
-const MIN_CAP: usize = 4;
-/// Category-2 entries left for the game's own animals and drives.
-const RESERVE: u32 = 2;
-/// Visitors that come at once when the garden loads; the others come one by one.
-const ON_ENTRY: usize = 3;
-const _: () = assert!(ON_ENTRY <= MIN_CAP && MIN_CAP <= MAX_VISITORS);
+// Used by the game side (and its tests).
+#[cfg_attr(not(target_arch = "x86"), allow(unused_imports))]
+pub use crate::chao_sim::wild::{
+    CALL_REACH, CALL_SECS, GONE_FAR, LOST_Y, MAX_SWIMMING, MAX_VISITORS, MIN_CAP, NEXT_SECS,
+    ON_ENTRY, RESERVE, Rng, STAY_SECS, Spots, Swim, WATER_Y, dist2, in_pond, land_spot, middle,
+    swim_y, to_pond, walk_toward,
+};
+
 /// Nothing comes (nor the area's name) until the garden has been up and not shared this long:
 /// a shared garden is only known once friends' states or the server's Chao arrive.
 const ALONE_MILLIS: u64 = 2500;
-/// Seconds between visitors, and how long one stays before it goes once out of the way.
-const NEXT_SECS: (u64, u64) = (20, 50);
-const STAY_SECS: (u64, u64) = (300, 480);
-/// A visitor that stayed long enough goes once the player is this far away.
-const GONE_FAR: f32 = 60.0;
-/// New visitors come at least this far from the player when a spot allows.
-const COME_FAR: f32 = 25.0;
-/// Of ten visitors, about this many go to the pond (when the area has water creatures).
-const POND_IN_TEN: u64 = 3;
-const MAX_SWIMMING: usize = 3;
 /// One visitor in this many is shiny.
 pub const SHINY_ODDS: u64 = 1024;
 /// How long the area's name shows when entering the garden.
@@ -63,44 +55,6 @@ const ROCKS_ONE_IN: u64 = 4;
 /// Of a pond visitor's picks, one in this many is from the fishing tables, when the area has
 /// both.
 const FISHING_ONE_IN: u64 = 4;
-/// The water surface of each garden (Neutral, Hero, Dark) and how far below it a swimmer is.
-pub const WATER_Y: [f32; 3] = [-2.0, -1.5, -1.0];
-const SWIM_DEPTH: f32 = 1.5;
-const BOB: f32 = 0.2;
-/// Units a frame.
-const SWIM_SPEED: f32 = 0.06;
-/// A pond spot has its floor at least this far below the surface.
-const POND_DEPTH: f32 = 3.0;
-/// Grid values.
-const LAND: i32 = 1;
-const WATER: i32 = 9;
-/// Below this a visitor fell out of the garden.
-const LOST_Y: f32 = -50.0;
-
-/// A small random source.
-#[derive(Clone, Debug)]
-pub struct Rng(u64);
-
-impl Rng {
-    pub fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        mix(self.0)
-    }
-
-    /// 0..n (0 when n is 0).
-    pub fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next() % n }
-    }
-
-    /// lo..=hi.
-    pub fn between(&mut self, lo: u64, hi: u64) -> u64 {
-        lo + self.below(hi.saturating_sub(lo) + 1)
-    }
-}
 
 /// One wild visitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +173,17 @@ pub fn pick(
     })
 }
 
+/// One of the player's own visitors where it is: handed over to a garden that turned shared, or
+/// kept while the player battles one of them (`snapshot`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    pub visitor: Visitor,
+    pub partner: Partner,
+    pub at: [f32; 3],
+    pub angle: u16,
+    pub swimming: bool,
+}
+
 fn all(tables: &[Vec<WildSlot>]) -> Vec<&Vec<WildSlot>> {
     tables.iter().collect()
 }
@@ -236,221 +201,12 @@ fn water_slot(area: &Area, keep: &impl Fn(u16) -> bool, rng: &mut Rng) -> Option
     from_tables(first, keep, rng).or_else(|| from_tables(second, keep, rng))
 }
 
-/// A grid cell (column, row).
-pub type Cell = (usize, usize);
-
-/// The middle of a cell (re/chao-wild-visitors.md §1).
-pub fn middle((col, row): Cell) -> (f32, f32) {
-    (
-        (col as f32 - 16.0 + 0.5) * 10.0,
-        (row as f32 - 20.0 + 0.5) * 10.0,
-    )
-}
-
-/// Where visitors can be in a garden: the middles of land cells on solid ground, and water
-/// cells over a pond deep enough to swim in (with the surface's height).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Spots {
-    pub land: Vec<V3>,
-    pub water: Vec<(Cell, f32)>,
-}
-
-impl Spots {
-    pub fn read(garden: &Garden) -> Self {
-        let mut out = Self::default();
-        for row in 0..GRID_ROWS {
-            for col in 0..GRID_COLS {
-                let value = garden.grid[row * GRID_COLS + col];
-                if value != LAND && value != WATER {
-                    continue;
-                }
-                let (x, z) = middle((col, row));
-                // The highest surface under the middle (probes see 220 up).
-                let Some(top) = [60.0, 180.0]
-                    .into_iter()
-                    .filter_map(|y| probe(&garden.tris, [x, y, z])[2])
-                    .max_by(|a, b| a.at.total_cmp(&b.at))
-                else {
-                    continue;
-                };
-                match (value, top.water()) {
-                    (LAND, false) => out.land.push([x, top.at, z]),
-                    (WATER, true)
-                        if floor_below(&garden.tris, [x, top.at - 0.01, z])
-                            .is_some_and(|y| y <= top.at - POND_DEPTH) =>
-                    {
-                        out.water.push(((col, row), top.at))
-                    }
-                    _ => {}
-                }
-            }
-        }
-        out
-    }
-
-    /// The pond cell `cell`'s surface, if it is one.
-    pub fn water_at(&self, cell: Cell) -> Option<f32> {
-        self.water.iter().find(|(c, _)| *c == cell).map(|(_, y)| *y)
-    }
-
-    /// The pond cells next to `cell` (8 around).
-    pub fn neighbours(&self, (col, row): Cell) -> Vec<Cell> {
-        self.water
-            .iter()
-            .map(|(c, _)| *c)
-            .filter(|&(c, r)| c.abs_diff(col) <= 1 && r.abs_diff(row) <= 1 && (c, r) != (col, row))
-            .collect()
-    }
-
-    /// Pond cells a visitor can come in at: those with water on at least three sides.
-    pub fn pond_entries(&self) -> Vec<Cell> {
-        self.water
-            .iter()
-            .map(|(c, _)| *c)
-            .filter(|&c| self.neighbours(c).len() >= 3)
-            .collect()
-    }
-}
-
-/// The solid floor below `q`, through water surfaces.
-fn floor_below(tris: &[Tri], q: V3) -> Option<f32> {
-    let mut q = q;
-    for _ in 0..4 {
-        let hit = probe(tris, q)[2]?;
-        if !hit.water() {
-            return Some(hit.at);
-        }
-        q[1] = hit.at - 0.01;
-    }
-    None
-}
-
-/// A swimming visitor: where it is and the pond cell it swims to.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Swim {
-    pub at: (f32, f32),
-    pub to: Cell,
-    pub from: Option<Cell>,
-}
-
-impl Swim {
-    /// Starts swimming at `at`, toward the nearest pond cell.
-    pub fn start(spots: &Spots, at: (f32, f32)) -> Option<Self> {
-        let to = spots
-            .water
-            .iter()
-            .map(|(c, _)| *c)
-            .min_by(|&a, &b| dist2(middle(a), at).total_cmp(&dist2(middle(b), at)))?;
-        Some(Self { at, to, from: None })
-    }
-
-    /// One frame on: toward its cell, and from there to a neighbouring one (not straight back
-    /// when it can help it; toward `called`, the whistling player, when it's called, staying
-    /// put at the pond cell nearest them). Returns the heading (BAMS, the game's sin/cos
-    /// convention).
-    pub fn step(&mut self, spots: &Spots, rng: &mut Rng, called: Option<(f32, f32)>) -> i32 {
-        let goal = middle(self.to);
-        let (dx, dz) = (goal.0 - self.at.0, goal.1 - self.at.1);
-        let d = (dx * dx + dz * dz).sqrt();
-        if d <= SWIM_SPEED {
-            self.at = goal;
-            if let Some(player) = called {
-                let here = dist2(goal, player);
-                let nearer = spots
-                    .neighbours(self.to)
-                    .into_iter()
-                    .filter(|&c| dist2(middle(c), player) < here)
-                    .min_by(|&a, &b| dist2(middle(a), player).total_cmp(&dist2(middle(b), player)));
-                if let Some(n) = nearer {
-                    self.from = Some(self.to);
-                    self.to = n;
-                }
-                return heading(player.0 - self.at.0, player.1 - self.at.1);
-            }
-            let mut next = spots.neighbours(self.to);
-            if next.len() > 1 {
-                next.retain(|c| Some(*c) != self.from);
-            }
-            if let Some(&n) = next.get(rng.below(next.len() as u64) as usize) {
-                self.from = Some(self.to);
-                self.to = n;
-            }
-        } else {
-            self.at.0 += dx / d * SWIM_SPEED;
-            self.at.1 += dz / d * SWIM_SPEED;
-        }
-        let goal = middle(self.to);
-        heading(goal.0 - self.at.0, goal.1 - self.at.1)
-    }
-}
-
-fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
-    (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)
-}
-
-/// The BAMS angle that walks along (dx, dz) as the game does (sin, cos).
-fn heading(dx: f32, dz: f32) -> i32 {
-    (dx.atan2(dz) * 65536.0 / std::f32::consts::TAU) as i32
-}
-
-/// A whistle calls visitors for this long (it starts again while the player whistles), from
-/// this far away; they come to within `CALL_NEAR` of the player.
-pub const CALL_SECS: u64 = 6;
-pub const CALL_REACH: f32 = 100.0;
-pub const CALL_NEAR: f32 = 4.0;
-/// How fast a called visitor walks (units a frame).
-const WALK_SPEED: f32 = 0.3;
-
-/// One frame of a called visitor at `at` walking to `player`: where it is next and its heading,
-/// or `None` once it's near enough.
-pub fn walk_toward(at: (f32, f32), player: (f32, f32)) -> Option<((f32, f32), i32)> {
-    let (dx, dz) = (player.0 - at.0, player.1 - at.1);
-    let d = (dx * dx + dz * dz).sqrt();
-    if d <= CALL_NEAR {
-        return None;
-    }
-    let step = WALK_SPEED.min(d - CALL_NEAR);
-    Some((
-        (at.0 + dx / d * step, at.1 + dz / d * step),
-        heading(dx, dz),
-    ))
-}
-
-/// Whether a roaming visitor at `at` in a garden (index 0..3) swims: in a pond cell, below the
-/// surface.
-pub fn in_pond(spots: &Spots, at: V3) -> bool {
-    cell_of(at[0], at[2])
-        .and_then(|c| spots.water_at(c))
-        .is_some_and(|surface| at[1] < surface)
-}
-
-/// Where a swimmer is drawn: under the surface, bobbing.
-pub fn swim_y(surface: f32, seconds: f32) -> f32 {
-    surface - SWIM_DEPTH + BOB * (seconds * 2.0).sin()
-}
-
-/// Whether the next visitor goes to the pond.
-pub fn to_pond(rng: &mut Rng, swimming: usize, pond_cells: bool) -> bool {
-    pond_cells && swimming < MAX_SWIMMING && rng.below(10) < POND_IN_TEN
-}
-
-/// A land spot for a new visitor: away from the player (`from`) when one is.
-pub fn land_spot(spots: &Spots, from: (f32, f32), rng: &mut Rng) -> Option<V3> {
-    let far: Vec<&V3> = spots
-        .land
-        .iter()
-        .filter(|s| dist2((s[0], s[2]), from) >= COME_FAR * COME_FAR)
-        .collect();
-    let list: Vec<&V3> = if far.is_empty() {
-        spots.land.iter().collect()
-    } else {
-        far
-    };
-    list.get(rng.below(list.len() as u64) as usize).map(|s| **s)
-}
-
 #[cfg(target_arch = "x86")]
-pub use game::{creatures, is_visitor, on_frame, room_for_partner, take};
+pub use game::{
+    adopt, adopt_visit, areas, battle_outcome, carry_out, creatures, give_to_player, is_visitor,
+    local_in_hands, on_frame, pending, release, room_for_partner, snapshot, take, take_handover,
+    take_pending, visit_nth,
+};
 
 #[cfg(not(target_arch = "x86"))]
 pub fn is_visitor(_object: usize) -> bool {
@@ -477,8 +233,8 @@ mod game {
 
     use super::super::rotation::{self, Area};
     use super::super::scene::{
-        D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1, hooked,
-        quietly, room, to_come,
+        D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_DISPLAY, OBJ_MAIN, create,
+        data1, hooked, quietly, room, to_come,
     };
     use super::super::store::Partner;
     use super::*;
@@ -492,6 +248,12 @@ mod game {
     const OBJ_DATA2: usize = 0x38;
     /// How long a failed garden read waits before it's tried again.
     const RETRY: Duration = Duration::from_secs(2);
+    /// The visitors of a visit that turned shared can be handed over to the server this long.
+    const HANDOVER: Duration = Duration::from_secs(30);
+    /// A visit kept for a battle comes back when the player does within this long.
+    const TRIP_LIMIT: Duration = Duration::from_secs(15 * 60);
+    /// A visitor brought back after a battle stays at least this long.
+    const BACK_FOR: Duration = Duration::from_secs(60);
 
     struct Live {
         object: usize,
@@ -509,6 +271,21 @@ mod game {
     struct Carried {
         visitor: Visitor,
         partner: Partner,
+    }
+
+    /// The visit kept while the player battles one of its visitors in the karate arena: it goes
+    /// on when they come back to that garden.
+    struct Trip {
+        garden: u8,
+        area: Option<Area>,
+        cap: usize,
+        came: usize,
+        /// Each visitor and how long it has left.
+        kept: Vec<(Placed, Duration)>,
+        battled: usize,
+        /// Whether the battled one stays (none: the battle never ended, as given up).
+        stays: Option<bool>,
+        since: Instant,
     }
 
     struct Wild {
@@ -537,6 +314,11 @@ mod game {
         /// The player whistled: visitors come to where they are until then.
         called: Option<(Instant, (f32, f32))>,
         rng: Rng,
+        /// The visit's visitors when the garden turned shared: (garden, section, them, when).
+        handover: Option<(u8, u8, Vec<Placed>, Instant)>,
+        trip: Option<Trip>,
+        /// Visitors back from a battle trip, to make again.
+        restore: Vec<(Placed, Duration)>,
     }
 
     // SAFETY: the object addresses are only used on the game thread.
@@ -570,6 +352,9 @@ mod game {
                 pending: None,
                 called: None,
                 rng: Rng::new(seed),
+                handover: None,
+                trip: None,
+                restore: Vec::new(),
             }
         });
         f(w)
@@ -623,6 +408,36 @@ mod game {
             }
             false
         });
+    }
+
+    /// Our live visitors where they are: (object, it).
+    fn placed(w: &Wild) -> Vec<(usize, Placed)> {
+        let live = live_objects();
+        w.live
+            .iter()
+            .filter(|v| live.contains(&v.object))
+            .filter_map(|v| {
+                // SAFETY: our live object (in the registry this frame), on the game thread.
+                let (at, angle) = unsafe {
+                    let d = data1(v.object);
+                    if d == 0 {
+                        return None;
+                    }
+                    (
+                        ((d + D_POSITION) as *const [f32; 3]).read_unaligned(),
+                        ((d + D_ANGLE) as *const i32).read_unaligned(),
+                    )
+                };
+                let placed = Placed {
+                    visitor: v.visitor,
+                    partner: v.partner,
+                    at,
+                    angle: angle as u16,
+                    swimming: v.swim.is_some(),
+                };
+                Some((v.object, placed))
+            })
+            .collect()
     }
 
     /// The visitor in the player's hands, if any.
@@ -696,6 +511,9 @@ mod game {
             }
             w.carrying = None;
             w.pending = None;
+            if sa2::current_level() != sa2::LEVEL_CHAO_WORLD {
+                w.trip = None;
+            }
             return;
         }
         if !sa2::in_garden() {
@@ -728,10 +546,26 @@ mod game {
             enter(w, garden, now);
         }
         if crate::garden::server_runs() || crate::bring::friends_in(i32::from(garden)) {
-            // A shared online garden: no visitors there (one in the player's hands goes once
-            // let go of; a carried one waits for a garden of their own).
+            // A shared online garden: our own visitors go (one in the player's hands goes once
+            // let go of; a carried one waits for a garden of their own, unless the garden's
+            // shared visitors take it, `shared`). Where they were is kept a while for the
+            // server's first pick there.
             w.alone_since = None;
             w.title = None;
+            w.restore.clear();
+            if running(w)
+                && let Some(section) = w.area.as_ref().map(|a| a.section)
+            {
+                let held = crate::garden::player_held();
+                let list: Vec<Placed> = placed(w)
+                    .into_iter()
+                    .filter(|(o, _)| *o != held)
+                    .map(|(_, p)| p)
+                    .collect();
+                if !list.is_empty() {
+                    w.handover = Some((garden, section, list, now));
+                }
+            }
             delete_all(w);
             w.carrying = carried(w);
             return;
@@ -758,6 +592,9 @@ mod game {
         let live = live_objects();
         w.live.retain(|v| live.contains(&v.object));
         w.carrying = carried(w);
+        if !w.restore.is_empty() {
+            come_back(w, garden, now);
+        }
         if w.pending.is_some() && crate::garden::player_held() == 0 {
             hand_over(w, garden, now);
         }
@@ -788,13 +625,50 @@ mod game {
         }
     }
 
-    /// Walked into garden `garden`: its visitors start anew.
+    /// Walked into garden `garden`: its visitors start anew, or go on as they were when the
+    /// player comes back from battling one of them.
     fn enter(w: &mut Wild, garden: u8, now: Instant) {
         delete_all(w);
         if let Some(c) = w.carrying.take() {
             w.pending = Some(c);
         }
         w.garden = garden;
+        w.restore.clear();
+        if let Some(t) = w
+            .trip
+            .take()
+            .filter(|t| t.garden == garden && now.duration_since(t.since) < TRIP_LIMIT)
+        {
+            let stays = t.stays == Some(true);
+            log!(
+                "gba link: back from a battle in garden {garden}: its visit goes on{}",
+                if stays {
+                    ""
+                } else {
+                    " without the one that ran away"
+                }
+            );
+            w.chosen = t.area.is_some();
+            w.area = t.area;
+            w.cap = t.cap;
+            w.came = t.came;
+            w.restore = t
+                .kept
+                .into_iter()
+                .enumerate()
+                .filter(|&(i, _)| i != t.battled || stays)
+                .map(|(_, k)| k)
+                .collect();
+            w.spots = w
+                .known_spots
+                .get(usize::from(garden.saturating_sub(1)))
+                .cloned()
+                .flatten();
+            w.spots_retry = None;
+            w.next = Some(now + delay(&mut w.rng));
+            w.alone_since = None;
+            return;
+        }
         w.chosen = false;
         if let Some(n) = w.visits.get_mut(usize::from(garden.saturating_sub(1))) {
             *n = n.wrapping_add(1);
@@ -814,23 +688,7 @@ mod game {
     /// The garden's area for this visit, and its name as the title. False while the ROM isn't
     /// there (or has no area for this garden).
     fn choose_area(w: &mut Wild, garden: u8, now: Instant) -> bool {
-        if w.areas.is_none() {
-            if w.areas_failed {
-                return false;
-            }
-            let Some(rom) = super::super::loaded_rom() else {
-                return false;
-            };
-            match rotation::areas(&rom) {
-                Some(a) => w.areas = Some(Arc::new(a)),
-                None => {
-                    log!("gba link: the ROM's wild tables can't be read; no wild visitors");
-                    w.areas_failed = true;
-                    return false;
-                }
-            }
-        }
-        let (Some(areas), Some(rom)) = (w.areas.clone(), super::super::loaded_rom()) else {
+        let (Some(areas), Some(rom)) = (load_areas(w), super::super::loaded_rom()) else {
             return false;
         };
         let nth = w
@@ -850,6 +708,219 @@ mod game {
         w.area = Some(area.clone());
         w.chosen = true;
         true
+    }
+
+    /// The ROM's wild areas, read once (none while the ROM isn't there).
+    fn load_areas(w: &mut Wild) -> Option<Arc<Vec<Area>>> {
+        if w.areas.is_none() {
+            if w.areas_failed {
+                return None;
+            }
+            let rom = super::super::loaded_rom()?;
+            match rotation::areas(&rom) {
+                Some(a) => w.areas = Some(Arc::new(a)),
+                None => {
+                    log!("gba link: the ROM's wild tables can't be read; no wild visitors");
+                    w.areas_failed = true;
+                    return None;
+                }
+            }
+        }
+        w.areas.clone()
+    }
+
+    /// The ROM's wild areas (`rotation::areas`), read once.
+    pub fn areas() -> Option<Arc<Vec<Area>>> {
+        with(load_areas)
+    }
+
+    /// Garden `garden`'s visits so far, which pick its area in turn (`rotation::area_at`).
+    pub fn visit_nth(garden: u8) -> u32 {
+        with(|w| {
+            w.visits
+                .get(usize::from(garden.saturating_sub(1)))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Where our visitors were when garden `garden` turned shared, with its area's section, if
+    /// that was a moment ago: for the server's first pick there. Taken once.
+    pub fn take_handover(garden: u8) -> Option<(u8, Vec<Placed>)> {
+        with(|w| {
+            let (g, section, list, at) = w.handover.take()?;
+            (g == garden && at.elapsed() < HANDOVER).then_some((section, list))
+        })
+    }
+
+    /// The visitor the player carried out of a shared garden waits for the next garden, as one
+    /// carried out of their own.
+    pub fn carry_out(visitor: Visitor, partner: Partner) {
+        with(|w| w.pending = Some(Carried { visitor, partner }));
+    }
+
+    /// The visitor the player carries to the next garden, if any.
+    pub fn pending() -> Option<(Visitor, Partner)> {
+        with(|w| w.pending.map(|c| (c.visitor, c.partner)))
+    }
+
+    /// Takes the visitor the player carries (a shared garden has it now).
+    pub fn take_pending() {
+        with(|w| w.pending = None);
+    }
+
+    /// One of our visitors in the player's hands: its object, it and what it teaches.
+    pub fn local_in_hands() -> Option<(usize, Visitor, Partner)> {
+        with(|w| {
+            let held = crate::garden::player_held();
+            w.live
+                .iter()
+                .find(|v| held != 0 && v.object == held)
+                .map(|v| (v.object, v.visitor, v.partner))
+        })
+    }
+
+    /// Visitor `object` is no longer ours (a shared garden's copy now): its own main, it and
+    /// what it teaches. The object stays.
+    pub fn release(object: usize) -> Option<(usize, Visitor, Partner)> {
+        with(|w| {
+            let i = w.live.iter().position(|v| v.object == object)?;
+            let v = w.live.remove(i);
+            Some((v.main, v.visitor, v.partner))
+        })
+    }
+
+    /// A shared garden's copy `object` (whose own main is `main`) is our visitor from now on
+    /// (the garden is the player's own again).
+    ///
+    /// # Safety
+    /// Game thread; `object` is a live animal of ours (`scene::create`).
+    pub unsafe fn adopt(object: usize, main: usize, visitor: Visitor, partner: Partner) {
+        // SAFETY: as the caller's.
+        unsafe {
+            ((object + OBJ_MAIN) as *mut usize)
+                .write(visitor_main as extern "C" fn(usize) as usize);
+            ((object + OBJ_DISPLAY) as *mut usize)
+                .write(visitor_display as extern "C" fn(usize) as usize);
+        }
+        with(|w| {
+            let stay = Duration::from_secs(w.rng.between(STAY_SECS.0, STAY_SECS.1));
+            w.live.push(Live {
+                object,
+                visitor,
+                partner,
+                main,
+                born: Instant::now(),
+                stay,
+                swim: None,
+            });
+        });
+    }
+
+    /// Garden `garden` is the player's own again, its shared visitors from map section `section`
+    /// now theirs (`adopt`): the visit goes on from that area, with no title.
+    pub fn adopt_visit(garden: u8, section: Option<u8>) {
+        with(|w| {
+            if w.garden != garden {
+                return;
+            }
+            let area = section.and_then(|s| {
+                let areas = load_areas(w)?;
+                areas.iter().find(|a| a.section == s).cloned()
+            });
+            if let Some(area) = area {
+                w.area = Some(area);
+                w.chosen = true;
+            }
+            w.title = None;
+            w.came = w.came.max(ON_ENTRY);
+            let now = Instant::now();
+            w.next = Some(now + delay(&mut w.rng));
+        });
+    }
+
+    /// Keeps the visit as it is for a battle with visitor `object` in the karate arena: it
+    /// goes on when the player comes back to this garden (`battle_outcome` says whether that
+    /// one stays). Whether `object` is one of ours.
+    pub fn snapshot(object: usize) -> bool {
+        with(|w| {
+            if !running(w) {
+                return false;
+            }
+            let now = Instant::now();
+            let kept: Vec<(usize, Placed, Duration)> = placed(w)
+                .into_iter()
+                .filter_map(|(o, p)| {
+                    let v = w.live.iter().find(|v| v.object == o)?;
+                    let left = v.stay.saturating_sub(now.duration_since(v.born));
+                    Some((o, p, left.max(BACK_FOR)))
+                })
+                .collect();
+            let Some(battled) = kept.iter().position(|(o, _, _)| *o == object) else {
+                return false;
+            };
+            w.trip = Some(Trip {
+                garden: w.garden,
+                area: w.area.clone(),
+                cap: w.cap,
+                came: w.came,
+                kept: kept.into_iter().map(|(_, p, left)| (p, left)).collect(),
+                battled,
+                stays: None,
+                since: now,
+            });
+            true
+        })
+    }
+
+    /// The battle with the visitor kept by `snapshot` is over: whether it stays. Before the
+    /// player left the garden the visit simply goes on (one that ran away goes).
+    pub fn battle_outcome(stays: bool) {
+        with(|w| {
+            let here = running(w);
+            let Some(t) = w.trip.as_mut() else { return };
+            t.stays = Some(stays);
+            if !(here && w.garden == t.garden) {
+                return;
+            }
+            let battled = t.kept.get(t.battled).map(|(p, _)| p.visitor);
+            w.trip = None;
+            if stays {
+                return;
+            }
+            let live = live_objects();
+            if let Some(i) = w
+                .live
+                .iter()
+                .position(|v| Some(v.visitor) == battled && live.contains(&v.object))
+            {
+                let v = w.live.remove(i);
+                // SAFETY: our live object; the game deletes it on its next pass.
+                unsafe { ((v.object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT) };
+            }
+        })
+    }
+
+    /// The visitors back from a battle trip come again where they were.
+    fn come_back(w: &mut Wild, garden: u8, now: Instant) {
+        let coming = to_come(garden) as u32;
+        for (p, left) in std::mem::take(&mut w.restore) {
+            if !room(RESERVE + coming) {
+                break;
+            }
+            let at = Vector {
+                x: p.at[0],
+                y: p.at[1] + 0.5,
+                z: p.at[2],
+            };
+            // SAFETY: game thread, in a running garden with room in category 2.
+            if let Some(object) =
+                unsafe { spawn(w, at, i32::from(p.angle), p.visitor, p.partner, now) }
+                && let Some(v) = w.live.iter_mut().find(|v| v.object == object)
+            {
+                v.stay = left;
+            }
+        }
     }
 
     fn read_spots(w: &mut Wild, garden: u8, now: Instant) -> bool {
@@ -906,7 +977,25 @@ mod game {
             return;
         };
         w.pending = None;
-        // SAFETY: the player's pickup with our live object (it checks the hands are empty).
+        // SAFETY: our live object, on the game thread.
+        unsafe { give_to_player(object) };
+        log!(
+            "gba link: a visitor (species {}) came along in the player's hands",
+            c.visitor.species
+        );
+        let name = super::super::loaded_rom()
+            .and_then(|rom| rom.species_name(c.visitor.species))
+            .map(|n| super::super::ascii(&n))
+            .unwrap_or_else(|| "Your visitor".into());
+        crate::hud::toast(format!("{name} came along"));
+    }
+
+    /// Hands `object` to the player (the game's pickup; it checks the hands are empty).
+    ///
+    /// # Safety
+    /// Game thread; `object` is a live animal.
+    pub unsafe fn give_to_player(object: usize) {
+        // SAFETY: as the caller's.
         unsafe {
             std::arch::asm!(
                 "push {object}",
@@ -918,15 +1007,6 @@ mod game {
                 clobber_abi("C"),
             );
         }
-        log!(
-            "gba link: a visitor (species {}) came along in the player's hands",
-            c.visitor.species
-        );
-        let name = super::super::loaded_rom()
-            .and_then(|rom| rom.species_name(c.visitor.species))
-            .map(|n| super::super::ascii(&n))
-            .unwrap_or_else(|| "Your visitor".into());
-        crate::hud::toast(format!("{name} came along"));
     }
 
     /// Visitors that stayed long enough go once the player is away from them.
@@ -1212,7 +1292,6 @@ mod game {
 mod tests {
     use super::super::rotation::{self, Theme};
     use super::*;
-    use crate::chao_sim::land::{LAND_EXPORT, PeFile};
     use std::path::Path;
 
     fn rom() -> Option<Rom> {
@@ -1337,122 +1416,6 @@ mod tests {
             .count();
         let expected = n / SHINY_ODDS as usize;
         assert!(shiny > expected / 2 && shiny < expected * 2, "{shiny}");
-    }
-
-    #[test]
-    fn swimmers_stay_on_pond_cells() {
-        // A 3x3 pond with its middle at (5, 5).
-        let mut spots = Spots::default();
-        for c in 4..7 {
-            for r in 4..7 {
-                spots.water.push(((c, r), -2.0));
-            }
-        }
-        assert_eq!(spots.pond_entries().len(), 9);
-        assert_eq!(spots.neighbours((5, 5)).len(), 8);
-        assert_eq!(spots.neighbours((4, 4)).len(), 3);
-        let (x, z) = middle((5, 5));
-        assert!(in_pond(&spots, [x, -3.0, z]));
-        assert!(!in_pond(&spots, [x, -1.0, z]));
-        assert!(!in_pond(&spots, [x + 30.0, -3.0, z]));
-        let mut swim = Swim::start(&spots, (x + 1.0, z)).unwrap();
-        assert_eq!(swim.to, (5, 5));
-        let mut rng = Rng::new(3);
-        let (lo, hi) = (middle((4, 4)), middle((6, 6)));
-        for _ in 0..5_000 {
-            swim.step(&spots, &mut rng, None);
-            assert!((lo.0 - 0.01..=hi.0 + 0.01).contains(&swim.at.0));
-            assert!((lo.1 - 0.01..=hi.1 + 0.01).contains(&swim.at.1));
-        }
-        // Heading follows the game's (sin, cos).
-        assert_eq!(heading(0.0, 1.0), 0);
-        assert_eq!(heading(1.0, 0.0), 0x4000);
-        let y = swim_y(-2.0, 0.0);
-        assert!((y + 3.5).abs() < 1e-4);
-        // Called from beyond the pond's (6, 6) corner: it swims there and stays.
-        let player = (middle((6, 6)).0 + 20.0, middle((6, 6)).1 + 20.0);
-        for _ in 0..2_000 {
-            swim.step(&spots, &mut rng, Some(player));
-        }
-        assert_eq!(swim.to, (6, 6));
-        let corner = middle((6, 6));
-        assert!(dist2(swim.at, corner) < 0.01);
-    }
-
-    #[test]
-    fn a_whistle_walks_a_visitor_to_the_player() {
-        let mut at = (0.0, 0.0);
-        let player = (30.0, 40.0);
-        let mut steps = 0;
-        while let Some((next, angle)) = walk_toward(at, player) {
-            // Heading toward the player, a step at a time, never past the stopping distance.
-            assert_eq!(angle, heading(player.0 - at.0, player.1 - at.1));
-            assert!(dist2(next, at).sqrt() <= WALK_SPEED + 1e-4);
-            at = next;
-            steps += 1;
-            assert!(steps < 1_000);
-        }
-        assert!((dist2(at, player).sqrt() - CALL_NEAR).abs() < 1e-3);
-        assert_eq!(walk_toward((29.0, 40.0), player), None);
-    }
-
-    #[test]
-    fn new_visitors_come_away_from_the_player() {
-        let spots = Spots {
-            land: vec![[0.0, 0.0, 0.0], [100.0, 1.0, 0.0]],
-            water: Vec::new(),
-        };
-        let mut rng = Rng::new(5);
-        for _ in 0..20 {
-            assert_eq!(
-                land_spot(&spots, (0.0, 0.0), &mut rng),
-                Some([100.0, 1.0, 0.0])
-            );
-        }
-        assert!(land_spot(&Spots::default(), (0.0, 0.0), &mut rng).is_none());
-        // No pond cells: never the pond; three swimming: never again.
-        assert!((0..100).all(|_| !to_pond(&mut rng, 0, false)));
-        assert!((0..100).all(|_| !to_pond(&mut rng, MAX_SWIMMING, true)));
-        assert!((0..100).any(|_| to_pond(&mut rng, 0, true)));
-    }
-
-    #[test]
-    fn gardens_have_spots_on_grass_and_in_the_pond() {
-        let (Ok(dll), Ok(exe)) = (
-            std::fs::read(
-                "/mnt/SSD1/SteamLibrary/steamapps/common/Sonic Adventure 2/resource/gd_PC/DLL/Win32/Data_DLL_orig.dll",
-            ),
-            std::fs::read(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/re/bin/sonic2app.dumped.exe"
-            )),
-        ) else {
-            return;
-        };
-        let (dll, exe) = (PeFile::parse(dll).unwrap(), PeFile::parse(exe).unwrap());
-        for (i, name) in LAND_EXPORT.iter().enumerate() {
-            let garden = Garden::read(&dll, dll.export(name).unwrap(), &exe, i).unwrap();
-            let spots = Spots::read(&garden);
-            let entries = spots.pond_entries();
-            eprintln!(
-                "{name}: {} land, {} pond, {} pond entries",
-                spots.land.len(),
-                spots.water.len(),
-                entries.len()
-            );
-            assert!(spots.land.len() > 150, "{name}");
-            assert!(entries.len() > 10, "{name}");
-            for (cell, surface) in &spots.water {
-                assert!(
-                    (surface - WATER_Y[i]).abs() < 0.3,
-                    "{name} {cell:?} {surface}"
-                );
-            }
-            // Land spots are on the ground, not in the pond.
-            for s in &spots.land {
-                assert!(!in_pond(&spots, *s));
-            }
-        }
     }
 
     #[test]

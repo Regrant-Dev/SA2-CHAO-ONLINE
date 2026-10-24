@@ -19,19 +19,24 @@
 //!   `partners.txt` next to them, which is read from `chao/import`.
 //! - Wild visitors: each garden has an area of the ROM's wild tables each day (`rotation`), whose
 //!   creatures come by now and then and are absorbed like partners (`wild`).
+//! - In a garden the server runs, its visitors and the partners players bring are the server's,
+//!   shown in every game there from its own ROM (`shared`); the link machine is there too, each
+//!   player using it for themselves.
 
 // Off the game (Linux builds) only the tests use the garden side.
 #![cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 
 pub(crate) mod billboard;
 mod card;
-mod machine;
+pub(crate) mod machine;
 mod machine_model;
 pub mod profile;
 pub mod rotation;
 mod scene;
+mod shared;
 pub mod store;
 mod wild;
+pub mod wild_battle;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -651,8 +656,11 @@ fn absorbed(garden: u8, key: u64, identity: u64, name: &str) {
 /// Each frame: the garden's waiting partners (scene.rs) and wild visitors (wild.rs).
 pub fn on_frame() {
     scene::on_frame();
+    // Before `wild`: a shared visitor carried out of the garden becomes its to carry on.
+    shared::on_frame();
     wild::on_frame();
     machine::on_frame();
+    wild_battle::on_frame();
     card::on_frame();
 }
 
@@ -680,6 +688,7 @@ fn make_folder() {
 
 pub fn install() {
     make_folder();
+    crate::registry::raise_animal_limit();
     scene::install();
     // The ROM in the background, so the status balloon has the type names from the start.
     std::thread::spawn(|| {
@@ -692,7 +701,34 @@ pub fn install() {
 /// A garden object that is one of our partners (items.rs leaves them out: they're never shared
 /// or saved).
 pub fn is_partner(object: usize) -> bool {
-    scene::is_partner_object(object) || wild::is_visitor(object)
+    scene::is_partner_object(object) || wild::is_visitor(object) || shared::is_copy(object)
+}
+
+/// Settings from config.ini (`SharedVisitors`): the gardens the server runs show their shared
+/// wild visitors and link machine.
+pub fn set_shared_visitors(on: bool) {
+    shared::set_enabled(on);
+}
+
+/// Network: one of the host's messages about the shared visitors (`Body::WildList`,
+/// `WildAsk`, `WildAnswer`, `WildTaught`, `WildUsed`); anyone else's is dropped.
+pub fn received_wild(from: u8, body: crate::net::protocol::Body) {
+    shared::received(from, body);
+}
+
+/// Network: our messages about the shared visitors for the host, (body, reliable).
+pub fn take_wild_outgoing() -> Vec<(crate::net::protocol::Body, bool)> {
+    shared::take_outgoing()
+}
+
+/// Network: connected or disconnected (`WildHello` goes again).
+pub fn wild_connected() {
+    shared::connected();
+}
+
+/// Chao `chao` keeps off the shared visitor the player holds (its owner can't learn from it).
+pub fn keeps_off_visitor(chao: usize) -> bool {
+    shared::keeps_off_visitor(chao)
 }
 
 /// Settings from config.ini (`WildVisitors`): wild visitors come to the gardens.
@@ -722,6 +758,9 @@ fn learned_wild(identity: u64, partner: Partner, name: &str) {
 /// `angle` (BAMS) instead of walking in ahead of the player (the link machine). The message to
 /// show, or why it can't come.
 pub fn bring_out(c: &Candidate, at: [f32; 3], angle: i32) -> Result<String, String> {
+    if crate::game::in_garden() && crate::garden::server_runs() {
+        return bring_shared(c, at, angle);
+    }
     if crate::game::in_garden() {
         let garden = crate::game::current_chao_area() as u8;
         with_store(|s| s.can_import(c.key, garden, today()))
@@ -733,6 +772,34 @@ pub fn bring_out(c: &Candidate, at: [f32; 3], angle: i32) -> Result<String, Stri
     let name = import_checked(c)?;
     scene::arrive_at(c.key, at, angle);
     Ok(format!("{name} came out of the link machine"))
+}
+
+/// `bring_out` in a garden the server runs: the server is asked to take it as a shared visitor;
+/// it's recorded as brought only once it does (`shared`).
+fn bring_shared(c: &Candidate, at: [f32; 3], angle: i32) -> Result<String, String> {
+    let garden = crate::game::current_chao_area() as u8;
+    with_store(|s| s.can_import(c.key, garden, today())).map_err(|r| r.message().to_string())?;
+    let rom = rom()?;
+    let species = rom
+        .species(c.species)
+        .ok_or("The ROM has no data for this one")?;
+    let partner = Partner {
+        species: c.species,
+        types: species.types,
+        moves: c.moves,
+        level: c.level.clamp(1, 100),
+        ability: ability_of(&species, c.ability_slot),
+        from_save: matches!(c.source, Source::Party(_) | Source::Box { .. }),
+    };
+    let name = ascii(&rom.species_name(c.species).unwrap_or_default());
+    shared::bring(shared::Bring {
+        key: c.key,
+        garden,
+        partner,
+        name: name.clone(),
+        at: Some((at, angle)),
+    })?;
+    Ok(format!("{name} is coming out of the link machine"))
 }
 
 /// Settings from config.ini (`LinkMachine`): each garden has its link machine, which replaces

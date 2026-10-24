@@ -64,6 +64,9 @@
       <Property name="WildVisitors" display="Wild visitors in the gardens" type="bool" defaultvalue="True" alwaysinclude="true">
         <HelpText>Each garden has an area of the GBA game each day, and that area's wild creatures come by now and then for your Chao to absorb. Needs the ROM.</HelpText>
       </Property>
+      <Property name="SharedVisitors" display="Wild visitors in shared gardens" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Online, a garden shared with friends has wild visitors everyone there sees, and its link machine. Each player's game shows them from their own ROM (players with another ROM, or none, don't see them). Off: shared gardens have no wild visitors or link machine for you, and your Chao learn nothing from the ones friends hand them.</HelpText>
+      </Property>
       <Property name="BattleEffects" display="Battle effects" type="bool" defaultvalue="True" alwaysinclude="true">
         <HelpText>In Chao battles, the Chao move by kind of move and show their status, with the GBA game's move effects, sparkles, a flash on strong hits and sounds. Off: karate punches and hits only.</HelpText>
       </Property>

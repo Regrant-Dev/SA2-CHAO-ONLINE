@@ -28,6 +28,7 @@
 //! - `visuals`: how the arena shows each cue (motions by kind of move, status signs, effect
 //!   sprites, flash and shake), with `effects_gfx` reading the ROM's effect sprites and drawing
 //!   them and `movement` moving each move's sprites the way its script does.
+//! - `wild`: battling a wild visitor from a garden, a trip to the karate arena and back.
 //! - `arena`: the karate arena's menu, Chao, camera and motions.
 //! - `game`: ties the session to the arena and the HUD each frame.
 
@@ -55,6 +56,7 @@ pub mod session;
 pub mod team;
 pub mod trainers;
 pub mod visuals;
+pub mod wild;
 
 pub use data::{Effectiveness, MoveData, Target, TypeChart};
 pub use engine::{Action, Battle, BattleError, Choice, Format, Phase, Rules};

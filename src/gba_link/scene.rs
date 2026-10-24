@@ -4,14 +4,16 @@
 //! animals, Chao only notice one while the player carries it: a Chao that's handed one absorbs
 //! it as usual (motions, sparkles, the status balloon),
 //! but at `0x56708E` a partner skips the animal effects for ours (`super::absorbed`); so does a
-//! wild visitor (`super::wild`), which makes its objects with the same helpers.
+//! wild visitor (`super::wild`), which makes its objects with the same helpers, and a copy of a
+//! shared garden's visitor (`super::shared`), which goes to the server instead. In a shared
+//! garden waiting partners have no objects of their own: the server's visitors show them.
 
 #[cfg(target_arch = "x86")]
 pub(super) use game::creatures;
 #[cfg(target_arch = "x86")]
 pub(super) use game::{
-    D_MODE, D_POSITION, DELETE_OBJECT, MODE_PLAYER, MODE_ROAM, OBJ_MAIN, create, data1, hooked,
-    quietly, room, to_come,
+    D_MODE, D_POSITION, DELETE_OBJECT, MODE_CHAO, MODE_PLAYER, MODE_ROAM, OBJ_DISPLAY, OBJ_MAIN,
+    create, data1, hooked, quietly, room, to_come,
 };
 #[cfg(target_arch = "x86")]
 pub use game::{install, is_partner_object, on_frame};
@@ -80,7 +82,7 @@ mod game {
     use std::sync::Mutex;
 
     use super::super::store::Partner;
-    use super::super::{absorbed, learned_wild, rom, wild, with_store};
+    use super::super::{absorbed, learned_wild, rom, shared, wild, with_store};
     use super::{arrival, hop, take_arrival};
     use crate::game::{self as sa2, Vector};
     use crate::log;
@@ -98,7 +100,7 @@ mod game {
     const ADD_HAPPINESS: usize = 0x0053_6320;
 
     pub const OBJ_MAIN: usize = 0x10;
-    const OBJ_DISPLAY: usize = 0x14;
+    pub const OBJ_DISPLAY: usize = 0x14;
     const OBJ_DATA1: usize = 0x34;
     const OBJ_ENTRY: usize = 0x3C;
     /// Animal Data1: +0 mode (0 roam, 1 held by the player, 2 held by a Chao, 3 deleted),
@@ -107,6 +109,7 @@ mod game {
     pub const D_POSITION: usize = 0x14;
     pub const MODE_ROAM: u8 = 0;
     pub const MODE_PLAYER: u8 = 1;
+    pub const MODE_CHAO: u8 = 2;
     const MODE_DELETED: u8 = 3;
     /// The Chao record: Chao Data1 + 0x5C.
     const CHAO_RECORD: usize = 0x5C;
@@ -272,7 +275,7 @@ mod game {
             }
             return;
         }
-        if sa2::between_areas() || crate::garden::server_runs() {
+        if sa2::between_areas() {
             return;
         }
         let garden = sa2::current_chao_area() as u8;
@@ -280,6 +283,26 @@ mod game {
             .into_iter()
             .map(|(_, o)| o)
             .collect();
+        if crate::garden::server_runs() || crate::bring::friends_in(i32::from(garden)) {
+            // A shared garden: waiting partners stay waiting without objects here (a Chao that
+            // absorbed one would be a friend's copy; the server's visitors show them), one in
+            // the player's hands too (dropped first).
+            let held = crate::garden::player_held();
+            for s in scene.spawned.drain(..) {
+                if !live.contains(&s.object) {
+                    continue;
+                }
+                // SAFETY: our live object, on the game thread; the game deletes it on its next
+                // pass.
+                unsafe {
+                    if s.object == held {
+                        crate::items::drop_held();
+                    }
+                    ((s.object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT);
+                }
+            }
+            return;
+        }
         scene
             .spawned
             .retain(|s| live.contains(&s.object) && s.garden == garden);
@@ -442,13 +465,18 @@ mod game {
     /// Hook: whether the animal a Chao absorbs is a partner or a wild visitor (cdecl).
     extern "C" fn is_partner(_chao: usize, animal: usize) -> u32 {
         let partner = lock().spawned.iter().any(|s| s.object == animal);
-        u32::from(partner || wild::is_visitor(animal))
+        u32::from(partner || wild::is_visitor(animal) || shared::is_copy(animal))
     }
 
     /// What a Chao absorbed.
     enum Took {
-        Partner { garden: u8, key: u64 },
+        Partner {
+            garden: u8,
+            key: u64,
+        },
         Wild(Partner),
+        /// A shared garden's visitor: the server tells the Chao's owner (`shared::take`).
+        Shared,
     }
 
     /// Hook: a Chao absorbs partner or visitor `animal`: our effect, then the animal goes.
@@ -467,9 +495,12 @@ mod game {
                         key: s.key,
                     },
                 ),
-                None => match wild::take(animal) {
-                    Some((main, partner)) => (main, Took::Wild(partner)),
-                    None => return,
+                None => match shared::take(chao, animal) {
+                    Some(main) => (main, Took::Shared),
+                    None => match wild::take(animal) {
+                        Some((main, partner)) => (main, Took::Wild(partner)),
+                        None => return,
+                    },
                 },
             };
             // SAFETY: the Chao and animal the absorb behaviour has, on the game thread. The
@@ -497,6 +528,7 @@ mod game {
                 match took {
                     Took::Partner { garden, key } => absorbed(garden, key, identity, &name),
                     Took::Wild(partner) => learned_wild(identity, partner, &name),
+                    Took::Shared => {}
                 }
                 // Happiness +1 as for an animal; no alignment change.
                 std::arch::asm!(

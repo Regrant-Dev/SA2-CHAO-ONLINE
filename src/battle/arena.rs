@@ -21,6 +21,11 @@ pub const AREA_KARATE: i32 = 10;
 const PAUSED: usize = 0x0174_AFF7;
 /// Menu buttons pressed this frame, player 1 (built from the pad and keyboard by 0x441AB0).
 const MENU_BUTTONS: usize = 0x01DE_FAB0;
+/// The byte karate's exit clears before it leaves (state 0xF, 0x542E83).
+const EXIT_CLEARS: usize = 0x0174_AFD6;
+/// `GoToChaoArea(area)` 0x52B5B0 (cdecl).
+#[cfg(target_arch = "x86")]
+const GO_TO_CHAO_AREA: usize = 0x0052_B5B0;
 
 // Offsets in `g`.
 /// Set while a menu part (the banner) is busy; the mode select reads no buttons then.
@@ -37,6 +42,8 @@ const STATE_MENU: u8 = 2;
 pub const STATE_MODE_SELECT: u8 = 3;
 const STATE_CONFIRM: u8 = 7;
 const STATE_SPAWN: u8 = 9;
+/// After the exit: the main object only holds `G_BUSY` set until the area goes.
+const STATE_GONE: u8 = 0x10;
 const SUB_INPUT: u8 = 1;
 /// A sub-state that returns at once: the window stays up and reads no buttons.
 const SUB_HELD: u8 = 2;
@@ -191,6 +198,24 @@ impl Karate {
         self.set_camera(MENU_CAMERA.0, MENU_CAMERA.1);
         write(self.g + G_VS, 0u8);
         self.set_state(STATE_MENU, 0);
+    }
+
+    /// Leaves the karate area for Chao World area `area` with the steps of karate's own exit
+    /// (state 0xF, 0x542E83..0x542EBA), which always goes to the Neutral garden: the byte it
+    /// clears, `GoToChaoArea(area)`, then state 0x10 and the menu parts held. Called from the
+    /// main object's MainSub, as the game's own exit runs.
+    pub fn exit_to(self, area: i32) {
+        write(EXIT_CLEARS, 0u8);
+        #[cfg(target_arch = "x86")]
+        // SAFETY: the game's cdecl GoToChaoArea, as karate's own exit calls it from here.
+        unsafe {
+            let go: extern "C" fn(i32) = std::mem::transmute(GO_TO_CHAO_AREA);
+            go(area);
+        }
+        #[cfg(not(target_arch = "x86"))]
+        let _ = area;
+        self.set_state(STATE_GONE, 0);
+        write(self.g + G_BUSY, 1u8);
     }
 
     /// Points the karate camera from `position` at `look`.

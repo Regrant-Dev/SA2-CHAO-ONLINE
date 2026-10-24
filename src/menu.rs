@@ -157,6 +157,9 @@ pub struct Settings {
     pub gba: crate::gba_link::Paths,
     /// Wild visitors come to the gardens (`gba_link::set_wild_visitors`).
     pub wild_visitors: bool,
+    /// Gardens the server runs show their shared wild visitors and link machine
+    /// (`gba_link::set_shared_visitors`).
+    pub shared_visitors: bool,
     /// Battles show moves with effects and status on the Chao (`battle::visuals`).
     pub battle_effects: bool,
     /// Each garden has its link machine (`gba_link::set_link_machine`).
@@ -191,6 +194,7 @@ impl Settings {
             player_key: String::new(),
             gba: crate::gba_link::Paths::default(),
             wild_visitors: true,
+            shared_visitors: true,
             battle_effects: true,
             link_machine: true,
             battle_trainers: true,
@@ -234,6 +238,12 @@ impl Settings {
                 "gbasave" => s.gba.save = v,
                 "wildvisitors" => {
                     s.wild_visitors = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                }
+                "sharedvisitors" => {
+                    s.shared_visitors = !matches!(
                         v.to_ascii_lowercase().as_str(),
                         "off" | "0" | "false" | "no"
                     )
@@ -298,7 +308,7 @@ impl Settings {
     /// `config.ini` in the format SA Mod Manager writes for configschema.xml.
     pub fn to_ini(&self) -> String {
         format!(
-            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\nWildVisitors={}\nBattleEffects={}\nLinkMachine={}\nBattleTrainers={}\nBattleOnline={}\n\n[ChaoWorld]\nBlackMarketRefresh={}\n",
+            "[Multiplayer]\nMode={}\nName={}\nHost={}\nPort={}\nNameTags={}\nChaoRace={}\nMyChao={}\n{}OthersChangeChao={}\nRoomMode={}\nSkin={}\nSkinVoiceVolume={}\nGameVolume={}\nStageSync={}\nPlayerKey={}\n\n[GBALink]\nGbaRom={}\nGbaSave={}\nWildVisitors={}\nSharedVisitors={}\nBattleEffects={}\nLinkMachine={}\nBattleTrainers={}\nBattleOnline={}\n\n[ChaoWorld]\nBlackMarketRefresh={}\n",
             MODES[self.mode],
             self.name,
             self.host,
@@ -324,6 +334,7 @@ impl Settings {
             self.gba.rom,
             self.gba.save,
             if self.wild_visitors { "On" } else { "Off" },
+            if self.shared_visitors { "On" } else { "Off" },
             if self.battle_effects { "On" } else { "Off" },
             if self.link_machine { "On" } else { "Off" },
             if self.battle_trainers { "On" } else { "Off" },
@@ -342,6 +353,7 @@ pub fn load(mod_path: &str) -> Settings {
         .unwrap_or_else(|| Settings::parse(""));
     crate::gba_link::set_paths(settings.gba.clone());
     crate::gba_link::set_wild_visitors(settings.wild_visitors);
+    crate::gba_link::set_shared_visitors(settings.shared_visitors);
     crate::battle::visuals::set_enabled(settings.battle_effects);
     crate::gba_link::set_link_machine(settings.link_machine);
     crate::battle::trainers::set_enabled(settings.battle_trainers);
@@ -421,6 +433,7 @@ static MENU: Mutex<Menu> = Mutex::new(Menu {
             save: String::new(),
         },
         wild_visitors: true,
+        shared_visitors: true,
         battle_effects: true,
         link_machine: true,
         battle_trainers: true,
@@ -1313,6 +1326,7 @@ mod tests {
                 save: "saves/mine.sav".into(),
             },
             wild_visitors: false,
+            shared_visitors: false,
             battle_effects: false,
             link_machine: false,
             battle_trainers: false,
@@ -1331,6 +1345,20 @@ mod tests {
                 0xEE, 0xFF
             ])
         );
+    }
+
+    #[test]
+    fn shared_visitors_are_on_unless_switched_off() {
+        assert!(Settings::parse("").shared_visitors);
+        let off = Settings::parse("[GBALink]\nSharedVisitors=Off\n");
+        assert!(!off.shared_visitors && off.wild_visitors);
+        assert!(off.to_ini().contains("\nSharedVisitors=Off\n"));
+        assert_eq!(Settings::parse(&off.to_ini()), off);
+        let on = Settings {
+            shared_visitors: true,
+            ..off
+        };
+        assert!(on.to_ini().contains("\nSharedVisitors=On\n"));
     }
 
     #[test]

@@ -12,6 +12,10 @@
 //! A trainer's creatures stand in the ring as their ROM pictures (figures.rs) where a Chao would.
 //! The battle uses copies of the Chao records: no battle ever changes the save.
 //!
+//! A battle with a wild visitor (wild.rs) comes from a garden: once the karate menu waits for
+//! input, the picker opens on its own at the team screen against it, and when it ends the karate
+//! area is left for that garden.
+//!
 //! Live battles (online.rs): the friends in the karate area are offered in the opponent list,
 //! a friend's challenge opens the picker on its own at the mode select (or interrupts it), and
 //! the session's messages go to the host. Anywhere else, or in another battle, a challenge is
@@ -43,6 +47,7 @@ use super::session::{
 use super::team::Dex;
 use super::trainers::{self, Roster};
 use super::visuals::{self, Director, Order};
+use super::wild::{self, Ending, WildFoe};
 use super::{figures, ladder};
 
 /// The arena gets this many frames (15 seconds of running game) to come up after the menu
@@ -138,6 +143,7 @@ fn lock() -> std::sync::MutexGuard<'static, Game> {
 /// Every frame: wraps the karate main object while we're in the karate area, and forgets the
 /// battle when the area goes.
 pub fn on_frame() {
+    wild::on_frame();
     let mut g = lock();
     online::set_busy(g.session.as_ref().is_some_and(Session::busy));
     let Some(k) = arena::karate() else {
@@ -157,6 +163,10 @@ pub fn on_frame() {
     if live {
         // Live karate wraps the main object itself; our button and picker let go.
         if (g.session.is_some() || g.on_button) && g.arena == Arena::Menu {
+            if g.session.as_ref().is_some_and(Session::is_wild) {
+                // The karate area is live karate's now: the trip only goes on (unfought).
+                wild::ended(None);
+            }
             close_session(&mut g);
             g.on_button = false;
             k.hold_mode_select(false);
@@ -201,6 +211,7 @@ fn network(g: &mut Game, k: Karate) {
             match &event {
                 Incoming::Offer { from, .. } => {
                     let free = online::enabled()
+                        && !wild::underway()
                         && (k.mode_select_input() || (g.on_button && k.mode_select_held()));
                     if free {
                         let was_on = g.on_button;
@@ -304,19 +315,37 @@ fn before(object: usize) {
     if g.session.is_some() && g.arena == Arena::Menu && !k.mode_select_held() {
         // The picker lost the mode select (live karate started from it): let it go.
         log!("battle: the karate menu moved on; picker closed");
+        let ending = wild_ending(&g);
         close_session(&mut g);
         g.on_button = false;
+        if let Some(ending) = ending {
+            leave_wild(&mut g, k, ending);
+        }
     }
     network(&mut g, k);
     if g.session.as_ref().is_some_and(Session::done) {
         // Done without closing: it failed part-way (a panic caught in `main_exec`).
         log!("battle: the battle stopped; back to the menu");
         if g.arena == Arena::Menu {
+            let ending = wild_ending(&g);
             close_session(&mut g);
             g.on_button = false;
             k.hold_mode_select(false);
+            if let Some(ending) = ending {
+                leave_wild(&mut g, k, ending);
+            }
         } else {
             end_battle(&mut g, k);
+        }
+        return;
+    }
+    if g.session.is_none() && wild::wants_menu() {
+        // Here for a wild visitor: its battle opens once the menu waits for input.
+        if wild::open_overdue() {
+            log!("battle: the karate menu didn't come up for the wild battle; back");
+            leave_wild(&mut g, k, Some(Ending::Cancelled));
+        } else if k.mode_select_input() {
+            open_wild(&mut g, k);
         }
         return;
     }
@@ -403,8 +432,53 @@ fn homes(format: Format) -> [[[f32; 3]; 2]; 2] {
     [0, 1].map(|side| [0, 1].map(|pos| home(format, Slot::new(side, pos)).0))
 }
 
+/// How the wild visitor's battle in the session ended for it (`Some(None)`: not decided), or
+/// `None` when the session isn't one.
+fn wild_ending(g: &Game) -> Option<Option<Ending>> {
+    g.session
+        .as_ref()
+        .filter(|s| s.is_wild())
+        .map(Session::wild_ending)
+}
+
+/// The battle menu for the trip's wild visitor, at the held mode select.
+fn open_wild(g: &mut Game, k: Karate) {
+    wild::opened();
+    g.on_button = true;
+    k.hold_mode_select(true);
+    open_with(g, wild::trip_foe());
+    if g.session.is_none() {
+        leave_wild(g, k, Some(Ending::Cancelled));
+    }
+}
+
+/// The wild visitor's battle is over (`ending`; none: it didn't say): the trip goes back to
+/// its garden, leaving the karate area the way its own exit does.
+fn leave_wild(g: &mut Game, k: Karate, ending: Option<Ending>) {
+    g.on_button = false;
+    match wild::ended(ending) {
+        Some(garden) => {
+            log!("battle: leaving the karate area for garden {garden}");
+            k.exit_to(i32::from(garden));
+        }
+        None => k.hold_mode_select(false),
+    }
+}
+
+/// The player has a hatched Chao to battle with.
+pub fn has_chao() -> bool {
+    (0..crate::game::GARDEN_SLOTS)
+        .filter_map(crate::game::read_chao_slot)
+        .any(|c| usable(&c))
+}
+
 /// Opens the picker: the ROM's data, our Chao and the opponents to choose from.
 fn open(g: &mut Game) {
+    open_with(g, None);
+}
+
+/// Opens the picker; against `wild` (a visitor from a garden), only its team screen.
+fn open_with(g: &mut Game, wild: Option<WildFoe>) {
     let rom = match crate::gba_link::rom() {
         Ok(rom) => rom,
         Err(e) => {
@@ -427,6 +501,20 @@ fn open(g: &mut Game) {
                 return;
             }
         },
+    };
+    let foe = match wild {
+        Some(foe) => match wild::creature(&rom, &dex, &foe) {
+            Some(creature) => Some((creature, foe.shiny)),
+            None => {
+                log!(
+                    "battle: the wild visitor (species {}) can't battle",
+                    foe.species
+                );
+                hud::toast("That visitor can't battle");
+                return;
+            }
+        },
+        None => None,
     };
     if visuals::enabled() && g.book.is_none() {
         let book = Book::from_rom(&rom);
@@ -460,7 +548,10 @@ fn open(g: &mut Game) {
             None => session.with_progress(ladder::load()),
         };
     }
-    session.set_friends(friends());
+    match foe {
+        Some((creature, shiny)) => session = session.with_wild(creature, shiny),
+        None => session.set_friends(friends()),
+    }
     g.session = Some(session);
     g.bars = [[f32::NAN; session::TEAM_SIZE]; 2];
 }
@@ -599,6 +690,9 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
             Command::Cue(cue) => cue_frame(g, cue),
             Command::OpenArena(format) => {
                 log!("battle: starting ({format:?})");
+                if g.session.as_ref().is_some_and(Session::is_wild) {
+                    wild::fought();
+                }
                 g.format = format;
                 let effects = visuals::enabled() && g.book.is_some();
                 g.director = Some(Director::new(
@@ -616,8 +710,13 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
                 return;
             }
             Command::Closed => {
-                // Back to our button in the held mode select.
+                // Back to our button in the held mode select (or, unfought against a wild
+                // visitor, back to its garden).
+                let ending = wild_ending(g);
                 close_session(g);
+                if let Some(ending) = ending {
+                    leave_wild(g, k, ending);
+                }
                 return;
             }
             Command::Released => {
@@ -658,8 +757,10 @@ fn run_session(g: &mut Game, k: Karate, pressed: u32) {
     }
 }
 
-/// The battle is over or failed: our Chao go and the karate menu comes back.
+/// The battle is over or failed: our Chao go and the karate menu comes back (or, against a
+/// wild visitor, the trip goes back to its garden).
 fn end_battle(g: &mut Game, k: Karate) {
+    let ending = wild_ending(g);
     for row in &mut g.shown {
         for s in row.iter_mut() {
             if let Some(shown) = s.take() {
@@ -678,6 +779,9 @@ fn end_battle(g: &mut Game, k: Karate) {
     figures::clear(false);
     crate::gba_link::billboard::forget();
     log!("battle: back to the menu");
+    if let Some(ending) = ending {
+        leave_wild(g, k, ending);
+    }
 }
 
 fn object_at(g: &Game, slot: Slot) -> Option<usize> {
@@ -710,7 +814,11 @@ fn cue_frame(g: &mut Game, cue: Cue) {
                 .session
                 .as_ref()
                 .and_then(|s| s.species(slot.side, member));
-            figures::show(slot, species, home(g.format, slot).0);
+            let shiny = g
+                .session
+                .as_ref()
+                .is_some_and(|s| s.shiny(slot.side, member));
+            figures::show(slot, species, shiny, home(g.format, slot).0);
             if species.is_some() {
                 let orders = g.director.as_mut().map(|d| d.cue(&cue)).unwrap_or_default();
                 carry_out(g, &orders);
@@ -736,7 +844,7 @@ fn cue_frame(g: &mut Game, cue: Cue) {
         }
         Cue::Hide { slot } => {
             hide(g, slot);
-            figures::show(slot, None, [0.0; 3]);
+            figures::show(slot, None, false, [0.0; 3]);
         }
         Cue::Sound(s) => {
             arena::sound(match s {

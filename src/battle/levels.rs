@@ -7,6 +7,9 @@
 //!   (from the ROM) times its level / 7. The total is shared equally among the Chao that took
 //!   part (were sent out at least once), then 1.5 times as in any trainer battle. A loss gives
 //!   only what the fainted foes were worth.
+//! - Battles with a wild visitor in a garden: the same worth (XP yield times level / 7), shared
+//!   among the Chao that took part, without the trainer bonus, and only for a win (Gen 3 gives
+//!   XP for a wild creature only when it faints).
 //! - Live battles: each Chao that took part gets a share of its own level's step (`step`):
 //!   `step * R * (n + 3w) / (4 * max(n, 3))`, shared among the Chao that took part, where R is 1
 //!   for the winner and 1/2 for the loser, n is the size of the other team and w counts its
@@ -133,6 +136,15 @@ pub fn trainer_xp(foes: &[Foe], won: bool, takers: usize) -> u32 {
     (pool / takers as u32).max(1) * TRAINER_PERCENT / 100
 }
 
+/// The XP each of the `takers` Chao that took part gets from a battle with the wild visitor
+/// `foe` (`won`: the player won): its worth shared among them, at least 1; nothing for a loss.
+pub fn wild_xp(foe: &Foe, won: bool, takers: usize) -> u32 {
+    if !won || takers == 0 {
+        return 0;
+    }
+    (worth(foe) / takers as u32).max(1)
+}
+
 /// The XP a Chao at `level` gets from a live battle (`won`: its side won) against a team of
 /// `foes`, whose Chao at the battle levels in `fainted` fainted, shared among the `takers` Chao
 /// that took part.
@@ -226,6 +238,28 @@ mod tests {
         // Nobody took part: none; a tiny foe still gives something.
         assert_eq!(trainer_xp(&party, true, 0), 0);
         assert_eq!(trainer_xp(&[foe(1, 1, true)], true, 3), 1);
+    }
+
+    #[test]
+    fn wild_xp_is_gen_3_without_the_trainer_bonus() {
+        let foe = Foe {
+            exp_yield: 140,
+            level: 20,
+            fainted: true,
+        };
+        // 140 * 20 / 7 = 400, and two that took part share it.
+        assert_eq!(wild_xp(&foe, true, 1), 400);
+        assert_eq!(wild_xp(&foe, true, 2), 200);
+        assert_eq!(wild_xp(&foe, true, 1) * 3 / 2, trainer_xp(&[foe], true, 1));
+        // Nothing for a loss or when nobody took part; a tiny one still gives something.
+        assert_eq!(wild_xp(&foe, false, 1), 0);
+        assert_eq!(wild_xp(&foe, true, 0), 0);
+        let tiny = Foe {
+            exp_yield: 1,
+            level: 1,
+            fainted: true,
+        };
+        assert_eq!(wild_xp(&tiny, true, 3), 1);
     }
 
     /// Losing a trainer battle on purpose (sending a weak Chao against the strongest party)

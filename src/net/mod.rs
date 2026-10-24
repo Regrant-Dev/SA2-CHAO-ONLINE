@@ -8,4 +8,6 @@ pub mod referee;
 pub mod roster;
 pub mod session;
 pub mod udp;
+pub mod wild_host;
+pub mod wild_print;
 pub mod wire;

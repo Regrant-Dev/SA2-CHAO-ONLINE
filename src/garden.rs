@@ -1633,6 +1633,30 @@ pub fn run_here() -> Vec<(u8, u8, usize, usize)> {
         .collect()
 }
 
+/// The Chao a garden object is: (owner, index) of a copy (a friend's, a held one or one of ours
+/// following the server) or of one of our own our game runs.
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+pub fn chao_of(object: usize) -> Option<(u8, u8)> {
+    if object == 0 {
+        return None;
+    }
+    let (mirrored, mine) = with(|g| {
+        let mirrored = g
+            .mirrors
+            .iter()
+            .find(|(_, m)| m.object == object)
+            .map(|(&key, _)| key);
+        (mirrored, g.mine.clone())
+    });
+    if mirrored.is_some() {
+        return mirrored;
+    }
+    let me = crate::keeper::me()?;
+    mine.into_iter()
+        .find(|&(_, slot)| live_object(slot) == Some(object))
+        .map(|(index, _)| (me, index))
+}
+
 /// Rotates (x, z) by a BAMS angle about Y; `-angle` undoes it.
 pub fn rotate(v: [f32; 3], angle: i32) -> [f32; 3] {
     let a = angle as f32 * (std::f32::consts::TAU / 65536.0);
@@ -2935,6 +2959,7 @@ extern "C" fn sane_place(chao: usize) {
     let _ = std::panic::catch_unwind(|| {
         // SAFETY: the Chao the AI tick is about to run (its object and Data1), game thread.
         unsafe {
+            clear_stale_links(chao);
             let d = data1(chao);
             if d == 0 {
                 return;
@@ -2954,6 +2979,47 @@ extern "C" fn sane_place(chao: usize) {
             log!("garden: a Chao's place wasn't a number ({at:?}); put it next to the player");
         }
     });
+}
+
+/// A Chao's world entry (object +0x3C) links to its partner (entry +0x40) and its target
+/// (entry +0x44, set by 0x5304F0). The game's unregister 0x5307F0 clears the partner link both
+/// ways and an entry's object (+0x3C) but never other entries' targets, so a target normally
+/// goes to an empty entry. One whose object no longer points back at it (freed without its
+/// unregister) would have the Chao's behaviours read the freed object (0x530510 -> 0x54B0A0, a
+/// crash at 0x54B0AF): such a link is cleared before the Chao thinks.
+///
+/// # Safety
+/// Game thread; `chao` is a live Chao object.
+#[cfg(target_arch = "x86")]
+unsafe fn clear_stale_links(chao: usize) {
+    const ENTRY_OBJECT: usize = 0x3C;
+    const ENTRY_LINKS: [usize; 2] = [0x40, 0x44];
+    unsafe {
+        let entry = ((chao + ENTRY_OBJECT) as *const usize).read();
+        if !crate::registry::is_entry(entry) {
+            return;
+        }
+        for at in ENTRY_LINKS {
+            let link = (entry + at) as *mut usize;
+            let other = link.read();
+            if other == 0 {
+                continue;
+            }
+            let object = if crate::registry::is_entry(other) {
+                ((other + ENTRY_OBJECT) as *const usize).read()
+            } else {
+                usize::MAX
+            };
+            // An empty entry is fine (the game checks its object); a live one points back.
+            let live = object == 0
+                || (object != usize::MAX
+                    && ((object + ENTRY_OBJECT) as *const usize).read() == other);
+            if !live {
+                link.write(0);
+                log!("garden: cleared a Chao's link to an object that was already gone (+{at:#x})");
+            }
+        }
+    }
 }
 
 /// A sound played while a Chao thinks (game thread, from the thunks): noted for `sounds_frame`.
@@ -3116,10 +3182,14 @@ unsafe extern "C" fn wear_hat_thunk() {
 #[cfg(not(target_arch = "x86"))]
 unsafe extern "C" fn wear_hat_thunk() {}
 
-/// Whether Chao `object` may react to an item: not a copy of ours that keeps off them.
+/// Whether Chao `object` may react to an item: not a copy of ours that keeps off them, nor one
+/// offered a shared wild visitor its owner can't learn from (`gba_link::keeps_off_visitor`).
 #[cfg(target_arch = "x86")]
 extern "C" fn may_take_items(object: usize) -> u32 {
-    u32::from(!std::panic::catch_unwind(|| keeps_off(object)).unwrap_or(false))
+    let off = std::panic::catch_unwind(|| {
+        keeps_off(object) || crate::gba_link::keeps_off_visitor(object)
+    });
+    u32::from(!off.unwrap_or(false))
 }
 
 /// An item check (`$check`) only for Chao that may take items; else "no reaction" (EAX 0).

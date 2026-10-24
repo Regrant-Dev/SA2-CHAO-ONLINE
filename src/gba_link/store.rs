@@ -575,6 +575,16 @@ impl Store {
         Some(self.learn(identity, partner))
     }
 
+    /// The waiting partner `key` of `garden` was absorbed elsewhere (another player's game
+    /// taught a Chao in a shared garden): it waits no more, and teaches nothing here. Whether it
+    /// was waiting.
+    pub fn drop_waiting(&mut self, garden: u8, key: u64) -> bool {
+        let before = self.waiting.len();
+        self.waiting
+            .retain(|w| !(w.garden == garden && w.key == key));
+        self.waiting.len() != before
+    }
+
     /// A Chao (`identity`) absorbed `partner`, which never waited here (a wild visitor): as
     /// `absorbed`. Its moves join the ones the Chao knows (`Moves::learn`). Returns what the
     /// Chao has now and the moves new to it.
@@ -1006,5 +1016,19 @@ mod tests {
         assert_eq!(s.waiting.len(), 1);
         assert_eq!(s.imports.len(), 1);
         assert_eq!(s.partners[&77].partner, wild);
+    }
+
+    #[test]
+    fn a_partner_used_elsewhere_waits_no_more() {
+        let mut s = Store::default();
+        s.import(1, 1, 20_100, p(1)).unwrap();
+        s.import(1, 2, 20_100, p(1)).unwrap();
+        assert!(!s.drop_waiting(3, 1));
+        assert!(s.drop_waiting(1, 1));
+        assert!(!s.drop_waiting(1, 1));
+        // Only that garden's; nothing learned, and not again today.
+        assert_eq!(s.waiting_in(2).count(), 1);
+        assert!(s.partners.is_empty());
+        assert_eq!(s.can_import(1, 1, 20_100), Err(Refused::Today));
     }
 }

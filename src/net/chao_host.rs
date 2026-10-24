@@ -44,7 +44,7 @@ use crate::chao::{ChaoData, changes};
 use crate::chao_sim::brain::{Chao, FruitEvent, ItemEvent, LifeEvent, TreeEvent};
 use crate::chao_sim::evolve::evolve;
 use crate::chao_sim::land::V3;
-use crate::chao_sim::land::{Garden, fell_through};
+use crate::chao_sim::land::{Blocker, Garden, fell_through};
 use crate::chao_sim::motion::MotionTable;
 use crate::chao_sim::picker::{Ball, Carried, Fruit, Release, Senses, Signal, ToyEvent, Tree};
 use crate::chao_sim::record::{Record, off};
@@ -59,6 +59,7 @@ use super::protocol::{
 };
 use super::referee::{Out, To};
 use super::roster::{Candidate, ChaoId, Roster, choose};
+use super::wild_host::{ChaoSeen, Gardens, OwnerSeen, Seen as WildSeen, WildHost};
 
 /// The game's frame rate.
 const FRAME: Duration = Duration::from_micros(16_667);
@@ -149,6 +150,8 @@ struct Run {
     fingerprint: u32,
     /// Since when too few players are here (it goes back to their games after `RUN_GRACE`).
     short: Option<Instant>,
+    /// The link machine's box in its ground, while there is one (`WildHost::machine_blocker`).
+    machine: Option<Blocker>,
 }
 
 #[derive(Default)]
@@ -214,6 +217,8 @@ pub struct ChaoHost {
     told_locks: HashMap<u8, Vec<Key>>,
     /// The time of the latest message or tick (locks look at where owners are then).
     now: Option<Instant>,
+    /// The shared gardens' wild visitors.
+    wild: WildHost,
 }
 
 /// A Chao a player's game runs for a touch, between their reports (`ChaoTouched`).
@@ -373,6 +378,19 @@ impl ChaoHost {
                 bytes,
             } => self.land_part(from, *garden, *fingerprint, *part, *parts, bytes),
             Body::Brought { awake, lock, list } => self.brought(from, *awake, *lock, list, now),
+            Body::WildHello { .. }
+            | Body::WildPick { .. }
+            | Body::WildBring { .. }
+            | Body::WildCarry { .. }
+            | Body::WildTake { .. }
+            | Body::WildHeld { .. }
+            | Body::WildPut { .. }
+            | Body::WildAbsorbed { .. }
+            | Body::WildBattle { .. } => {
+                let mut wild = std::mem::take(&mut self.wild);
+                wild.observe(from, body, now, self);
+                self.wild = wild;
+            }
             _ => {}
         }
     }
@@ -419,6 +437,9 @@ impl ChaoHost {
 
     /// Player `id` left: their Chao go (and sleep where they were).
     pub fn left(&mut self, id: u8) {
+        let mut wild = std::mem::take(&mut self.wild);
+        wild.left(id, self);
+        self.wild = wild;
         for index in 0..3 {
             let mine: Vec<Key> = self.runs[index]
                 .iter()
@@ -1057,6 +1078,24 @@ impl ChaoHost {
                 self.send(index, now, out);
             }
         }
+        let mut wild = std::mem::take(&mut self.wild);
+        wild.frame(now, self, out);
+        if look {
+            let players = self.players();
+            for (index, run) in self.runs.iter_mut().enumerate() {
+                let Some(run) = run.as_mut() else { continue };
+                let machine = wild.machine_blocker(index as u8 + 1, &players);
+                if run.machine != machine {
+                    let blockers = &mut run.world.garden.blockers;
+                    if let Some(old) = run.machine.take() {
+                        blockers.retain(|b| *b != old);
+                    }
+                    blockers.extend(machine);
+                    run.machine = machine;
+                }
+            }
+        }
+        self.wild = wild;
         if look {
             self.relock(now);
             self.tell(out);
@@ -1317,6 +1356,7 @@ impl ChaoHost {
                 slots: BTreeMap::new(),
                 fingerprint,
                 short: None,
+                machine: None,
             });
         }
         let table = self.table();
@@ -2089,6 +2129,81 @@ impl ChaoHost {
 
 /// Whether owner stream `key` is current: heard within `VISIT_STALE` of its owner's last
 /// state (their game paused, both stop alike; their game going on without it, it's gone).
+/// What the shared gardens' visitors see of them (wild_host.rs).
+impl Gardens for ChaoHost {
+    fn players(&self) -> Vec<WildSeen> {
+        self.players
+            .iter()
+            .map(|(&id, p)| WildSeen {
+                id,
+                area: p.area,
+                since: p.since,
+                loading: p.left.is_some(),
+                position: p.position,
+                rotation_y: p.rotation_y,
+                action: p.action,
+                heard: p.at,
+            })
+            .collect()
+    }
+
+    fn ground(&self, area: u8) -> Option<(u32, &Garden)> {
+        let run = self.runs.get(usize::from(area).checked_sub(1)?)?.as_ref()?;
+        Some((run.fingerprint, &run.world.garden))
+    }
+
+    fn animals(&self, area: u8) -> usize {
+        self.items
+            .iter()
+            .filter(|(a, _, i)| *a == area && i.category == 2)
+            .count()
+    }
+
+    fn chao(&self, area: u8, key: Key) -> Option<ChaoSeen> {
+        let run = self.runs.get(usize::from(area).checked_sub(1)?)?.as_ref()?;
+        let chao = run.world.chao.get(*run.slots.get(&key)?)?.as_ref()?;
+        let awake = key.0 < HELD_OWNER || self.shown.get(&key).is_some_and(|s| !s.asleep);
+        Some(ChaoSeen {
+            position: chao.body.pos,
+            awake,
+        })
+    }
+
+    fn owner(&self, key: Key) -> Option<(u64, Vec<u8>)> {
+        if key.0 >= HELD_OWNER {
+            let shown = self.shown.get(&key)?;
+            return Some((shown.id.identity, self.sessions(&shown.id.key)));
+        }
+        let identity = self.records.get(&key)?.identity();
+        let (owner, _) = self.keys.get(&key.0)?;
+        Some((identity, self.sessions(owner)))
+    }
+
+    fn locked_against(&self, from: u8, key: Key) -> bool {
+        ChaoHost::locked_against(self, from, key)
+    }
+
+    fn owners(&self, area: u8) -> Vec<OwnerSeen> {
+        let players = self.present_in(area).into_iter().filter_map(|id| {
+            Some(OwnerSeen {
+                owner: id,
+                awake: true,
+                sessions: self.sessions(&self.keys.get(&id)?.0),
+            })
+        });
+        let held = self
+            .shown
+            .iter()
+            .filter(|(_, s)| s.area == area)
+            .map(|(key, s)| OwnerSeen {
+                owner: key.0,
+                awake: !s.asleep,
+                sessions: self.sessions(&s.id.key),
+            });
+        players.chain(held).collect()
+    }
+}
+
 fn streaming(
     own: &HashMap<Key, (GardenChao, Instant)>,
     players: &HashMap<u8, Player>,
@@ -4534,5 +4649,95 @@ mod tests {
         assert!(host.locked_against(3, (0, 0)) && !host.locked_against(0, (0, 0)));
         assert!(changes_to_owner(&out).is_empty());
         assert_eq!(locked_to(&out, 3), Some(vec![(0, 0)]));
+    }
+
+    #[test]
+    fn shared_visitors_come_from_the_picker_and_teach_through_the_lock() {
+        use super::super::protocol::{
+            WILD_PICK, WILD_SEE, WildArrive, WildCreature, WildPicked, WildPlace,
+        };
+        for (lock, learns) in [(ChaoLock::Always, true), (ChaoLock::Never, false)] {
+            let t0 = Instant::now();
+            let (mut host, each) = mason_brings(lock, t0);
+            let hello = Body::WildHello {
+                flags: WILD_SEE | WILD_PICK,
+                print: 7,
+            };
+            host.observe(0, &hello, t0 + ms(2000));
+            host.observe(3, &hello, t0 + ms(2000));
+            let out = live(&mut host, &each, ms(2000), ms(2200), t0);
+            let Some((ask, land)) = out.iter().find_map(|o| match (&o.to, &o.body) {
+                (To::One(0), Body::WildAsk { ask, land, .. }) => Some((*ask, *land)),
+                _ => None,
+            }) else {
+                panic!("the picker (there first, the lower id) is asked")
+            };
+            let creature = WildCreature {
+                species: 1,
+                level: 5,
+                ability: 3,
+                shiny: false,
+                moves: [33, 0, 0, 0],
+            };
+            let pick = Body::WildPick {
+                area: 1,
+                ask,
+                section: 4,
+                list: vec![
+                    WildPicked {
+                        creature,
+                        arrive: WildArrive::Land,
+                    };
+                    usize::from(land)
+                ],
+            };
+            host.observe(0, &pick, t0 + ms(2200));
+            let out = live(&mut host, &each, ms(2200), ms(2400), t0);
+            let lists = |out: &[Out], to: u8| -> Vec<_> {
+                out.iter()
+                    .filter_map(|o| match (&o.to, &o.body) {
+                        (To::One(t), Body::WildList { list, .. }) if *t == to => Some(list.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let list = lists(&out, 3).pop().expect("a list for player 3");
+            assert!(!list.is_empty());
+            assert_eq!(lists(&out, 0).pop(), Some(list.clone()));
+            // Player 3 picks one up and hands it to player 0's Chao.
+            let v = list.iter().find(|e| e.place == WildPlace::Roam).unwrap();
+            let mut near = each.clone();
+            near[2] = (3, state(1, [v.v[0] + 2.0, v.v[1], v.v[2]]));
+            live(&mut host, &near, ms(2400), ms(2500), t0);
+            host.observe(3, &Body::WildTake { id: v.id }, t0 + ms(2500));
+            let chao = host.chao_mut((0, 0)).unwrap().body.pos;
+            near[2] = (3, state(1, [chao[0] + 1.0, chao[1], chao[2]]));
+            live(&mut host, &near, ms(2500), ms(2700), t0);
+            let absorbed = Body::WildAbsorbed {
+                id: v.id,
+                owner: 0,
+                index: 0,
+            };
+            host.observe(3, &absorbed, t0 + ms(2700));
+            let out = live(&mut host, &near, ms(2700), ms(2900), t0);
+            let taught: Vec<u64> = out
+                .iter()
+                .filter_map(|o| match (&o.to, &o.body) {
+                    (To::One(0), Body::WildTaught { identity, .. }) => Some(*identity),
+                    _ => None,
+                })
+                .collect();
+            let expect = if learns {
+                vec![kid(1).identity()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(taught, expect, "{lock:?}");
+            assert!(
+                lists(&out, 3)
+                    .iter()
+                    .all(|l| l.iter().all(|e| e.id != v.id))
+            );
+        }
     }
 }

@@ -5,7 +5,9 @@
 //! rows of `Page`). The machine's screen shows the picture of the one highlighted, and the one
 //! picked hops out of the machine's hatch into the garden (`super::bring_out`). Its first row,
 //! "Moves", lists the player's Chao by name and then one's moves, to choose the four it battles
-//! with (`Page::chao_list`, `Page::chao_moves`).
+//! with (`Page::chao_list`, `Page::chao_moves`). A shared garden has it while it shows its
+//! shared visitors (`super::shared`): each player uses it for themselves, and the one picked
+//! comes out as a shared visitor once the server takes it.
 //!
 //! The machine is an object of list 0, which runs after the pads are read and before the
 //! player: the press that opens the list is taken out of the frame's input there, so the
@@ -44,7 +46,7 @@ const MODELS: [&[u8]; 3] = [
 /// Where each garden's machine stands (its floor) and the Y angle (BAMS) its front faces when
 /// the garden's ground can't be searched (`find_spot`): 20 to 25 units from the transporter on
 /// flat ground, the front toward the garden.
-const SPOTS: [([f32; 3], i32); 3] = [
+pub(crate) const SPOTS: [([f32; 3], i32); 3] = [
     ([50.0, 10.0, 22.0], 0x96F8),
     ([117.0, 0.0, 117.0], 0xA6C0),
     ([-98.0, 3.5, -98.0], 0x10D9),
@@ -216,7 +218,7 @@ pub fn in_reach(at: [f32; 3], angle: i32, (min, max): Bounds, player: [f32; 3]) 
 type Bounds = ([f32; 3], [f32; 3]);
 
 /// Garden `garden`'s machine box (its model's), read once.
-fn machine_box(garden: u8) -> Option<Bounds> {
+pub(crate) fn machine_box(garden: u8) -> Option<Bounds> {
     static BOXES: std::sync::OnceLock<[Option<Bounds>; 3]> = std::sync::OnceLock::new();
     let boxes = BOXES.get_or_init(|| {
         std::array::from_fn(|i| model(i as u8 + 1).map(|m| (m.box_min, m.box_max)))
@@ -1039,7 +1041,9 @@ mod game {
     pub fn on_frame() {
         let mut s = lock();
         let garden = sa2::current_chao_area();
-        let here = enabled() && sa2::in_garden() && !crate::garden::server_runs();
+        // A shared garden has it while it shows its shared visitors (`shared`).
+        let shared = crate::garden::server_runs() || crate::bring::friends_in(garden);
+        let here = enabled() && sa2::in_garden() && (!shared || super::super::shared::showing());
         if !here {
             close(&mut s);
             remove();

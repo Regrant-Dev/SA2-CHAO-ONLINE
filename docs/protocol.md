@@ -1,4 +1,4 @@
-# Network protocol (v24)
+# Network protocol (v26)
 
 Code: `src/net/`. All multi-byte values are little-endian. Every received byte goes through
 the bounds-checked `wire::Reader`; bad data is dropped, never trusted. Players need the same
@@ -120,6 +120,20 @@ Game bodies:
 | 70 | BattleStep | from the host, to both players, reliable | battle u16, step u16, seed u64, count u8 (≤ 4), count × (side u8 (0..=1), pick): both players' choices for the step and its rolls' seed |
 | 71 | BattleLeave | to the host only, reliable | battle u16 (0: before a battle starts, taking back the sender's challenge or turning down one to them), reason u8 (0 the battle reached its end, 1 gave up, 2 left the battle) |
 | 72 | BattleEnd | from the host, reliable | battle u16 (0: a challenge that never started a battle), reason u8 (0 busy, 1 declined, 2 the ROM data differs, 3 forfeit: the opponent gave up, 4 disconnect: the opponent left the battle or the lobby, 5 timeout, 6 desync, 7 withdrawn), winner u8 (the winning side, 2 nobody) |
+| 73 | WildHello | to the host only, reliable, on connecting and when it changes | flags u8 (only bits 1 see: SharedVisitors on and the ROM read; 2 pick: WildVisitors on too; 4 machine: LinkMachine on too), print u32 (the ROM's visitor print, `net::wild_print`; non-zero exactly with bit 1). See Shared wild visitors |
+| 74 | WildList | from the host (0xFF), every 6 frames, unreliable | area u8 (1..=3), serial u16 (one more for each list the host sends; a game drops a list not newer than the last one it took, while that one is under 1.5 s old), section u8 (the garden's wild area this run, a map section id; 0xFF none yet), print u32 (its visitors' print; for an empty list with no area its picker's, 0 with no picker either), picker u8 (a player id, 0xFF none), learners u16 (a bit per owner id 0..=15 whose Chao can learn from these visitors now), count u8 (≤ 12), count × entry: id u16 (not 0, each once), creature, origin u8 (0 wild, 1 a partner), bringer u8 (the partner's bringer, a player id; 0xFF for a wild one), place u8 (0 on the ground, 1 swimming, 2 in a player's hands, 3 battled by a player), by u8 (that player's id, 0xFF for 0 and 1), v f32×3 (places 0, 1, 3: its world position; 2: its offset in the holder's frame, each axis ≤ 10), angle u16 (BAMS). A **creature** is species u16 (1..`SPECIES_COUNT`), level u8 (1..=100), ability u8 (an ability id, < `ABILITY_COUNT`), shiny u8 (0/1), moves u16×4 (each < `MOVE_COUNT`, at least one not 0, none twice): 13 bytes |
+| 75 | WildAsk | from the host to a garden's picker, reliable | area u8, ask u16, section u8 (0xFF: the picker chooses the garden's area), land u8, pond u8 (land + pond 1..=5), fresh u8 (0/1: the garden just became shared; the picker may hand over its own visitors where they are) |
+| 76 | WildPick | to the host only, reliable | area u8, ask u16, section u8 (not 0xFF), count u8 (≤ 5), count × (creature, place u8 (0 the host puts it on the grass, 1 in the pond, 2 on the grass at v, 3 swimming at v), v f32×3, angle u16) |
+| 77 | WildBring | to the host only, reliable | area u8, key u64 (the partner's key in the sender's store), from_save u8 (0/1: from their GBA save), creature, place u8 (0 the host puts it, 2 at v), v f32×3, angle u16: a partner of the sender's comes into the garden (from the link machine, or one waiting there) |
+| 78 | WildCarry | to the host only, reliable | area u8, creature, offset f32×3 (each axis ≤ 10): the sender comes into the garden holding a visitor from elsewhere |
+| 79 | WildTake | to the host only, reliable | id u16: the sender picks up that visitor |
+| 80 | WildHeld | to the host only, about 10 a second while holding, unreliable | id u16, mode u8 (0 in hands: v is the offset in the sender's frame, each axis ≤ 10; 1 let go of: v is its world position), v f32×3 |
+| 81 | WildPut | to the host only, reliable | id u16, at f32×3, angle u16: the visitor the sender let go of is on the ground |
+| 82 | WildAbsorbed | to the host only, reliable | id u16, owner u8 (a player id or 8..=15), index u8 (< 4): that Chao took the visitor from the sender |
+| 83 | WildBattle | to the host only, reliable | id u16, step u8 (0 reserve it for a battle, 1 won, 2 lost or gave up, 3 backed out before the fight) |
+| 84 | WildAnswer | from the host (0xFF) to one player, reliable | kind u8 (0 take, 1 carry, 2 bring, 3 battle), id u16 (the visitor's; 0 when refused before it had one), key u64 (a bring's key, else 0), ok u8 (0/1) |
+| 85 | WildTaught | from the host (0xFF) to every session of a Chao's owner, reliable | identity u64 (`ChaoData::identity`), origin u8 (0 wild, 1 a partner from a GBA save, 2 another partner), creature: that Chao absorbed this visitor |
+| 86 | WildUsed | from the host (0xFF) to a partner's bringer, reliable | garden u8 (1..=3), key u64: their partner waiting in that garden was absorbed and waits no more |
 
 ## Skins (`net/files.rs`, `skin_sync.rs`)
 
@@ -207,6 +221,80 @@ passed on.
   and the battle ends on the host once both games have said so. If the other game has chosen
   for a step, or chooses after, it gets `BattleEnd` desync with no winner.
 - The battle never touches either save.
+
+## Shared wild visitors (net/wild_host.rs, net/wild_print.rs)
+
+While the host runs a garden, its wild visitors are the same for everyone in it: the host
+keeps the garden's list and moves the visitors, on the ground players sent (`GardenLand`). It
+never has the ROM: it keeps and sends ids and positions, and every game names, draws and checks
+them from its own ROM. All the visitor messages a player sends are for the host only (never
+passed on); the ones the host sends, from a player, are dropped.
+
+- **Print**: a ROM's visitor print (`visitor_print`) is FNV-1a over the battle data
+  (`dex_print`), every species' record and level-up learnset, and every map's wild tables with
+  its map section. Never 0. A player whose `WildHello` has no *see*, or whose print differs from
+  a garden's visitors' (while it has none, its picker's), is never sent its list, never asked and
+  never taught from it.
+- **Picker**: of the players settled in the garden with *see* and *pick* and the garden's print
+  (any print while the list is empty), the one there longest, the lower id on a tie, worked out
+  every frame. When they leave, the next one is picker at once; the list, the area and the cap
+  stay. An ask to a player who isn't picker any more is dropped and asked again of the new one;
+  one unanswered for 5 s is dropped.
+- **Coming**: a run starts with a cap of 6..=7 wild visitors and asks for 4 at once (fresh while
+  nothing has been picked this run, within 10 s of its start); then for one at a time, 20..50 s apart, while
+  there are fewer than the cap and room. Room: the list and the garden's animal and drive items
+  (category 2) and 2 more stay within 20 animal entries (the mod raises the game's 10), and a
+  list has at most 12 (`MAX_WILD_LIST`). Each
+  visitor of a pick is added only while there is room. A pick from someone else, for another ask,
+  with more land or pond visitors than asked, another section than asked or (not fresh) placed
+  ones is dropped whole. The host puts land visitors on a land spot at least 25 from every player
+  in the garden when one allows, pond ones at a pond cell with water on three sides; placed ones
+  stay where they are when a land spot (place 2) or pond cell (place 3) is within 15. Land spots
+  within 8 of the link machine's spot (the one every game finds in the same ground) are left out.
+- **Moving**: on the ground a visitor stands 60..240 frames, then walks at 0.15 a frame to a land
+  spot within 30, never onto a water cell, on the floor; players closer than 3 push it aside. A
+  swimmer swims from pond cell to pond cell. A player whose state has action 42 (whistling)
+  calls every visitor on the ground or swimming within 100 for 6 s (the nearest whistler wins):
+  it walks to within 4 of them at 0.3 a frame, or swims to the pond cell nearest them. A held one
+  is in its holder's hands (their position and turn, its offset) or, let go of, where their
+  `WildHeld` says.
+- **Going**: a wild visitor stays 300..480 s, then goes once on the ground or swimming with every
+  player in the garden at least 60 away; one below y −50 goes at once. A partner goes when its
+  bringer is settled elsewhere, leaves or stops seeing visitors. When the run ends the list goes
+  (but for battled visitors, below).
+- **Hands**: `WildTake` on a visitor on the ground or swimming, from a player settled in its
+  garden with its print, within 30 of it and holding no other, is granted (the first one wins);
+  everything else is refused. `WildHeld` and `WildPut` count only from the holder; a position more
+  than 40 from the holder is taken as the holder's. A put visitor lands on the floor under it, and
+  swims when that is a pond cell under the surface. Held with no `WildHeld` for 2 s: put down where
+  it is. Its holder settled in another area: a wild one still in their hands leaves the garden with
+  them (gone for everyone); a partner is put down where they last were, and one let go of where
+  their `WildHeld` had it. Its holder disconnecting: put down there.
+- **Carry and bring**: `WildCarry` from a player settled in the garden with *see* and its print
+  (an empty list's: its area's or picker's, or any with neither), holding none and with no other
+  carry since they came into the garden, adds it in their hands while there are fewer than 5 wild
+  visitors and room. `WildBring` from a player there with *see* and *machine* and the print (the
+  same way), with fewer than 4 partners of theirs there and none with that key, adds it: at v when
+  v is within 15 of the machine's spot and the floor is within 10 under it, else where the host
+  puts it. With no room the roaming wild visitor farthest from every player goes first; with
+  none to send away it's refused.
+- **Absorbing**: `WildAbsorbed` counts when the sender holds the visitor (or let it go less than
+  2 s ago and nobody has taken or reserved it since) and the Chao is in that garden's run, awake, within 25 of it. The visitor is then gone
+  for everyone, and a partner's bringer gets `WildUsed`. Every session of the Chao's owner with
+  *see* and the visitor's print gets `WildTaught`, unless the Chao is locked against the sender
+  (Locked Chao; never against its owner). `learners` in the list has the bit of each owner id
+  in the garden (players there, awake held Chao) one of whose sessions has *see* and the print.
+- **Battles**: `WildBattle` 0 on a wild visitor (never a partner) on the ground or swimming, from a
+  player settled in its garden with its print, within 30 and with no other reservation, reserves
+  it (`WildAnswer`): it stands where it is and can't be taken or reserved. Only that player's
+  result counts, from any area: won or backed out, it's free again where it was; lost, it goes
+  for everyone. The player disconnecting frees it; a reservation older than 15 minutes counts as
+  lost. If the run ends meanwhile, the garden keeps its battled visitors (not moved, not sent, no
+  asks; the others go, as the remaining player's game keeps them as its own) until the
+  reservation ends and 3 minutes after, and a run on the same ground takes them up again, its
+  first ask fresh.
+- **The link machine**: while someone in a garden the host runs has *see* and *machine*, the
+  host's Chao walk round the machine's box at the machine's spot.
 
 ## Held Chao (net/roster.rs, net/chao_host.rs, held.rs)
 

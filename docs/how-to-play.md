@@ -73,7 +73,8 @@ You see everyone who's in the same stage or garden as you.
 **Chat:** press **T**, type, Enter to send.
 
 **Go to:** F9 > Go to, pick a friend. If you're in the same stage or garden you're moved next to
-them. From Stage Select you're taken into their stage.
+them. From Stage Select, or from Chao World (you leave it first), you're taken into their stage
+as their character. From inside another stage, go to Stage Select first.
 
 **Parties:** one player creates a party in F9 > Party and the others join it. Parties are for stages, races and Karate; gardens are shared with everyone in them, party or not. In a party:
 
@@ -270,7 +271,7 @@ and pictures are read from your ROM, and the save is only read, never changed.
 - Put the ROM (`.gba`) and the save (`.sav`) in `mods/sa2-chao-online/gba/` (the mod makes this
   folder the first time it runs, with a note inside), or set their paths
   in the Mod Manager (GBA link group; `GbaRom` and `GbaSave` in `config.ini`).
-- Each garden of your own (not a shared online one) has a **link machine** beside its
+- Each garden has a **link machine** beside its
   transporter, a short walk to one side of its doorway: plain in the Neutral Garden, white and gold with a halo and wings in the Hero
   Garden, dark and spiky in the Dark Garden. Stand next to it (any side), with empty hands and
   nothing to pick up closer to you, and press the action button to open its list of
@@ -318,8 +319,9 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
 
 - The area's name shows for a few seconds when you walk into the garden.
 - Wild creatures of that area come by now and then, picked with the same chances and levels as
-  in the GBA game: three when you arrive, then one every 20 to 50 seconds, up to 4 or 5 at a
-  time and never more than 5 (fewer when the garden is full of other animals).
+  in the GBA game: four when you arrive, then one every 20 to 50 seconds, up to 6 or 7 at a
+  time and never more than 7. They don't crowd out the garden's own animals: the mod lets a
+  garden hold 20 animals instead of the game's 10.
   Land creatures walk on the grass and water creatures swim in the pond. Now and then one is
   shiny, in the GBA game's shiny colours.
 - Whistle and nearby ones come to you: land creatures walk over and stop a few steps away,
@@ -332,15 +334,53 @@ Dark Garden caves, mountains and sandy or ashy routes. Only the ROM is needed, n
 - Stand next to one, or pick it up, and a card at the top right shows it: name, level, types,
   ability, its stats at that level and the four moves a Chao that absorbs it learns. Partners
   brought from the link machine get the same card.
+- **Battle one:** with a wild visitor's card showing and your hands empty, press **Y** (needs
+  the Battle DLC). You go straight to the karate arena, pick your team against it (singles),
+  and when the battle ends you're back in the garden where you stood. It fights at its level
+  with the four moves, types, ability and stats its card shows. Win and your Chao that were sent
+  out get battle XP and it stays in the garden; lose or give up and it runs away. B on the team
+  screen goes back without a battle and leaves it as it was. In a shared garden others see it
+  busy while you battle it (nobody can pick it up), and one that runs away leaves the garden for
+  everyone. A visitor never needs to be battled before a Chao absorbs it.
 - Carry one through the transporter and it comes along (in the lobby a note at the top says
   you're carrying it; your hands look empty there): it is in your hands when you reach
   the next garden, ready to give to a Chao there.
 - Wild visitors are never saved; one that has been about for a few minutes leaves once you are
-  away from it, and new ones keep coming. They don't come to shared online gardens, and the ones
-  about leave when a friend joins you (one in your hands stays until you put it down; one you
-  carry in waits for your next garden that isn't shared).
+  away from it, and new ones keep coming.
 - Turn them off with **Wild visitors in the gardens** in the Mod Manager (GBA link group;
   `WildVisitors` in `config.ini`).
+
+**Wild visitors in shared gardens:** online, a garden shared with friends has one set of wild
+visitors that everyone in it sees. The server keeps them and moves them about.
+
+- The player who has been in the garden longest picks its area and its visitors from their ROM.
+  When they leave, the next one takes over, and the visitors already there stay. The area's name
+  shows when you walk in. Your own visitors leave when the garden becomes shared; the first
+  player's stay where they are as the garden's.
+- Each game draws them from its own ROM, so everyone needs the same ROM: a player with another
+  ROM, or none, sees no shared visitors and no link machine there.
+- Picking one up, carrying it, putting it down and whistling work as in your own garden, and
+  everyone sees the same thing. Only one player can take a visitor at a time, and one someone
+  holds is in their hands for everyone; its card says who holds it.
+- Hand one to a Chao and it's gone for everyone. What it teaches goes to the Chao's owner:
+  always for your own Chao, and for a friend's only when their **Others can change my Chao**
+  lets you change it (a Chao locked for you doesn't take it). It is kept in the owner's
+  `gba/partners.txt`, never in yours.
+- Carry one out through the transporter and it leaves the garden for everyone and comes along to
+  your next garden. Carry one into a shared garden and it joins the garden's visitors, still in
+  your hands (when the garden is full of animals or already has five wild visitors, it waits for
+  your next garden).
+- The **link machine** is there too, and each player uses it for themselves: their own GBA save,
+  kept ones, gift and Moves. A partner brought out of it, and the ones waiting for you in that
+  garden, join the garden's visitors: anyone can see one, carry it and hand it to a Chao, with
+  the same rule for teaching. A waiting partner leaves the garden with you and is back on your
+  next visit, until a Chao absorbs it.
+- When the garden is yours alone again, the wild visitors about stay as your own. One a friend is
+  battling isn't among them: it waits for them, and when they come back to the garden (and it's
+  shared again) it's there, unless it ran away.
+- Turn them off with **Wild visitors in shared gardens** in the Mod Manager (GBA link group;
+  `SharedVisitors` in `config.ini`): shared gardens then have no wild visitors or link machine
+  for you, and your Chao learn nothing from the ones friends hand them.
 
 **Chao files:** your Chao are saved as files in `chao/export`. Put a friend's `.sa2chao` files in
 `chao/import` and they visit your garden, even when you're not online together.
@@ -450,6 +490,9 @@ in `gba/partners.txt` (never in your save). XP comes only from battles:
 - Trainer battles give the GBA game's trainer XP for each foe that fainted (by its kind and
   level), shared among your Chao that were sent out. A loss gives only what the fainted foes
   were worth. Beaten trainers can be battled again for more.
+- Battling a wild visitor in a garden (above) gives the GBA game's XP for a wild one (by its
+  kind and level, without the trainer battles' extra), shared among your Chao that were sent
+  out, and only for a win.
 - Live battles give both players XP, by each Chao's own level, more for the winner and more
   for each of the other team's Chao that fainted (less for one below your Chao's battle level,
   whatever the level rule). Against a team of fewer than three, each of its Chao counts as one

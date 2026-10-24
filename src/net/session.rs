@@ -218,13 +218,14 @@ impl Host {
                         body: body.clone(),
                     };
                     // The server's Chao stream, their sounds and live fields go like `GardenChao`
-                    // and players' `ChaoSounds`: unreliably, often.
+                    // and players' `ChaoSounds`: unreliably, often. So do its wild visitors.
                     if matches!(
                         msg,
                         Message::Game {
                             body: Body::ServerChao { .. }
                                 | Body::ChaoSounds { .. }
-                                | Body::ChaoLive { .. },
+                                | Body::ChaoLive { .. }
+                                | Body::WildList { .. },
                             ..
                         }
                     ) {

@@ -12,4 +12,5 @@ pub mod motion;
 pub mod physics;
 pub mod picker;
 pub mod record;
+pub mod wild;
 pub mod world;

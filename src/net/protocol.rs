@@ -4,7 +4,7 @@ use super::wire::{Reader, Result, WireError, Writer};
 use crate::chao::{CHAO_SIZE, ChaoData};
 
 /// Bump on any incompatible change to messages or framing.
-pub const PROTOCOL_VERSION: u16 = 25;
+pub const PROTOCOL_VERSION: u16 = 26;
 pub const MAX_PLAYERS: usize = 8;
 /// Highest level number a room may pick.
 const MAX_LEVEL: i16 = 100;
@@ -668,6 +668,111 @@ pub enum Body {
         reason: u8,
         winner: u8,
     },
+    /// To the host only (net/wild_host.rs): whether the sender sees shared wild visitors and
+    /// what they may do (`WILD_SEE`, `WILD_PICK`, `WILD_MACHINE`), and their ROM's visitor
+    /// fingerprint (`net::wild_print`; 0 without `WILD_SEE`). On connecting and on change.
+    WildHello {
+        flags: u8,
+        print: u32,
+    },
+    /// From the host, every 6 frames (unreliable), to the players in garden `area` who see its
+    /// visitors: its `serial` (one more each list the host sends, so an older one arriving late
+    /// is told apart), the garden's wild area (`section`, a map section id; none yet), the
+    /// print its visitors are of, who picks them (`picker`), the owner ids whose Chao can learn
+    /// from them now (`learners`, a bit per owner id 0..=15) and every visitor.
+    WildList {
+        area: u8,
+        serial: u16,
+        section: Option<u8>,
+        print: u32,
+        picker: Option<u8>,
+        learners: u16,
+        list: Vec<WildEntry>,
+    },
+    /// From the host, to garden `area`'s picker: pick `land` visitors for the grass and `pond`
+    /// for the pond from `section` (none: choose the garden's area for this run). `fresh`: the
+    /// garden just became shared, and the picker may hand over its own visitors where they are.
+    WildAsk {
+        area: u8,
+        ask: u16,
+        section: Option<u8>,
+        land: u8,
+        pond: u8,
+        fresh: bool,
+    },
+    /// To the host only: the picker's answer to ask `ask`, from `section`.
+    WildPick {
+        area: u8,
+        ask: u16,
+        section: u8,
+        list: Vec<WildPicked>,
+    },
+    /// To the host only: a partner of the sender's (from the link machine, or one waiting in
+    /// this garden) comes to garden `area`, at `at` (none: where the host puts it). `key` is its
+    /// key in the sender's store.
+    WildBring {
+        area: u8,
+        key: u64,
+        from_save: bool,
+        creature: WildCreature,
+        at: Option<([f32; 3], u16)>,
+    },
+    /// To the host only: the sender comes into garden `area` carrying a wild visitor from
+    /// elsewhere, held at `offset`.
+    WildCarry {
+        area: u8,
+        creature: WildCreature,
+        offset: [f32; 3],
+    },
+    /// To the host only: the sender picks up visitor `id`.
+    WildTake {
+        id: u16,
+    },
+    /// To the host only, about 10 a second while the sender holds visitor `id`: in their hands
+    /// at `v` (in their frame), or let go of and at world position `v` (`let_go`).
+    WildHeld {
+        id: u16,
+        let_go: bool,
+        v: [f32; 3],
+    },
+    /// To the host only: visitor `id` the sender let go of is on the ground at `at`.
+    WildPut {
+        id: u16,
+        at: [f32; 3],
+        angle: u16,
+    },
+    /// To the host only: a Chao (`owner`, `index`) took visitor `id` from the sender.
+    WildAbsorbed {
+        id: u16,
+        owner: u8,
+        index: u8,
+    },
+    /// To the host only: the sender battles visitor `id` (`WildStep`).
+    WildBattle {
+        id: u16,
+        step: WildStep,
+    },
+    /// From the host, to the player who asked: whether their `kind` request was granted, for
+    /// visitor `id` (0 when refused before it had one) and, for a bring, the partner's `key`.
+    WildAnswer {
+        kind: WildRequest,
+        id: u16,
+        key: u64,
+        ok: bool,
+    },
+    /// From the host, to every session of a Chao's owner: the Chao whose `ChaoData::identity`
+    /// is `identity` absorbed this visitor.
+    WildTaught {
+        identity: u64,
+        origin: WildOrigin,
+        creature: WildCreature,
+    },
+    /// From the host, to a partner's bringer: their partner `key` waiting in garden `garden` was
+    /// absorbed (by anyone's Chao): it waits no more.
+    WildUsed {
+        garden: u8,
+        key: u64,
+    },
 }
 
 /// Most Chao on a live battle team.
@@ -700,6 +805,115 @@ pub const END_DESYNC: u8 = 6;
 pub const END_WITHDRAWN: u8 = 7;
 /// `BattleEnd::winner` for nobody.
 pub const NO_WINNER: u8 = 2;
+
+/// `WildHello::flags`: SharedVisitors is on and the ROM is read (the print is its); WildVisitors
+/// is on too (the player may pick a garden's visitors); LinkMachine is on too.
+pub const WILD_SEE: u8 = 1;
+pub const WILD_PICK: u8 = 2;
+pub const WILD_MACHINE: u8 = 4;
+/// Most visitors in one `WildList`: the game's 10 animal entries less 2 left for its own.
+pub const MAX_WILD_LIST: usize = 12;
+/// Most visitors in one `WildPick`.
+pub const MAX_WILD_PICK: usize = 5;
+/// A held visitor's offset in its holder's frame is at most this along each axis.
+pub const MAX_WILD_OFFSET: f32 = 10.0;
+
+/// A wild visitor as ids from the ROM (every game names and draws it from its own).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WildCreature {
+    /// 1..`SPECIES_COUNT`.
+    pub species: u16,
+    /// 1..=100.
+    pub level: u8,
+    /// The ability id (not the slot).
+    pub ability: u8,
+    pub shiny: bool,
+    /// Its four moves (0: an empty slot; at least one, none twice).
+    pub moves: [u16; 4],
+}
+
+/// Where a visitor of a `WildList` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WildPlace {
+    /// On the ground (walking about, or let go of and falling): `WildEntry::v` is its world
+    /// position.
+    Roam,
+    /// In the pond: `v` is its world position (the surface's height).
+    Swim,
+    /// In player `by`'s hands: `v` is the offset in their frame.
+    Held { by: u8 },
+    /// Player `by` battles it: `v` is where it stands.
+    Battle { by: u8 },
+}
+
+/// One visitor of a `WildList`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WildEntry {
+    /// Never 0.
+    pub id: u16,
+    pub creature: WildCreature,
+    /// A partner, brought by this player (none: a wild one).
+    pub bringer: Option<u8>,
+    pub place: WildPlace,
+    pub v: [f32; 3],
+    /// Facing (BAMS).
+    pub angle: u16,
+}
+
+/// Where a picked visitor comes (`WildPicked`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WildArrive {
+    /// Where the host puts it on the grass, or in the pond.
+    Land,
+    Pond,
+    /// Where it is now in the picker's game (a fresh ask only): on the grass, or swimming.
+    LandAt {
+        at: [f32; 3],
+        angle: u16,
+    },
+    SwimAt {
+        at: [f32; 3],
+        angle: u16,
+    },
+}
+
+/// One visitor of a `WildPick`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WildPicked {
+    pub creature: WildCreature,
+    pub arrive: WildArrive,
+}
+
+/// `WildBattle::step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WildStep {
+    /// Asks to battle it (answered by `WildAnswer`); others can't take it meanwhile.
+    Reserve,
+    /// The battle is won: it stays.
+    Won,
+    /// Lost, or given up: it runs away.
+    Lost,
+    /// Backed out before the fight: it stays.
+    Cancelled,
+}
+
+/// `WildAnswer::kind`: what was asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WildRequest {
+    Take,
+    Carry,
+    Bring,
+    Battle,
+}
+
+/// `WildTaught::origin`: where the absorbed visitor came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WildOrigin {
+    Wild,
+    /// A partner from a GBA save, or another partner (a kept one, the gift).
+    SavePartner,
+    Partner,
+}
 
 /// A Chao on a live battle team: a copy of its record and its battle profile (ROM ids).
 #[derive(Clone, Debug, PartialEq)]
@@ -1221,6 +1435,20 @@ mod tag {
     pub const BATTLE_STEP: u8 = 70;
     pub const BATTLE_LEAVE: u8 = 71;
     pub const BATTLE_END: u8 = 72;
+    pub const WILD_HELLO: u8 = 73;
+    pub const WILD_LIST: u8 = 74;
+    pub const WILD_ASK: u8 = 75;
+    pub const WILD_PICK: u8 = 76;
+    pub const WILD_BRING: u8 = 77;
+    pub const WILD_CARRY: u8 = 78;
+    pub const WILD_TAKE: u8 = 79;
+    pub const WILD_HELD: u8 = 80;
+    pub const WILD_PUT: u8 = 81;
+    pub const WILD_ABSORBED: u8 = 82;
+    pub const WILD_BATTLE: u8 = 83;
+    pub const WILD_ANSWER: u8 = 84;
+    pub const WILD_TAUGHT: u8 = 85;
+    pub const WILD_USED: u8 = 86;
 }
 
 fn write_battle_team(w: &mut Writer, team: &[BattleMember]) {
@@ -1519,6 +1747,158 @@ fn name(r: &mut Reader) -> Result<String> {
     } else {
         Ok(s)
     }
+}
+
+/// No map section yet (`WildList`, `WildAsk`).
+const NO_SECTION: u8 = 0xFF;
+/// No player (`WildList` picker, an entry's bringer or holder).
+const NO_PLAYER: u8 = 0xFF;
+
+fn write_creature(w: &mut Writer, c: &WildCreature) {
+    w.u16(c.species)
+        .u8(c.level)
+        .u8(c.ability)
+        .u8(u8::from(c.shiny));
+    for m in c.moves {
+        w.u16(m);
+    }
+}
+
+/// A visitor off the wire: a species, level, ability and moves the ROM has, at least one move
+/// and none twice.
+fn read_creature(r: &mut Reader) -> Result<WildCreature> {
+    use crate::gba::rom::{ABILITY_COUNT, MOVE_COUNT, SPECIES_COUNT};
+    let c = WildCreature {
+        species: r.u16()?,
+        level: r.u8()?,
+        ability: r.u8()?,
+        shiny: wire_flag(r, "wild shiny")?,
+        moves: [r.u16()?, r.u16()?, r.u16()?, r.u16()?],
+    };
+    let twice = (0..4).any(|i| c.moves[i] != 0 && c.moves[..i].contains(&c.moves[i]));
+    if !(1..SPECIES_COUNT).contains(&c.species)
+        || !(1..=100).contains(&c.level)
+        || c.ability >= ABILITY_COUNT
+        || c.moves.iter().any(|&m| m >= MOVE_COUNT)
+        || c.moves == [0; 4]
+        || twice
+    {
+        return Err(WireError::BadValue("wild creature"));
+    }
+    Ok(c)
+}
+
+fn wild_area(r: &mut Reader) -> Result<u8> {
+    let area = r.u8()?;
+    if (1..=3).contains(&area) {
+        Ok(area)
+    } else {
+        Err(WireError::BadValue("wild area"))
+    }
+}
+
+fn wild_id(r: &mut Reader) -> Result<u16> {
+    match r.u16()? {
+        0 => Err(WireError::BadValue("wild id")),
+        id => Ok(id),
+    }
+}
+
+fn write_v3(w: &mut Writer, v: [f32; 3]) {
+    for x in v {
+        w.f32(x);
+    }
+}
+
+fn read_v3(r: &mut Reader, limit: f32) -> Result<[f32; 3]> {
+    Ok([r.f32(limit)?, r.f32(limit)?, r.f32(limit)?])
+}
+
+fn write_section(w: &mut Writer, section: Option<u8>) {
+    w.u8(section.unwrap_or(NO_SECTION));
+}
+
+fn read_section(r: &mut Reader) -> Result<Option<u8>> {
+    Ok(Some(r.u8()?).filter(|&s| s != NO_SECTION))
+}
+
+fn write_wild_entry(w: &mut Writer, e: &WildEntry) {
+    w.u16(e.id);
+    write_creature(w, &e.creature);
+    let (place, by) = match e.place {
+        WildPlace::Roam => (0, NO_PLAYER),
+        WildPlace::Swim => (1, NO_PLAYER),
+        WildPlace::Held { by } => (2, by),
+        WildPlace::Battle { by } => (3, by),
+    };
+    w.u8(u8::from(e.bringer.is_some()))
+        .u8(e.bringer.unwrap_or(NO_PLAYER))
+        .u8(place)
+        .u8(by);
+    write_v3(w, e.v);
+    w.u16(e.angle);
+}
+
+fn read_wild_entry(r: &mut Reader) -> Result<WildEntry> {
+    let id = wild_id(r)?;
+    let creature = read_creature(r)?;
+    let bad = || WireError::BadValue("wild entry");
+    let player = |by: u8| usize::from(by) < MAX_PLAYERS;
+    let bringer = match (r.u8()?, r.u8()?) {
+        (0, NO_PLAYER) => None,
+        (1, id) if player(id) => Some(id),
+        _ => return Err(bad()),
+    };
+    let place = match (r.u8()?, r.u8()?) {
+        (0, NO_PLAYER) => WildPlace::Roam,
+        (1, NO_PLAYER) => WildPlace::Swim,
+        (2, by) if player(by) => WildPlace::Held { by },
+        (3, by) if player(by) => WildPlace::Battle { by },
+        _ => return Err(bad()),
+    };
+    let limit = match place {
+        WildPlace::Held { .. } => MAX_WILD_OFFSET,
+        _ => MAX_COORD,
+    };
+    Ok(WildEntry {
+        id,
+        creature,
+        bringer,
+        place,
+        v: read_v3(r, limit)?,
+        angle: r.u16()?,
+    })
+}
+
+fn write_wild_picked(w: &mut Writer, p: &WildPicked) {
+    write_creature(w, &p.creature);
+    let (place, at, angle) = match p.arrive {
+        WildArrive::Land => (0, [0.0; 3], 0),
+        WildArrive::Pond => (1, [0.0; 3], 0),
+        WildArrive::LandAt { at, angle } => (2, at, angle),
+        WildArrive::SwimAt { at, angle } => (3, at, angle),
+    };
+    w.u8(place);
+    write_v3(w, at);
+    w.u16(angle);
+}
+
+fn read_wild_picked(r: &mut Reader) -> Result<WildPicked> {
+    let creature = read_creature(r)?;
+    let place = r.u8()?;
+    let (at, angle) = (read_v3(r, MAX_COORD)?, r.u16()?);
+    let arrive = match place {
+        0 => WildArrive::Land,
+        1 => WildArrive::Pond,
+        2 => WildArrive::LandAt { at, angle },
+        3 => WildArrive::SwimAt { at, angle },
+        _ => return Err(WireError::BadValue("wild place")),
+    };
+    Ok(WildPicked { creature, arrive })
+}
+
+fn read_u64(r: &mut Reader) -> Result<u64> {
+    Ok(u64::from_le_bytes(r.take(8)?.try_into().unwrap()))
 }
 
 impl Message {
@@ -2264,6 +2644,136 @@ impl Body {
                 winner,
             } => {
                 w.u8(tag::BATTLE_END).u16(*battle).u8(*reason).u8(*winner);
+            }
+            Self::WildHello { flags, print } => {
+                w.u8(tag::WILD_HELLO).u8(*flags).u32(*print);
+            }
+            Self::WildList {
+                area,
+                serial,
+                section,
+                print,
+                picker,
+                learners,
+                list,
+            } => {
+                w.u8(tag::WILD_LIST).u8(*area).u16(*serial);
+                write_section(w, *section);
+                w.u32(*print)
+                    .u8(picker.unwrap_or(NO_PLAYER))
+                    .u16(*learners)
+                    .u8(list.len() as u8);
+                for e in list {
+                    write_wild_entry(w, e);
+                }
+            }
+            Self::WildAsk {
+                area,
+                ask,
+                section,
+                land,
+                pond,
+                fresh,
+            } => {
+                w.u8(tag::WILD_ASK).u8(*area).u16(*ask);
+                write_section(w, *section);
+                w.u8(*land).u8(*pond).u8(u8::from(*fresh));
+            }
+            Self::WildPick {
+                area,
+                ask,
+                section,
+                list,
+            } => {
+                w.u8(tag::WILD_PICK)
+                    .u8(*area)
+                    .u16(*ask)
+                    .u8(*section)
+                    .u8(list.len() as u8);
+                for p in list {
+                    write_wild_picked(w, p);
+                }
+            }
+            Self::WildBring {
+                area,
+                key,
+                from_save,
+                creature,
+                at,
+            } => {
+                w.u8(tag::WILD_BRING)
+                    .u8(*area)
+                    .bytes(&key.to_le_bytes())
+                    .u8(u8::from(*from_save));
+                write_creature(w, creature);
+                let (place, v, angle) = at.map_or((0, [0.0; 3], 0), |(v, a)| (2, v, a));
+                w.u8(place);
+                write_v3(w, v);
+                w.u16(angle);
+            }
+            Self::WildCarry {
+                area,
+                creature,
+                offset,
+            } => {
+                w.u8(tag::WILD_CARRY).u8(*area);
+                write_creature(w, creature);
+                write_v3(w, *offset);
+            }
+            Self::WildTake { id } => {
+                w.u8(tag::WILD_TAKE).u16(*id);
+            }
+            Self::WildHeld { id, let_go, v } => {
+                w.u8(tag::WILD_HELD).u16(*id).u8(u8::from(*let_go));
+                write_v3(w, *v);
+            }
+            Self::WildPut { id, at, angle } => {
+                w.u8(tag::WILD_PUT).u16(*id);
+                write_v3(w, *at);
+                w.u16(*angle);
+            }
+            Self::WildAbsorbed { id, owner, index } => {
+                w.u8(tag::WILD_ABSORBED).u16(*id).u8(*owner).u8(*index);
+            }
+            Self::WildBattle { id, step } => {
+                let step = match step {
+                    WildStep::Reserve => 0,
+                    WildStep::Won => 1,
+                    WildStep::Lost => 2,
+                    WildStep::Cancelled => 3,
+                };
+                w.u8(tag::WILD_BATTLE).u16(*id).u8(step);
+            }
+            Self::WildAnswer { kind, id, key, ok } => {
+                let kind = match kind {
+                    WildRequest::Take => 0,
+                    WildRequest::Carry => 1,
+                    WildRequest::Bring => 2,
+                    WildRequest::Battle => 3,
+                };
+                w.u8(tag::WILD_ANSWER)
+                    .u8(kind)
+                    .u16(*id)
+                    .bytes(&key.to_le_bytes())
+                    .u8(u8::from(*ok));
+            }
+            Self::WildTaught {
+                identity,
+                origin,
+                creature,
+            } => {
+                let origin = match origin {
+                    WildOrigin::Wild => 0,
+                    WildOrigin::SavePartner => 1,
+                    WildOrigin::Partner => 2,
+                };
+                w.u8(tag::WILD_TAUGHT)
+                    .bytes(&identity.to_le_bytes())
+                    .u8(origin);
+                write_creature(w, creature);
+            }
+            Self::WildUsed { garden, key } => {
+                w.u8(tag::WILD_USED).u8(*garden).bytes(&key.to_le_bytes());
             }
             Self::UpgradeGot {
                 level,
@@ -3318,6 +3828,171 @@ impl Body {
                     winner,
                 }
             }
+            tag::WILD_HELLO => {
+                let (flags, print) = (r.u8()?, r.u32()?);
+                let see = flags & WILD_SEE != 0;
+                if flags & !(WILD_SEE | WILD_PICK | WILD_MACHINE) != 0 || see != (print != 0) {
+                    return Err(WireError::BadValue("wild hello"));
+                }
+                Self::WildHello { flags, print }
+            }
+            tag::WILD_LIST => {
+                let area = wild_area(r)?;
+                let serial = r.u16()?;
+                let section = read_section(r)?;
+                let print = r.u32()?;
+                let picker = match r.u8()? {
+                    NO_PLAYER => None,
+                    id if usize::from(id) < MAX_PLAYERS => Some(id),
+                    _ => return Err(WireError::BadValue("wild picker")),
+                };
+                let learners = r.u16()?;
+                let count = usize::from(r.u8()?);
+                if count > MAX_WILD_LIST {
+                    return Err(WireError::BadValue("wild list"));
+                }
+                let list: Vec<WildEntry> = (0..count)
+                    .map(|_| read_wild_entry(r))
+                    .collect::<Result<_>>()?;
+                if (0..count).any(|i| list[..i].iter().any(|e| e.id == list[i].id)) {
+                    return Err(WireError::BadValue("wild list"));
+                }
+                Self::WildList {
+                    area,
+                    serial,
+                    section,
+                    print,
+                    picker,
+                    learners,
+                    list,
+                }
+            }
+            tag::WILD_ASK => {
+                let area = wild_area(r)?;
+                let ask = r.u16()?;
+                let section = read_section(r)?;
+                let (land, pond) = (r.u8()?, r.u8()?);
+                let fresh = wire_flag(r, "wild ask")?;
+                if !(1..=MAX_WILD_PICK).contains(&(usize::from(land) + usize::from(pond))) {
+                    return Err(WireError::BadValue("wild ask"));
+                }
+                Self::WildAsk {
+                    area,
+                    ask,
+                    section,
+                    land,
+                    pond,
+                    fresh,
+                }
+            }
+            tag::WILD_PICK => {
+                let area = wild_area(r)?;
+                let ask = r.u16()?;
+                let section = r.u8()?;
+                let count = usize::from(r.u8()?);
+                if section == NO_SECTION || count > MAX_WILD_PICK {
+                    return Err(WireError::BadValue("wild pick"));
+                }
+                let list = (0..count)
+                    .map(|_| read_wild_picked(r))
+                    .collect::<Result<_>>()?;
+                Self::WildPick {
+                    area,
+                    ask,
+                    section,
+                    list,
+                }
+            }
+            tag::WILD_BRING => {
+                let area = wild_area(r)?;
+                let key = read_u64(r)?;
+                let from_save = wire_flag(r, "wild bring")?;
+                let creature = read_creature(r)?;
+                let place = r.u8()?;
+                let (v, angle) = (read_v3(r, MAX_COORD)?, r.u16()?);
+                let at = match place {
+                    0 => None,
+                    2 => Some((v, angle)),
+                    _ => return Err(WireError::BadValue("wild bring")),
+                };
+                Self::WildBring {
+                    area,
+                    key,
+                    from_save,
+                    creature,
+                    at,
+                }
+            }
+            tag::WILD_CARRY => Self::WildCarry {
+                area: wild_area(r)?,
+                creature: read_creature(r)?,
+                offset: read_v3(r, MAX_WILD_OFFSET)?,
+            },
+            tag::WILD_TAKE => Self::WildTake { id: wild_id(r)? },
+            tag::WILD_HELD => {
+                let id = wild_id(r)?;
+                let let_go = wire_flag(r, "wild held")?;
+                let v = read_v3(r, if let_go { MAX_COORD } else { MAX_WILD_OFFSET })?;
+                Self::WildHeld { id, let_go, v }
+            }
+            tag::WILD_PUT => Self::WildPut {
+                id: wild_id(r)?,
+                at: read_v3(r, MAX_COORD)?,
+                angle: r.u16()?,
+            },
+            tag::WILD_ABSORBED => {
+                let id = wild_id(r)?;
+                let owner = chao_owner(r)?;
+                let index = r.u8()?;
+                if usize::from(index) >= MAX_CARRIED_CHAO {
+                    return Err(WireError::BadValue("wild absorbed"));
+                }
+                Self::WildAbsorbed { id, owner, index }
+            }
+            tag::WILD_BATTLE => {
+                let id = wild_id(r)?;
+                let step = match r.u8()? {
+                    0 => WildStep::Reserve,
+                    1 => WildStep::Won,
+                    2 => WildStep::Lost,
+                    3 => WildStep::Cancelled,
+                    _ => return Err(WireError::BadValue("wild battle")),
+                };
+                Self::WildBattle { id, step }
+            }
+            tag::WILD_ANSWER => {
+                let kind = match r.u8()? {
+                    0 => WildRequest::Take,
+                    1 => WildRequest::Carry,
+                    2 => WildRequest::Bring,
+                    3 => WildRequest::Battle,
+                    _ => return Err(WireError::BadValue("wild answer")),
+                };
+                Self::WildAnswer {
+                    kind,
+                    id: r.u16()?,
+                    key: read_u64(r)?,
+                    ok: wire_flag(r, "wild answer")?,
+                }
+            }
+            tag::WILD_TAUGHT => {
+                let identity = read_u64(r)?;
+                let origin = match r.u8()? {
+                    0 => WildOrigin::Wild,
+                    1 => WildOrigin::SavePartner,
+                    2 => WildOrigin::Partner,
+                    _ => return Err(WireError::BadValue("wild taught")),
+                };
+                Self::WildTaught {
+                    identity,
+                    origin,
+                    creature: read_creature(r)?,
+                }
+            }
+            tag::WILD_USED => Self::WildUsed {
+                garden: wild_area(r)?,
+                key: read_u64(r)?,
+            },
             _ => return Err(WireError::BadTag("body", t)),
         })
     }
@@ -4087,6 +4762,231 @@ mod tests {
                     winner: NO_WINNER,
                 },
             },
+            Message::Game {
+                from: 2,
+                body: Body::WildHello {
+                    flags: WILD_SEE | WILD_PICK | WILD_MACHINE,
+                    print: 0xDEAD_BEEF,
+                },
+            },
+            Message::Game {
+                from: 2,
+                body: Body::WildHello { flags: 0, print: 0 },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildList {
+                    area: 2,
+                    serial: 0xBEEF,
+                    section: Some(16),
+                    print: 9,
+                    picker: Some(3),
+                    learners: 0x8201,
+                    list: vec![
+                        WildEntry {
+                            id: 1,
+                            creature: wild_creature(),
+                            bringer: None,
+                            place: WildPlace::Roam,
+                            v: [10.0, 0.5, -30.0],
+                            angle: 0x1234,
+                        },
+                        WildEntry {
+                            id: 2,
+                            creature: WildCreature {
+                                shiny: true,
+                                ..wild_creature()
+                            },
+                            bringer: Some(4),
+                            place: WildPlace::Held { by: 5 },
+                            v: [0.0, 4.0, 2.0],
+                            angle: 0,
+                        },
+                        WildEntry {
+                            id: 0xFFFF,
+                            creature: wild_creature(),
+                            bringer: None,
+                            place: WildPlace::Battle { by: 7 },
+                            v: [-1.0, 2.0, 3.0],
+                            angle: 9,
+                        },
+                        WildEntry {
+                            id: 3,
+                            creature: wild_creature(),
+                            bringer: None,
+                            place: WildPlace::Swim,
+                            v: [-1.0, -2.0, 3.0],
+                            angle: 9,
+                        },
+                    ],
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildList {
+                    area: 1,
+                    serial: 0,
+                    section: None,
+                    print: 0,
+                    picker: None,
+                    learners: 0,
+                    list: Vec::new(),
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildAsk {
+                    area: 3,
+                    ask: 500,
+                    section: None,
+                    land: 2,
+                    pond: 1,
+                    fresh: true,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildPick {
+                    area: 3,
+                    ask: 500,
+                    section: 0,
+                    list: vec![
+                        WildPicked {
+                            creature: wild_creature(),
+                            arrive: WildArrive::Land,
+                        },
+                        WildPicked {
+                            creature: wild_creature(),
+                            arrive: WildArrive::Pond,
+                        },
+                        WildPicked {
+                            creature: wild_creature(),
+                            arrive: WildArrive::LandAt {
+                                at: [1.0, 2.0, 3.0],
+                                angle: 4,
+                            },
+                        },
+                        WildPicked {
+                            creature: wild_creature(),
+                            arrive: WildArrive::SwimAt {
+                                at: [1.0, -2.0, 3.0],
+                                angle: 5,
+                            },
+                        },
+                    ],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildBring {
+                    area: 1,
+                    key: 0x0123_4567_89AB_CDEF,
+                    from_save: true,
+                    creature: wild_creature(),
+                    at: Some(([50.0, 10.0, 22.0], 0x96F8)),
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildBring {
+                    area: 2,
+                    key: 1,
+                    from_save: false,
+                    creature: wild_creature(),
+                    at: None,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildCarry {
+                    area: 1,
+                    creature: wild_creature(),
+                    offset: [0.0, 5.0, -2.0],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildTake { id: 77 },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildHeld {
+                    id: 77,
+                    let_go: false,
+                    v: [0.0, 5.0, 2.0],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildHeld {
+                    id: 77,
+                    let_go: true,
+                    v: [100.0, 5.0, -200.0],
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildPut {
+                    id: 77,
+                    at: [100.0, 0.0, -200.0],
+                    angle: 0x8000,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildAbsorbed {
+                    id: 77,
+                    owner: 9,
+                    index: 3,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildBattle {
+                    id: 77,
+                    step: WildStep::Reserve,
+                },
+            },
+            Message::Game {
+                from: 1,
+                body: Body::WildBattle {
+                    id: 77,
+                    step: WildStep::Cancelled,
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildAnswer {
+                    kind: WildRequest::Bring,
+                    id: 0,
+                    key: 99,
+                    ok: false,
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildAnswer {
+                    kind: WildRequest::Battle,
+                    id: 12,
+                    key: 0,
+                    ok: true,
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildTaught {
+                    identity: 0xFEED_FACE_0000_0001,
+                    origin: WildOrigin::SavePartner,
+                    creature: wild_creature(),
+                },
+            },
+            Message::Game {
+                from: SERVER,
+                body: Body::WildUsed {
+                    garden: 3,
+                    key: 0x77,
+                },
+            },
         ]
     }
 
@@ -4253,6 +5153,212 @@ mod tests {
         assert!(Message::decode(&some(1, 100, 1)).is_ok());
         assert!(Message::decode(&some(1, 0, 1)).is_err());
         assert!(Message::decode(&some(1, 101, 1)).is_err());
+    }
+
+    fn wild_creature() -> WildCreature {
+        WildCreature {
+            species: 25,
+            level: 30,
+            ability: 9,
+            shiny: false,
+            moves: [84, 0, 98, 86],
+        }
+    }
+
+    #[test]
+    fn wild_visitors_stay_in_range() {
+        let decodes =
+            |body: Body| Message::decode(&Message::Game { from: 1, body }.encode()).is_ok();
+        let carry = |creature: WildCreature| Body::WildCarry {
+            area: 1,
+            creature,
+            offset: [0.0; 3],
+        };
+        let c = wild_creature();
+        assert!(decodes(carry(c)));
+        for bad in [
+            WildCreature { species: 0, ..c },
+            WildCreature {
+                species: crate::gba::rom::SPECIES_COUNT,
+                ..c
+            },
+            WildCreature { level: 0, ..c },
+            WildCreature { level: 101, ..c },
+            WildCreature {
+                ability: crate::gba::rom::ABILITY_COUNT,
+                ..c
+            },
+            WildCreature { moves: [0; 4], ..c },
+            WildCreature {
+                moves: [84, 84, 0, 0],
+                ..c
+            },
+            WildCreature {
+                moves: [crate::gba::rom::MOVE_COUNT, 0, 0, 0],
+                ..c
+            },
+        ] {
+            assert!(!decodes(carry(bad)), "{bad:?}");
+        }
+        // A shiny byte past 1.
+        let mut bytes = Message::Game {
+            from: 1,
+            body: carry(c),
+        }
+        .encode();
+        // tag, from, body tag, area, species u16, level, ability: the shiny byte.
+        bytes[8] = 2;
+        assert!(Message::decode(&bytes).is_err());
+        // Areas, ids, owners, indexes, steps.
+        assert!(!decodes(Body::WildCarry {
+            area: 4,
+            creature: c,
+            offset: [0.0; 3]
+        }));
+        assert!(!decodes(Body::WildUsed { garden: 0, key: 1 }));
+        assert!(!decodes(Body::WildTake { id: 0 }));
+        assert!(!decodes(Body::WildAbsorbed {
+            id: 1,
+            owner: 16,
+            index: 0
+        }));
+        assert!(!decodes(Body::WildAbsorbed {
+            id: 1,
+            owner: 0,
+            index: 4
+        }));
+        // An offset in hands is short; a let-go position can be anywhere in the garden.
+        assert!(!decodes(Body::WildHeld {
+            id: 1,
+            let_go: false,
+            v: [0.0, 11.0, 0.0]
+        }));
+        assert!(decodes(Body::WildHeld {
+            id: 1,
+            let_go: true,
+            v: [0.0, 11.0, 300.0]
+        }));
+        assert!(!decodes(Body::WildCarry {
+            area: 1,
+            creature: c,
+            offset: [f32::NAN, 0.0, 0.0]
+        }));
+        assert!(!decodes(Body::WildPut {
+            id: 1,
+            at: [2.0e6, 0.0, 0.0],
+            angle: 0
+        }));
+        // Hellos: known flags only, a print exactly when seeing.
+        assert!(!decodes(Body::WildHello { flags: 8, print: 0 }));
+        assert!(!decodes(Body::WildHello {
+            flags: WILD_SEE,
+            print: 0
+        }));
+        assert!(!decodes(Body::WildHello {
+            flags: WILD_PICK,
+            print: 5
+        }));
+        // Asks of 1..=5; picks of at most 5 with a section; lists of at most 8, ids once.
+        let ask = |land: u8, pond: u8| Body::WildAsk {
+            area: 1,
+            ask: 1,
+            section: Some(3),
+            land,
+            pond,
+            fresh: false,
+        };
+        assert!(decodes(ask(4, 1)));
+        assert!(!decodes(ask(0, 0)) && !decodes(ask(5, 1)));
+        let pick = |section: u8, n: usize| Body::WildPick {
+            area: 1,
+            ask: 1,
+            section,
+            list: vec![
+                WildPicked {
+                    creature: c,
+                    arrive: WildArrive::Land,
+                };
+                n
+            ],
+        };
+        assert!(decodes(pick(0, MAX_WILD_PICK)));
+        assert!(!decodes(pick(0, MAX_WILD_PICK + 1)) && !decodes(pick(0xFF, 1)));
+        let entry = |id: u16, place: WildPlace, v: [f32; 3]| WildEntry {
+            id,
+            creature: c,
+            bringer: None,
+            place,
+            v,
+            angle: 0,
+        };
+        let list = |list: Vec<WildEntry>| Body::WildList {
+            area: 1,
+            serial: 1,
+            section: None,
+            print: 1,
+            picker: None,
+            learners: 0,
+            list,
+        };
+        let many = |n: u16| {
+            (1..=n)
+                .map(|i| entry(i, WildPlace::Roam, [0.0; 3]))
+                .collect()
+        };
+        assert!(decodes(list(many(MAX_WILD_LIST as u16))));
+        assert!(!decodes(list(many(MAX_WILD_LIST as u16 + 1))));
+        let one = entry(1, WildPlace::Roam, [0.0; 3]);
+        assert!(!decodes(list(vec![one, one])));
+        assert!(!decodes(list(vec![entry(
+            1,
+            WildPlace::Held { by: 8 },
+            [0.0; 3]
+        )])));
+        assert!(!decodes(list(vec![entry(
+            1,
+            WildPlace::Held { by: 1 },
+            [0.0, 20.0, 0.0]
+        )])));
+        assert!(!decodes(list(vec![WildEntry {
+            bringer: Some(MAX_PLAYERS as u8),
+            ..one
+        }])));
+        // Enum bytes past the known ones.
+        let mut battle = Message::Game {
+            from: 1,
+            body: Body::WildBattle {
+                id: 1,
+                step: WildStep::Cancelled,
+            },
+        }
+        .encode();
+        *battle.last_mut().unwrap() = 4;
+        assert!(Message::decode(&battle).is_err());
+        let mut taught = Message::Game {
+            from: SERVER,
+            body: Body::WildTaught {
+                identity: 1,
+                origin: WildOrigin::Partner,
+                creature: c,
+            },
+        }
+        .encode();
+        taught[11] = 3;
+        assert!(Message::decode(&taught).is_err());
+        // A full list is small (33 bytes an entry), well inside one unreliable packet.
+        let full = Message::Game {
+            from: SERVER,
+            body: Body::WildList {
+                area: 1,
+                serial: 2,
+                section: Some(1),
+                print: 1,
+                picker: Some(0),
+                learners: 0xFFFF,
+                list: many(MAX_WILD_LIST as u16),
+            },
+        };
+        assert_eq!(full.encode().len(), 3 + 12 + MAX_WILD_LIST * 33);
     }
 
     #[test]

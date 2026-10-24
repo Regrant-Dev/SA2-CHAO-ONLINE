@@ -600,9 +600,11 @@ fn pump(online: &mut Online, now: Instant) {
                 online.brought = None;
                 RESEND_MY_CHAO.store(true, Ordering::Relaxed);
                 RESEND_PARTNERS.store(true, Ordering::Relaxed);
+                crate::gba_link::wild_connected();
             }
             Event::Disconnected { reason } => {
                 log!("online: disconnected: {reason}");
+                crate::gba_link::wild_connected();
                 crate::battle::online::lost();
                 online.remote.clear();
                 crate::held::clear();
@@ -880,6 +882,30 @@ fn pump(online: &mut Online, now: Instant) {
                     | Body::BattleAnswer { .. }
                     | Body::BattleChoice { .. }
                     | Body::BattleLeave { .. },
+                ..
+            } => {}
+            // Shared wild visitors (net/wild_host.rs): the host's are for our game (only from the
+            // host, gba_link checks); players' go to the host only.
+            Event::Game {
+                from,
+                body:
+                    body @ (Body::WildList { .. }
+                    | Body::WildAsk { .. }
+                    | Body::WildAnswer { .. }
+                    | Body::WildTaught { .. }
+                    | Body::WildUsed { .. }),
+            } => crate::gba_link::received_wild(from, body),
+            Event::Game {
+                body:
+                    Body::WildHello { .. }
+                    | Body::WildPick { .. }
+                    | Body::WildBring { .. }
+                    | Body::WildCarry { .. }
+                    | Body::WildTake { .. }
+                    | Body::WildHeld { .. }
+                    | Body::WildPut { .. }
+                    | Body::WildAbsorbed { .. }
+                    | Body::WildBattle { .. },
                 ..
             } => {}
             // The Chao locked against us (only the host says so).
@@ -1366,8 +1392,9 @@ pub fn on_frame() {
     let Some(online) = guard.as_mut() else {
         room::update(None, Vec::new());
         crate::bring::set_friend_gardens(0);
-        // Nobody to send live battle messages to.
+        // Nobody to send live battle or visitor messages to.
         crate::battle::online::take_outgoing();
+        crate::gba_link::take_wild_outgoing();
         return;
     };
     let now = Instant::now();
@@ -1624,6 +1651,12 @@ pub fn on_frame() {
     for body in crate::battle::online::take_outgoing() {
         if online.session.my_id().is_some() {
             online.session.send(body, true, now);
+        }
+    }
+    // The shared wild visitors' (gba_link).
+    for (body, reliable) in crate::gba_link::take_wild_outgoing() {
+        if online.session.my_id().is_some() {
+            online.session.send(body, reliable, now);
         }
     }
 

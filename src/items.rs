@@ -92,14 +92,14 @@ struct Copy {
 /// An item's latest reported position, when it came and how fast it went since the one
 /// before (per second).
 #[derive(Clone, Copy, Debug)]
-struct Walk {
+pub(crate) struct Walk {
     at: [f32; 3],
     when: Instant,
     velocity: [f32; 3],
 }
 
 impl Walk {
-    fn new(at: [f32; 3], now: Instant) -> Self {
+    pub(crate) fn new(at: [f32; 3], now: Instant) -> Self {
         Self {
             at,
             when: now,
@@ -108,7 +108,7 @@ impl Walk {
     }
 
     /// A report at `at` came `now` (only when it moved: the same report is read every frame).
-    fn report(&mut self, at: [f32; 3], now: Instant) {
+    pub(crate) fn report(&mut self, at: [f32; 3], now: Instant) {
         let dt = now.duration_since(self.when).as_secs_f32();
         self.velocity = if (0.01..=STILL_AFTER.as_secs_f32()).contains(&dt) {
             std::array::from_fn(|i| (at[i] - self.at[i]) / dt)
@@ -129,7 +129,7 @@ impl Walk {
     }
 
     /// Where it is by `now`: the latest report moved on by its speed (a report's worth at most).
-    fn predicted(&self, now: Instant) -> [f32; 3] {
+    pub(crate) fn predicted(&self, now: Instant) -> [f32; 3] {
         let ahead = now
             .duration_since(self.when)
             .min(PREDICT_AT_MOST)
@@ -507,7 +507,7 @@ unsafe fn release(entry: usize) {
 /// # Safety
 /// Game thread.
 #[cfg(target_arch = "x86")]
-unsafe fn drop_held() {
+pub(crate) unsafe fn drop_held() {
     let player = game::local_entity() as usize;
     if player == 0 {
         return;
@@ -528,7 +528,7 @@ unsafe fn adopt(_entry: usize, _object: usize, _area: u8) {}
 #[cfg(not(target_arch = "x86"))]
 unsafe fn release(_entry: usize) {}
 #[cfg(not(target_arch = "x86"))]
-unsafe fn drop_held() {}
+pub(crate) unsafe fn drop_held() {}
 
 fn wrap(object: usize) -> usize {
     // SAFETY: a live item we own the wrapper for; returns its original MainSub.
@@ -1082,7 +1082,7 @@ const BLEND_MOTION: usize = 0x0079_3D30;
 ///
 /// # Safety
 /// `d` is a live animal's Data1, on the game thread.
-unsafe fn hold_still(d: usize) {
+pub(crate) unsafe fn hold_still(d: usize) {
     unsafe {
         let state = (d + D_ANIMAL_STATE) as *mut i8;
         if WANDER_STATES.contains(&state.read()) {
@@ -1098,7 +1098,7 @@ unsafe fn hold_still(d: usize) {
 ///
 /// # Safety
 /// `d` is a live animal's Data1, on the game thread.
-unsafe fn walk_with(d: usize, walk: &Walk, now: Instant) {
+pub(crate) unsafe fn walk_with(d: usize, walk: &Walk, now: Instant) {
     unsafe {
         let p = (d + D_POSITION) as *mut Vector;
         let here = p.read_unaligned();

@@ -56,7 +56,9 @@ retrying: `while true; do target/.../fakepeer client 127.0.0.1:43902 fakepeer; s
 | `FAKEPEER_KARATE=1` | 5 s after you reach the karate area (in its party), start a live karate fight against you and replay the recorded fight, or a pretend one (once per run) |
 | `FAKEPEER_KARATE_FILE=<file>` | Where a live fight you lead against fakepeer is recorded (default `target/karate-fight.rec`) |
 | `FAKEPEER_BATTLE=accept` | Accept your live Chao battle challenges with its `FAKEPEER_CHAO` Chao (Normal, basic moves), choosing with the battle AI. `singles` or `doubles`: also challenge you 5 s after you reach the karate area (again a minute after each battle) |
-| `FAKEPEER_ROM=<file>` | The GBA ROM for live battles (the same as your game's; default `~/Games/gba/emerald.gba`) |
+| `FAKEPEER_ROM=<file>` | The GBA ROM for live battles and shared wild visitors (the same as your game's; default `~/Games/gba/emerald.gba`) |
+| `FAKEPEER_WILD=<mode>[,<mode>]` | Share the garden's wild visitors with you (its ROM's visitor print, seeing, picking, with the machine). `pick`: answer the host's asks from its ROM (it picks while it was in the garden first). `take`: every 30 s pick up the visitor nearest it, hold it 10 s, put it down; with `carry` it goes to the lobby holding it instead and comes back 10 s later; with `absorb` it hands it to your nearest Chao. `whistle`: whistle 2 s every 20 s. `battle-won` / `battle-lost`: every 40 s reserve the nearest visitor, go to the karate area and send that result 25 s later (longer than a run with one player in it lasts), then come back. `hostile`: every 5 s send visitor messages with unknown ids, picks without an ask and values out of range |
+| `FAKEPEER_WILD_LEAVE=<secs>` | With `FAKEPEER_WILD`: go to the lobby for good after that many seconds (your game takes over picking) |
 
 Rebuild and restart it after any protocol change (`PROTOCOL_VERSION`, docs/protocol.md).
 In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start.
@@ -89,6 +91,20 @@ In game: F9 > Multiplayer = Join, Host address = `127.0.0.1:43902`, Save & Start
   challenge pops up on the karate menu; accept it and you play side 1 (your Chao still on the
   left).
 - **Chat:** T, type, Enter; fakepeer answers "heard: ...".
+- **Shared wild visitors:** `FAKEPEER_WILD=pick` with SharedVisitors on and the same ROM: in
+  a garden the server runs, the visitors fakepeer picks show as copies (its log: `wild: picked
+  N for garden G`); with `FAKEPEER_WILD_LEAVE=60` your game picks the next ones. `take`, `carry`:
+  the one it holds is in its puppet's hands, and carried out it's gone. `absorb`: your
+  partners.txt changes only when F9 "Others can change my Chao" allows fakepeer. `battle-won`,
+  `battle-lost`: fakepeer's puppet leaves the garden and the visitor shows busy; 15 s later the
+  garden is yours alone (its other visitors stay as yours, the battled one goes), and when
+  fakepeer comes back it's shared again with your visitors where they were and the battled one
+  back (won) or not (lost). `hostile`: nothing changes and
+  nothing crashes. In your game the link machine is there; a partner you bring out of it, and
+  the ones waiting in that garden, join the visitors (log: `gba link: species S (level L) came
+  to shared garden G`), and one you hand to your own Chao teaches it (`a Chao absorbed a wild
+  species`). When fakepeer leaves and the server stops running the garden, the visitors about
+  stay as your own (`the garden is ours again`).
 - **Party battles:** main menu 2P button (PARTY BATTLES) > Kart Race (fakepeer's kart, no CPU karts) and
   Treasure Hunt.
 

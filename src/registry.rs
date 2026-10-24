@@ -42,6 +42,34 @@ pub fn entries(category: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// The game's animal limit (category 2, at `LIMITS + 8`): 10 in the game.
+const GAME_ANIMAL_LIMIT: u32 = 10;
+
+/// Raises the gardens' animal limit to `chao_sim::wild::ANIMAL_LIMIT` (once, at start) so wild
+/// visitors and partners don't crowd out the game's own animals. Only the registry's own
+/// functions (0x530400..0x5307F0) read the limits, and a category has room for `MAX_ENTRIES`.
+pub fn raise_animal_limit() {
+    let raised = crate::chao_sim::wild::ANIMAL_LIMIT;
+    const _: () = assert!(crate::chao_sim::wild::ANIMAL_LIMIT as usize <= MAX_ENTRIES);
+    let ok = crate::patch::replace_code(
+        LIMITS + 2 * 4,
+        &GAME_ANIMAL_LIMIT.to_le_bytes(),
+        &raised.to_le_bytes(),
+    );
+    if ok {
+        crate::log!("registry: gardens hold up to {raised} animals");
+    } else {
+        crate::log!("registry: the animal limit isn't the game's; left as it is");
+    }
+}
+
+/// `entry` is the start of an entry in the registry (any category, in use or not).
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+pub fn is_entry(entry: usize) -> bool {
+    let end = WORLD + CATEGORIES * CATEGORY_SIZE;
+    (WORLD..end).contains(&entry) && ((entry - WORLD) % CATEGORY_SIZE).is_multiple_of(ENTRY_SIZE)
+}
+
 /// The category an entry belongs to.
 pub fn category_of(entry: usize) -> usize {
     entry.wrapping_sub(WORLD) / CATEGORY_SIZE

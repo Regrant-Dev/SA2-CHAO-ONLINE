@@ -12,7 +12,10 @@ item records in `chao-garden-items.md`; the garden ground and grid in `garden-co
 - Create 0x548D30 `(i8 id, pos*, angY, vel*, save*)`; with `save = NULL` the animal has no
   record: it is never written to the Chao save and is lost when carried out (§3).
 - Registry category 2 holds animals and Chaos Drives together. The add 0x530750 (CX = category)
-  compares against `0x8AB838[category]` (u32 array): category 2 is `0x8AB840` = **10**. The
+  compares against `0x8AB838[category]` (u32 array): category 2 is `0x8AB840` = **10**
+  (the mod raises it to 20 at start, `registry::raise_animal_limit`; each category has room for
+  64 entries, 0x1200 bytes of 0x48, and only the registry functions 0x530400..0x5307F0 read the
+  limits). The
   count is `0x1DC0F80[category]`, category 2 at `0x1DC0F88`. When the category is full the add
   returns 0 and `obj+0x3C` stays NULL.
 - The game's own animals and drives (stage animals released in the garden 0x5492B0, drives,

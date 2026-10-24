@@ -168,3 +168,28 @@ while its picker shows, then does the handler's steps itself: +0x40 = entry, 0x6
 Calling 0x672B10 / CurrentMenu = 10 directly from SubMenu 2 crashes at 0x77D0F1 (a sprite draw
 with a null animation, from the kart menu's display 0x670830), because the panels never slid
 out.
+
+## Picking a stage for the player (`room::go`)
+
+- Stage Select's update (0x671FC0) switches on CurrentSubMenu through the table at 0x6725FC
+  (0..10). Sub-menu 2 (0x672065) is the map being browsed; its confirm (0x6721C0) calls
+  0x686E00, which sets CurrentLevel, CurrentCharacter and MissionNum from the map entry under
+  the cursor (page 0x1D1BF54, index 0x1D1BF8C, entries in the table at 0xC711F8 built while the
+  game runs) and returns the entry's kind (jump table 0x672628).
+- For a stage the confirm plays sound 0x8001, calls **0x673AE0**, then writes MenuReturn
+  0x1A559E8 = 6, `[*0xC77F48]` = `[*0xC77F48+4]` = 0, `[*0xC77F44]` = 0, 0x1AEE2FC = 0 and
+  CurrentSubMenu = 5.
+- **0x673AE0** saves the menus' working state (the panels behind 0xC77F00..0xC77F1C) into
+  0x1A559EC onwards; returning to the menus after the stage restores Stage Select from that
+  copy.
+- Sub-menu 5 (0x672438) waits for the panel (`[*0xC77F48+8]` == 0), calls 0x674980, which
+  sets the menu resources for CurrentMenu 12 and releases the rest (the resource table at
+  0xC77D10, 12 bytes an entry: wanted flag, load, release), and moves to CurrentMenu 12.
+  Sub-menus 9 and 10 (0x67250E, 0x67259C) load Chao World (CurrentLevel 0x5A).
+- The map's display object (created by 0x6779A0 from the menu setup 0x66661F; display
+  0x6777C0, delete 0x677990) draws through 0x675DF0 with the model at `*0x1AEE750`, which only
+  the resource entry at 0xC77D28 (load 0x677AE0, release 0x677B60) sets. Returning to Stage
+  Select without the saved state from 0x673AE0 brings the map up with that model released,
+  and 0x41DC80 writes through the null pointer (0x41DD16).
+- So the mod picks only in sub-menu 2, calls 0x673AE0 first, then writes what the confirm
+  writes with the chosen level, mission and character.

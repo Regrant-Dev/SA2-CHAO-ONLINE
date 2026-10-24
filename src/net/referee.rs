@@ -144,6 +144,22 @@ impl Referee {
             | Body::HeldChao { .. }
             | Body::SaveChao { .. }
             | Body::ChaoLocked { .. } => false,
+            // Shared wild visitors (wild_host.rs): players' are for the host alone, and only it
+            // sends the others.
+            Body::WildHello { .. }
+            | Body::WildPick { .. }
+            | Body::WildBring { .. }
+            | Body::WildCarry { .. }
+            | Body::WildTake { .. }
+            | Body::WildHeld { .. }
+            | Body::WildPut { .. }
+            | Body::WildAbsorbed { .. }
+            | Body::WildBattle { .. }
+            | Body::WildList { .. }
+            | Body::WildAsk { .. }
+            | Body::WildAnswer { .. }
+            | Body::WildTaught { .. }
+            | Body::WildUsed { .. } => false,
             // A Chao locked against its sender (its owner's `ChaoLock`): never to its owner.
             Body::ChaoChanges { owner, index, .. }
                 if self
@@ -854,6 +870,42 @@ mod tests {
         let mut out = Vec::new();
         assert!(!r.observe(from, &Body::ItemClaim { id: MANGO }, &mut out));
         out
+    }
+
+    #[test]
+    fn wild_visitor_bodies_are_never_passed_on() {
+        use crate::net::protocol::{WILD_SEE, WildCreature, WildRequest};
+        let mut r = Referee::new();
+        let mut out = Vec::new();
+        let creature = WildCreature {
+            species: 1,
+            level: 1,
+            ability: 0,
+            shiny: false,
+            moves: [1, 0, 0, 0],
+        };
+        for body in [
+            Body::WildHello {
+                flags: WILD_SEE,
+                print: 1,
+            },
+            Body::WildTake { id: 1 },
+            Body::WildCarry {
+                area: 1,
+                creature,
+                offset: [0.0; 3],
+            },
+            // Only the host sends these.
+            Body::WildAnswer {
+                kind: WildRequest::Take,
+                id: 1,
+                key: 0,
+                ok: true,
+            },
+            Body::WildUsed { garden: 1, key: 0 },
+        ] {
+            assert!(!r.observe(2, &body, &mut out), "{body:?}");
+        }
     }
 
     #[test]

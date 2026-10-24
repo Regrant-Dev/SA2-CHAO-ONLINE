@@ -1,7 +1,8 @@
 //! One battle from the karate menu to the result: picking singles or doubles, your team and the
-//! opponents (or a trainer from the GBA game, `trainers`, or a friend online, `online`), then the
-//! turns (your choices from menus, the opponents' from the AI or the friend's game) played out
-//! beat by beat, and the XP the player's Chao earn from trainer and live battles (`levels`).
+//! opponents (or a trainer from the GBA game, `trainers`, a friend online, `online`, or a wild
+//! visitor from a garden, `wild`), then the turns (your choices from menus, the opponents' from
+//! the AI or the friend's game) played out beat by beat, and the XP the player's Chao earn from
+//! trainer, wild and live battles (`levels`).
 //!
 //! No game access here: `update` takes the buttons pressed this frame and returns `Command`s for
 //! the arena (game.rs), and `screen` says what the HUD shows. A live battle's messages come in
@@ -33,7 +34,8 @@ use super::narrate::{self, Beat, Cue, Names, Sound, View};
 use super::online::{self, Incoming};
 use super::rng::Rng;
 use super::team::{self, Dex};
-use super::trainers::{self, Picker, Roster};
+use super::trainers::{self, Creature, Picker, Roster};
+use super::wild::Ending;
 
 /// Menu buttons (the game's `MenuButtons_Pressed` bits; the keyboard and the stick count).
 /// Start isn't one of ours: it opens the game's pause menu.
@@ -268,6 +270,15 @@ pub struct Session {
     levels: BTreeMap<u64, Level>,
     /// The notice to show as the menu closes after `Command::Released`.
     farewell: Option<String>,
+    /// A battle with a wild visitor (`with_wild`): the menu is only its team screen and fight.
+    wild: Option<Wild>,
+}
+
+/// The wild visitor a session battles, and how it ended for it (once decided).
+struct Wild {
+    creature: Creature,
+    shiny: bool,
+    ending: Option<Ending>,
 }
 
 /// Frames a challenge shows before buttons answer it (a press already on its way doesn't).
@@ -472,7 +483,37 @@ impl Session {
             offer_actual_levels: false,
             levels: BTreeMap::new(),
             farewell: None,
+            wild: None,
         }
+    }
+
+    /// The menu for a battle with the wild visitor `creature` (`shiny`: in its shiny colours):
+    /// it opens at the team screen for singles against it; B there closes it unfought.
+    pub fn with_wild(mut self, creature: Creature, shiny: bool) -> Session {
+        self.wild = Some(Wild {
+            creature,
+            shiny,
+            ending: None,
+        });
+        self.state = State::Team {
+            format: Format::Singles,
+            cursor: 0,
+            picked: Vec::new(),
+            foe: None,
+            live: None,
+            moves: None,
+        };
+        self
+    }
+
+    /// A battle with a wild visitor.
+    pub fn is_wild(&self) -> bool {
+        self.wild.is_some()
+    }
+
+    /// How the battle with the wild visitor ended for it, once decided.
+    pub fn wild_ending(&self) -> Option<Ending> {
+        self.wild.as_ref()?.ending
     }
 
     /// A friend's challenge opened this menu: turning it down (or its end) closes the menu.
@@ -523,12 +564,15 @@ impl Session {
         out
     }
 
-    /// In a battle or a live battle's challenge (others see us busy).
+    /// In a battle or a live battle's challenge, or battling a wild visitor (others see us
+    /// busy).
     pub fn busy(&self) -> bool {
-        matches!(
-            self.state,
-            State::Offer { .. } | State::Waiting(_) | State::Fight(_)
-        ) || matches!(&self.state, State::Team { live: Some(_), .. })
+        self.wild.is_some()
+            || matches!(
+                self.state,
+                State::Offer { .. } | State::Waiting(_) | State::Fight(_)
+            )
+            || matches!(&self.state, State::Team { live: Some(_), .. })
     }
 
     /// Waiting on the host: a challenge, an answer or a live battle still going.
@@ -574,6 +618,15 @@ impl Session {
 
     /// A message from the host about a live battle.
     pub fn network(&mut self, event: Incoming) {
+        if self.wild.is_some() && !matches!(self.state, State::Fight(_)) {
+            // Battling a wild visitor: no challenge is taken.
+            match event {
+                Incoming::Offer { from, .. } => self.outbox.push(answer(from, ANSWER_BUSY)),
+                Incoming::Start(start) => self.outbox.push(leave(start.battle, LEAVE_LEFT)),
+                _ => {}
+            }
+            return;
+        }
         let state = std::mem::replace(&mut self.state, State::Done);
         self.state = match (state, event) {
             (State::Fight(mut f), event) => {
@@ -1117,6 +1170,31 @@ impl Session {
         Some(fight)
     }
 
+    /// A singles fight of the picked Chao against the wild visitor.
+    fn wild_fight(&self, picked: &[usize]) -> Option<Fight> {
+        let wild = self.wild.as_ref()?;
+        let mine: Vec<Entry> = picked.iter().map(|&i| self.own[i].clone()).collect();
+        let theirs = vec![Member {
+            fighter: wild.creature.fighter.clone(),
+            record: None,
+            species: Some(wild.creature.species),
+            exp_yield: wild.creature.exp_yield,
+        }];
+        let mut fight = Fight::new(
+            Format::Singles,
+            [self.chao_members(&mine), theirs],
+            self.dex.clone(),
+            self.seed,
+        )?;
+        fight.wild = true;
+        fight.intro = Some(format!(
+            "Wild {} wants to battle!",
+            wild.creature.fighter.name
+        ));
+        self.take_part(&mut fight, picked);
+        Some(fight)
+    }
+
     /// After a frame of a battle, once it's decided (once): a trainer win records progress and
     /// its reward, and the player's Chao that took part in a trainer or live battle earn XP
     /// (`levels`), with "<Chao> grew to Lv N!" after the battle's last messages.
@@ -1128,7 +1206,19 @@ impl Session {
             return;
         };
         fight.recorded = true;
-        let won = decided == Decided::Won;
+        // A wild visitor's trip that went on too long counted as given up: it ran away.
+        let overdue = self.wild.is_some() && super::wild::overdue();
+        let won = decided == Decided::Won && !overdue;
+        if let Some(wild) = self.wild.as_mut() {
+            let ending = if won { Ending::Won } else { Ending::RanAway };
+            wild.ending = Some(ending);
+            let name = &wild.creature.fighter.name;
+            fight.reward.push(if won {
+                format!("{name} stays in the garden.")
+            } else {
+                format!("{name} ran away.")
+            });
+        }
         if let Some(id) = fight.foe.filter(|_| won) {
             let first = self.progress.beat(id);
             if let Some(roster) = &self.trainers {
@@ -1190,6 +1280,11 @@ impl Session {
             State::Fight(f) => f.records.get(side)?.get(member)?.as_ref(),
             _ => None,
         }
+    }
+
+    /// `side`'s team member `member` is the wild visitor in its shiny colours.
+    pub fn shiny(&self, side: usize, member: usize) -> bool {
+        side == 1 && member == 0 && self.wild.as_ref().is_some_and(|w| w.shiny)
     }
 
     /// The species of `side`'s team member `member` when it's a trainer's creature, for its
@@ -1437,7 +1532,11 @@ impl Session {
                     live,
                     moves: None,
                 };
-                if pressed & buttons::B != 0 {
+                if pressed & buttons::B != 0 && self.wild.is_some() {
+                    out.push(sound(Sound::Back));
+                    out.push(Command::Closed);
+                    State::Done
+                } else if pressed & buttons::B != 0 {
                     out.push(sound(Sound::Back));
                     match (foe, &self.trainers, live) {
                         (_, _, Some((from, name))) => State::Offer {
@@ -1489,6 +1588,17 @@ impl Session {
                             actual_levels: self.offer_actual_levels,
                             waited: 0,
                         }))
+                    } else if self.wild.is_some() {
+                        match self.wild_fight(&picked) {
+                            Some(fight) => {
+                                out.push(sound(Sound::Confirm));
+                                State::Fight(Box::new(fight))
+                            }
+                            None => {
+                                self.notice = Some("That battle can't start.".into());
+                                stay(cursor, picked, foe, None)
+                            }
+                        }
                     } else if let Some(id) = foe {
                         match self.trainer_fight(&picked, id) {
                             Some(fight) => {
@@ -1718,6 +1828,7 @@ impl Session {
                 items.push("Choose moves".into());
                 items.push(format!("Done ({} picked)", picked.len()));
                 let against = foe.and_then(|id| self.trainers.as_ref()?.foes.get(&id));
+                let wild = self.wild.as_ref().map(|w| w.creature.fighter.name.as_str());
                 // Answering a challenge under the Level 50 rule: the stats at 50.
                 let fair = live.is_some() && !self.offer_actual_levels;
                 let detail = match (self.own.get(*cursor), self.own_profiles.get(*cursor)) {
@@ -1735,32 +1846,45 @@ impl Session {
                          it has learned."
                             .into(),
                     ),
-                    _ => Some(match (against, live) {
-                        (Some(f), _) => format!(
+                    _ => Some(match (wild, against, live) {
+                        (Some(name), _, _) => format!(
+                            "Start with the Chao you picked, in that order, against wild {name} \
+                             (singles). Win and it stays; lose or give up and it runs away."
+                        ),
+                        (None, Some(f), _) => format!(
                             "Start with the Chao you picked, in that order, against {} ({}).",
                             f.name,
                             if f.double { "doubles" } else { "singles" }
                         ),
-                        (None, Some((_, name))) => format!(
+                        (None, None, Some((_, name))) => format!(
                             "Accept {name}'s challenge with the Chao you picked, in that order."
                         ),
-                        (None, None) => "Start with the Chao you picked, in that order.".into(),
+                        (None, None, None) => {
+                            "Start with the Chao you picked, in that order.".into()
+                        }
                     }),
                 };
                 Screen {
-                    title: match (against, live) {
-                        (Some(f), _) => {
+                    title: match (wild, against, live) {
+                        (Some(name), _, _) => {
+                            format!("Your team against wild {name} (up to {TEAM_SIZE})")
+                        }
+                        (None, Some(f), _) => {
                             format!("Your team against {} (up to {TEAM_SIZE})", f.name)
                         }
-                        (None, Some((_, name))) => {
+                        (None, None, Some((_, name))) => {
                             format!("Your team against {name} (up to {TEAM_SIZE})")
                         }
-                        (None, None) => format!("Your team (up to {TEAM_SIZE})"),
+                        (None, None, None) => format!("Your team (up to {TEAM_SIZE})"),
                     },
                     items,
                     cursor: Some(*cursor),
                     detail,
-                    hint: "A: pick or drop  B: back",
+                    hint: if wild.is_some() {
+                        "A: pick or drop  B: leave"
+                    } else {
+                        "A: pick or drop  B: back"
+                    },
                     bars,
                     ..Screen::default()
                 }
@@ -1984,6 +2108,8 @@ struct Fight {
     species: [Vec<Option<u16>>; 2],
     /// The trainer battled, its challenge, and what a win brought (once recorded).
     foe: Option<u16>,
+    /// Against a wild visitor.
+    wild: bool,
     intro: Option<String>,
     reward: Vec<String>,
     recorded: bool,
@@ -2075,6 +2201,7 @@ impl Fight {
             records,
             species,
             foe: None,
+            wild: false,
             intro: None,
             reward: Vec::new(),
             recorded: false,
@@ -2211,8 +2338,8 @@ impl Fight {
     }
 
     /// The XP the player's Chao that took part earn (`won`: the player won), added to `levels`:
-    /// a trainer battle's by its foes, a live battle's by each Chao's level step; none for
-    /// other battles or Chao at level 100.
+    /// a trainer or wild battle's by its foes, a live battle's by each Chao's level step; none
+    /// for other battles or Chao at level 100.
     fn earn(&mut self, won: bool, levels: &mut BTreeMap<u64, Level>) -> Vec<Gain> {
         let takers: Vec<usize> = (0..self.own_ids.len())
             .filter(|&m| self.took_part.get(m) == Some(&true))
@@ -2227,7 +2354,7 @@ impl Fight {
             .map(|(i, f)| self.foe_levels.get(i).copied().unwrap_or(f.level))
             .collect();
         let foe_count = foes.len();
-        let trainer_xp = self.foe.map(|_| {
+        let foe_xp = (self.foe.is_some() || self.wild).then(|| {
             let list: Vec<levels::Foe> = foes
                 .iter()
                 .enumerate()
@@ -2237,7 +2364,11 @@ impl Fight {
                     fainted: f.fainted(),
                 })
                 .collect();
-            levels::trainer_xp(&list, won, k)
+            if self.wild {
+                list.first().map_or(0, |f| levels::wild_xp(f, won, k))
+            } else {
+                levels::trainer_xp(&list, won, k)
+            }
         });
         let live = self.link.is_some();
         let mut out = Vec::new();
@@ -2247,7 +2378,7 @@ impl Fight {
             if level.level >= levels::MAX_LEVEL {
                 continue;
             }
-            let xp = match trainer_xp {
+            let xp = match foe_xp {
                 Some(xp) => xp,
                 None if live => levels::online_xp(level.level, won, &fainted, foe_count, k),
                 None => 0,
@@ -2901,7 +3032,11 @@ impl Fight {
         let ended = self.link.as_ref().and_then(|l| Some((l.ended?, &l.name)));
         let (mine, my_team) = self.standing(self.me);
         let (theirs, their_team) = self.standing(self.foe());
-        let foes = if self.foe.is_some() { "team" } else { "Chao" };
+        let foes = if self.foe.is_some() || self.wild {
+            "team"
+        } else {
+            "Chao"
+        };
         let mut items = vec![
             format!("Your Chao standing: {mine} of {my_team}"),
             format!("Foe's {foes} standing: {theirs} of {their_team}"),
@@ -3756,6 +3891,108 @@ mod tests {
         let (out, _) = run(&mut s, &[buttons::A], 20_000);
         assert!(out.contains(&Command::Levels) && !out.contains(&Command::Progress));
         assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 25 });
+    }
+
+    /// A weak wild visitor (species 9, XP yield 70, level 14) for `with_wild`.
+    fn visitor() -> Creature {
+        Creature {
+            species: 9,
+            exp_yield: 70,
+            fighter: Fighter::new(
+                "Wildmon",
+                14,
+                trainers::stats([5; 6], 0, 1, 0),
+                [0, 0],
+                0,
+                &[MoveData::plain(1, 0, 10)],
+            ),
+        }
+    }
+
+    #[test]
+    fn a_wild_visitor_opens_at_the_team_screen_and_b_leaves_unfought() {
+        let mut s = session(2, Vec::new()).with_wild(visitor(), true);
+        assert!(s.is_wild() && s.busy());
+        let screen = s.screen();
+        assert_eq!(
+            screen.title,
+            format!("Your team against wild Wildmon (up to {TEAM_SIZE})")
+        );
+        assert_eq!(screen.hint, "A: pick or drop  B: leave");
+        // A challenge meanwhile is turned down.
+        s.network(Incoming::Offer {
+            from: 4,
+            name: "Friend".into(),
+            format: Format::Singles,
+            save_partners: true,
+            actual_levels: false,
+        });
+        assert_eq!(s.take_outgoing(), [busy_answer(4)]);
+        assert!(s.screen().title.contains("wild Wildmon"));
+        let out = s.update(buttons::B, false);
+        assert!(out.contains(&Command::Closed));
+        assert!(s.done());
+        assert_eq!(s.wild_ending(), None);
+    }
+
+    #[test]
+    fn a_won_wild_battle_gives_wild_xp_and_it_stays() {
+        let id = chao(200).identity();
+        let mut s = session(2, Vec::new()).with_wild(visitor(), true);
+        s.update(buttons::A, false); // Own0
+        s.update(buttons::UP, false); // wraps to "Done"
+        s.update(buttons::A, false);
+        assert_eq!(s.update(0, false), [Command::OpenArena(Format::Singles)]);
+        // It stands as its picture, in its shiny colours.
+        assert_eq!(s.species(1, 0), Some(9));
+        assert!(s.shiny(1, 0) && !s.shiny(0, 0));
+        s.update(0, true);
+        assert_eq!(
+            s.screen().message.as_deref(),
+            Some("Wild Wildmon wants to battle!")
+        );
+        let mut out = Vec::new();
+        for _ in 0..20_000 {
+            if matches!(&s.state, State::Fight(f) if f.stage == Stage::Result) {
+                break;
+            }
+            out.extend(s.update(buttons::A, true));
+        }
+        assert_eq!(s.wild_ending(), Some(Ending::Won));
+        // 70 * 14 / 7 = 140, with no trainer bonus; no ladder progress.
+        assert!(out.contains(&Command::Levels) && !out.contains(&Command::Progress));
+        let mut expect = Level::default();
+        expect.gain(140);
+        assert_eq!(s.levels()[&id], expect);
+        let screen = s.screen();
+        assert_eq!(screen.title, "You won!");
+        assert!(
+            screen
+                .items
+                .contains(&"Wildmon stays in the garden.".to_string()),
+            "{screen:?}"
+        );
+        let (out, _) = run(&mut s, &[buttons::A], 100);
+        assert!(out.contains(&Command::CloseArena));
+        assert_eq!(s.wild_ending(), Some(Ending::Won));
+    }
+
+    #[test]
+    fn giving_up_on_a_wild_visitor_lets_it_run_away_without_xp() {
+        let mut s = session(1, Vec::new()).with_wild(visitor(), false);
+        assert!(!s.shiny(1, 0));
+        s.update(buttons::A, false);
+        s.update(buttons::UP, false);
+        s.update(buttons::A, false);
+        to_choice(&mut s);
+        s.update(buttons::UP, true); // wraps to "Give up"
+        s.update(buttons::A, true);
+        s.update(buttons::DOWN, true);
+        let out = s.update(buttons::A, true);
+        assert!(!out.contains(&Command::Levels));
+        assert_eq!(s.wild_ending(), Some(Ending::RanAway));
+        assert!(s.levels().is_empty() && s.gains().is_empty());
+        assert!(s.screen().items.contains(&"Wildmon ran away.".to_string()));
     }
 
     #[test]
