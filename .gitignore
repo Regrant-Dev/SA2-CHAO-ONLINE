@@ -1,0 +1,35 @@
+# Build output
+target/
+dist/
+
+# Third-party sources and tools checked out locally (SA2 Mod Loader headers, dump parsers)
+third_party/
+
+# Game binaries, dumps and other copyrighted/extracted files: never commit
+re/bin/
+
+# Logs
+*.log
+
+# Private game images and save files: never commit; generated caches belong in target/.
+*.3ds
+*.cia
+*.cxi
+*.cci
+*.gba
+*.sav
+# Local source images, generated caches and player progress when running from the repo.
+/creature/
+/gba/
+
+# Personal tooling and notes (each developer has their own setup)
+/notes/
+.mcp.json
+.claude/
+docs/re-tools.md
+.vscode/
+
+# Skin sources and converted skins (third-party models): never in the public repo.
+/skins-src/
+/skins/
+__pycache__/

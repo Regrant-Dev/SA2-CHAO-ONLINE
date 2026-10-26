@@ -1,0 +1,16 @@
+# SA2 is a 32-bit Windows game; the mod is a 32-bit DLL built with MinGW.
+[build]
+target = "i686-pc-windows-gnu"
+
+[target.i686-pc-windows-gnu]
+linker = "i686-w64-mingw32-gcc"
+# Link libgcc/libstdc++ statically so the DLL has no MinGW runtime dependencies.
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Local source conversion runs outside SA2's 32-bit process.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

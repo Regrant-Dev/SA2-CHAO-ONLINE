@@ -1,0 +1,55 @@
+[package]
+name = "sa2-chao-online"
+version = "0.1.0"
+edition = "2024"
+authors = ["Regrant-Dev"]
+description = "Online multiplayer for Sonic Adventure 2 (SA2 Mod Loader mod)"
+license = "MIT"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "sa2_chao_online"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Builds the fake second player used for testing (src/bin/fakepeer.rs); off by default.
+fakepeer = []
+launcher = ["dep:zip"]
+# Builds the separate local source importer; extracted assets never ship with the mod.
+game-import = []
+# Adds the importer's developer commands (inspect, list, extract, ...); never shipped.
+game-import-dev = ["game-import"]
+# Dev only: at start, saves the game's decrypted code section to `sonic2app.text.bin` in the
+# mod folder, for reverse engineering (tools/rebuild_exe.py turns it back into an exe).
+dumpexe = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zip = { version = "2.4", default-features = false, features = ["deflate"], optional = true }
+
+[[bin]]
+name = "sa2co-launcher"
+path = "src/bin/launcher.rs"
+required-features = ["launcher"]
+
+# Dedicated server: relays a lobby without anyone's game hosting it (also as a Docker image).
+[[bin]]
+name = "sa2co-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "fakepeer"
+path = "src/bin/fakepeer.rs"
+required-features = ["fakepeer"]
+
+[[bin]]
+name = "sa2co-import"
+path = "src/bin/importer.rs"
+required-features = ["game-import"]
+
+[profile.release]
+opt-level = 2
+debug = "line-tables-only"

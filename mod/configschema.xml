@@ -1,0 +1,106 @@
+<?xml version="1.0"?>
+<ConfigSchema xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns="http://www.sonicretro.org">
+  <Groups>
+    <Group name="Multiplayer" display="Multiplayer">
+      <Property name="Mode" display="Multiplayer" type="Mode" defaultvalue="Off" alwaysinclude="true">
+        <HelpText>Off, Host (others join you) or Join (connect to a host or server). You can also change it in game with F9.</HelpText>
+      </Property>
+      <Property name="Name" display="Your name" type="string" defaultvalue="Player" alwaysinclude="true">
+        <HelpText>Shown above your character (up to 10 characters).</HelpText>
+      </Property>
+      <Property name="Host" display="Host address (when joining)" type="string" defaultvalue="127.0.0.1:43902" alwaysinclude="true">
+        <HelpText>The host's or server's address, e.g. 100.101.102.103. Add :port only if it isn't 43902.</HelpText>
+      </Property>
+      <Property name="Port" display="Port (when hosting)" type="int" defaultvalue="43902" minvalue="1024" maxvalue="65535" alwaysinclude="true">
+        <HelpText>The UDP port others connect to (default 43902).</HelpText>
+      </Property>
+      <Property name="NameTags" display="Name tags" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Show names above other players.</HelpText>
+      </Property>
+      <Property name="MyChao" display="My Chao (save slot, -1 = first)" type="int" defaultvalue="-1" minvalue="-1" maxvalue="23" alwaysinclude="true">
+        <HelpText>The Chao you race and fight with. Easier to pick in game: F9 > My Chao.</HelpText>
+      </Property>
+      <Property name="Visitor1" display="Bring Chao 1 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the first. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 1.</HelpText>
+      </Property>
+      <Property name="Visitor2" display="Bring Chao 2 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the second. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 2.</HelpText>
+      </Property>
+      <Property name="Visitor3" display="Bring Chao 3 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the third. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 3.</HelpText>
+      </Property>
+      <Property name="Visitor4" display="Bring Chao 4 (save slot, -1 = auto, -2 = none)" type="int" defaultvalue="-1" minvalue="-2" maxvalue="23" alwaysinclude="true">
+        <HelpText>Online, you bring up to 4 Chao from each garden to the shared garden; this is the fourth. Auto picks the first ones of that garden. Easier to pick in game: F9 > Bring Chao 4.</HelpText>
+      </Property>
+      <Property name="OthersChangeChao" display="Others can change my Chao" type="OthersChangeChao" defaultvalue="Always" alwaysinclude="true">
+        <HelpText>When other players' feeding, petting and play count for your Chao. Always; ChaoWorld: while you're anywhere in Chao World (gardens, lobby, Kindergarten, races, karate); ThatGarden: while you're in the garden your Chao is in; Never. Otherwise they can still see, carry, throw and pet them, but nothing reaches your save. Also in game: F9 > Others can change my Chao.</HelpText>
+      </Property>
+      <Property name="RoomMode" display="Party mode (parties you create)" type="RoomMode" defaultvalue="Race" alwaysinclude="true">
+        <HelpText>Race: everyone has their own enemies. Coop: enemies someone destroys are gone for everyone.</HelpText>
+      </Property>
+      <Property name="SkinVoiceVolume" display="Skin voice volume (%)" type="int" defaultvalue="100" minvalue="0" maxvalue="150" alwaysinclude="true">
+        <HelpText>How loud skins' voices are, 0 to 150 (100 = as the skin makes them). Also in game: F9 > Skin voices.</HelpText>
+      </Property>
+      <Property name="GameVolume" display="Game volume (%)" type="int" defaultvalue="100" minvalue="0" maxvalue="100" alwaysinclude="true">
+        <HelpText>The whole game's volume: music, sounds, voices and skins (the game has no volume option of its own). Also in game: F9 > Game volume.</HelpText>
+      </Property>
+      <Property name="StageSync" display="Shared enemies and bosses" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>In party Co-op stages, enemies, bosses and mech lock-ons are shared between players. Turn this off if a party stage misbehaves; everything else stays shared.</HelpText>
+      </Property>
+      <Property name="ChaoRace" display="Friends' Chao in races" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Friends' Chao fill the other lanes in your Chao Races.</HelpText>
+      </Property>
+      <Property name="PlayerKey" display="Player key (made by the mod)" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Made by the mod the first time it runs: servers know your Chao by it, so the ones you leave in a shared garden are still yours next time. Leave it as it is and don't share it.</HelpText>
+      </Property>
+    </Group>
+    <Group name="CreatureLink" display="Creature link and battles">
+      <Property name="SourceImage" display="Source game image" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Your own Pokémon Ultra Sun cartridge dump (.3ds), decrypted and without the update. Leave empty to use the first .3ds file in the mod's creature folder. The file stays on your computer.</HelpText>
+      </Property>
+      <Property name="AssetCache" display="Private asset cache" type="string" defaultvalue="" alwaysinclude="true">
+        <HelpText>Optional folder for the creature link's cache: a new or empty folder, not the one with your game file. The cache is prepared from your game file (about 3.6 GB; about 7.2 GB free is needed while it's prepared). Leave empty to use the mod's creature folder. The cache stays on your computer.</HelpText>
+      </Property>
+      <Property name="WildVisitors" display="Wild visitors in the gardens" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Wild creatures from your creature link visit the gardens and can teach your Chao their moves, types and abilities. Needs your game file.</HelpText>
+      </Property>
+      <Property name="SharedVisitors" display="Wild visitors in shared gardens" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Online, show the wild visitors and the link machine in gardens you share with friends. Everyone uses their own creature link, which must come from the same game.</HelpText>
+      </Property>
+      <Property name="BattleEffects" display="Creature battle effects" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Show attack motions, status marks, particles, camera shake and sounds in creature battles. Chao Karate isn't affected.</HelpText>
+      </Property>
+      <Property name="LinkMachine" display="Creature link machine in the gardens" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Use each garden's link machine to choose your starter partner and manage your Chao's moves, types and abilities. Off: F9's Creature link entry lists partners instead.</HelpText>
+      </Property>
+      <Property name="BattleTrainers" display="Trainers in creature battles" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Offer trainer battles in F9 > Creature battles. The trainers you've beaten are kept in the mod's creature folder.</HelpText>
+      </Property>
+      <Property name="BattleOnline" display="Live creature battles with friends" type="bool" defaultvalue="True" alwaysinclude="true">
+        <HelpText>Challenge friends who are in a garden from F9 > Creature battles, and accept their challenges. Each player picks and controls their own Chao. Chao Karate isn't affected.</HelpText>
+      </Property>
+    </Group>
+    <Group name="ChaoWorld" display="Chao World">
+      <Property name="BlackMarketRefresh" display="Black Market restocks every 10 minutes" type="bool" defaultvalue="False" alwaysinclude="true">
+        <HelpText>Off (the default): the game's own restock, new stock on your first visit 3 to 7 minutes of play after the last. On: new stock every 10 minutes of play instead (pausing doesn't count, and time played carries over between sessions), picked by the game's own rules, jewel eggs included. The market shows the time to the next restock either way.</HelpText>
+      </Property>
+    </Group>
+  </Groups>
+  <Enums>
+    <Enum name="Mode">
+      <EnumMember name="Off" />
+      <EnumMember name="Host" />
+      <EnumMember name="Join" />
+    </Enum>
+    <Enum name="RoomMode">
+      <EnumMember name="Race" />
+      <EnumMember name="Coop" />
+    </Enum>
+    <Enum name="OthersChangeChao">
+      <EnumMember name="Always" />
+      <EnumMember name="ChaoWorld" />
+      <EnumMember name="ThatGarden" />
+      <EnumMember name="Never" />
+    </Enum>
+  </Enums>
+</ConfigSchema>

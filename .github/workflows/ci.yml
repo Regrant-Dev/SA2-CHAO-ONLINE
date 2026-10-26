@@ -1,0 +1,144 @@
+# Builds the mod and runs the tests on every push and pull request. Every push to main then
+# replaces the one GitHub release ("latest") with the new zip: no version tags, no old releases,
+# and publishes the dedicated server image as ghcr.io/regrant-dev/sa2-chao-online-server:latest.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Publishing replaces the release/tag. Let an active run finish so another push can't
+  # interrupt it between removing the old release and creating the new one.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 gcc-mingw-w64-x86-64
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: |
+          # The game DLL as it ships, then with the importer's modules too.
+          cargo clippy --release --features launcher -- -D warnings
+          cargo clippy --release --features launcher,game-import -- -D warnings
+          cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer,launcher,game-import -- -D warnings
+          # The importer's developer commands are never shipped, but still compiled and linted.
+          cargo clippy --release --target x86_64-unknown-linux-gnu --all-targets --features fakepeer,launcher,game-import-dev -- -D warnings
+          # The importer as it ships: 64-bit Windows.
+          cargo clippy --release --target x86_64-pc-windows-gnu --features game-import --bin sa2co-import -- -D warnings
+      - name: Test
+        run: |
+          cargo test --target x86_64-unknown-linux-gnu --features launcher,game-import
+          python3 scripts/test-steam-launch.py
+      - name: Package
+        run: scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sa2-chao-online
+          path: |
+            dist/sa2-chao-online.zip
+            dist/sa2co-server.exe
+
+  updater-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup target add i686-pc-windows-msvc x86_64-pc-windows-gnu
+      - name: Test updater on Windows
+        run: cargo test --target i686-pc-windows-msvc --features launcher --bin sa2co-launcher
+      - name: Test menu archive recovery and native x86 calling conventions
+        run: cargo test --target i686-pc-windows-msvc --lib menu_textures
+      - name: Test bounded source readers and private output publication
+        run: |
+          cargo test --target i686-pc-windows-msvc --features game-import --lib creature
+          cargo test --target i686-pc-windows-msvc --features game-import --bin sa2co-import
+      - name: Test the importer as it ships (64-bit Windows)
+        run: |
+          cargo test --target x86_64-pc-windows-gnu --features game-import --lib creature
+          cargo test --target x86_64-pc-windows-gnu --features game-import --bin sa2co-import
+
+  release:
+    needs: [build, updater-windows]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: sa2-chao-online
+      - name: Replace the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Players get an update prompt (SA Mod Manager) for every release, so only release when
+          # something in the zip changed since the last one.
+          prev=$(git rev-list -n 1 latest 2>/dev/null || true)
+          if [ -n "$prev" ] && git diff --quiet "$prev" "$GITHUB_SHA" -- \
+              src mod assets Cargo.toml Cargo.lock .cargo docs/how-to-play.md LICENSE \
+              scripts/package.sh tools/source-model-notices.txt; then
+            echo "Nothing for players changed since ${prev::7}; keeping the current release."
+            exit 0
+          fi
+          # SA Mod Manager shows these notes when it offers the update: what changed first.
+          if [ -n "$prev" ]; then
+            changes=$(git log --format='- %s' "$prev..$GITHUB_SHA")
+          else
+            changes=$(git log -1 --format='- %s' "$GITHUB_SHA")
+          fi
+          # Remove every release and tag, then publish the one release at this commit.
+          for tag in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
+            gh release delete "$tag" --yes --cleanup-tag
+          done
+          for ref in $(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" --jq '.[].ref'); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/${ref#refs/}"
+          done
+          gh release create latest sa2-chao-online.zip sa2co-server.exe \
+            --target "$GITHUB_SHA" --latest \
+            --title "SA2 Chao Online $version" \
+            --notes "**What's new:**
+          $changes
+
+          Download **sa2-chao-online.zip** below, extract it into the game's \`mods\` folder and enable **SA2 Chao Online** in SA Mod Manager. The same zip works on Windows and on Linux (Proton). See \`how-to-play.md\` inside the zip.
+
+          **Dedicated server** (optional, keeps a lobby up without anyone's game hosting it): \`sa2co-server.exe\` below for Windows, or the Docker image \`ghcr.io/regrant-dev/sa2-chao-online-server:latest\`.
+
+          Mod version $version, built from ${GITHUB_SHA::7}. Everyone playing together needs the same mod version."
+
+  server-image:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/regrant-dev/sa2-chao-online-server:latest

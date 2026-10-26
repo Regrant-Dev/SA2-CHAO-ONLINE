@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""Animated skins: a model on its own skeleton, with its own animations (re/skins.md).
+
+    tools/skinanim.py <merged.gltf> skins/my_skin --name "My Skin" [--height 9]
+
+The input is a glTF with a skinned mesh and its animations (tools/blender_merge_anims.py makes
+one from Mixamo downloads; some models come with their animations already). The output skin folder holds:
+  model.sa2mdl    the skeleton as a node tree: a hidden root node that turns it to face -X,
+                  stand on y = 0 and be --height tall, then one node per bone. A vertex moved
+                  by one bone sits in that bone's space; one moved by several is weighted: each
+                  of its bones adds its share in the game's shared vertex buffer (Ninja weighted
+                  vertices, as Sonic's body has), so joints bend smoothly instead of stretching.
+                  Small separate pieces, like a rod, move whole with their main bone. A triangle
+                  across bones is drawn by the last of them, once its corners are complete. A
+                  bone with many vertices gets extra pieces: child nodes with no transform of
+                  their own, so nothing is reduced;
+  motions.sa2mot  every animation as a Ninja motion (positions and angles per node, one key per
+                  frame at 30 per second; pointers as file offsets like the model);
+  textures/       the texture pack; skin.ini names the animations for idle, walk, run, jump and
+                  fall (picked by name, or --role role=name) and their lengths.
+The mod plays them on the model where the player's character is, picking the animation from
+what the character is doing.
+"""
+import argparse
+import heapq
+import math
+import re
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+import charskel  # noqa: E402
+import skinconv  # noqa: E402
+import skinpreview  # noqa: E402
+
+FPS = 30
+MAX_NODE_VERTS = 800
+# Weighted vertices: at most this many bones each, each with at least this share (the rest go
+# to the ones kept). Weights are stored in 255ths.
+MAX_BONES = 3
+MIN_WEIGHT = 0.1
+# --clean-sides: vertices further than this share of the height from the middle are on one side;
+# a separate piece of the mesh is one side's when that side has this share of its limb weights.
+SIDE_BAND = 0.01
+SIDE_PIECE = 0.75
+# The game's chunk vertex buffer (0x25EFE48) holds 8192 slots (src/skins.rs VERTEX_SLOTS).
+VERTEX_SLOTS = 8192
+MOTION_MAGIC = b"SA2COMOT"
+BAMS = 65536 / (2 * math.pi)
+# Which animation plays when, by name (first match).
+ROLES = [
+    ("idle", r"^(?!.*(box|carr|hold)).*(idle(?!.*fall)|breath|stand)"),
+    ("walk", r"^(?!.*(box|carr|hold)).*walk"),
+    ("run", r"^(?!.*(box|carr|hold)).*(run|sprint)"),
+    ("jump", r"jump"),
+    ("fall", r"fall"),
+    # The garden: re/skins.md "Garden actions" (the mod plays them for the game's actions).
+    ("pickup", r"pick"),
+    ("carry", r"box idle|carry(?!.*(walk|run|jog))"),
+    ("carry_walk", r"hold.*walk|carry.*walk|box walk"),
+    ("carry_run", r"jog.*box|box.*(run|jog)|carry.*run"),
+    ("throw", r"throw"),
+    ("put_down", r"put.*down|placement"),
+    ("pet", r"pet"),
+    ("shake", r"pull|shak"),
+    ("whistle", r"whistl|wav|beckon"),
+    # On a board and grinding a rail (the mod plays idle when a skin has neither).
+    ("ride", r"board|skate|surf|ride"),
+    ("grind", r"grind"),
+]
+
+
+def quat_matrix(q):
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def rot(axis, a):
+    return charskel.rot(axis, a)[:3, :3]
+
+
+def euler_zyx(r, near=None):
+    """Angles (x, y, z) in BAMS with r = Rz(z) Ry(y) Rx(x), as the game's nodes rotate. Of the
+    two equivalent answers, the one closest to `near` (unwrapped next to it)."""
+    b = math.asin(max(-1.0, min(1.0, -r[2, 0])))
+    if abs(math.cos(b)) > 1e-6:
+        c = math.atan2(r[2, 1], r[2, 2])
+        a = math.atan2(r[1, 0], r[0, 0])
+    else:
+        a = 0.0
+        c = math.atan2(-r[1, 2], r[1, 1])
+    sets = [[c, b, a], [c + math.pi, math.pi - b, a + math.pi]]
+    sets = [[int(round(v * BAMS)) for v in s] for s in sets]
+    if near is None:
+        return [((v + 0x8000) & 0xFFFF) - 0x8000 for v in sets[0]]
+
+    def unwrap(v, ref):
+        return ref + ((v - ref + 0x8000) & 0xFFFF) - 0x8000
+
+    sets = [[unwrap(v, n) for v, n in zip(s, near)] for s in sets]
+    return min(sets, key=lambda s: sum(abs(v - n) for v, n in zip(s, near)))
+
+
+def check_euler():
+    for q in ([0.1, 0.7, 0.2, 0.6], [0.5, 0.5, 0.5, 0.5], [0, 0, 0, 1], [0.3, -0.2, 0.9, 0.1]):
+        q = np.array(q, float) / np.linalg.norm(q)
+        r = quat_matrix(q)
+        x, y, z = euler_zyx(r)
+        back = rot("z", z) @ rot("y", y) @ rot("x", x)
+        assert np.allclose(back, r, atol=2e-3), (q, back, r)
+
+
+def in_place(positions, up, airborne):
+    """The root joint's positions with the animation's own travel taken out: the character's
+    movement does that. Along the ground, the steady drift from first to last frame goes (the
+    sway stays); in the air the height stays too, as the character's own jump moves it."""
+    ps = np.array(positions, float)
+    flat = ps - np.outer(ps @ up, up)
+    drift = flat[-1] - flat[0]
+    steps = np.linspace(0.0, 1.0, len(ps))
+    ps = ps - np.outer(steps, drift)
+    if airborne:
+        ps = ps - np.outer(ps @ up - ps[0] @ up, up)
+    return list(ps), drift
+
+
+def rigid_islands(pos, tris, jw, ww, under, across):
+    """The separate pieces of a mesh (joined by shared corners, seams included) with fewer than
+    `under` triangles and no wider than `across` (a buckle, a plate; not a stocking, which has
+    to bend at the knee): vertex -> the joint weighing most over the whole piece."""
+    keys = {}
+    parent = list(range(len(pos)))
+
+    def find(v):
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+
+    for v, p in enumerate(np.round(pos, 5)):
+        first = keys.setdefault(tuple(p), v)
+        parent[find(v)] = find(first)
+    for a, b, c in tris:
+        parent[find(b)] = find(a)
+        parent[find(c)] = find(a)
+    count = {}
+    for t in tris:
+        r = find(t[0])
+        count[r] = count.get(r, 0) + 1
+    lo, hi = {}, {}
+    for v in range(len(pos)):
+        r = find(v)
+        lo[r] = np.minimum(lo.get(r, pos[v]), pos[v])
+        hi[r] = np.maximum(hi.get(r, pos[v]), pos[v])
+    weight = {}
+    for v in range(len(pos)):
+        r = find(v)
+        if count.get(r, 0) < under and float((hi[r] - lo[r]).max()) < across:
+            for j, x in zip(jw[v], ww[v]):
+                weight.setdefault(r, {})
+                weight[r][int(j)] = weight[r].get(int(j), 0.0) + float(x)
+    main = {r: max(js, key=js.get) for r, js in weight.items()}
+    return {v: main[find(v)] for v in range(len(pos)) if find(v) in main}
+
+
+def bone_side(name):
+    """'L' or 'R' for a left or right limb bone, by its name (LeftLeg, thigh_l, Arm.R...)."""
+    m = re.search(r"(?i)(left|right)|[_.]([lr])(?:_\d+)?$", name)
+    if not m:
+        return ""
+    return "L" if (m.group(1) or m.group(2)).lower().startswith("l") else "R"
+
+
+def vertex_sides(prims, sides, centre, left, tall):
+    """Per primitive, the side each vertex is on ('L', 'R' or '' in the middle). A separate piece
+    of the mesh (joined by shared corners or positions, across primitives) with nearly all its
+    limb weights on one side is that side's, every vertex of it (a trouser leg's inner face
+    crosses the middle); otherwise each vertex by where it is, beyond SIDE_BAND of the height
+    from the middle. `prims`: [(positions, joints, weights, triangles)]."""
+    pos = np.concatenate([p for p, _, _, _ in prims])
+    starts = np.cumsum([0] + [len(p) for p, _, _, _ in prims])
+    parent = list(range(len(pos)))
+
+    def find(v):
+        while parent[v] != v:
+            parent[v] = parent[parent[v]]
+            v = parent[v]
+        return v
+
+    keys = {}
+    for v, p in enumerate(np.round(pos / tall, 4)):
+        parent[find(v)] = find(keys.setdefault(tuple(p), v))
+    for (_, _, _, tris), at in zip(prims, starts):
+        for a, b, c in tris + at:
+            parent[find(b)] = find(a)
+            parent[find(c)] = find(a)
+    weight = {}
+    for (_, jw, ww, _), at in zip(prims, starts):
+        for v in range(len(jw)):
+            got = weight.setdefault(find(at + v), {"L": 0.0, "R": 0.0})
+            for j, x in zip(jw[v], ww[v]):
+                if sides[j]:
+                    got[sides[j]] += float(x)
+    piece_side = {}
+    for r, got in weight.items():
+        total = got["L"] + got["R"]
+        piece_side[r] = next((sd for sd in "LR" if total and got[sd] / total >= SIDE_PIECE), "")
+    off = (pos[:, 0] - centre) * left / tall
+    by_place = np.where(off >= SIDE_BAND, "L", np.where(off <= -SIDE_BAND, "R", ""))
+    out = [piece_side[find(v)] or by_place[v] for v in range(len(pos))]
+    return [out[a:b] for a, b in zip(starts, starts[1:])]
+
+
+def mirror_bones(names):
+    """Each bone's counterpart on the other side, by name (LeftLeg <-> RightLeg, thigh_l <->
+    thigh_r), or itself."""
+    swaps = [(r"(?i)left", "Right"), (r"(?i)right", "Left"), (r"([_.])l((?:_\d+)?)$", r"\1r\2"),
+             (r"([_.])r((?:_\d+)?)$", r"\1l\2"), (r"([_.])L((?:_\d+)?)$", r"\1R\2"),
+             (r"([_.])R((?:_\d+)?)$", r"\1L\2")]
+    index = {n.lower(): i for i, n in enumerate(names)}
+    out = []
+    for i, n in enumerate(names):
+        twin = i
+        for pattern, to in swaps:
+            m = re.sub(pattern, to, n, count=1)
+            if m != n and m.lower() in index:
+                twin = index[m.lower()]
+                break
+        out.append(twin)
+    return out
+
+
+def clean_sides(jw, ww, sides, vside, mirror):
+    """Weights of the other side's limb bones off the vertices on one side (`vside`), the rest
+    scaled back up to the same total; a vertex weighted only to the other side has its weights
+    moved to the same bones on its own side (`mirror`)."""
+    jw, ww = jw.copy(), ww.copy()
+    for v, here in enumerate(vside):
+        if not here:
+            continue
+        other = "R" if here == "L" else "L"
+        wrong = np.array([sides[j] == other for j in jw[v]])
+        kept = ww[v] * ~wrong
+        if kept.sum() > 1e-6:
+            ww[v] = kept * (ww[v].sum() / kept.sum())
+        elif wrong.any():
+            jw[v] = [mirror[j] if w else j for j, w in zip(jw[v], wrong)]
+    return jw, ww
+
+
+def blend(joints, weights):
+    """A vertex's joints and shares in 255ths (summing to 255): its heaviest few, each at least
+    MIN_WEIGHT."""
+    order = np.argsort(weights)[::-1]
+    kept = [(int(joints[i]), float(weights[i])) for i in order[:MAX_BONES]
+            if weights[i] >= MIN_WEIGHT]
+    if not kept:
+        kept = [(int(joints[order[0]]), 1.0)]
+    # Merge repeats of a joint, then share 255 by the weights (largest remainders round up).
+    merged = {}
+    for j, x in kept:
+        merged[j] = merged.get(j, 0.0) + x
+    total = sum(merged.values())
+    exact = {j: x / total * 255 for j, x in merged.items()}
+    q = {j: int(x) for j, x in exact.items()}
+    for j in sorted(exact, key=lambda j: exact[j] - q[j], reverse=True)[:255 - sum(q.values())]:
+        q[j] += 1
+    return [(j, x) for j, x in sorted(q.items(), key=lambda e: -e[1]) if x > 0]
+
+
+def decompose(m):
+    """4x4 of translation, rotation and scale -> (pos, angles BAMS (x, y, z), scale)."""
+    s = np.linalg.norm(m[:3, :3], axis=0)
+    return m[:3, 3], euler_zyx(m[:3, :3] / s), s
+
+
+def sample(times, values, t, rotation):
+    if len(times) == 1 or t <= times[0]:
+        return values[0]
+    if t >= times[-1]:
+        return values[-1]
+    i = int(np.searchsorted(times, t)) - 1
+    f = (t - times[i]) / (times[i + 1] - times[i])
+    a, b = values[i], values[i + 1]
+    if rotation:
+        if np.dot(a, b) < 0:
+            b = -b
+        q = a * (1 - f) + b * f
+        return q / np.linalg.norm(q)
+    return a * (1 - f) + b * f
+
+
+def ball_normals(pos, nrm, mask):
+    """Anime faces: normals of the `mask` vertices pointed out from a centre behind the face, so
+    light falls on it smoothly instead of picking out every dip (the original look)."""
+    if not mask.any():
+        return nrm
+    pts = pos[mask]
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    centre = (lo + hi) / 2
+    # Behind the face: the face is the side the normals mostly point to.
+    facing = nrm[mask].mean(axis=0)
+    axis = int(np.argmax(np.abs(facing)))
+    centre[axis] -= np.sign(facing[axis]) * (hi - lo)[axis] * 1.6
+    out = nrm.copy()
+    d = pos[mask] - centre
+    out[mask] = d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-9)
+    return out
+
+
+def main():
+    check_euler()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("gltf", type=Path)
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--height", type=float, default=9.0, help="height in game units (Sonic ~8)")
+    ap.add_argument("--size", type=float, default=1.0,
+                    help="drawn this much bigger on the character (movement stays the character's)")
+    ap.add_argument("--texture-size", type=int, default=1024)
+    ap.add_argument("--soft-face", default="", help="regex of material names to light smoothly")
+    ap.add_argument("--stiff", action="append", default=[], metavar="MATERIAL=BONE",
+                    help="material (regex) moved whole by one bone, e.g. a cape on the spine")
+    ap.add_argument("--cape", default="", metavar="MATERIAL=BONE",
+                    help="a cape (material regex) hung from BONE that swings back clear of the "
+                         "legs in every animation")
+    ap.add_argument("--rigid-islands", type=float, default=0.03, metavar="FRACTION",
+                    help="small separate pieces (under this share of the triangles, and of the "
+                         "height across) move whole with their main bone instead of bending")
+    ap.add_argument("--clean-sides", action="store_true",
+                    help="take the other side's limb bones off vertices clearly on one side: "
+                         "auto-rigging (Mixamo) can bleed weights between legs that nearly touch, "
+                         "pulling each leg toward the other (not for a skirt joining them)")
+    ap.add_argument("--rigid", action="store_true",
+                    help="every vertex on its strongest bone only (no weighted vertices)")
+    ap.add_argument("--role", action="append", default=[], help="role=animation name override")
+    ap.add_argument("--only", default="", help="regex: keep only these animations")
+    ap.add_argument("--credit", default="")
+    ap.add_argument("--trim", action="append", default=[], metavar="NAME=START:END",
+                    help="keep only frames START..END of an animation (a long one-off: the part "
+                         "the game's action needs)")
+    args = ap.parse_args()
+    skinconv.MAX_TEXTURE = args.texture_size
+
+    g, accessor = skinconv.load_gltf(args.gltf)
+    nodes = g["nodes"]
+    skin = g["skins"][0]
+    joints = skin["joints"]
+    jindex = {n: i for i, n in enumerate(joints)}
+    parent = {}
+    for n, node in enumerate(nodes):
+        for c in node.get("children", []):
+            parent[c] = n
+
+    def world(n):
+        m = skinconv.node_matrix(nodes[n])
+        while n in parent:
+            n = parent[n]
+            m = skinconv.node_matrix(nodes[n]) @ m
+        return m
+
+    roots = [j for j in joints if parent.get(j) not in jindex]
+    above = world(parent[roots[0]]) if roots[0] in parent else np.eye(4)
+    ibm = accessor(skin["inverseBindMatrices"]).reshape(-1, 4, 4).transpose(0, 2, 1)
+    soft = re.compile(args.soft_face, re.I) if args.soft_face else None
+    joint_world = [world(n) for n in joints]
+    stiff = []
+    for item in args.stiff:
+        pattern, bone = item.rsplit("=", 1)
+        j = next((i for i, n in enumerate(joints) if nodes[n].get("name") == bone), None)
+        if j is None:
+            sys.exit(f"--stiff: no bone {bone!r}")
+        stiff.append((pattern, j))
+
+    # A cape: a bone of its own at the cape's top edge, under BONE; its angle per frame comes
+    # later (`cape_angles`), swung back just enough to stay behind the legs.
+    cape = None
+    if args.cape:
+        pattern, bone = args.cape.rsplit("=", 1)
+        pj = next((i for i, n in enumerate(joints) if nodes[n].get("name") == bone), None)
+        if pj is None:
+            sys.exit(f"--cape: no bone {bone!r}")
+        bind = joint_world[pj] @ ibm[pj]
+        pts = []
+        for node in nodes:
+            if "mesh" not in node or "skin" not in node:
+                continue
+            for p in g["meshes"][node["mesh"]]["primitives"]:
+                m_ = p.get("material")
+                mname = g["materials"][m_].get("name", "") if m_ is not None else ""
+                if re.search(pattern, mname):
+                    pos = accessor(p["attributes"]["POSITION"])
+                    pts.extend((bind @ np.c_[pos, np.ones(len(pos))].T).T[:, :3])
+        if not pts:
+            sys.exit(f"--cape: no material matches {pattern!r}")
+        pts = np.array(pts)
+        top = pts[:, 1].max()
+        band = pts[pts[:, 1] > top - (top - pts[:, 1].min()) * 0.05]
+        pivot = np.array([band[:, 0].mean(), top, band[:, 2].mean()])
+        bottom = pts[pts[:, 1] < pts[:, 1].min() + (top - pts[:, 1].min()) * 0.05].mean(axis=0)
+        local = np.linalg.inv(joint_world[pj]) @ np.r_[pivot, 1.0]
+        pn = joints[pj]
+        cn = len(nodes)
+        nodes.append({"name": "cape", "translation": list(map(float, local[:3]))})
+        nodes[pn].setdefault("children", []).append(cn)
+        parent[cn] = pn
+        joints = list(joints) + [cn]
+        jindex[cn] = len(joints) - 1
+        offset = np.eye(4)
+        offset[:3, 3] = local[:3]
+        ibm = np.concatenate([ibm, (np.linalg.inv(offset) @ ibm[pj])[None]])
+        joint_world.append(world(cn))
+        stiff.append((pattern, jindex[cn]))
+        cape = (cn, pn, pivot, bottom)
+
+    # The skinned mesh: each vertex in the space of each of its joints, with that joint's share
+    # (one joint: all of it). Triangles whose corners are on different joints are drawn by the
+    # last of them (depth-first), using the others' vertices from the game's shared vertex
+    # buffer, so joints bend instead of tearing.
+    textures, images = {}, []
+    verts = {}  # its parts (rounded) -> vertex id
+    vert_list = []  # [(joint, position, normal, share in 255ths)] per vertex
+    tri_list = []  # (texture, [(vertex id, uv)] x 3)
+    bind_points = []
+    skinned = [p for node in nodes if "mesh" in node and "skin" in node
+               for p in g["meshes"][node["mesh"]]["primitives"]]
+    total = sum(g["accessors"][p["indices"]]["count"] // 3 for p in skinned)
+    # The mesh's height (bind pose, its own units): small pieces are a share of it.
+    span = max(float(np.ptp(accessor(p["attributes"]["POSITION"]), axis=0).max()) for p in skinned)
+    # Which side each bone is on, and where the middle is (bind pose, mesh space).
+    sides = [bone_side(nodes[j].get("name", "")) for j in joints]
+    bind_x = [np.linalg.inv(m)[0, 3] for m in ibm]
+    middle = [x for x, sd in zip(bind_x, sides) if not sd]
+    lefts = [x for x, sd in zip(bind_x, sides) if sd == "L"]
+    centre = float(np.mean(middle)) if middle else 0.0
+    left = float(np.sign(np.mean(lefts) - centre)) if lefts else 0.0
+    tall = max(float(np.ptp(accessor(p["attributes"]["POSITION"])[:, 1])) for p in skinned)
+    vsides = [[]] * len(skinned)
+    mirror = mirror_bones([nodes[j].get("name", "") for j in joints])
+    if left and args.clean_sides:
+        vsides = vertex_sides([(accessor(p["attributes"]["POSITION"]),
+                                accessor(p["attributes"]["JOINTS_0"]).astype(int),
+                                accessor(p["attributes"]["WEIGHTS_0"]),
+                                accessor(p["indices"])[:, 0].astype(int).reshape(-1, 3))
+                               for p in skinned], sides, centre, left, tall)
+    for p, vside in zip(skinned, vsides):
+        if True:
+            a = p["attributes"]
+            pos = accessor(a["POSITION"])
+            nrm = accessor(a["NORMAL"]) if "NORMAL" in a else np.tile([0.0, 1.0, 0.0], (len(pos), 1))
+            uv = accessor(a["TEXCOORD_0"]) if "TEXCOORD_0" in a else np.zeros((len(pos), 2))
+            jw = accessor(a["JOINTS_0"]).astype(int)
+            ww = accessor(a["WEIGHTS_0"])
+            if left and args.clean_sides:
+                jw, ww = clean_sides(jw, ww, sides, vside, mirror)
+            strongest = jw[np.arange(len(jw)), np.argmax(ww, axis=1)]
+            tris = accessor(p["indices"])[:, 0].astype(int).reshape(-1, 3)
+            material = p.get("material")
+            mname = g["materials"][material].get("name", "") if material is not None else ""
+            if soft and soft.search(mname):
+                nrm = ball_normals(pos, nrm, np.ones(len(pos), bool))
+            if material not in textures:
+                textures[material] = len(images)
+                images.append(skinconv.texture_for(g, args.gltf, material))
+            tex = textures[material]
+            stiff_j = next((j for pattern, j in stiff if re.search(pattern, mname)), None)
+            island_joint = rigid_islands(pos, tris, jw, ww, total * args.rigid_islands,
+                                         span * args.rigid_islands * 3)
+            ids = {}
+
+            def vertex(v):
+                if v not in ids:
+                    if stiff_j is not None:
+                        shares = [(stiff_j, 255)]
+                    elif v in island_joint:
+                        shares = [(island_joint[v], 255)]
+                    elif args.rigid:
+                        shares = [(int(strongest[v]), 255)]
+                    else:
+                        shares = blend(jw[v], ww[v])
+                    parts = []
+                    for j, q in shares:
+                        lp = (ibm[j] @ np.r_[pos[v], 1.0])[:3]
+                        ln = ibm[j][:3, :3] @ nrm[v]
+                        ln /= max(np.linalg.norm(ln), 1e-9)
+                        parts.append((j, lp, ln, q))
+                    key = tuple((j, tuple(np.round(lp, 6)), tuple(np.round(ln, 4)), q)
+                                for j, lp, ln, q in parts)
+                    if key not in verts:
+                        verts[key] = len(vert_list)
+                        vert_list.append(parts)
+                        # Where the skeleton puts it (its joints' world bind matrices).
+                        bind_points.append(sum((joint_world[j] @ np.r_[lp, 1.0])[:3] * q / 255
+                                               for j, lp, _, q in parts))
+                    ids[v] = verts[key]
+                return ids[v]
+
+            for tri in tris:
+                tri_list.append((tex, [(vertex(v), (float(uv[v][0]), float(uv[v][1])))
+                                       for v in tri]))
+
+    # Our root: what's above the root joints (the armature's own transform), then face -X
+    # (glTF faces +Z), scale to --height and put the feet on y = 0, all measured in the
+    # skeleton's world bind pose.
+    pts = np.array(bind_points)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    k = args.height / (hi[1] - lo[1])
+    face = np.eye(4)
+    face[:3, :3] = rot("y", -0x4000)
+    place = face @ np.diag([k, k, k, 1.0])
+    place[1, 3] -= (place @ np.r_[0, lo[1], 0, 1])[1]
+    root_m = place @ above
+    # Straight up, in the root joints' parent space (moves along it are the character's).
+    up = np.linalg.inv(above[:3, :3]) @ np.array([0.0, 1.0, 0.0])
+    up /= np.linalg.norm(up)
+
+    # Joints depth-first; each triangle goes to the last joint among its corners.
+    jorder = []
+
+    def walk(n):
+        jorder.append(n)
+        for c in nodes[n].get("children", []):
+            if c in jindex:
+                walk(c)
+
+    for r in roots:
+        walk(r)
+    jpos = {joints.index(n): i for i, n in enumerate(jorder)}
+    # A vertex is complete once the last of its joints (depth-first) has added its share.
+    done_by = [max((j for j, *_ in parts), key=jpos.get) for parts in vert_list]
+    drawn_by = {}  # joint index -> its triangles
+    for tri in tri_list:
+        j = max((done_by[v] for v, _ in tri[1]), key=jpos.get)
+        drawn_by.setdefault(j, []).append(tri)
+
+    # Each joint's triangles in pieces bringing at most MAX_NODE_VERTS of its own vertices.
+    pieces = {}  # joint node -> [[triangles]]
+    for j, tris in drawn_by.items():
+        out, seen, group = [], set(), []
+        for tri in tris:
+            new = {v for v, _ in tri[1] if done_by[v] == j and v not in seen}
+            if group and len(seen) + len(new) > MAX_NODE_VERTS:
+                out.append(group)
+                seen, group = set(), []
+                new = {v for v, _ in tri[1] if done_by[v] == j}
+            seen |= new
+            group.append(tri)
+        out.append(group)
+        pieces[joints[j]] = out
+
+    # Where a weighted vertex's other joints add their shares: not at the joint itself but at a
+    # node of its own (no transform: the joint's space) right before the child whose subtree
+    # completes the vertex, or after all the joint's children when none does. So its buffer
+    # slot is held only from there on, not across every subtree in between.
+    def toward(j, e):
+        """The child of joint node `j` whose subtree holds node `e`, if any."""
+        n = e
+        while n in parent:
+            if parent[n] == j:
+                return n
+            n = parent[n]
+        return None
+
+    share_at = {}  # (vertex, part) -> ("share", joint node, child node or None)
+    for v, parts in enumerate(vert_list):
+        for i, (j, *_) in enumerate(parts):
+            if len(parts) > 1 and j != done_by[v]:
+                share_at[(v, i)] = ("share", joints[j], toward(joints[j], joints[done_by[v]]))
+    shares = set(share_at.values())
+
+    # Node order (depth-first, as motions address nodes): our root, then each joint followed by
+    # its extra pieces (its triangles only use vertices complete by then), then its children
+    # (each after the share node for it, if any), then its share node for none of them.
+    order = []  # ("joint", gltf node), ("share", gltf node, child or None), ("piece", gltf node, i)
+
+    def kids(n):
+        out = [("piece", n, i) for i in range(1, len(pieces.get(n, [])))]
+        for c in nodes[n].get("children", []):
+            if c in jindex:
+                out += [("share", n, c)] if ("share", n, c) in shares else []
+                out.append(("joint", c))
+        out += [("share", n, None)] if ("share", n, None) in shares else []
+        return out
+
+    def visit(n):
+        order.append(("joint", n))
+        for item in kids(n):
+            if item[0] == "joint":
+                visit(item[1])
+            else:
+                order.append(item)
+
+    for r in roots:
+        visit(r)
+    at = {item: i for i, item in enumerate(order)}
+
+    # Which nodes put each vertex in the buffer: its last joint's (the first of that joint's
+    # nodes using it, or the joint itself when a node before that needs it) completes it, its
+    # other joints add their shares before (at their own nodes); and the last node needing it.
+    users = {}
+    for n, plist in pieces.items():
+        for i, tris in enumerate(plist):
+            item = ("joint", n) if i == 0 else ("piece", n, i)
+            for _, corners in tris:
+                for v, _ in corners:
+                    users.setdefault(v, []).append(at[item])
+    adds = {}  # node -> [(vertex, its part, weight status)]
+    first, last = {}, {}
+    for v, where in users.items():
+        j = joints[done_by[v]]
+        own = [p for p in where if order[p][1] == j]
+        done = min(own) if own and min(own) == min(where) else at[("joint", j)]
+        nodes_ = sorted((done if j_ == done_by[v] else at[share_at[(v, i)]], i)
+                        for i, (j_, *_) in enumerate(vert_list[v]))
+        for rank, (p, i) in enumerate(nodes_):
+            # One joint: a plain vertex (None); else start, middle or end of its weights.
+            status = None if len(nodes_) == 1 else 0 if rank == 0 else 2 if rank == len(nodes_) - 1 else 1
+            adds.setdefault(p, []).append((v, i, status))
+        first[v] = nodes_[0][0]
+        last[v] = max(max(where), done)
+    # Buffer slots: a slot is free again once the last node needing its vertex is drawn.
+    slot, free, live, peak = {}, list(range(VERTEX_SLOTS)), [], 0
+    heapq.heapify(free)
+    starting = {}
+    for v in sorted(first, key=lambda v: (first[v], v)):
+        starting.setdefault(first[v], []).append(v)
+    for p in range(len(order)):
+        while live and live[0][0] < p:
+            heapq.heappush(free, heapq.heappop(live)[1])
+        for v in starting.get(p, []):
+            if not free:
+                sys.exit(f"more than {VERTEX_SLOTS} vertices in use at once: fewer triangles")
+            slot[v] = heapq.heappop(free)
+            heapq.heappush(live, (last[v], slot[v]))
+        peak = max(peak, len(live))
+
+    w = skinconv.Writer()
+    alpha = {i for i, img in enumerate(images) if skinconv.has_alpha(img)}
+    models = {}
+    for item in order:
+        p = at[item]
+        n = item[1]
+        here = adds.get(p, [])
+        mine = sorted((v for v, _, status in here if status is None), key=slot.get)
+        plist = pieces.get(n, []) if item[0] != "share" else []
+        i = 0 if item[0] == "joint" else item[2] if item[0] == "piece" else 0
+        tris = plist[i] if i < len(plist) else []
+        if not here and not tris:
+            continue
+        # Plain vertices in runs of consecutive slots, one block each.
+        w.align()
+        vl = w.here()
+        runs = []
+        for v in mine:
+            if runs and slot[v] == slot[runs[-1][-1]] + 1:
+                runs[-1].append(v)
+            else:
+                runs.append([v])
+        for run in runs:
+            w.put("I", 0x29 | ((1 + 6 * len(run)) << 16))  # CnkV_VN
+            w.put("I", slot[run[0]] | (len(run) << 16))  # buffer offset, count
+            for v in run:
+                _, lp, ln, _ = vert_list[v][0]
+                w.put("6f", *lp, *ln)
+        # Shares of weighted vertices, a block per weight status (0 start: the slot is set,
+        # 1 middle: added to, 2 end: added to and complete; re/skins.md "Weighted vertices").
+        for status in (0, 1, 2):
+            group = sorted(((v, part) for v, part, st in here if st == status),
+                           key=lambda e: slot[e[0]])
+            if not group:
+                continue
+            w.put("I", 0x2C | (status << 8) | ((1 + 7 * len(group)) << 16))  # CnkV_VN_NF
+            w.put("I", 0 | (len(group) << 16))  # buffer offset 0 (slots are in each entry), count
+            for v, part in group:
+                _, lp, ln, q = vert_list[v][part]
+                w.put("6fI", *lp, *ln, slot[v] | (q << 16))
+        w.put("I", 0xFF)
+        groups = {}
+        for tex, corners in tris:
+            groups.setdefault(tex, []).append([(slot[v], uv) for v, uv in corners])
+        pl = skinconv.poly_chunks(w, sorted(groups.items()), alpha)
+        # Never left out as off screen: later nodes use its vertices.
+        w.align()
+        models[item] = w.put("II4f", vl, pl, 0.0, 0.0, 0.0, 1.0e4)
+    w.align()
+    pos0, ang0, scl0 = decompose(root_m)
+    obj_root = w.put("II3f3i3fII", 0x08, 0, *pos0, *ang0, *scl0, 0, 0)  # hidden, no mesh
+    obj = {}
+    rest = {}
+    for item in order:
+        if item[0] == "joint":
+            n = item[1]
+            t = nodes[n].get("translation", [0, 0, 0])
+            q = nodes[n].get("rotation", [0, 0, 0, 1])
+            s = nodes[n].get("scale", [1, 1, 1])
+            a = euler_zyx(quat_matrix(q))
+            rest[n] = (np.array(t, float), a)
+            model = models.get(item, 0)
+            obj[item] = w.put("II3f3i3fII", 0 if model else 0x08, model, *t, *a, *s, 0, 0)
+        else:
+            # A piece or share node: no transform of its own (unit position, angles and
+            # scale), so the bone's space.
+            obj[item] = w.put("II3f3i3fII", 0x07, models[item], 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0)
+
+    w.patch(obj_root + 0x2C, "I", obj[("joint", roots[0])])
+    top = [("joint", r) for r in roots]
+    for a_, b_ in zip(top, top[1:]):
+        w.patch(obj[a_] + 0x30, "I", obj[b_])
+    for item in order:
+        if item[0] != "joint":
+            continue
+        ks = kids(item[1])
+        if ks:
+            w.patch(obj[item] + 0x2C, "I", obj[ks[0]])
+        for a_, b_ in zip(ks, ks[1:]):
+            w.patch(obj[a_] + 0x30, "I", obj[b_])
+    meta = w.put("II", 0x444E45, 0)
+    w.patch(0, "QII", skinconv.SA2MDL, obj_root, meta)
+
+    # Motions: per joint, an angle key per frame (and positions where it moves). Our root and
+    # the piece and share nodes have no keys (they keep their own transform).
+    m = skinconv.Writer()
+    m.buf = bytearray(MOTION_MAGIC + b"\0" * 8)
+    only = re.compile(args.only, re.I) if args.only else None
+    trims = {}
+    for item in args.trim:
+        n, span = item.rsplit("=", 1)
+        a, b = span.split(":")
+        trims[n] = (int(a), int(b))
+    def posed(n, tt, tracks, memo):
+        """Node `n`'s world matrix at time `tt` of an animation (its tracks, else its rest)."""
+        if n not in memo:
+            node = dict(nodes[n])
+            if (n, "translation") in tracks:
+                node["translation"] = list(map(float, sample(*tracks[(n, "translation")], tt, False)))
+            if (n, "rotation") in tracks:
+                node["rotation"] = list(map(float, sample(*tracks[(n, "rotation")], tt, True)))
+            m_ = skinconv.node_matrix(node)
+            memo[n] = posed(parent[n], tt, tracks, memo) @ m_ if n in parent else m_
+        return memo[n]
+
+    legs = [n for n in joints if re.search(r"(up)?leg|foot|toe", nodes[n].get("name", ""), re.I)
+            and re.search(r"left|right", nodes[n].get("name", ""), re.I)]
+
+    def cape_angles(tracks, frames, first):
+        """The cape's angles (BAMS, its own bone) per frame: swung back about its top edge just
+        enough to stay behind the knees, feet and toes; at once when a leg comes back, settling
+        slowly after (like cloth)."""
+        cn, _, pivot0, bottom0 = cape
+        up = np.array([0.0, 1.0, 0.0])
+        length = float(np.linalg.norm(bottom0 - pivot0))
+        # Forward: from the feet to the toes at rest, level; the side axis across it.
+        toes = [n for n in legs if re.search(r"toe", nodes[n].get("name", ""), re.I)]
+        foot = [n for n in legs if re.search(r"foot", nodes[n].get("name", ""), re.I)]
+        fwd = sum(world(t)[:3, 3] for t in toes) - sum(world(f)[:3, 3] for f in foot)
+        fwd = fwd - up * (fwd @ up)
+        fwd /= max(np.linalg.norm(fwd), 1e-9)
+        side = np.cross(up, fwd)
+
+        def turn(t):
+            # About `side` by `t` radians (Rodrigues).
+            k = np.array([[0, -side[2], side[1]], [side[2], 0, -side[0]], [-side[1], side[0], 0]])
+            return np.eye(3) + math.sin(t) * k + (1 - math.cos(t)) * (k @ k)
+
+        # Which way round swings the bottom back.
+        back = 1.0 if (turn(0.1) @ -up) @ fwd < 0 else -1.0
+        hang = bottom0 - pivot0
+        rest = math.atan2(-(hang @ fwd), -(hang @ up))
+        # The hang in the cape bone's own space: where the body's lean alone would put it.
+        bind = joint_world[jindex[cn]][:3, :3]
+        hang_local = np.linalg.inv(bind) @ hang
+
+        def tilt(o):
+            h = o @ hang_local
+            return math.atan2(-(h @ fwd), -(h @ up))
+
+        margin = 0.08 * length
+        need = []
+        for f in range(frames):
+            memo = {}
+            tt = (first + f) / FPS
+            top = posed(cn, tt, tracks, memo)[:3, 3]
+            want = rest
+            for n in legs:
+                d = posed(n, tt, tracks, memo)[:3, 3] - top
+                down = -(d @ up)
+                if length * 0.05 < down < length * 1.1:
+                    want = max(want, math.atan((margin - d @ fwd) / down))
+            need.append(min(want, math.radians(70)))
+        # Back at once, forward slowly; twice round so the loop's start matches its end.
+        s_, out = need[-1], list(need)
+        for _ in range(2):
+            for i, v in enumerate(need):
+                s_ = v if v > s_ else s_ + (v - s_) * 0.15
+                out[i] = s_
+        angles, near = [], None
+        for f, phi in enumerate(out):
+            tt = (first + f) / FPS
+            o = posed(cn, tt, tracks, {})[:3, :3]
+            # From where the body's lean leaves it (it hangs, it doesn't lean with the back).
+            swing = phi - tilt(o)
+            o = o / np.linalg.norm(o, axis=0)
+            near = euler_zyx(o.T @ turn(back * swing) @ o, near)
+            angles.append(near)
+        return angles
+
+    table, infos = [], []
+    for anim in g.get("animations", []):
+        name = anim.get("name", f"anim{len(infos)}").split("|")[-1]
+        if only and not only.search(name):
+            continue
+        tracks = {}
+        end = 0.0
+        for ch in anim["channels"]:
+            node, path = ch["target"].get("node"), ch["target"]["path"]
+            if node not in jindex or path not in ("translation", "rotation"):
+                continue
+            smp = anim["samplers"][ch["sampler"]]
+            times = accessor(smp["input"])[:, 0]
+            tracks[(node, path)] = (times - times[0], accessor(smp["output"]))
+            end = max(end, float(times[-1] - times[0]))
+        frames = max(2, int(round(end * FPS)) + 1)
+        # Only part of it: frames start..end.
+        first = 0
+        if name in trims:
+            first, last_ = trims[name]
+            first = min(first, frames - 2)
+            frames = max(2, min(last_, frames - 1) - first + 1)
+        airborne = re.search(r"jump|fall", name, re.I) is not None
+        stride = 0.0
+        entries = []
+        swing = cape_angles(tracks, frames, first) if cape else None
+        for item in order:
+            if item[0] != "joint":
+                entries.append(([], []))
+                continue
+            n = item[1]
+            t0, a0 = rest[n]
+            if cape and n == cape[0]:
+                entries.append(([], swing))
+                continue
+            angles, positions = [], []
+            near, moves = a0, False
+            for f in range(frames):
+                tt = (first + f) / FPS
+                if (n, "rotation") in tracks:
+                    near = euler_zyx(quat_matrix(sample(*tracks[(n, "rotation")], tt, True)), near)
+                angles.append(near)
+                if (n, "translation") in tracks:
+                    positions.append(sample(*tracks[(n, "translation")], tt, False))
+            if positions and n in roots:
+                positions, drift = in_place(positions, up, airborne)
+                # How far one cycle goes, in game units (the mod plays it as fast as the
+                # character moves).
+                stride = max(stride, float(np.linalg.norm(root_m[:3, :3] @ drift)))
+            moves = any(np.linalg.norm(p - t0) > 1e-5 for p in positions)
+            entries.append((positions if moves else [], angles))
+        key_at = []
+        for positions, angles in entries:
+            m.align()
+            pa = m.here() if positions else 0
+            for f, p in enumerate(positions):
+                m.put("I3f", f, *p)
+            aa = m.here() if angles else 0
+            for f, a in enumerate(angles):
+                # Unwrapped, so the game's in-between frames don't turn the long way round.
+                m.put("I3i", f, *a)
+            key_at.append((pa, aa, len(positions), len(angles)))
+        m.align()
+        mdata = m.here()
+        m.put("4I", 0, 0, 0, 0)  # our root node
+        for pa, aa, pc, ac in key_at:
+            m.put("4I", pa, aa, pc, ac)
+        table.append(m.put("IIHH", mdata, frames, 3, 2))
+        infos.append((name, frames, stride))
+    m.align()
+    table_at = m.here()
+    for t in table:
+        m.put("I", t)
+    struct.pack_into("<II", m.buf, 8, len(table), table_at)
+
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "model.sa2mdl").write_bytes(bytes(w.buf))
+    (out / "motions.sa2mot").write_bytes(bytes(m.buf))
+    tex_dir = out / "textures"
+    tex_dir.mkdir(exist_ok=True)
+    for f in tex_dir.iterdir():
+        f.unlink()
+    gbix = skinconv.GBIX_BASE | (skinconv.hash_name(args.name) & 0xFFFF) << 8
+    lines = []
+    for i, img in enumerate(images):
+        file_ = f"tex{i:02d}.png"
+        img.save(tex_dir / file_)
+        lines.append(f"{gbix + i},{file_}")
+    (tex_dir / "index.txt").write_text("\n".join(lines) + "\n")
+    roles = dict(r.split("=", 1) for r in args.role)
+    hits = {}
+    ini = [f"name={args.name}", f"textures={len(lines)}", "animated=on",
+           f"nodes={len(order) + 1}", f"height={args.height}", f"character_scale={args.size}",
+           "motions=" + ",".join(f"{n}:{f}" for n, f, _ in infos),
+           "strides=" + ",".join(f"{st:.3f}" for _, _, st in infos)]
+    for role, pattern in ROLES:
+        want = roles.get(role)
+        hit = next((i for i, (n, _, _) in enumerate(infos)
+                    if (n == want if want else re.search(pattern, n, re.I))), None)
+        if hit is not None:
+            ini.append(f"{role}={hit}")
+            hits[role] = hit
+    if args.credit:
+        ini.append(f"credit={args.credit}")
+    (out / "skin.ini").write_text("\n".join(ini) + "\n")
+    # Feet on the ground as it stands idle (the bind pose can stand differently).
+    if "idle" in hits:
+        # By the feet (a cape or a tail can hang lower); the whole model if it has none.
+        feet = {i + 1 for i, item in enumerate(order)
+                if re.search(r"foot|toe", nodes[item[1]].get("name", ""), re.I)}
+        idle = skinpreview.Model(out, hits["idle"])
+        tris = idle.triangles(0, feet or None) or idle.triangles(0)
+        low = min(p[1] for t in tris for p in t)
+        y = struct.unpack_from("<f", w.buf, obj_root + 0xC)[0]
+        struct.pack_into("<f", w.buf, obj_root + 0xC, y - low)
+        (out / "model.sa2mdl").write_bytes(bytes(w.buf))
+        print(f"{args.name}: idle feet {low:+.2f} moved to the ground")
+    split = sum(len(p) - 1 for p in pieces.values())
+    print(f"{args.name}: {len(order) + 1} nodes ({split} extra pieces), "
+          f"{len(tri_list)} triangles ({peak} buffer slots), {len(infos)} motions "
+          f"{[(n, round(st, 1)) for n, _, st in infos]}, {len(lines)} textures, scale {k:.4f}")
+
+
+if __name__ == "__main__":
+    main()
