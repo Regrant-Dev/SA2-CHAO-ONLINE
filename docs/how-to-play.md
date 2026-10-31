@@ -7,6 +7,12 @@
    Mod Manager.
 3. Start the game. Multiplayer is off until you turn it on.
 
+**No Pokémon ROM is needed for the main mod.** Multiplayer, shared Chao gardens, Chao Races,
+normal Chao Karate and the other SA2 features work without one. The optional creature link,
+Pokémon visitors and creature battles require your own decrypted **Pokémon Ultra Sun**
+cartridge ROM (`.3ds`); the mod does not include or download it. See
+[creature link setup](#setup).
+
 Everyone playing together needs the same version of the mod. The optional Steam launcher
 checks and installs new releases automatically before the game starts; configure it once
 using [the setup instructions](https://github.com/Regrant-Dev/SA2-CHAO-ONLINE/blob/main/docs/setup.md#automatic-updates-when-launching-from-steam-windows).
@@ -301,9 +307,10 @@ it.
 
 ### Setup
 
-You need a decrypted `.3ds` dump of your own **Pokémon Ultra Sun** cartridge (any region),
-without the update applied. Other games, an eShop download or another `.cia` file don't work.
-The mod doesn't decrypt or download anything.
+You must provide your own ROM: a decrypted `.3ds` dump of your own **Pokémon Ultra Sun**
+cartridge (any region), without the update applied. The ROM is not included in the mod.
+Other games, an eShop download or another `.cia` file don't work. The mod doesn't decrypt or
+download anything.
 
 1. Put the `.3ds` file in `mods/sa2-chao-online/creature/` (the mod makes that folder, with a
    "PUT YOUR GAME FILE HERE.txt" note inside, the first time the game starts), or set
@@ -381,9 +388,16 @@ area is a type habitat: creatures of one type, matched to the garden (grassy rou
 for the Neutral Garden; sea, sky and shore for the Hero Garden; caves, mountains and sand for
 the Dark Garden). Each garden goes through all of its areas before any comes back.
 
+When the habitat changes, roaming visitors from the old habitat leave and a new group
+arrives. A visitor you are carrying or battling stays until that interaction finishes.
+Partners brought from the link machine stay with you as usual.
+
 The machine's **Who can come here** page shows each garden's current and next area, with its
 visitors, their levels and chances. Land creatures roam, water creatures swim, and whistling
 brings nearby visitors to you. Hand one to a Chao to teach it what its info card shows.
+
+Four visitors arrive when you enter. More arrive one at a time every 10–20 seconds while
+there is room; handing one to a Chao does not restart that countdown.
 
 Online, everyone in a shared garden sees the same visitors. One player at a time can pick a
 visitor up, carry it or battle it, and the others see that. A friend's **Others can change my
@@ -420,6 +434,9 @@ both of your Chao, and pick targets where needed. The result screen shows who wo
 battle XP earned; confirming takes you back to the garden. Start opens the normal pause menu.
 **F9 > Creature battles: return to garden** closes the scene; a battle already started counts
 as given up.
+
+Trainer, wild and completed live battles share their XP across your whole selected team,
+including Chao that never enter the fight. The result screen shows each Chao's share.
 
 To battle a wild visitor, walk up to it with empty hands until its info card shows
 "Y: Battle", and press **Y**. In a shared garden the host keeps it for you first ("Asking to

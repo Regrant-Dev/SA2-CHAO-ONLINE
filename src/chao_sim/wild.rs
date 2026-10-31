@@ -29,7 +29,7 @@ pub fn scaled_cap(base: usize, players: usize) -> usize {
     (base + PER_EXTRA_PLAYER * players.saturating_sub(1)).min(MAX_SHARED_VISITORS)
 }
 /// Seconds between visitors, and how long one stays before it goes once out of the way.
-pub const NEXT_SECS: (u64, u64) = (20, 50);
+pub const NEXT_SECS: (u64, u64) = (10, 20);
 pub const STAY_SECS: (u64, u64) = (300, 480);
 /// A visitor that stayed long enough goes once the player is this far away.
 pub const GONE_FAR: f32 = 60.0;

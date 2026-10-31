@@ -154,7 +154,9 @@ garden:
   in `shared-visitors.md`, "The area and the clock").
 - **A new window** (`wild::next_area`): every frame the garden is the player's alone, the
   window is worked out again; when it isn't the one the visit's area is for, the area becomes
-  the new window's. New visitors then come from it; the ones about stay until they go as usual.
+  the new window's. Roaming visitors from the old habitat leave and `came` and `next` restart
+  the entry group immediately. Visitors being held or battled are marked `retiring` and leave
+  once free; old visitors waiting to be restored after a battle are discarded.
   The area's name (its habitat name) shows at the top for 4 s with the minutes its window
   has left (`rotation::until_next`) on entering the garden and whenever the area changes
   (`hud::top_title`).

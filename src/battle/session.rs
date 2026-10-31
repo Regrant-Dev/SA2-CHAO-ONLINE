@@ -1163,7 +1163,7 @@ impl Session {
             seats[0].name(),
             pair(&seats[1].name(), &seats[2].name())
         ));
-        self.take_part(&mut fight, &plan.picked);
+        self.set_party(&mut fight, &plan.picked);
         Some(fight)
     }
 
@@ -1224,7 +1224,7 @@ impl Session {
             .flat_map(|s| s.team.iter().map(|m| m.level))
             .collect();
         fight.fair = !start.actual_levels;
-        self.take_part(&mut fight, picked);
+        self.set_party(&mut fight, picked);
         let others: Vec<(usize, String)> = (0..4)
             .filter(|&p| p != start.place && start.seats[p].player.is_some())
             .map(|p| (p, start.seats[p].name.clone()))
@@ -1394,7 +1394,7 @@ impl Session {
                 fight.intro = Some(format!("A live battle against {}!", w.name));
                 fight.foe_levels = start.team.iter().map(|m| m.level).collect();
                 fight.fair = !w.actual_levels;
-                self.take_part(&mut fight, &w.picked);
+                self.set_party(&mut fight, &w.picked);
                 fight.link = Some(Link {
                     battle: start.battle,
                     opponent: start.opponent,
@@ -1864,9 +1864,8 @@ impl Session {
         self.own_profiles = self.own.iter().map(|e| self.profile(e)).collect();
     }
 
-    /// Notes the player's Chao on `fight`'s side (the `picked` ones, in order), so the ones that
-    /// take part earn XP.
-    fn take_part(&self, fight: &mut Fight, picked: &[usize]) {
+    /// Notes the player's selected party in order, so every member shares the battle's XP.
+    fn set_party(&self, fight: &mut Fight, picked: &[usize]) {
         fight.own_ids = self.own_ids(picked);
         fight.own_levels = fight.own_ids.iter().map(|&id| self.level_of(id)).collect();
     }
@@ -1923,7 +1922,7 @@ impl Session {
         )?;
         fight.foe = Some(id);
         fight.intro = Some(format!("{} wants to battle!", foe.name));
-        self.take_part(&mut fight, picked);
+        self.set_party(&mut fight, picked);
         Some(fight)
     }
 
@@ -1951,12 +1950,12 @@ impl Session {
             "Wild {} wants to battle!",
             wild.creature.fighter.name
         ));
-        self.take_part(&mut fight, picked);
+        self.set_party(&mut fight, picked);
         Some(fight)
     }
 
     /// After a frame of a battle, once it's decided (once): a trainer win records progress and
-    /// its reward, and the player's Chao that took part in a trainer or live battle earn XP
+    /// its reward, and the player's whole party in a trainer, wild or live battle earns XP
     /// (`levels`), with "<Chao> grew to Lv N!" after the battle's last messages.
     fn record_result(&mut self, fight: &mut Fight, out: &mut Vec<Command>) {
         if fight.recorded {
@@ -3488,10 +3487,9 @@ struct Fight {
     /// A live battle under the Level 50 rule (every Chao at `team::FAIR_LEVEL`).
     fair: bool,
     /// The identities of the player's Chao on side `me` (none for a battle that gives no XP),
-    /// their battle levels, and which ones were sent out.
+    /// and their battle levels. The whole selected party shares XP, including reserves.
     own_ids: Vec<u64>,
     own_levels: Vec<Level>,
-    took_part: Vec<bool>,
     /// What they earned, and the result screen's lines for it.
     gains: Vec<Gain>,
     xp_lines: Vec<String>,
@@ -3545,7 +3543,6 @@ impl Fight {
         let records = [0, 1].map(|s| teams[shown(s)].iter().map(|m| m.record.clone()).collect());
         let species = [0, 1].map(|s| teams[shown(s)].iter().map(|m| m.species).collect());
         let yields = [0, 1].map(|s| teams[s].iter().map(|m| m.exp_yield).collect());
-        let took_part = vec![false; teams[me].len()];
         let [mine, theirs] = teams;
         let fighters = [mine, theirs].map(|t| t.into_iter().map(|m| m.fighter).collect());
         let mut battle = match Battle::new(format, fighters, dex.chart().clone(), dex.rules(), seed)
@@ -3580,7 +3577,6 @@ impl Fight {
             fair: false,
             own_ids: Vec::new(),
             own_levels: Vec::new(),
-            took_part,
             gains: Vec::new(),
             xp_lines: Vec::new(),
             result_top: 0,
@@ -3612,14 +3608,6 @@ impl Fight {
     }
 
     fn enqueue(&mut self, events: &[Event]) {
-        for e in events {
-            if let Event::SwitchedIn { at, member } = e
-                && at.side == self.me
-                && let Some(t) = self.took_part.get_mut(*member)
-            {
-                *t = true;
-            }
-        }
         let swapped: Vec<Event>;
         let events = if self.me == 0 {
             events
@@ -3707,14 +3695,11 @@ impl Fight {
         }
     }
 
-    /// The XP the player's Chao that took part earn (`won`: the player won), added to `levels`:
+    /// The XP the player's selected party earns (`won`: the player won), added to `levels`:
     /// a trainer or wild battle's by its foes, a live battle's by each Chao's level step; none
     /// for other battles or Chao at level 100.
     fn earn(&mut self, won: bool, levels: &mut BTreeMap<u64, Level>) -> Vec<Gain> {
-        let takers: Vec<usize> = (0..self.own_ids.len())
-            .filter(|&m| self.took_part.get(self.own_first + m) == Some(&true))
-            .collect();
-        let k = takers.len();
+        let k = self.own_ids.len();
         let foe_side = self.foe();
         let foes = self.battle.team(foe_side);
         let fainted: Vec<u8> = foes
@@ -3742,7 +3727,7 @@ impl Fight {
         });
         let live = self.link.is_some();
         let mut out = Vec::new();
-        for m in takers {
+        for m in 0..k {
             let identity = self.own_ids[m];
             let mut level = levels.get(&identity).copied().unwrap_or_default();
             if level.level >= levels::MAX_LEVEL {
@@ -5656,12 +5641,12 @@ mod tests {
     }
 
     #[test]
-    fn trainer_battles_give_the_chao_that_took_part_xp() {
-        let ids: Vec<u64> = (0..2).map(|i| chao(200 + i * 100).identity()).collect();
+    fn trainer_battles_share_xp_with_the_whole_selected_party() {
+        let ids: Vec<u64> = (0..3).map(|i| chao(200 + i * 100).identity()).collect();
         assert_ne!(ids[0], ids[1]);
         // Own0 one XP short of level 6.
         let near = Level::new(5, levels::step(5) - 1);
-        let mut s = session(2, Vec::new())
+        let mut s = session(3, Vec::new())
             .with_trainers(Arc::new(roster()), Progress::default())
             .with_levels(BTreeMap::from([(ids[0], near)]));
         assert_eq!(s.own_profiles[0].level, 5);
@@ -5672,12 +5657,7 @@ mod tests {
         s.update(buttons::A, false);
         s.update(buttons::A, false); // the first leader
         assert!(s.screen().detail.unwrap().starts_with("Lv 5 (XP 20/21)."));
-        s.update(buttons::A, false); // Own0
-        s.update(buttons::DOWN, false);
-        s.update(buttons::A, false); // Own1
-        s.update(buttons::DOWN, false);
-        s.update(buttons::DOWN, false);
-        s.update(buttons::A, false); // Done
+        pick_team(&mut s, 2);
         let mut out = Vec::new();
         let mut grew = false;
         for _ in 0..20_000 {
@@ -5688,23 +5668,29 @@ mod tests {
             grew |= s.screen().message.as_deref() == Some("Own0 grew to Lv 6!");
         }
         assert!(grew, "no level-up message");
-        // The weak foe fell to Own0 alone: 64 * 1 / 7 = 9, times 1.5.
+        // Own0 beat the foe alone; both selected Chao share (64 * 1 / 7) / 2 * 1.5.
+        assert!(!out.contains(&Command::Cue(Cue::Show {
+            slot: Slot::new(0, 0),
+            member: 1,
+        })));
         assert_eq!(out.iter().filter(|&&c| c == Command::Levels).count(), 1);
-        assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 12 });
-        assert!(!s.levels().contains_key(&ids[1]));
+        assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 5 });
+        assert_eq!(s.levels()[&ids[1]], Level { level: 5, xp: 6 });
+        assert!(!s.levels().contains_key(&ids[2]));
         let screen = s.screen();
         assert!(
             screen
                 .items
-                .contains(&"Own0 gained 13 XP and grew to Lv 6!".to_string()),
+                .contains(&"Own0 gained 6 XP and grew to Lv 6!".to_string()),
             "{screen:?}"
         );
+        assert!(screen.items.contains(&"Own1 gained 6 XP.".to_string()));
         // The HP box shows the level and the XP toward the next.
         let box0 = &screen.fighters[0];
         assert_eq!(box0.level, 5);
         assert_eq!(
             box0.xp,
-            Some((12.0 / levels::step(6) as f32 * 1000.0) as u16)
+            Some((5.0 / levels::step(6) as f32 * 1000.0) as u16)
         );
         assert_eq!(screen.fighters[1].level, 1);
         assert_eq!(screen.fighters[1].xp, None);
@@ -5717,7 +5703,7 @@ mod tests {
         let (_, _) = run(&mut s, &[buttons::A], 100);
         // A rematch gives XP again (and no new progress).
         let (progress, levels) = (s.progress().clone(), s.levels().clone());
-        let mut s = session(2, Vec::new())
+        let mut s = session(3, Vec::new())
             .with_trainers(Arc::new(roster()), progress)
             .with_levels(levels);
         s.update(buttons::UP, false);
@@ -5733,7 +5719,9 @@ mod tests {
         s.update(buttons::A, false);
         let (out, _) = run(&mut s, &[buttons::A], 20_000);
         assert!(out.contains(&Command::Levels) && !out.contains(&Command::Progress));
-        assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 25 });
+        assert_eq!(s.levels()[&ids[0]], Level { level: 6, xp: 18 });
+        assert_eq!(s.levels()[&ids[1]], Level { level: 5, xp: 6 });
+        assert!(!s.levels().contains_key(&ids[2]));
     }
 
     /// A weak wild visitor (species 9, XP yield 70, level 14) for `with_wild`.
@@ -5781,11 +5769,9 @@ mod tests {
 
     #[test]
     fn a_won_wild_battle_gives_wild_xp_and_it_stays() {
-        let id = chao(200).identity();
-        let mut s = session(2, Vec::new()).with_wild(visitor(), true);
-        s.update(buttons::A, false); // Own0
-        s.update(buttons::UP, false); // wraps to "Done"
-        s.update(buttons::A, false);
+        let ids: Vec<u64> = (0..3).map(|i| chao(200 + i * 100).identity()).collect();
+        let mut s = session(3, Vec::new()).with_wild(visitor(), true);
+        pick_team(&mut s, 2);
         assert_eq!(s.update(0, false), [Command::OpenArena(Format::Singles)]);
         // It stands as its picture, in its shiny colours.
         assert_eq!(s.species(1, 0), Some(9));
@@ -5803,11 +5789,18 @@ mod tests {
             out.extend(s.update(buttons::A, true));
         }
         assert_eq!(s.wild_ending(), Some(Ending::Won));
-        // 70 * 14 / 7 = 140, with no trainer bonus; no ladder progress.
+        // 70 * 14 / 7 = 140, shared with the reserve; no trainer bonus or ladder progress.
         assert!(out.contains(&Command::Levels) && !out.contains(&Command::Progress));
+        assert!(!out.contains(&Command::Cue(Cue::Show {
+            slot: Slot::new(0, 0),
+            member: 1,
+        })));
         let mut expect = Level::default();
-        expect.gain(140);
-        assert_eq!(s.levels()[&id], expect);
+        expect.gain(70);
+        for id in &ids[..2] {
+            assert_eq!(s.levels()[id], expect);
+        }
+        assert!(!s.levels().contains_key(&ids[2]));
         let screen = s.screen();
         assert_eq!(screen.title, "You won!");
         assert!(
@@ -6095,6 +6088,9 @@ mod tests {
             // Both earned XP, the winner more.
             let xp = |i: usize| l.s[i].gains().iter().map(|g| g.xp).sum::<u32>();
             assert!(xp(1) > xp(0) && xp(0) > 0, "{} {}", xp(1), xp(0));
+            for s in &l.s {
+                assert_eq!(s.gains().len(), 3, "all selected Chao share live battle XP");
+            }
             assert!(l.out.iter().all(|o| o.contains(&Command::Levels)));
             // Both say so in the arena, from their own side.
             for (i, out) in l.out.iter().enumerate() {
@@ -6682,11 +6678,11 @@ mod tests {
                 || titles.iter().all(|t| t == "It's a draw."),
             "{titles:?}"
         );
-        // Each earned XP for their own Chao.
+        // Each earned XP for all of their selected Chao, including reserves.
         for i in 0..3 {
             let gains = l.s[i].gains();
-            assert!(!gains.is_empty(), "{i}");
-            let own: Vec<u64> = l.s[i].own.iter().map(|e| e.chao.identity()).collect();
+            let own = &l.fight(i).own_ids;
+            assert_eq!(gains.len(), own.len(), "{i}");
             assert!(gains.iter().all(|g| own.contains(&g.identity)));
         }
         // Done: nothing more goes out.

@@ -174,6 +174,8 @@ struct Visitor {
     angle: u16,
     born: Instant,
     stay: Duration,
+    /// From an old habitat: keep it only while carried or battled.
+    retiring: bool,
     place: Place,
     /// Called by this whistling player until then.
     called: Option<(u8, Instant)>,
@@ -222,6 +224,8 @@ struct Visit {
     full_logged: bool,
     came: usize,
     started: Instant,
+    /// A new run may hand over local visitors; a habitat refresh must use fresh picks.
+    handover: bool,
     next: Instant,
     ask: Option<Ask>,
     list: Vec<Visitor>,
@@ -624,7 +628,7 @@ impl WildHost {
         };
         let Some(ask) = g
             .ask
-            .filter(|a| a.serial == serial && a.to == from && !g.frozen)
+            .filter(|a| a.serial == serial && a.to == from && a.slot == self.slot && !g.frozen)
         else {
             return;
         };
@@ -649,11 +653,7 @@ impl WildHost {
             crate::log!("wild host: player {from}'s pick for garden {area} didn't fit its ask");
             return;
         }
-        // An ask from the window before (out at most `ASK_LIMIT`) still brings its visitors,
-        // but its area isn't this window's.
-        if ask.slot == self.slot {
-            g.section = Some((section, print));
-        }
+        g.section = Some((section, print));
         g.came += list.len().max(1);
         let around: Vec<(f32, f32)> = players
             .iter()
@@ -680,6 +680,7 @@ impl WildHost {
                 angle,
                 born: now,
                 stay,
+                retiring: false,
                 place,
                 called: None,
                 let_go: None,
@@ -758,6 +759,7 @@ impl WildHost {
             angle,
             born: now,
             stay: Duration::MAX,
+            retiring: false,
             place,
             called: None,
             let_go: None,
@@ -841,6 +843,7 @@ impl WildHost {
             angle: p.rotation_y as u16,
             born: now,
             stay,
+            retiring: false,
             place: Place::Held {
                 by: from,
                 offset,
@@ -907,10 +910,7 @@ impl WildHost {
         }
         let print = g.print;
         self.remove(area, i);
-        let delay = self.delay();
-        if let Some(g) = self.gardens[usize::from(area) - 1].as_mut() {
-            g.next = g.next.max(now + delay);
-        }
+        // Keep the arrival countdown running while visitors are used.
         crate::log!(
             "wild host: Chao {key:?} absorbed visitor {id} (species {}) from player {from} in garden {area}",
             v.creature.species
@@ -1094,17 +1094,29 @@ impl WildHost {
         self.frame_at(now, slot, gardens, out);
     }
 
-    /// `frame` in clock window `slot`. A new window forgets every garden's area (the run, its
-    /// visitors and an ask out stay), so the next ask is for the new window's.
+    /// `frame` in clock window `slot`. A new window replaces roaming wild visitors and cancels
+    /// old picks. Busy visitors finish their interaction; partners stay with their bringers.
     fn frame_at(&mut self, now: Instant, slot: u32, gardens: &impl Gardens, out: &mut Vec<Out>) {
         self.frames += 1;
         out.append(&mut self.out);
         if slot != self.slot {
             self.slot = slot;
             for (i, g) in self.gardens.iter_mut().enumerate() {
-                if let Some(g) = g.as_mut()
-                    && g.section.take().is_some()
-                {
+                if let Some(g) = g.as_mut() {
+                    g.section = None;
+                    g.ask = None;
+                    g.handover = false;
+                    g.next = now;
+                    g.full_logged = false;
+                    for v in &mut g.list {
+                        if v.origin == Origin::Wild {
+                            v.retiring = true;
+                        }
+                    }
+                    g.list.retain(|v| v.origin != Origin::Wild || !v.free());
+                    if g.list.is_empty() {
+                        g.print = 0;
+                    }
                     crate::log!("wild host: a new window: garden {}'s area changes", i + 1);
                 }
             }
@@ -1190,6 +1202,7 @@ impl WildHost {
                     g.kept = None;
                     g.started = now;
                     g.came = 0;
+                    g.handover = true;
                     g.next = now;
                 }
                 true
@@ -1216,6 +1229,7 @@ impl WildHost {
                     full_logged: false,
                     came: 0,
                     started: now,
+                    handover: true,
                     next: now,
                     ask: None,
                     list: Vec::new(),
@@ -1371,8 +1385,8 @@ impl WildHost {
         }
     }
 
-    /// Wild visitors that stayed long enough go once every player is away from them; ones that
-    /// fell out of the garden go at once; partners go with their bringers.
+    /// Old-habitat visitors go once free; visitors that stayed long enough go once every player
+    /// is away from them. Ones that fell go at once; partners go with their bringers.
     fn leave(&mut self, index: usize, players: &[Seen], now: Instant) {
         let area = index as u8 + 1;
         let Some(g) = self.gardens[index].as_ref() else {
@@ -1386,7 +1400,7 @@ impl WildHost {
             .filter(|(_, v)| {
                 let lost = v.at[1] < LOST_Y;
                 let far = here.iter().all(|p| distance(p.position, v.at) >= GONE_FAR);
-                let done = now.duration_since(v.born) > v.stay && v.free() && far;
+                let done = v.free() && (v.retiring || (now.duration_since(v.born) > v.stay && far));
                 let left = match v.origin {
                     Origin::Wild => false,
                     Origin::Partner { bringer, .. } => {
@@ -1404,12 +1418,8 @@ impl WildHost {
         if gone.is_empty() {
             return;
         }
-        let delay = self.delay();
         for i in gone.into_iter().rev() {
             self.remove(area, i);
-        }
-        if let Some(g) = self.gardens[index].as_mut() {
-            g.next = g.next.max(now + delay);
         }
     }
 
@@ -1475,10 +1485,14 @@ impl WildHost {
             return;
         }
         g.full_logged = false;
-        let count = if g.came == 0 { ON_ENTRY } else { 1 }
-            .min(cap - wild)
-            .min(room)
-            .min(MAX_WILD_PICK);
+        let count = if g.came == 0 || g.section.is_none() {
+            ON_ENTRY
+        } else {
+            1
+        }
+        .min(cap - wild)
+        .min(room)
+        .min(MAX_WILD_PICK);
         let pond_cells = !g.spots.pond_entries().is_empty();
         let mut swimming = g
             .list
@@ -1492,7 +1506,7 @@ impl WildHost {
                 swimming += 1;
             }
         }
-        let fresh = g.came == 0 && now.duration_since(g.started) < HANDOVER;
+        let fresh = g.handover && g.came == 0 && now.duration_since(g.started) < HANDOVER;
         let section = g.section.filter(|&(_, p)| p == print).map(|(s, _)| s);
         self.asks = self.asks.wrapping_add(1);
         let ask = Ask {
@@ -1934,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_window_changes_the_area_and_keeps_the_visitors_and_the_run() {
+    fn a_new_window_refreshes_the_visitors_and_keeps_the_run() {
         let t0 = Instant::now();
         let (mut host, mut fake, mut now, out) = with_visitors(t0);
         let (section, _, _, _, before) = list_to(&out, 1).unwrap();
@@ -1943,27 +1957,27 @@ mod tests {
             let g = host.gardens[0].as_ref().unwrap();
             (g.started, g.came)
         };
-        // The window changes: the area is forgotten, the visitors and the run stay.
+        // The window changes: roaming visitors go and the new habitat is asked for at once.
         fake.slot += 1;
         let out = run(&mut host, &mut fake, 12, &mut now);
         let (section, print, picker, _, list) = list_to(&out, 1).unwrap();
         assert_eq!((section, print, picker), (None, PRINT, Some(0)));
-        assert_eq!(ids(&list), ids(&before));
+        assert!(list.is_empty());
         let g = host.gardens[0].as_ref().unwrap();
         assert_eq!((g.started, g.came), (started, came));
-        // The next ask is for the new window's area, not a fresh one.
-        let out = until_ask(&mut host, &mut fake, &mut now);
+        // Refill the first group without handing the old habitat's visitors back over.
         let a = asks(&out);
         assert!(matches!(
             a.first(),
-            Some((0, Body::WildAsk { section: None, fresh: false, slot, .. })) if *slot == fake.slot
+            Some((0, Body::WildAsk { section: None, land, pond, fresh: false, slot, .. }))
+                if *slot == fake.slot && land + pond == ON_ENTRY as u8
         ));
         answer_from(&mut host, &fake, &out, now, 44);
         let out = run(&mut host, &mut fake, 12, &mut now);
         let (section, _, _, _, list) = list_to(&out, 1).unwrap();
         assert_eq!(section, Some(44));
-        assert!(ids(&before).iter().all(|id| ids(&list).contains(id)));
-        assert!(list.len() > before.len());
+        assert!(ids(&before).iter().all(|id| !ids(&list).contains(id)));
+        assert_eq!(list.len(), ON_ENTRY);
         // The asks after are for it, until the window after.
         let out = run(&mut host, &mut fake, 60 * 60, &mut now);
         assert!(asks(&out).iter().all(|(_, b)| matches!(
@@ -1976,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn picks_across_a_window_change_bring_their_visitors_but_not_their_area() {
+    fn picks_from_a_previous_window_cannot_restore_its_visitors() {
         let t0 = Instant::now();
         let (mut host, mut fake) = two(t0);
         let mut now = t0 + Duration::from_secs(2);
@@ -1986,25 +2000,23 @@ mod tests {
             asks(&out).first(),
             Some((0, Body::WildAsk { section: None, fresh: true, slot: s, .. })) if *s == slot
         ));
-        // The window changes before the answer comes: its visitors come, as they are.
+        // The window changes before the answer comes: a new ask replaces the old one.
         fake.slot += 1;
-        run(&mut host, &mut fake, 1, &mut now);
+        let current = run(&mut host, &mut fake, 1, &mut now);
         answer(&mut host, &fake, &out, now);
         let out = run(&mut host, &mut fake, 12, &mut now);
         let (section, _, _, _, list) = list_to(&out, 1).unwrap();
-        assert_eq!((section, list.len()), (None, ON_ENTRY));
-        // The next ask is the new window's, and its answer sets the area.
-        let out = until_ask(&mut host, &mut fake, &mut now);
+        assert_eq!((section, list.len()), (None, 0));
+        // The current ask has no handover, even though the run only just started.
         assert!(matches!(
-            asks(&out).first(),
-            Some((0, Body::WildAsk { section: None, slot: s, .. })) if *s == slot + 1
+            asks(&current).first(),
+            Some((0, Body::WildAsk { section: None, fresh: false, slot: s, .. })) if *s == slot + 1
         ));
-        answer_from(&mut host, &fake, &out, now, 44);
+        answer_from(&mut host, &fake, &current, now, 44);
         let out = run(&mut host, &mut fake, 12, &mut now);
         assert_eq!(list_to(&out, 1).unwrap().0, Some(44));
-        // An ask for that area answered after the next change: taken, the area forgotten.
+        // A delayed top-up for the old area is also discarded on the next change.
         let out = until_ask(&mut host, &mut fake, &mut now);
-        let had = host.gardens[0].as_ref().unwrap().list.len();
         assert!(matches!(
             asks(&out).first(),
             Some((
@@ -2016,12 +2028,76 @@ mod tests {
             ))
         ));
         fake.slot += 1;
-        run(&mut host, &mut fake, 1, &mut now);
+        let current = run(&mut host, &mut fake, 1, &mut now);
         answer_from(&mut host, &fake, &out, now, 44);
         let out = run(&mut host, &mut fake, 12, &mut now);
         let (section, _, _, _, list) = list_to(&out, 1).unwrap();
         assert_eq!(section, None);
-        assert!(list.len() > had);
+        assert!(list.is_empty());
+        answer_from(&mut host, &fake, &current, now, 55);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let (section, _, _, _, list) = list_to(&out, 1).unwrap();
+        assert_eq!((section, list.len()), (Some(55), ON_ENTRY));
+    }
+
+    #[test]
+    fn a_new_window_keeps_busy_visitors_and_partners_until_they_are_free() {
+        let t0 = Instant::now();
+        let (mut host, mut fake, mut now, out) = with_visitors(t0);
+        let held = roaming(&out);
+        let battled = entries(&out, 0)
+            .into_iter()
+            .find(|v| v.id != held.id)
+            .unwrap();
+        next_to(&mut fake, 0, &held);
+        host.observe(0, &Body::WildTake { id: held.id }, now, &fake);
+        next_to(&mut fake, 1, &battled);
+        battle(&mut host, &fake, 1, battled.id, WildStep::Reserve, now);
+        bring(&mut host, &fake, 0, 77, now);
+
+        fake.slot += 1;
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let list = entries(&out, 0);
+        assert_eq!(list.len(), 3);
+        assert!(
+            list.iter()
+                .any(|v| v.id == held.id && v.place == WildPlace::Held { by: 0 })
+        );
+        assert!(
+            list.iter()
+                .any(|v| v.id == battled.id && v.place == WildPlace::Battle { by: 1 })
+        );
+        let partner = list.iter().find(|v| v.bringer == Some(0)).unwrap().id;
+        answer_from(&mut host, &fake, &out, now, 44);
+
+        host.observe(
+            0,
+            &Body::WildPut {
+                id: held.id,
+                at: fake.players[0].position,
+                angle: 0,
+            },
+            now,
+            &fake,
+        );
+        battle(&mut host, &fake, 1, battled.id, WildStep::Won, now);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let list = entries(&out, 0);
+        assert!(!list.iter().any(|v| v.id == held.id || v.id == battled.id));
+        assert!(list.iter().any(|v| v.id == partner));
+        assert_eq!(list.len(), ON_ENTRY + 1);
+    }
+
+    #[test]
+    fn a_held_visitor_from_the_previous_window_can_still_teach_a_chao() {
+        let t0 = Instant::now();
+        let (mut host, mut fake, mut now, v) = holding(t0);
+        fake.slot += 1;
+        run(&mut host, &mut fake, 12, &mut now);
+        absorb(&mut host, &fake, 1, v.id, now);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        assert_eq!(taught(&out), [(0, 0xABCD, WildOrigin::Wild, v.creature)]);
+        assert!(!entries(&out, 0).iter().any(|e| e.id == v.id));
     }
 
     #[test]
@@ -2481,6 +2557,25 @@ mod tests {
         // Gone: a second absorb does nothing.
         absorb(&mut host, &fake, 1, v.id, now);
         assert!(taught(&run(&mut host, &mut fake, 1, &mut now)).is_empty());
+    }
+
+    #[test]
+    fn absorbing_a_visitor_keeps_the_next_arrival_on_schedule() {
+        let t0 = Instant::now();
+        let (mut host, mut fake, _, v) = holding(t0);
+        // Use one just before the next arrival is due: it should still arrive on time.
+        let mut now = host.gardens[0].as_ref().unwrap().next - Duration::from_secs(1);
+        absorb(&mut host, &fake, 1, v.id, now);
+        let out = run(&mut host, &mut fake, 120, &mut now);
+        assert!(
+            matches!(&asks(&out)[..], [(0, Body::WildAsk { land, pond, .. })] if land + pond == 1),
+            "using a visitor must not restart the arrival countdown"
+        );
+        answer(&mut host, &fake, &out, now);
+        let out = run(&mut host, &mut fake, 12, &mut now);
+        let list = entries(&out, 0);
+        assert_eq!(list.len(), ON_ENTRY);
+        assert!(!list.iter().any(|e| e.id == v.id));
     }
 
     #[test]

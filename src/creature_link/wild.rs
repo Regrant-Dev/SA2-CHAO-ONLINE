@@ -445,6 +445,8 @@ mod game {
         main: usize,
         born: Instant,
         stay: Duration,
+        /// From an old habitat: leave once no longer held or battled.
+        retiring: bool,
         swim: Option<Swim>,
     }
 
@@ -760,7 +762,7 @@ mod game {
         if now.duration_since(alone) < alone_wait(online, w.was_shared) {
             return;
         }
-        // A new window: its area from now on (the visitors already here stay).
+        // A new habitat replaces roaming visitors; busy ones finish their interaction.
         let slot = rotation::slot_now();
         if w.slot != Some(slot) && !choose_area(w, garden, slot, now) && w.area.is_none() {
             return;
@@ -880,6 +882,16 @@ mod game {
         let Some((area, titled)) = next_area(&areas, garden, section, w.slot, slot) else {
             return false;
         };
+        if section.is_some_and(|s| s != area.section) {
+            for v in &mut w.live {
+                v.retiring = true;
+            }
+            w.restore.clear();
+            w.handover = None;
+            w.called = None;
+            w.came = 0;
+            w.next = Some(now);
+        }
         if titled {
             log!(
                 "creature link: garden {garden}'s wild area is section {} until the next window",
@@ -989,6 +1001,7 @@ mod game {
                 main,
                 born: Instant::now(),
                 stay,
+                retiring: false,
                 swim: None,
             });
         });
@@ -1188,11 +1201,16 @@ mod game {
         }
     }
 
-    /// Visitors that stayed long enough go once the player is away from them.
+    /// Old-habitat visitors go once free; visitors that stayed long enough go when far away.
     fn go_away(w: &mut Wild, now: Instant) {
         let Some((player, _)) = sa2::player_position() else {
             return;
         };
+        let battled = w
+            .trip
+            .as_ref()
+            .and_then(|t| t.kept.get(t.battled))
+            .map(|(p, _)| p.visitor);
         let mut gone = Vec::new();
         for v in &w.live {
             // SAFETY: our live object (checked against the registry this frame).
@@ -1208,7 +1226,10 @@ mod game {
             };
             let far = (at[0] - player.x).powi(2) + (at[2] - player.z).powi(2) > GONE_FAR * GONE_FAR;
             let old = now.duration_since(v.born) > v.stay;
-            if at[1] < LOST_Y || (mode == MODE_ROAM && old && far) {
+            let free = mode == MODE_ROAM
+                && Some(v.visitor) != battled
+                && v.object != crate::garden::player_held();
+            if at[1] < LOST_Y || (free && (v.retiring || (old && far))) {
                 gone.push(v.object);
             }
         }
@@ -1216,7 +1237,6 @@ mod game {
             // SAFETY: as above.
             unsafe { ((object + OBJ_MAIN) as *mut usize).write(DELETE_OBJECT) };
             w.live.retain(|v| v.object != object);
-            w.next = Some(now + delay(&mut w.rng));
         }
     }
 
@@ -1316,6 +1336,7 @@ mod game {
             main,
             born: now,
             stay,
+            retiring: false,
             swim: None,
         });
         Some(object)
@@ -1469,7 +1490,7 @@ mod game {
                 "creature link: a Chao absorbed a wild visitor (species {})",
                 v.visitor.species
             );
-            w.next = Some(Instant::now() + delay(&mut w.rng));
+            // Keep the arrival countdown running while visitors are used.
             Some((v.main, v.partner))
         })
     }

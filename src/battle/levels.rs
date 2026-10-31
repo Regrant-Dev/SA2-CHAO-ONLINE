@@ -4,14 +4,14 @@
 //! battles:
 //!
 //! - Trainer battles: each foe that fainted is worth its species' XP yield
-//!   (from the catalog) times its level / 7. The total is shared equally among the Chao that took
-//!   part (were sent out at least once), then 1.5 times as in any trainer battle. A loss gives
+//!   (from the catalog) times its level / 7. The total is shared equally among the whole selected
+//!   party, including reserves, then 1.5 times as in any trainer battle. A loss gives
 //!   only what the fainted foes were worth.
 //! - Battles with a wild visitor in a garden: the same worth (XP yield times level / 7), shared
-//!   among the Chao that took part, without the trainer bonus, and only for a win (a wild
+//!   among the whole selected party, without the trainer bonus, and only for a win (a wild
 //!   creature gives XP only when it faints).
-//! - Live battles: each Chao that took part gets a share of its own level's step (`step`):
-//!   `step * R * (n + 3w) / (4 * max(n, 3))`, shared among the Chao that took part, where R is 1
+//! - Live battles: each Chao in the selected party gets a share of its own level's step (`step`):
+//!   `step * R * (n + 3w) / (4 * max(n, 3))`, shared among the party, where R is 1
 //!   for the winner and 1/2 for the loser, n is the size of the other team and w counts its
 //!   Chao that fainted, each as its battle level over the Chao's (at most 1). A win that knocks
 //!   out a whole team of three or more at the Chao's level is one level step, split among the
@@ -123,7 +123,7 @@ fn worth(f: &Foe) -> u32 {
     u32::from(f.exp_yield) * u32::from(f.level) / 7
 }
 
-/// The XP each of the `takers` Chao that took part gets from a trainer battle against `foes`
+/// The XP each of the `takers` selected party members gets from a trainer battle against `foes`
 /// (`won`: the player won; a draw is a loss). A loss gives only the fainted foes' worth.
 pub fn trainer_xp(foes: &[Foe], won: bool, takers: usize) -> u32 {
     if takers == 0 {
@@ -136,7 +136,7 @@ pub fn trainer_xp(foes: &[Foe], won: bool, takers: usize) -> u32 {
     (pool / takers as u32).max(1) * TRAINER_PERCENT / 100
 }
 
-/// The XP each of the `takers` Chao that took part gets from a battle with the wild visitor
+/// The XP each of the `takers` selected party members gets from a battle with the wild visitor
 /// `foe` (`won`: the player won): its worth shared among them, at least 1; nothing for a loss.
 pub fn wild_xp(foe: &Foe, won: bool, takers: usize) -> u32 {
     if !won || takers == 0 {
@@ -147,7 +147,7 @@ pub fn wild_xp(foe: &Foe, won: bool, takers: usize) -> u32 {
 
 /// The XP a Chao at `level` gets from a live battle (`won`: its side won) against a team of
 /// `foes`, whose Chao at the battle levels in `fainted` fainted, shared among the `takers` Chao
-/// that took part.
+/// in the selected party, including reserves.
 pub fn online_xp(level: u8, won: bool, fainted: &[u8], foes: usize, takers: usize) -> u32 {
     if takers == 0 || foes == 0 {
         return 0;
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(trainer_xp(&party, false, 1), 600);
         let party = [foe(140, 20, false), foe(140, 20, false)];
         assert_eq!(trainer_xp(&party, false, 1), 0);
-        // Nobody took part: none; a tiny foe still gives something.
+        // No party: none; a tiny foe still gives something.
         assert_eq!(trainer_xp(&party, true, 0), 0);
         assert_eq!(trainer_xp(&[foe(1, 1, true)], true, 3), 1);
     }
@@ -247,11 +247,11 @@ mod tests {
             level: 20,
             fainted: true,
         };
-        // 140 * 20 / 7 = 400, and two that took part share it.
+        // 140 * 20 / 7 = 400, and a party of two shares it.
         assert_eq!(wild_xp(&foe, true, 1), 400);
         assert_eq!(wild_xp(&foe, true, 2), 200);
         assert_eq!(wild_xp(&foe, true, 1) * 3 / 2, trainer_xp(&[foe], true, 1));
-        // Nothing for a loss or when nobody took part; a tiny one still gives something.
+        // Nothing for a loss or an empty party; a tiny one still gives something.
         assert_eq!(wild_xp(&foe, false, 1), 0);
         assert_eq!(wild_xp(&foe, true, 0), 0);
         let tiny = Foe {

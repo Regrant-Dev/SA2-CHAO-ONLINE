@@ -80,7 +80,8 @@ visitors and no machine.
 | `section` | the garden's wild area in the host's clock window (a habitat's section id, with the print it was picked with), `None` until the window's first pick |
 | `cap` | 6..=7, drawn once per run (`MIN_CAP..=MAX_VISITORS`) |
 | `came` | wild visitors added this run |
-| `next` | the frame the next visitor is due (`NEXT_SECS` 20..50 s apart; `ON_ENTRY` = 4 right at the start) |
+| `handover` | the run may hand over local visitors within `HANDOVER`; cleared on a habitat refresh |
+| `next` | the frame the next visitor is due (`NEXT_SECS` 10..20 s apart; `ON_ENTRY` = 4 right at the start) |
 | `ask` | the outstanding `WildAsk` (serial u16, the asked player, how many land and pond, sent at), at most one |
 | `list` | the visitors |
 | `frozen` | the run ended while a battle reservation in it is open: only the battled visitors are kept (section 6) |
@@ -92,6 +93,7 @@ visitors and no machine.
 | `id` | u16 serial from the host's one counter, 1..=0xFFFF wrapping, never 0, never one in use |
 | `creature` | species u16, form u8, level u8, ability u8 (the ability id, worked out by whoever made it with `creature_link::ability_of`), shiny bool, moves [u16; 4] |
 | `origin` | `Wild`, or `Partner { bringer: player id, key: u64 }` |
+| `retiring` | from an old habitat; kept only while held or reserved for a battle |
 | `at`, `angle` | world position and facing (BAMS, low 16 bits) |
 | `born`, `stay` | when it came; how long it stays (`STAY_SECS` 300..480 s; partners: until taken) |
 | `place` | `Roam(Roam)`, `Swim(Swim)`, `Held { by, offset, heard, let_go }` or `Battle { by, since }` |
@@ -127,7 +129,9 @@ visitors and no machine.
 ### Coming and going
 - When `next` is due, wild visitors < `cap`, there is room, and no ask is out, the server asks
   the picker (section 3) for one visitor, `to_pond` (fewer than 3 swimming, the garden has pond
-  cells, 3 in 10) deciding land or pond. At the start of a run it asks for `ON_ENTRY`.
+  cells, 3 in 10) deciding land or pond. At the start of a run or habitat it asks for `ON_ENTRY`.
+- A Chao absorbing a visitor leaves the next arrival's countdown running, so teaching several
+  visitors in a row does not keep postponing their replacements.
 - The server places what it gets: land visitors on a `land_spot` at least `COME_FAR` (25) from
   every present player when a spot allows, pond visitors at a pond entry (`pond_entries`).
 - A wild visitor whose `stay` is over goes once every present player is at least `GONE_FAR`
@@ -145,11 +149,13 @@ visitors and no machine.
   with that window, so the area never depends on the picker's own clock, and it is the same
   area a player alone in that garden has in that window (`chao-wild-visitors.md` §6).
 - The first pick answering an ask of the current window sets `section`; later asks name it.
-- When the window changes the host forgets every garden's `section` (logged), and nothing else:
-  the run, `came`, its visitors and an ask that is out stay. The next ask has no section and the
-  new window, and lists say 0xFF meanwhile.
-- A pick answering an ask from the window before (asks last at most 5 s) is taken as usual, its
-  visitors added, but doesn't set `section`, so an old area is never kept into a new window.
+- When the window changes the host clears every garden's `section` and outstanding ask, sends
+  roaming wild visitors away and asks for `ON_ENTRY` from the new habitat immediately. The run
+  and `came` stay; the new ask cannot hand over old local visitors. Lists say 0xFF until answered.
+- Held and battled wild visitors are marked `retiring`: kept until put down or their battle
+  ends, then sent away. Partners from the link machine are kept as usual.
+- A delayed reply to an ask from a previous window is ignored, so it cannot restore visitors
+  from the old habitat.
 - A new run (the garden going shared again, another ground) starts with no section; its first
   pick is the window's area again, so a run restarting doesn't change the area by itself.
 
